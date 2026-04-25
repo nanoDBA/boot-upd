@@ -124,6 +124,7 @@ function Write-Log {
     if ($Message -match '^-{5,}.*\d+\.\d+.*[KMG]?B.*eta') { return }
     if ($Message -match '^\s*━+|^\s*\|█+') { return }
     if ($Message -match 'Progress:\s*\d+%\s*-\s*Saving') { return }
+    if ($Message -match 'is currently in use\.\s*Retry the operation after closing') { return }
 
     $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $entry = "[$ts] [$Level] $Message"
@@ -905,7 +906,11 @@ function Update-PowerShellModules {
     Write-Log 'Checking installed PowerShell modules...'
     $installed = Get-InstalledModule -EA SilentlyContinue
     if (-not $installed) { Write-Log 'No user-installed modules found.' -Level Warn; return @{ Success = $true; Count = 0 } }
-    $modules = $installed | Where-Object { $_.Name -notlike 'Microsoft.PowerShell.*' }
+    $modules = $installed | Where-Object {
+        $_.Name -notlike 'Microsoft.PowerShell.*' -and
+        $_.Name -notlike 'AWS.Tools.*' -and          # AWS.Tools handled by Update-AWSToolsModule
+        $_.Name -ne 'Az'                              # Meta-module; sub-modules (Az.*) update individually
+    }
     if (-not $modules) { Write-Log 'Only built-in modules found.'; return @{ Success = $true; Count = 0 } }
     Write-Log "Found $(@($modules).Count) module(s) to check."
     $count = 0; $perModTimeout = [math]::Min($script:PackageTimeoutMinutes, 5)
@@ -942,6 +947,34 @@ function Update-PowerShellModules {
             Write-Log "  [WHATIF] Would run: Update-Module -Name $modName -Force"
         }
     }
+    <# AWS.Tools modules: use the dedicated installer if available #>
+    $awsInstalled = $installed | Where-Object { $_.Name -like 'AWS.Tools.*' -and $_.Name -ne 'AWS.Tools.Installer' }
+    if ($awsInstalled -and (Get-Command Update-AWSToolsModule -EA SilentlyContinue)) {
+        Write-Log "Updating $(@($awsInstalled).Count) AWS.Tools module(s) via Update-AWSToolsModule..."
+        if ($PSCmdlet.ShouldProcess('AWS.Tools.*', 'Update-AWSToolsModule -CleanUp')) {
+            try {
+                $job = Start-Job -ScriptBlock { Update-AWSToolsModule -CleanUp -Force -Confirm:$false 2>&1 }
+                $done = $job | Wait-Job -Timeout ($script:PackageTimeoutMinutes * 60)
+                if (-not $done) {
+                    Write-Log 'TIMEOUT: AWS.Tools update exceeded timeout' -Level Warn
+                    try { Get-Process -Id $job.ChildJobs[0].ProcessId -EA SilentlyContinue | Stop-Process -Force -EA SilentlyContinue } catch { }
+                    $job | Stop-Job -PassThru | Remove-Job -Force
+                } else {
+                    $jobOutput = Receive-Job $job -EA SilentlyContinue
+                    Remove-Job $job -Force
+                    $jobOutput | ForEach-Object { Write-Log $_ }
+                    $awsCount = @($jobOutput | Where-Object { $_ -match 'Installed|Updated' }).Count
+                    if ($awsCount -gt 0) { Write-Log "  AWS.Tools: $awsCount module(s) updated"; $count += $awsCount }
+                    else { Write-Log '  AWS.Tools: already latest' }
+                }
+            } catch { Write-Log "AWS.Tools update error: $_" -Level Warn }
+        } else {
+            Write-Log '  [WHATIF] Would run: Update-AWSToolsModule -CleanUp'
+        }
+    } elseif ($awsInstalled) {
+        Write-Log "AWS.Tools modules found but Update-AWSToolsModule not available — skipping (install AWS.Tools.Installer)" -Level Warn
+    }
+
     Write-Log "PS module updates: $count updated."
     return @{ Success = $true; Count = $count }
 }
