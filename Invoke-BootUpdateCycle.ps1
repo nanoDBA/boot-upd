@@ -97,7 +97,16 @@ $script:SmtpCredential        = $SmtpCredential
 $script:MaintenanceWindowStart = $MaintenanceWindowStart
 $script:MaintenanceWindowEnd   = $MaintenanceWindowEnd
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 2 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.3.3' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.3.4' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+
+<# Force UTF-8 console I/O so box-drawing/block chars (BBS splash) render in cmd.exe regardless of system code page.
+   chcp 65001 sets conhost interpretation; [Console]::OutputEncoding makes .NET write proper UTF-8 bytes. #>
+try {
+    [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+    [Console]::InputEncoding  = [System.Text.UTF8Encoding]::new($false)
+    $OutputEncoding           = [System.Text.UTF8Encoding]::new($false)
+    & chcp.com 65001 > $null 2>&1
+} catch { <# no console attached (SYSTEM scheduled task) — ignore #> }
 
 #region Logging
 function Invoke-LogRotation {
@@ -1549,9 +1558,10 @@ function Send-RebootWarning {
    and do NOT go to the log file — the log stays clean and greppable.  #>
 
 function Show-StartupArt {
-    <# BBS-inspired ANSI splash — shown on first iteration only.
-       ░▒▓█ gradient borders, neon palette, interpunct separators.
-       Evokes the ACiD/iCE era login screens of the early '90s.  #>
+    <# BBS-inspired ANSI splash — ░▒▓█ gradient borders, neon palette, interpunct
+       separators.  Evokes the ACiD/iCE era login screens of the early '90s.
+       UTF-8 console encoding is forced at script start; on cmd.exe this requires
+       chcp 65001 to also have run, which we attempt at top of file. #>
     $e = [char]27
     <# Curated neon palettes — each is (art, bar-accent, tagline) #>
     $palettes = @(

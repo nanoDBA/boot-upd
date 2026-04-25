@@ -1,8 +1,16 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.3.3  
+**Current Version:** v2.3.4  
 **Release Date:** 2026-04-25  
 **Status:** STABLE
+
+---
+
+## v2.3.4 (2026-04-25)
+
+**Fix:** BBS splash rendered as blank when launched via `upd.cmd` — Unicode block-drawing chars stripped by inherited CP437/CP1252 console encoding.
+
+- Forces UTF-8 console I/O on script start (`[Console]::OutputEncoding` + `chcp 65001`) so block/box-drawing chars (U+2588, U+2557, U+2550, etc.) survive the cmd.exe → pwsh handoff
 
 ---
 
