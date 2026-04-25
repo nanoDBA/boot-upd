@@ -384,14 +384,14 @@ function Get-ProcessTreeActivity {
     $totalCpuMs = [int64]0; $procCount = 0; $handles = 0
 
     while ($queue.Count -gt 0) {
-        $pid = $queue.Dequeue()
-        if (-not $visited.Add($pid)) { continue }
-        $cim = $byPid[$pid]
+        $procId = $queue.Dequeue()
+        if (-not $visited.Add($procId)) { continue }
+        $cim = $byPid[$procId]
         if ($cim) {
             $totalCpuMs += ([int64]$cim.KernelModeTime + [int64]$cim.UserModeTime) / 10000
             $handles += [int]$cim.HandleCount; $procCount++
         }
-        if ($childMap.ContainsKey($pid)) { foreach ($c in $childMap[$pid]) { if (-not $visited.Contains($c)) { $queue.Enqueue($c) } } }
+        if ($childMap.ContainsKey($procId)) { foreach ($c in $childMap[$procId]) { if (-not $visited.Contains($c)) { $queue.Enqueue($c) } } }
     }
     return [pscustomobject]@{ TotalCpuTime = [timespan]::FromMilliseconds($totalCpuMs); ProcessCount = $procCount; HandleCount = $handles }
 }
