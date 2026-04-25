@@ -83,14 +83,14 @@ if ([string]::IsNullOrWhiteSpace($raw)) {
 
 $allEntries = $null
 try {
-    $allEntries = @($raw | ConvertFrom-Json)
+    $allEntries = @($raw | ConvertFrom-Json) | Where-Object { $null -ne $_ }
 }
 catch {
     Write-Host "Error parsing history file: $_"
     exit 1
 }
 
-if ($allEntries.Count -eq 0) {
+if (-not $allEntries -or $allEntries.Count -eq 0) {
     Write-Host "No update history found at $historyPath"
     exit 0
 }

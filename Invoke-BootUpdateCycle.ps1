@@ -61,7 +61,9 @@ param(
     [string]$NotifyEmail      = '',   # SMTP recipient email address
     [string]$SmtpServer       = '',   # SMTP relay hostname (e.g., smtp.office365.com)
     [string[]]$ExcludePatterns = @(),  # Package name/ID patterns to skip (substring match, case-insensitive)
+    [ValidateRange(-1, 23)]
     [int]$MaintenanceWindowStart = -1,  # Hour of day (0-23) when updates may begin. -1 = no window enforced.
+    [ValidateRange(-1, 23)]
     [int]$MaintenanceWindowEnd   = -1   # Hour of day when updates must stop. -1 = no window enforced.
 )
 
@@ -702,7 +704,7 @@ function Update-WingetPackages {
                 foreach ($pkgId in $packageIds) {
                     $matchedPattern = $null
                     foreach ($pattern in $script:ExcludePatterns) {
-                        if ($pkgId -like "*$pattern*") { $matchedPattern = $pattern; break }
+                        if ($pkgId.IndexOf($pattern, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { $matchedPattern = $pattern; break }
                     }
                     if ($matchedPattern) {
                         Write-Log "Excluded by pattern '$matchedPattern': $pkgId" -Level Info
@@ -777,7 +779,7 @@ function Update-ChocolateyPackages {
                 if (-not $pkgName) { continue }
                 $matchedPattern = $null
                 foreach ($pattern in $script:ExcludePatterns) {
-                    if ($pkgName -like "*$pattern*") { $matchedPattern = $pattern; break }
+                    if ($pkgName.IndexOf($pattern, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { $matchedPattern = $pattern; break }
                 }
                 if ($matchedPattern) {
                     Write-Log "Excluded by pattern '$matchedPattern': $pkgName" -Level Info

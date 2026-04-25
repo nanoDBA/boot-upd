@@ -407,7 +407,10 @@ function Register-ScheduledTaskNow {
     if ($Config.SkipDotnetTools)      { $taskArgs += '-SkipDotnetTools' }
     if ($Config.SkipVscode)           { $taskArgs += '-SkipVscode' }
     if ($Config.SkipRestorePoint)     { $taskArgs += '-SkipRestorePoint' }
+    if ($Config.SkipHealthCheck)      { $taskArgs += '-SkipHealthCheck' }
     if ($Config.StagedRollout)        { $taskArgs += '-StagedRollout' }
+    if ($Config.MaintenanceWindowStart -ge 0) { $taskArgs += "-MaintenanceWindowStart $($Config.MaintenanceWindowStart)" }
+    if ($Config.MaintenanceWindowEnd   -ge 0) { $taskArgs += "-MaintenanceWindowEnd $($Config.MaintenanceWindowEnd)" }
     if ($Config.WebhookUrl)           { $taskArgs += "-WebhookUrl `"$($Config.WebhookUrl)`"" }
     if ($Config.NotifyEmail)          { $taskArgs += "-NotifyEmail `"$($Config.NotifyEmail)`"" }
     if ($Config.SmtpServer)           { $taskArgs += "-SmtpServer `"$($Config.SmtpServer)`"" }
