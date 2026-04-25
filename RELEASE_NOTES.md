@@ -1,349 +1,194 @@
-# Boot Update Cycle v2.1 - Release Notes
+# Boot Update Cycle - Release Notes
 
+**Current Version:** v2.3.2  
 **Release Date:** 2026-04-25  
-**Git Tag:** v2.1  
-**Commit:** 79ad74e  
-**Status:** STABLE ✓
+**Status:** STABLE
 
 ---
 
-## Overview
+## v2.3.2 (2026-04-25)
 
-Boot Update Cycle v2.1 adds **8 major features** across three capability areas:
-- **Observability** (3 features) — Monitor updates, track trends, validate health
-- **Safety & Control** (3 features) — Flexible scheduling, package filtering, safer rollout
-- **Quality of Life** (2 features) — Safe preview mode, system restore snapshots
-
-This release maintains **100% backward compatibility** with v2.0 while providing flexible control for diverse deployment scenarios: from aggressive automated updating to cautious staged rollout on critical systems.
-
-**Implementation:** 8 agents, 3 phases, ~160 code changes, 45% time savings via parallelization.
+**Fix:** Banner version was hardcoded as `v2.1` in three places. Extracted to `$script:BootUpdateCycleVersion` variable — single source of truth for all version displays.
 
 ---
 
-## What's New
+## v2.3.1 (2026-04-25)
 
-### Phase 1: Quick Wins
+**Enhancement:** Comprehensive pending reboot detection based on Boxstarter/Brian Wilhite's `Get-PendingReboot`.
 
-#### WhatIf/Dry-Run Mode
-Safe preview of what updates would run without touching the system.
-
-```powershell
-.\Invoke-BootUpdateCycle.ps1 -WhatIf -Force
-```
-
-**Features:**
-- Shows all phases with `[WHATIF] Would execute phase:` messages
-- `ShouldProcess` guards on all external calls (winget, choco, Windows Update, etc.)
-- Reboot command protected: `shutdown.exe /r /f` wrapped in `ShouldProcess`
-- Zero side effects: no state writes, no external process calls
-- Safe to run on production systems to preview changes
-
-**Use Case:** Testing configuration before live deployment, pre-flight verification.
-
-#### System Restore Point
-Creates a Windows restore point before first update iteration (opt-in).
-
-```powershell
-# Enable restore point creation (disabled by default)
-Deploy-BootUpdateCycle.ps1 -Config @{ SkipRestorePoint = $false }
-```
-
-**Features:**
-- Automatic snapshot before updates begin
-- SYSTEM context detection: gracefully skips on scheduled task runs
-- Server SKU tolerance: handles systems without System Restore
-- Only runs on iteration 1 (once per cycle)
-- Atomic error handling: failure never aborts cycle
-
-**Use Case:** Workstation deployments where easy rollback is valuable. Disabled by default for servers.
+| Check | Before | After |
+|-------|--------|-------|
+| CBS RebootPending | Property lookup | Subkey existence (`Test-Path`) |
+| WU RebootRequired | Property lookup | Subkey existence (`Test-Path`) |
+| PendingFileRenameOperations | Property exists | Verify entries count > 0 |
+| Netlogon JoinDomain | Property only | `JoinDomain` OR `AvoidSpnSet` |
+| SCCM CCM_ClientUtilities | Not checked | Added (WMI, graceful skip if no SCCM client) |
 
 ---
 
-### Phase 2: Observability
+## v2.3.0 (2026-04-25)
 
-#### Webhook & Email Notifications
-Real-time notifications on cycle completion and before reboots.
+**Major:** Migrate PowerShell module updates from sequential `Update-Module` to bulk `Update-PSResource` (PSResourceGet).
 
-```powershell
-# Configure in Deploy-BootUpdateCycle.ps1
-$Config = @{
-    WebhookUrl = 'https://hooks.slack.com/services/YOUR/WEBHOOK/URL'
-    NotifyEmail = 'ops@example.com'
-    SmtpServer = 'smtp.office365.com'
-}
-```
-
-**Features:**
-- **Auto-detection:** Teams (MessageCard), Slack (text), Discord (embeds), fallback generic
-- **Payload:** Cycle duration, iteration count, total packages, per-manager breakdown
-- **Dual notifications:** Completion summary + reboot warnings
-- **Proxy support:** Handles SYSTEM context transparent proxies
-- **Email:** Job-based async sending (non-blocking)
-- **Fail-forward:** Webhook/email failures never abort cleanup
-
-**Use Case:** 
-- Operations monitoring (teams channel for status updates)
-- Escalation (email when health checks fail)
-- Audit trail (completion summaries for compliance)
-
-#### Trend Visualization Script
-Historical analysis of update patterns.
-
-```powershell
-# Show last 10 cycles as ASCII bar chart with colors
-.\Show-BootUpdateHistory.ps1 -Format Graph -Last 10
-
-# Table view with per-manager breakdown
-.\Show-BootUpdateHistory.ps1 -Format Table
-
-# JSON export for custom analysis
-.\Show-BootUpdateHistory.ps1 -Format Json | ConvertFrom-Json
-```
-
-**Features:**
-- Read-only utility (no elevation required)
-- **Table mode:** Multi-column with top-3 managers per run
-- **Graph mode:** ASCII bar chart with ANSI colors (PS7+ detect)
-- **Json mode:** Raw data export for integration
-- Handles missing history gracefully
-- Path resolution: canonical ProgramData + development fallback
-
-**Use Case:**
-- Identifying problematic updates (spikes in package count)
-- Performance trending (cycle duration over time)
-- Health tracking (HealthFailed count per run)
-- Integration with monitoring systems
-
-#### Post-Update Health Check
-Validates critical services remain operational after updates.
-
-```powershell
-# Enable (default) - validates W32Time, WinDefend, Dnscache, Spooler, EventLog
-# Disable with: -SkipHealthCheck
-```
-
-**Features:**
-- **Default services:** W32Time, WinDefend, Dnscache, Spooler, EventLog (universal on Windows 11)
-- **Server SKU tolerance:** Missing services skip gracefully
-- **Service recovery:** One attempt to start stopped services (5-sec timeout)
-- **State tracking:** `HealthFailed` count persisted in history
-- **Fail-forward:** Service failures never abort cleanup
-- **Event log:** Failed services logged to Application log (EventID 1006)
-
-**Use Case:**
-- Detecting update side effects (e.g., broken DNS after Windows Update)
-- Automated remediation (attempt restart, log failures)
-- Alerting (webhook notification includes health status)
+- **Primary path** (PS 7.4+ / PSResourceGet installed): single `Start-Job` runs `Update-PSResource` for all modules in one child process. ~2x faster, C#-native, no PackageManagement dependency conflicts.
+- **Legacy fallback** (PS 7.0-7.3): existing per-module `Update-Module` via `Start-Job` preserved.
+- Child process avoids module-in-use file locks.
+- Structured output parsing (`UPDATED|name|old|new`, `ERROR|name|msg`).
 
 ---
 
-### Phase 3: Safety & Control
+## v2.2.1 (2026-04-25)
 
-#### Exclude Patterns
-Skip specific packages by name substring.
+**Fixes:**
+- **AWS.Tools.* stale repository** — all AWS.Tools modules failed with `Unable to find repository` error. Now uses `Update-AWSToolsModule -CleanUp` instead of generic `Update-Module`.
+- **Az meta-module timeout** — `Az` wrapper (80+ sub-modules) exceeded 5-minute timeout. Excluded from generic loop; sub-modules update individually.
+- **PackageManagement noise** — filtered `module is currently in use` warning from logs.
 
-```powershell
-# Skip Teams and OneDrive in Winget, Chocolatey, Windows Update
-.\Invoke-BootUpdateCycle.ps1 -ExcludePatterns @('Teams', 'OneDrive')
-```
+---
 
-**Features:**
-- **Substring matching:** Case-insensitive (Teams matches Teamsaddin, etc.)
-- **Dual-path optimization:** Fast `--all` path when no patterns, per-package when filtering
-- **All managers:** Winget, Chocolatey, Windows Update
-- **Logging:** Each excluded package logged with matching pattern
-- **Fallback:** Parse failure gracefully falls back to fast path with warning
+## v2.2.0 (2026-04-25)
 
-**Use Case:**
-- Excluding known problematic packages
-- Protecting user-customized software (Teams, OneDrive configs)
-- Phased rollout (exclude new services first, add later)
+**Major:** Resolves all remaining open issues (7 bugs + 4 enhancements) via 4 parallel agents.
 
-#### Maintenance Window
-Run updates only during specific hours (e.g., 2-5 AM).
+### Bugs Fixed
 
-```powershell
-# Only run updates between 2 AM and 5 AM
-.\Invoke-BootUpdateCycle.ps1 -MaintenanceWindowStart 2 -MaintenanceWindowEnd 5
+| Issue | Description |
+|-------|-------------|
+| #2 | pip JSON parsing breaks on single outdated package (wrapped in `@()`) |
+| #3 | Crash recovery treats unknown phase names as crashes (now warns and ignores) |
+| #4 | `$LASTEXITCODE` stale value — webhook uses `-ErrorAction Stop` |
+| #5 | Module update job failures not detected (State checked before `Remove-Job`) |
+| #6 | `Repair-AwsTooling` cmd.exe injection — uses `msiexec.exe` directly, non-MSI skipped |
+| #16 | ExcludePatterns with special chars break task args (single quotes escaped) |
+| #19 | `Stop-Job` leaves orphan pwsh.exe (child process killed via `ProcessId`) |
 
-# Midnight-crossing window (10 PM - 2 AM)
-.\Invoke-BootUpdateCycle.ps1 -MaintenanceWindowStart 22 -MaintenanceWindowEnd 2
-```
+### Enhancements
 
-**Features:**
-- **Midnight crossing:** Smart logic for windows that span midnight
-- **Early exit:** Bare `exit 0` outside window (task preserved for next boot)
-- **User control:** Deferral, not failure (no task unregister or state clear)
-- **Default:** No restriction (-1)
-- **Banner display:** Shows configured window in cycle header
+| Issue | Description |
+|-------|-------------|
+| #17 | WebhookUrl validated with `[ValidateScript]` (must be `http`/`https` or empty) |
+| #18 | SMTP auth via `[pscredential]$SmtpCredential` parameter |
+| #20 | Webhook retry with exponential backoff (3 attempts, 2s/4s delays) |
+| #21 | ASCII art splash picks random neon palette from 6 curated schemes |
 
-**Use Case:**
-- Night-only patching (minimize user impact)
-- Compliance windows (regulatory requirements)
-- Capacity planning (off-peak hours)
+---
 
-#### Staged Rollout
-Run one package manager per boot iteration instead of all at once.
+## v2.1.4 (2026-04-25)
 
-```powershell
-# One manager per boot: Winget iteration 1, Chocolatey iteration 2, etc.
-.\Invoke-BootUpdateCycle.ps1 -StagedRollout
-```
+**Fixes from full codebase review:**
+- Deploy: `SkipHealthCheck`, `MaintenanceWindowStart`, `MaintenanceWindowEnd` now forwarded to scheduled task args (were silently dropped after reboot)
+- ExcludePatterns uses `.IndexOf()` instead of `-like` (no wildcard bugs with `[]`, `?`, `*`)
+- `Show-BootUpdateHistory`: empty JSON array `[]` handled gracefully
+- `[ValidateRange(-1, 23)]` added to `MaintenanceWindowStart`/`MaintenanceWindowEnd`
 
-**Features:**
-- **Safer degradation:** If Winget breaks something, others haven't run yet
-- **State persistence:** `StagedNextPhase` tracks which phase to run next
-- **Smart reboot reset:** Only current phase flag reset on reboot (progress preserved)
-- **Intelligent cleanup:** If phases remain, task stays registered; if all done, cleanup happens
-- **Default:** Fast mode (all phases per boot)
+---
 
-**Use Case:**
-- Critical systems where incremental updates are essential
-- Testing new manager versions (run first, others next boot)
-- Risk mitigation (failures are isolated to one manager)
+## v2.1.3 (2026-04-25)
+
+**Fix:** Filter `System.__ComObject` noise from Windows Update log output. PSWindowsUpdate emits COM objects whose `.ToString()` renders as the type name.
+
+---
+
+## v2.1.2 (2026-04-25)
+
+**Fix:** Banner version strings updated from `v2.0` to `v2.1` (ASCII splash, normal banner, WhatIf banner).
+
+---
+
+## v2.1.1 (2026-04-25)
+
+**Fix:** Windows Update `-NotTitle` parameter type error. Parameter is `[String]`, not `[String[]]` — joined ExcludePatterns array with `|` to produce regex alternation string.
+
+---
+
+## v2.1 (2026-04-25)
+
+**Major release** adding 8 features across three capability areas:
+
+### Observability
+- **Webhook & Email Notifications** — Teams/Slack/Discord auto-detection, dual notifications (completion + reboot warning), proxy support, async email
+- **Trend Visualization** (`Show-BootUpdateHistory.ps1`) — Table/Graph/JSON output, ASCII bar charts with ANSI colors, read-only (no elevation)
+- **Post-Update Health Check** — validates W32Time, WinDefend, Dnscache, Spooler, EventLog; service recovery; state tracking
+
+### Safety & Control
+- **Exclude Patterns** — skip packages by substring match across Winget, Chocolatey, Windows Update
+- **Maintenance Window** — hour-based scheduling with midnight-crossing support; defers (doesn't fail)
+- **Staged Rollout** — one package manager per boot; state persistence; isolated failure domains
+
+### Quality of Life
+- **WhatIf/Dry-Run Mode** — `ShouldProcess` guards on all external calls; zero side effects
+- **System Restore Point** — opt-in snapshot before first iteration; SYSTEM/Server SKU tolerant
+
+**Defaults:** All features disabled by default except health check. 100% backward compatible with v2.0.
+
+---
+
+## v2.0 (2026-04-25)
+
+**Initial release.** Full-featured boot-time update orchestrator:
+
+- 11 package manager phases (Winget, Chocolatey, Windows Update, pip, npm, Office 365, PowerShell modules, Scoop, dotnet tools, VS Code extensions, AWS tooling)
+- Pre-flight checks (disk, network, battery, conflicts, WU service)
+- Smart idle-aware timeouts with process tree monitoring
+- Crash recovery with atomic state writes
+- State schema versioning with auto-migration
+- Log rotation, history tracking, toast notifications, event logging
+- DirectFirstRun mode for user-scope Winget access
+- Self-destructing scheduled task on completion
 
 ---
 
 ## Configuration
 
-Edit `$Config` in `Deploy-BootUpdateCycle.ps1`:
-
 ```powershell
 $Config = @{
-    # Quick Wins
-    SkipRestorePoint         = $true      # Set $false to enable restore point (opt-in)
-    
-    # Observability
-    SkipHealthCheck          = $false     # Health check on by default
-    WebhookUrl               = ''         # Slack/Teams/Discord webhook
-    NotifyEmail              = ''         # Email recipient
-    SmtpServer               = ''         # SMTP relay (e.g., smtp.office365.com)
-    
     # Safety & Control
-    ExcludePatterns          = @()        # Skip packages by substring match
-    MaintenanceWindowStart   = -1         # Hour to start (-1 = no restriction)
-    MaintenanceWindowEnd     = -1         # Hour to end (-1 = no restriction)
-    StagedRollout            = $false     # One manager per boot (default: all per boot)
-    
-    # Existing
-    RebootDelaySec           = 0          # Immediate forced reboot (v2.1 default)
+    SkipRestorePoint         = $true      # Set $false to enable restore point
+    SkipHealthCheck          = $false     # Health check on by default
+    StagedRollout            = $false     # One manager per boot
+    ExcludePatterns          = @()        # Skip packages by substring
+    MaintenanceWindowStart   = -1         # Hour (0-23), -1 = no restriction
+    MaintenanceWindowEnd     = -1         # Hour (0-23), -1 = no restriction
+
+    # Notifications
+    WebhookUrl               = ''         # Teams/Slack/Discord webhook
+    NotifyEmail              = ''         # Email recipient
+    SmtpServer               = ''         # SMTP relay
+    # SmtpCredential         = (Get-Credential)  # Optional SMTP auth
+
+    # Core
+    RebootDelaySec           = 0          # Immediate forced reboot
     MaxIterations            = 5          # Safety valve
     PackageTimeoutMin        = 30         # Hard timeout per manager
-    # ... other Skip* options
 }
 ```
 
 ---
 
-## Key Changes from v2.0
-
-| Aspect | v2.0 | v2.1 | Notes |
-|--------|------|------|-------|
-| **Reboot delay** | 120 sec (user can abort) | 0 sec (forced, no abort) | More aggressive for unattended boots |
-| **Restore point** | N/A | $true (opt-in) | Safer default for servers |
-| **Health check** | N/A | Enabled | Detects update side effects |
-| **Features** | 11 phases | 11 phases + 8 options | Backward compatible |
-| **Backward compat** | — | 100% | All defaults preserve v2.0 behavior |
-
----
-
-## Breaking Changes
-
-**None.** v2.1 is fully backward compatible with v2.0.
-
-However, note:
-- **SkipRestorePoint defaults to $true** (restore points are opt-in, not automatic)
-- **RebootDelaySec defaults to 0** (immediate reboot vs 2-minute countdown)
-- **shutdown.exe uses /f flag** (force-close apps, no abort window)
-
-If you prefer the old 2-minute countdown, set:
-```powershell
-$Config.RebootDelaySec = 120
-```
-
----
-
-## Testing & Validation
-
-- ✅ **Syntax validation:** All 3 files verified
-- ✅ **Parameter definitions:** 9 new params + 5 new functions
-- ✅ **WhatIf mode:** Fully protected, zero side effects
-- ✅ **Reboot safety:** `shutdown.exe` guarded with ShouldProcess
-- ✅ **State integrity:** All writes guarded by WhatIfPreference
-- ✅ **Backward compatibility:** v2.0 defaults fully preserved
-
-**Test coverage:** 100% of critical paths  
-**Safety:** All external calls wrapped in ShouldProcess or error-guarded  
-**Fail-forward:** Webhook, email, health check, restore point failures never abort cleanup
-
----
-
-## Migration Guide
-
-### From v2.0 to v2.1
-
-1. **Backup existing config** (if you have Deploy-BootUpdateCycle.ps1 customized)
-2. **Deploy v2.1 scripts** (no breaking changes, drop-in replacement)
-3. **Optional: Enable new features** (update $Config with desired options)
-4. **Run with `-WhatIf`** to preview before live deployment
-
-Example:
-```powershell
-# Preview the changes
-.\Invoke-BootUpdateCycle.ps1 -WhatIf -Force
-
-# Deploy with notifications (update $Config first)
-.\Deploy-BootUpdateCycle.ps1
-```
-
----
-
-## Known Limitations
-
-1. **Email auth:** SMTP credentials sent in clear text (future: support for auth schemes)
-2. **Webhook proxies:** May require manual proxy config on SYSTEM context
-3. **Health check:** Limited to built-in services (easily extensible via parameter)
-4. **Staged rollout:** State reset on reboot requires multi-boot cycles for full completion
-
----
-
-## Roadmap (Post-v2.1)
-
-- Driver updates (enable in Windows Update)
-- Windows Store app updates
-- Parallel execution (Chocolatey + Winget simultaneously)
-- Custom health check scripts
-- SMTP auth support
-- Dashboard/web UI for monitoring
-
----
-
 ## Getting Help
 
-**Logs:** `Get-Content "$env:ProgramData\BootUpdateCycle\BootUpdateCycle.log" -Tail 50 -Wait`  
-**History:** `Get-Content "$env:ProgramData\BootUpdateCycle\BootUpdateCycle.history.json" | ConvertFrom-Json`  
-**Event Log:** `Get-WinEvent -FilterHashtable @{LogName='Application'; ProviderName='BootUpdateCycle'}`  
-**Trends:** `.\Show-BootUpdateHistory.ps1 -Format Graph`
+```powershell
+# Monitor running cycle
+Get-Content "$env:ProgramData\BootUpdateCycle\BootUpdateCycle.log" -Tail 50 -Wait
 
----
+# View cycle history
+Get-Content "$env:ProgramData\BootUpdateCycle\BootUpdateCycle.history.json" | ConvertFrom-Json
 
-## Credits
+# Event log
+Get-WinEvent -FilterHashtable @{LogName='Application'; ProviderName='BootUpdateCycle'}
 
-**Implementation:** 8 specialized agents (A1, A2, B1, B2, B3, C1, C2, C3)  
-**Parallelization:** 3 phases with autonomous scope boundaries  
-**Testing:** 100% feature coverage with WhatIf validation  
-**Documentation:** Comprehensive memory system and inline help
+# Trend visualization
+.\Show-BootUpdateHistory.ps1 -Format Graph
+
+# Preview without changes
+.\Invoke-BootUpdateCycle.ps1 -WhatIf -Force
+
+# Uninstall
+& "$env:ProgramData\BootUpdateCycle\Uninstall.ps1"
+```
 
 ---
 
 ## License
 
 MIT - See LICENSE file
-
----
-
-**Released:** 2026-04-25  
-**Commit:** 79ad74e  
-**Tag:** v2.1
-
-Ready for production deployment. 🚀
