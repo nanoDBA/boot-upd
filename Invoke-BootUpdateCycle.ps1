@@ -904,51 +904,113 @@ function Update-PowerShellModules {
     [CmdletBinding(SupportsShouldProcess)]
     param()
     Write-Log 'Checking installed PowerShell modules...'
-    $installed = Get-InstalledModule -EA SilentlyContinue
-    if (-not $installed) { Write-Log 'No user-installed modules found.' -Level Warn; return @{ Success = $true; Count = 0 } }
-    $modules = $installed | Where-Object {
-        $_.Name -notlike 'Microsoft.PowerShell.*' -and
-        $_.Name -notlike 'AWS.Tools.*' -and          # AWS.Tools handled by Update-AWSToolsModule
-        $_.Name -ne 'Az'                              # Meta-module; sub-modules (Az.*) update individually
-    }
-    if (-not $modules) { Write-Log 'Only built-in modules found.'; return @{ Success = $true; Count = 0 } }
-    Write-Log "Found $(@($modules).Count) module(s) to check."
-    $count = 0; $perModTimeout = [math]::Min($script:PackageTimeoutMinutes, 5)
-    foreach ($mod in $modules) {
-        $modName = $mod.Name; $curVer = $mod.Version
-        Write-Log "Updating: $modName ($curVer)"
-        if ($PSCmdlet.ShouldProcess($modName, 'Update-Module')) {
-            try {
-                $job = Start-Job -ScriptBlock { param($N) Update-Module -Name $N -Force -EA Stop 2>&1 } -ArgumentList $modName
-                $done = $job | Wait-Job -Timeout ($perModTimeout * 60)
-                if (-not $done) {
-                    Write-Log "TIMEOUT: $modName exceeded ${perModTimeout}m" -Level Warn
-                    # Kill child process tree before removing job
-                    try { Get-Process -Id $job.ChildJobs[0].ProcessId -EA SilentlyContinue | Stop-Process -Force -EA SilentlyContinue } catch { }
-                    $job | Stop-Job -PassThru | Remove-Job -Force
-                    continue
+    $count = 0
+    $usePSResourceGet = [bool](Get-Command Update-PSResource -EA SilentlyContinue)
+
+    if ($usePSResourceGet) {
+        <# ── PSResourceGet path: single bulk call in child process (avoids file-lock issues) ── #>
+        Write-Log 'Using PSResourceGet (Update-PSResource) for bulk module update...'
+        $installed = Get-InstalledPSResource -Scope AllUsers -EA SilentlyContinue
+        if (-not $installed) { $installed = Get-InstalledPSResource -EA SilentlyContinue }
+        $moduleNames = @($installed | Where-Object {
+            $_.Name -notlike 'Microsoft.PowerShell.*' -and
+            $_.Name -notlike 'AWS.Tools.*' -and
+            $_.Name -ne 'Az' -and
+            $_.Type -eq 'Module'
+        } | Select-Object -ExpandProperty Name -Unique)
+        if (-not $moduleNames) { Write-Log 'No updatable modules found.'; return @{ Success = $true; Count = 0 } }
+        Write-Log "Found $($moduleNames.Count) module(s) to update."
+        if ($PSCmdlet.ShouldProcess("$($moduleNames.Count) modules", 'Update-PSResource')) {
+            $job = Start-Job -ScriptBlock {
+                param($Names)
+                foreach ($n in $Names) {
+                    try {
+                        $before = (Get-InstalledPSResource -Name $n -EA SilentlyContinue | Sort-Object Version -Descending | Select-Object -First 1).Version
+                        Update-PSResource -Name $n -Scope AllUsers -TrustRepository -AcceptLicense -Quiet -EA Stop
+                        $after = (Get-InstalledPSResource -Name $n -EA SilentlyContinue | Sort-Object Version -Descending | Select-Object -First 1).Version
+                        if ($after -and $before -and $after -gt $before) {
+                            "UPDATED|$n|$before|$after"
+                        }
+                    } catch {
+                        "ERROR|$n|$_"
+                    }
                 }
-                $jobOutput = Receive-Job $job -EA SilentlyContinue
+            } -ArgumentList (,$moduleNames)
+            $done = $job | Wait-Job -Timeout ($script:PackageTimeoutMinutes * 60)
+            if (-not $done) {
+                Write-Log "TIMEOUT: PSResource bulk update exceeded ${script:PackageTimeoutMinutes}m" -Level Warn
+                try { Get-Process -Id $job.ChildJobs[0].ProcessId -EA SilentlyContinue | Stop-Process -Force -EA SilentlyContinue } catch { }
+                $job | Stop-Job -PassThru | Remove-Job -Force
+            } else {
+                $results = @(Receive-Job $job -EA SilentlyContinue)
                 $jobFailed = $job.State -eq 'Failed'
                 Remove-Job $job -Force
-                $jobOutput | ForEach-Object { Write-Log $_ }
-                if ($jobFailed) {
-                    Write-Log "  $modName update job failed" -Level Warn
-                    continue
+                foreach ($line in $results) {
+                    if ($line -is [string] -and $line -match '^UPDATED\|(.+)\|(.+)\|(.+)$') {
+                        Write-Log "  $($Matches[1]): $($Matches[2]) -> $($Matches[3])"
+                        $count++
+                    } elseif ($line -is [string] -and $line -match '^ERROR\|(.+)\|(.+)$') {
+                        Write-Log "  $($Matches[1]) error: $($Matches[2])" -Level Warn
+                    }
                 }
-                $newVer = (Get-InstalledModule -Name $modName -EA SilentlyContinue).Version
-                if ($newVer -and ($newVer -gt $curVer)) { Write-Log "  ${modName}: $curVer -> $newVer"; $count++ }
-                else { Write-Log "  ${modName}: already latest ($curVer)" }
-            } catch {
-                if ($_ -match 'already the latest') { Write-Log "  ${modName}: already latest" }
-                else { Write-Log "  $modName error: $_" -Level Warn }
+                if ($jobFailed) { Write-Log 'PSResource bulk update job reported failure' -Level Warn }
             }
         } else {
-            Write-Log "  [WHATIF] Would run: Update-Module -Name $modName -Force"
+            Write-Log "  [WHATIF] Would run: Update-PSResource for $($moduleNames.Count) modules"
+        }
+    } else {
+        <# ── Legacy path: per-module Update-Module via Start-Job (PowerShellGet v2 fallback) ── #>
+        Write-Log 'PSResourceGet not available — falling back to Update-Module (per-module)...'
+        $installed = Get-InstalledModule -EA SilentlyContinue
+        if (-not $installed) { Write-Log 'No user-installed modules found.' -Level Warn; return @{ Success = $true; Count = 0 } }
+        $modules = $installed | Where-Object {
+            $_.Name -notlike 'Microsoft.PowerShell.*' -and
+            $_.Name -notlike 'AWS.Tools.*' -and
+            $_.Name -ne 'Az'
+        }
+        if (-not $modules) { Write-Log 'Only built-in modules found.'; return @{ Success = $true; Count = 0 } }
+        Write-Log "Found $(@($modules).Count) module(s) to check."
+        $perModTimeout = [math]::Min($script:PackageTimeoutMinutes, 5)
+        foreach ($mod in $modules) {
+            $modName = $mod.Name; $curVer = $mod.Version
+            Write-Log "Updating: $modName ($curVer)"
+            if ($PSCmdlet.ShouldProcess($modName, 'Update-Module')) {
+                try {
+                    $job = Start-Job -ScriptBlock { param($N) Update-Module -Name $N -Force -EA Stop 2>&1 } -ArgumentList $modName
+                    $done = $job | Wait-Job -Timeout ($perModTimeout * 60)
+                    if (-not $done) {
+                        Write-Log "TIMEOUT: $modName exceeded ${perModTimeout}m" -Level Warn
+                        try { Get-Process -Id $job.ChildJobs[0].ProcessId -EA SilentlyContinue | Stop-Process -Force -EA SilentlyContinue } catch { }
+                        $job | Stop-Job -PassThru | Remove-Job -Force
+                        continue
+                    }
+                    $jobOutput = Receive-Job $job -EA SilentlyContinue
+                    $jobFailed = $job.State -eq 'Failed'
+                    Remove-Job $job -Force
+                    $jobOutput | ForEach-Object { Write-Log $_ }
+                    if ($jobFailed) {
+                        Write-Log "  $modName update job failed" -Level Warn
+                        continue
+                    }
+                    $newVer = (Get-InstalledModule -Name $modName -EA SilentlyContinue).Version
+                    if ($newVer -and ($newVer -gt $curVer)) { Write-Log "  ${modName}: $curVer -> $newVer"; $count++ }
+                    else { Write-Log "  ${modName}: already latest ($curVer)" }
+                } catch {
+                    if ($_ -match 'already the latest') { Write-Log "  ${modName}: already latest" }
+                    else { Write-Log "  $modName error: $_" -Level Warn }
+                }
+            } else {
+                Write-Log "  [WHATIF] Would run: Update-Module -Name $modName -Force"
+            }
         }
     }
-    <# AWS.Tools modules: use the dedicated installer if available #>
-    $awsInstalled = $installed | Where-Object { $_.Name -like 'AWS.Tools.*' -and $_.Name -ne 'AWS.Tools.Installer' }
+
+    <# AWS.Tools modules: use the dedicated installer if available (both paths) #>
+    $awsInstalled = if ($usePSResourceGet) {
+        Get-InstalledPSResource -EA SilentlyContinue | Where-Object { $_.Name -like 'AWS.Tools.*' -and $_.Name -ne 'AWS.Tools.Installer' }
+    } else {
+        Get-InstalledModule -EA SilentlyContinue | Where-Object { $_.Name -like 'AWS.Tools.*' -and $_.Name -ne 'AWS.Tools.Installer' }
+    }
     if ($awsInstalled -and (Get-Command Update-AWSToolsModule -EA SilentlyContinue)) {
         Write-Log "Updating $(@($awsInstalled).Count) AWS.Tools module(s) via Update-AWSToolsModule..."
         if ($PSCmdlet.ShouldProcess('AWS.Tools.*', 'Update-AWSToolsModule -CleanUp')) {
