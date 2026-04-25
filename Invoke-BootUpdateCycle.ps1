@@ -57,9 +57,11 @@ param(
     [switch]$SkipHealthCheck,
     [switch]$StagedRollout,           # Run one package manager per boot instead of all at once
     [switch]$Force,
+    [ValidateScript({ $_ -eq '' -or $_ -match '^https?://' })]
     [string]$WebhookUrl       = '',   # Teams/Slack/Discord incoming webhook URL
     [string]$NotifyEmail      = '',   # SMTP recipient email address
     [string]$SmtpServer       = '',   # SMTP relay hostname (e.g., smtp.office365.com)
+    [pscredential]$SmtpCredential = $null,  # SMTP credential (PSCredential object for authenticated relay)
     [string[]]$ExcludePatterns = @(),  # Package name/ID patterns to skip (substring match, case-insensitive)
     [ValidateRange(-1, 23)]
     [int]$MaintenanceWindowStart = -1,  # Hour of day (0-23) when updates may begin. -1 = no window enforced.
@@ -91,6 +93,7 @@ $script:ExcludePatterns       = $ExcludePatterns
 $script:WebhookUrl            = $WebhookUrl
 $script:NotifyEmail           = $NotifyEmail
 $script:SmtpServer            = $SmtpServer
+$script:SmtpCredential        = $SmtpCredential
 $script:MaintenanceWindowStart = $MaintenanceWindowStart
 $script:MaintenanceWindowEnd   = $MaintenanceWindowEnd
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 2 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
@@ -271,6 +274,10 @@ function Test-CrashRecovery {
         PowerShellModules='PowerShellModulesDone'; Scoop='ScoopDone'; DotnetTools='DotnetToolsDone'; Vscode='VscodeDone'
     }
     $flagName = $phaseToFlag[$State.LastPhaseStarted]
+    if (-not $flagName) {
+        Write-Log "Crash recovery: unknown phase '$($State.LastPhaseStarted)' in state file — ignoring." -Level Warn
+        return $false
+    }
     $isDone = if ($flagName -and ($State.PSObject.Properties.Name -contains $flagName)) { [bool]$State.$flagName } else { $false }
     if (-not $isDone) {
         $time = if ($State.LastPhaseTimestamp) { try { ([datetime]$State.LastPhaseTimestamp).ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss') } catch { $State.LastPhaseTimestamp } } else { '(unknown)' }
@@ -847,7 +854,7 @@ function Update-PipPackages {
     $count = 0
     if ($PSCmdlet.ShouldProcess('pip', 'Upgrade pip and outdated packages')) {
         & python -m pip install --upgrade pip 2>&1 | ForEach-Object { Write-Log $_ }
-        $outdated = & pip list --outdated --format=json 2>$null | ConvertFrom-Json -EA SilentlyContinue
+        $outdated = @(& pip list --outdated --format=json 2>$null | ConvertFrom-Json -EA SilentlyContinue)
         foreach ($pkg in $outdated) {
             Write-Log "Upgrading: $($pkg.name)"
             & pip install --upgrade $pkg.name 2>&1 | ForEach-Object { Write-Log $_ }
@@ -909,8 +916,21 @@ function Update-PowerShellModules {
             try {
                 $job = Start-Job -ScriptBlock { param($N) Update-Module -Name $N -Force -EA Stop 2>&1 } -ArgumentList $modName
                 $done = $job | Wait-Job -Timeout ($perModTimeout * 60)
-                if (-not $done) { Write-Log "TIMEOUT: $modName exceeded ${perModTimeout}m" -Level Warn; $job | Stop-Job -PassThru | Remove-Job -Force; continue }
-                Receive-Job $job | ForEach-Object { Write-Log $_ }; Remove-Job $job -Force
+                if (-not $done) {
+                    Write-Log "TIMEOUT: $modName exceeded ${perModTimeout}m" -Level Warn
+                    # Kill child process tree before removing job
+                    try { Get-Process -Id $job.ChildJobs[0].ProcessId -EA SilentlyContinue | Stop-Process -Force -EA SilentlyContinue } catch { }
+                    $job | Stop-Job -PassThru | Remove-Job -Force
+                    continue
+                }
+                $jobOutput = Receive-Job $job -EA SilentlyContinue
+                $jobFailed = $job.State -eq 'Failed'
+                Remove-Job $job -Force
+                $jobOutput | ForEach-Object { Write-Log $_ }
+                if ($jobFailed) {
+                    Write-Log "  $modName update job failed" -Level Warn
+                    continue
+                }
                 $newVer = (Get-InstalledModule -Name $modName -EA SilentlyContinue).Version
                 if ($newVer -and ($newVer -gt $curVer)) { Write-Log "  ${modName}: $curVer -> $newVer"; $count++ }
                 else { Write-Log "  ${modName}: already latest ($curVer)" }
@@ -1177,7 +1197,7 @@ function Register-BootUpdateTaskForReboot {
     if ($script:MaintenanceWindowStart -ge 0) { $taskArgs += "-MaintenanceWindowStart $($script:MaintenanceWindowStart)" }
     if ($script:MaintenanceWindowEnd   -ge 0) { $taskArgs += "-MaintenanceWindowEnd $($script:MaintenanceWindowEnd)" }
     if ($script:ExcludePatterns.Count -gt 0) {
-        $patternStr = ($script:ExcludePatterns | ForEach-Object { "'$_'" }) -join ','
+        $patternStr = ($script:ExcludePatterns | ForEach-Object { "'$($_ -replace "'", "''")'" }) -join ','
         $taskArgs += "-ExcludePatterns @($patternStr)"
     }
     $argString = $taskArgs -join ' '
@@ -1286,11 +1306,24 @@ function Send-WebhookNotification {
         }
 
         $jsonBody = $payload | ConvertTo-Json -Depth 6 -Compress
-        $response = Invoke-RestMethod -Uri $url -Method Post -Body $jsonBody `
-            -ContentType 'application/json' -TimeoutSec 10 -ErrorAction SilentlyContinue
-        Write-Log "Notification: webhook delivered (response: $response)"
+        $maxRetries = 3
+        for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
+            try {
+                Invoke-RestMethod -Uri $url -Method Post -Body $jsonBody `
+                    -ContentType 'application/json' -TimeoutSec 10 -ErrorAction Stop | Out-Null
+                Write-Log "Notification: webhook delivered"
+                break
+            } catch {
+                if ($attempt -lt $maxRetries) {
+                    Write-Log "Notification: webhook attempt $attempt failed, retrying in $($attempt * 2)s..." -Level Warn
+                    Start-Sleep -Seconds ($attempt * 2)
+                } else {
+                    Write-Log "Notification: webhook failed after $maxRetries attempts: $_" -Level Warn
+                }
+            }
+        }
     } catch {
-        Write-Log "Notification: webhook failed: $_" -Level Warn
+        Write-Log "Notification: webhook error: $_" -Level Warn
     }
 }
 
@@ -1303,8 +1336,7 @@ function Send-EmailNotification {
     if ([string]::IsNullOrWhiteSpace($script:NotifyEmail)) { return }
     if ([string]::IsNullOrWhiteSpace($script:SmtpServer))  { return }
 
-    <# WARNING: This sends credentials in clear text if SmtpServer requires auth.
-       Defer auth support to future iteration (SecretManagement/PSCredential). #>
+    <# SMTP auth: pass credential if provided, otherwise rely on anonymous/relay #>
 
     Write-Log "Sending email notification to $($script:NotifyEmail)"
 
@@ -1338,15 +1370,19 @@ function Send-EmailNotification {
     )
 
     try {
-        Send-MailMessage `
-            -To      $script:NotifyEmail `
-            -From    "BootUpdateCycle@$env:COMPUTERNAME" `
-            -Subject $Title `
-            -Body    ($bodyLines -join "`n") `
-            -SmtpServer $script:SmtpServer `
-            -UseSsl `
-            -Port    587 `
-            -AsJob | Out-Null
+        $mailParams = @{
+            To         = $script:NotifyEmail
+            From       = "BootUpdateCycle@$env:COMPUTERNAME"
+            Subject    = $Title
+            Body       = ($bodyLines -join "`n")
+            SmtpServer = $script:SmtpServer
+            UseSsl     = $true
+            Port       = 587
+        }
+        if ($script:SmtpCredential) {
+            $mailParams['Credential'] = $script:SmtpCredential
+        }
+        Send-MailMessage @mailParams -AsJob | Out-Null
         Write-Log "Notification: email job queued to $($script:NotifyEmail)"
     } catch {
         Write-Log "Notification: email failed: $_" -Level Warn
@@ -1402,28 +1438,38 @@ function Show-StartupArt {
        ░▒▓█ gradient borders, neon palette, interpunct separators.
        Evokes the ACiD/iCE era login screens of the early '90s.  #>
     $e = [char]27
-    <# Neon BBS palette #>
-    $cy = "$e[96m"; $bl = "$e[94m"; $mg = "$e[95m"
-    $yl = "$e[93m"; $wh = "$e[97m"; $dk = "$e[90m"
+    <# Curated neon palettes — each is (art, bar-accent, tagline) #>
+    $palettes = @(
+        @{ art = '96'; bar = '94'; tag = '93' }   # Cyan / Blue / Yellow (original)
+        @{ art = '92'; bar = '96'; tag = '93' }   # Green / Cyan / Yellow
+        @{ art = '95'; bar = '94'; tag = '96' }   # Magenta / Blue / Cyan
+        @{ art = '93'; bar = '95'; tag = '92' }   # Yellow / Magenta / Green
+        @{ art = '94'; bar = '92'; tag = '95' }   # Blue / Green / Magenta
+        @{ art = '91'; bar = '93'; tag = '96' }   # Red / Yellow / Cyan
+    )
+    $p = $palettes[(Get-Random -Maximum $palettes.Count)]
+
+    $art = "$e[$($p.art)m"; $bar2 = "$e[$($p.bar)m"; $tag = "$e[$($p.tag)m"
+    $wh = "$e[97m"; $dk = "$e[90m"; $mg = "$e[95m"
     $B  = "$e[1m";  $r  = "$e[0m"
 
-    $bar = "$dk░▒$bl▓$mg█$cy$B$('═' * 56)$r$mg█$bl▓$dk▒░$r"
+    $barLine = "$dk░▒$bar2▓$mg█$art$B$('═' * 56)$r$mg█$bar2▓$dk▒░$r"
 
     Write-Host ""
-    Write-Host "  $bar"
+    Write-Host "  $barLine"
     Write-Host ""
-    Write-Host "  $cy$B    ██████╗  ██████╗  ██████╗ ████████╗$r"
-    Write-Host "  $cy$B    ██╔══██╗██╔═══██╗██╔═══██╗╚══██╔══╝$r"
-    Write-Host "  $cy$B    ██████╔╝██║   ██║██║   ██║   ██║$r"
-    Write-Host "  $cy$B    ██╔══██╗██║   ██║██║   ██║   ██║$r"
-    Write-Host "  $cy$B    ██████╔╝╚██████╔╝╚██████╔╝   ██║$r"
-    Write-Host "  $cy$B    ╚═════╝  ╚═════╝  ╚═════╝    ╚═╝$r"
+    Write-Host "  $art$B    ██████╗  ██████╗  ██████╗ ████████╗$r"
+    Write-Host "  $art$B    ██╔══██╗██╔═══██╗██╔═══██╗╚══██╔══╝$r"
+    Write-Host "  $art$B    ██████╔╝██║   ██║██║   ██║   ██║$r"
+    Write-Host "  $art$B    ██╔══██╗██║   ██║██║   ██║   ██║$r"
+    Write-Host "  $art$B    ██████╔╝╚██████╔╝╚██████╔╝   ██║$r"
+    Write-Host "  $art$B    ╚═════╝  ╚═════╝  ╚═════╝    ╚═╝$r"
     Write-Host ""
     Write-Host "  $wh$B    U P D A T E $dk·$wh C Y C L E$r                     $dk v2.1$r"
     Write-Host ""
-    Write-Host "  $bar"
+    Write-Host "  $barLine"
     Write-Host ""
-    Write-Host "  $yl    $dk·$yl Updating all the things so you don't have to. $dk·$r"
+    Write-Host "  $tag    $dk·$tag Updating all the things so you don't have to. $dk·$r"
     Write-Host ""
 }
 

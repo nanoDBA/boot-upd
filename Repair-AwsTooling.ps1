@@ -176,15 +176,17 @@ function Uninstall-AwsCliV1IfPresent {
     foreach ($entry in $found) {
         if ($entry.UninstallString) {
             Write-Host "Uninstalling: $($entry.DisplayName)"
-
-            # Normalize MSI uninstall to silent mode.
             $cmd = $entry.UninstallString
-            if ($cmd -match 'MsiExec\.exe') {
-                $cmd = $cmd -replace '/I', '/X'
-                if ($cmd -notmatch '/qn') { $cmd += ' /qn' }
-                if ($cmd -notmatch '/norestart') { $cmd += ' /norestart' }
+
+            if ($cmd -match 'MsiExec\.exe\s*/[IX]\{([0-9A-Fa-f\-]+)\}') {
+                # MSI uninstall: invoke msiexec directly with structured args (no cmd.exe shell)
+                $productCode = $Matches[1]
+                $msiArgs = "/X{$productCode} /qn /norestart"
+                Write-Host "  Running: msiexec.exe $msiArgs"
+                Start-Process msiexec.exe -Wait -ArgumentList $msiArgs
+            } else {
+                Write-Host "  Skipping non-MSI uninstall (manual removal required): $cmd" -ForegroundColor Yellow
             }
-            Start-Process cmd.exe -Wait -ArgumentList "/c $cmd"
         }
     }
 }

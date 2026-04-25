@@ -415,7 +415,7 @@ function Register-ScheduledTaskNow {
     if ($Config.NotifyEmail)          { $taskArgs += "-NotifyEmail `"$($Config.NotifyEmail)`"" }
     if ($Config.SmtpServer)           { $taskArgs += "-SmtpServer `"$($Config.SmtpServer)`"" }
     if ($Config.ExcludePatterns.Count -gt 0) {
-        $patternStr = ($Config.ExcludePatterns | ForEach-Object { "'$_'" }) -join ','
+        $patternStr = ($Config.ExcludePatterns | ForEach-Object { "'$($_ -replace "'", "''")'" }) -join ','
         $taskArgs += "-ExcludePatterns @($patternStr)"
     }
 
