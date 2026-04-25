@@ -824,8 +824,10 @@ function Install-WindowsUpdates {
     if ($PSCmdlet.ShouldProcess('Windows Update', 'Install available updates')) {
         try {
             Get-WindowsUpdate @params -Verbose 4>&1 | ForEach-Object {
+                $line = $_.ToString()
+                if ($line -eq 'System.__ComObject') { return }
                 if ($_ -match 'Installed|Downloaded') { $count++ }
-                Write-Log $_.ToString()
+                Write-Log $line
             }
         } catch { Write-Log "Windows Update error: $_" -Level Error }
     } else {
