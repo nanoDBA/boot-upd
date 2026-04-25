@@ -51,10 +51,13 @@ $Config = @{
     SkipScoop             = $false  # Set $true to skip Scoop package updates
     SkipDotnetTools       = $true   # OFF by default - can break SDK-dependent builds!
     SkipVscode            = $false  # Set $true to skip VS Code extension updates
+    SkipRestorePoint      = $true   # Skip system restore point creation (opt-in: set $false to enable)
+    SkipHealthCheck       = $false  # Skip post-update health check for critical services
+    StagedRollout         = $false  # Run one package manager per boot instead of all at once. Slower but safer.
     MaxIterations         = 5       # Safety valve for reboot loops
     PackageTimeoutMin     = 30      # Minutes before killing a hung package manager (hard timeout)
                                     # Smart idle detection kills stuck processes after 5 min of no CPU
-    RebootDelaySec        = 120     # Seconds before reboot (user can abort with: shutdown /a)
+    RebootDelaySec        = 0       # Seconds before forced reboot (0 = immediate, /f = force-close apps, no abort)
     StartNow              = $true   # Start immediately after deployment
     InstallDir            = "$env:ProgramData\BootUpdateCycle"
 
@@ -66,6 +69,18 @@ $Config = @{
 
     RunAsUser             = $false  # Only matters if DirectFirstRun = $false
     NonInteractive        = $false  # Set $true for fire-and-forget: no prompts, no TUI
+
+    <# NOTIFICATIONS - leave empty to disable #>
+    WebhookUrl            = ''     # Teams/Slack/Discord webhook URL (leave empty to disable)
+    NotifyEmail           = ''     # Recipient email (leave empty to disable)
+    SmtpServer            = ''     # SMTP relay hostname (e.g., smtp.office365.com)
+
+    <# MAINTENANCE WINDOW - leave -1 to run at any time #>
+    MaintenanceWindowStart = -1   # Hour of day (0-23) when updates may start. -1 = no restriction. e.g., 2 = start at 2 AM
+    MaintenanceWindowEnd   = -1   # Hour of day when updates must stop. -1 = no restriction. Supports midnight-crossing: Start=22, End=2 = 10 PM to 2 AM
+
+    # Package name patterns to skip (substring match, case-insensitive). e.g. @('Teams', 'OneDrive')
+    ExcludePatterns        = @()
 }
 
 # Apply command-line parameter overrides
@@ -208,6 +223,15 @@ $invokeArgs = @{
     SkipScoop            = $Config.SkipScoop
     SkipDotnetTools      = $Config.SkipDotnetTools
     SkipVscode           = $Config.SkipVscode
+    SkipRestorePoint     = $Config.SkipRestorePoint
+    SkipHealthCheck      = $Config.SkipHealthCheck
+    StagedRollout        = $Config.StagedRollout
+    WebhookUrl              = $Config.WebhookUrl
+    NotifyEmail             = $Config.NotifyEmail
+    SmtpServer              = $Config.SmtpServer
+    MaintenanceWindowStart  = $Config.MaintenanceWindowStart
+    MaintenanceWindowEnd    = $Config.MaintenanceWindowEnd
+    ExcludePatterns         = $Config.ExcludePatterns
 }
 
 <# TUI: Modal overlay with deployment info #>
@@ -382,6 +406,15 @@ function Register-ScheduledTaskNow {
     if ($Config.SkipScoop)            { $taskArgs += '-SkipScoop' }
     if ($Config.SkipDotnetTools)      { $taskArgs += '-SkipDotnetTools' }
     if ($Config.SkipVscode)           { $taskArgs += '-SkipVscode' }
+    if ($Config.SkipRestorePoint)     { $taskArgs += '-SkipRestorePoint' }
+    if ($Config.StagedRollout)        { $taskArgs += '-StagedRollout' }
+    if ($Config.WebhookUrl)           { $taskArgs += "-WebhookUrl `"$($Config.WebhookUrl)`"" }
+    if ($Config.NotifyEmail)          { $taskArgs += "-NotifyEmail `"$($Config.NotifyEmail)`"" }
+    if ($Config.SmtpServer)           { $taskArgs += "-SmtpServer `"$($Config.SmtpServer)`"" }
+    if ($Config.ExcludePatterns.Count -gt 0) {
+        $patternStr = ($Config.ExcludePatterns | ForEach-Object { "'$_'" }) -join ','
+        $taskArgs += "-ExcludePatterns @($patternStr)"
+    }
 
     $argString = $taskArgs -join ' '
     $action   = New-ScheduledTaskAction -Execute $pwshPath -Argument $argString -WorkingDirectory $installDir
