@@ -1,8 +1,21 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.3.4  
+**Current Version:** v2.4.0  
 **Release Date:** 2026-04-25  
 **Status:** STABLE
+
+---
+
+## v2.4.0 (2026-04-25)
+
+**Performance:** PowerShell module updates now run in parallel via `ForEach-Object -Parallel`.
+
+- **PSResourceGet path** (PS 7.4+ / PSResourceGet installed): bulk `Update-PSResource` runs N modules concurrently inside the existing child job.
+- **Legacy path** (PS 7.0-7.3): per-module `Update-Module` calls also run in parallel inside one child job (was sequential).
+- Throttle limit: `min(8, max(2, ProcessorCount))` — caps concurrency to avoid repository contention and resource exhaustion.
+- Same structured output format (`UPDATED|name|old|new`, `ERROR|name|msg`); same hard timeout via `PackageTimeoutMinutes`.
+
+Expected: 3-5× faster module phase on machines with many installed modules.
 
 ---
 

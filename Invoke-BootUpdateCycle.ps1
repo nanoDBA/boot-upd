@@ -97,7 +97,7 @@ $script:SmtpCredential        = $SmtpCredential
 $script:MaintenanceWindowStart = $MaintenanceWindowStart
 $script:MaintenanceWindowEnd   = $MaintenanceWindowEnd
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 2 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.3.4' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.4.0' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 
 <# Force UTF-8 console I/O so box-drawing/block chars (BBS splash) render in cmd.exe regardless of system code page.
    chcp 65001 sets conhost interpretation; [Console]::OutputEncoding makes .NET write proper UTF-8 bytes. #>
@@ -950,9 +950,12 @@ function Update-PowerShellModules {
         if (-not $moduleNames) { Write-Log 'No updatable modules found.'; return @{ Success = $true; Count = 0 } }
         Write-Log "Found $($moduleNames.Count) module(s) to update."
         if ($PSCmdlet.ShouldProcess("$($moduleNames.Count) modules", 'Update-PSResource')) {
+            $throttle = [Math]::Min(8, [Math]::Max(2, [Environment]::ProcessorCount))
+            Write-Log "Running parallel updates (throttle: $throttle)..."
             $job = Start-Job -ScriptBlock {
-                param($Names)
-                foreach ($n in $Names) {
+                param($Names, $Throttle)
+                $Names | ForEach-Object -ThrottleLimit $Throttle -Parallel {
+                    $n = $_
                     try {
                         $before = (Get-InstalledPSResource -Name $n -EA SilentlyContinue | Sort-Object Version -Descending | Select-Object -First 1).Version
                         Update-PSResource -Name $n -Scope AllUsers -TrustRepository -AcceptLicense -Quiet -EA Stop
@@ -964,7 +967,7 @@ function Update-PowerShellModules {
                         "ERROR|$n|$_"
                     }
                 }
-            } -ArgumentList (,$moduleNames)
+            } -ArgumentList (,$moduleNames), $throttle
             $done = $job | Wait-Job -Timeout ($script:PackageTimeoutMinutes * 60)
             if (-not $done) {
                 Write-Log "TIMEOUT: PSResource bulk update exceeded ${script:PackageTimeoutMinutes}m" -Level Warn
@@ -988,49 +991,58 @@ function Update-PowerShellModules {
             Write-Log "  [WHATIF] Would run: Update-PSResource for $($moduleNames.Count) modules"
         }
     } else {
-        <# ── Legacy path: per-module Update-Module via Start-Job (PowerShellGet v2 fallback) ── #>
-        Write-Log 'PSResourceGet not available — falling back to Update-Module (per-module)...'
+        <# ── Legacy path: parallel Update-Module via ForEach-Object -Parallel inside one job ── #>
+        Write-Log 'PSResourceGet not available — falling back to parallel Update-Module...'
         $installed = Get-InstalledModule -EA SilentlyContinue
         if (-not $installed) { Write-Log 'No user-installed modules found.' -Level Warn; return @{ Success = $true; Count = 0 } }
-        $modules = $installed | Where-Object {
+        $modules = @($installed | Where-Object {
             $_.Name -notlike 'Microsoft.PowerShell.*' -and
             $_.Name -notlike 'AWS.Tools.*' -and
             $_.Name -ne 'Az'
-        }
+        })
         if (-not $modules) { Write-Log 'Only built-in modules found.'; return @{ Success = $true; Count = 0 } }
-        Write-Log "Found $(@($modules).Count) module(s) to check."
-        $perModTimeout = [math]::Min($script:PackageTimeoutMinutes, 5)
-        foreach ($mod in $modules) {
-            $modName = $mod.Name; $curVer = $mod.Version
-            Write-Log "Updating: $modName ($curVer)"
-            if ($PSCmdlet.ShouldProcess($modName, 'Update-Module')) {
-                try {
-                    $job = Start-Job -ScriptBlock { param($N) Update-Module -Name $N -Force -EA Stop 2>&1 } -ArgumentList $modName
-                    $done = $job | Wait-Job -Timeout ($perModTimeout * 60)
-                    if (-not $done) {
-                        Write-Log "TIMEOUT: $modName exceeded ${perModTimeout}m" -Level Warn
-                        try { Get-Process -Id $job.ChildJobs[0].ProcessId -EA SilentlyContinue | Stop-Process -Force -EA SilentlyContinue } catch { }
-                        $job | Stop-Job -PassThru | Remove-Job -Force
-                        continue
+        Write-Log "Found $($modules.Count) module(s) to check."
+        if ($PSCmdlet.ShouldProcess("$($modules.Count) modules", 'Update-Module')) {
+            $throttle = [Math]::Min(8, [Math]::Max(2, [Environment]::ProcessorCount))
+            $modulePairs = $modules | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Version = $_.Version.ToString() } }
+            Write-Log "Running parallel updates (throttle: $throttle)..."
+            $job = Start-Job -ScriptBlock {
+                param($Pairs, $Throttle)
+                $Pairs | ForEach-Object -ThrottleLimit $Throttle -Parallel {
+                    $n = $_.Name; $curVer = $_.Version
+                    try {
+                        Update-Module -Name $n -Force -EA Stop *> $null
+                        $newVer = (Get-InstalledModule -Name $n -EA SilentlyContinue).Version.ToString()
+                        if ($newVer -and ($newVer -ne $curVer)) {
+                            "UPDATED|$n|$curVer|$newVer"
+                        }
+                    } catch {
+                        if ($_ -match 'already the latest') { return }
+                        "ERROR|$n|$_"
                     }
-                    $jobOutput = Receive-Job $job -EA SilentlyContinue
-                    $jobFailed = $job.State -eq 'Failed'
-                    Remove-Job $job -Force
-                    $jobOutput | ForEach-Object { Write-Log $_ }
-                    if ($jobFailed) {
-                        Write-Log "  $modName update job failed" -Level Warn
-                        continue
-                    }
-                    $newVer = (Get-InstalledModule -Name $modName -EA SilentlyContinue).Version
-                    if ($newVer -and ($newVer -gt $curVer)) { Write-Log "  ${modName}: $curVer -> $newVer"; $count++ }
-                    else { Write-Log "  ${modName}: already latest ($curVer)" }
-                } catch {
-                    if ($_ -match 'already the latest') { Write-Log "  ${modName}: already latest" }
-                    else { Write-Log "  $modName error: $_" -Level Warn }
                 }
+            } -ArgumentList (,$modulePairs), $throttle
+            $done = $job | Wait-Job -Timeout ($script:PackageTimeoutMinutes * 60)
+            if (-not $done) {
+                Write-Log "TIMEOUT: parallel module update exceeded ${script:PackageTimeoutMinutes}m" -Level Warn
+                try { Get-Process -Id $job.ChildJobs[0].ProcessId -EA SilentlyContinue | Stop-Process -Force -EA SilentlyContinue } catch { }
+                $job | Stop-Job -PassThru | Remove-Job -Force
             } else {
-                Write-Log "  [WHATIF] Would run: Update-Module -Name $modName -Force"
+                $results = @(Receive-Job $job -EA SilentlyContinue)
+                $jobFailed = $job.State -eq 'Failed'
+                Remove-Job $job -Force
+                foreach ($line in $results) {
+                    if ($line -is [string] -and $line -match '^UPDATED\|(.+)\|(.+)\|(.+)$') {
+                        Write-Log "  $($Matches[1]): $($Matches[2]) -> $($Matches[3])"
+                        $count++
+                    } elseif ($line -is [string] -and $line -match '^ERROR\|(.+)\|(.+)$') {
+                        Write-Log "  $($Matches[1]) error: $($Matches[2])" -Level Warn
+                    }
+                }
+                if ($jobFailed) { Write-Log 'Parallel module update job reported failure' -Level Warn }
             }
+        } else {
+            Write-Log "  [WHATIF] Would run: parallel Update-Module for $($modules.Count) modules"
         }
     }
 
