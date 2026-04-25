@@ -816,7 +816,7 @@ function Install-WindowsUpdates {
     Import-Module PSWindowsUpdate -Force
     Write-Log 'Checking for Windows Updates (excluding SQL Server)...'
     $params = @{
-        AcceptAll = $true; Install = $true; NotTitle = (@('SQL') + $script:ExcludePatterns)
+        AcceptAll = $true; Install = $true; NotTitle = ((@('SQL') + $script:ExcludePatterns) -join '|')
         RootCategories = @('Security Updates','Critical Updates','Definition Updates')
         AutoReboot = $false; Confirm = $false; IgnoreReboot = $true
     }
