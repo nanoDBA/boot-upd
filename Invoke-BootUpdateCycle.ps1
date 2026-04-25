@@ -97,6 +97,7 @@ $script:SmtpCredential        = $SmtpCredential
 $script:MaintenanceWindowStart = $MaintenanceWindowStart
 $script:MaintenanceWindowEnd   = $MaintenanceWindowEnd
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 2 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.3.2' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 
 #region Logging
 function Invoke-LogRotation {
@@ -1579,7 +1580,7 @@ function Show-StartupArt {
     Write-Host "  $art$B    ██████╔╝╚██████╔╝╚██████╔╝   ██║$r"
     Write-Host "  $art$B    ╚═════╝  ╚═════╝  ╚═════╝    ╚═╝$r"
     Write-Host ""
-    Write-Host "  $wh$B    U P D A T E $dk·$wh C Y C L E$r                     $dk v2.1$r"
+    Write-Host "  $wh$B    U P D A T E $dk·$wh C Y C L E$r                     $dk v$($script:BootUpdateCycleVersion)$r"
     Write-Host ""
     Write-Host "  $barLine"
     Write-Host ""
@@ -1647,9 +1648,9 @@ function Invoke-BootUpdateCycle {
     <# Console: BBS splash on first boot, lean banner on reboots #>
     if ($isFirstIteration) { Show-StartupArt }
     $bannerTitle = if ($WhatIfPreference) {
-        'B O O T   U P D A T E   C Y C L E      [WHATIF - NO CHANGES]    v2.1'
+        "B O O T   U P D A T E   C Y C L E      [WHATIF - NO CHANGES]    v$($script:BootUpdateCycleVersion)"
     } else {
-        'B O O T   U P D A T E   C Y C L E                           v2.1'
+        "B O O T   U P D A T E   C Y C L E                           v$($script:BootUpdateCycleVersion)"
     }
     $bannerInfo = [System.Collections.Generic.List[string]]@(
         "$cycleVerb"
