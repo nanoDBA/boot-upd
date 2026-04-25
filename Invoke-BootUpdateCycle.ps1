@@ -97,7 +97,7 @@ $script:SmtpCredential        = $SmtpCredential
 $script:MaintenanceWindowStart = $MaintenanceWindowStart
 $script:MaintenanceWindowEnd   = $MaintenanceWindowEnd
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 2 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.3.2' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.3.3' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 
 #region Logging
 function Invoke-LogRotation {

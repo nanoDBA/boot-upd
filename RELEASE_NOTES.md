@@ -1,8 +1,14 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.3.2  
+**Current Version:** v2.3.3  
 **Release Date:** 2026-04-25  
 **Status:** STABLE
+
+---
+
+## v2.3.3 (2026-04-25)
+
+**UX:** BBS-style startup splash (`Show-StartupArt`) now renders on every iteration instead of only the first. Visible on every `upd.cmd` invocation and on post-reboot SYSTEM task runs.
 
 ---
 
