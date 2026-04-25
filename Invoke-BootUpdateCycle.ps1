@@ -1645,8 +1645,8 @@ function Invoke-BootUpdateCycle {
     $cycleVerb = if ($isFirstIteration) { 'STARTED' } else { 'RESUMED (after reboot)' }
     $context = if (([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value) -eq 'S-1-5-18') { 'SYSTEM (scheduled task)' } else { "$env:USERNAME (user context)" }
 
-    <# Console: BBS splash on first boot, lean banner on reboots #>
-    if ($isFirstIteration) { Show-StartupArt }
+    <# Console: BBS splash on every run #>
+    Show-StartupArt
     $bannerTitle = if ($WhatIfPreference) {
         "B O O T   U P D A T E   C Y C L E      [WHATIF - NO CHANGES]    v$($script:BootUpdateCycleVersion)"
     } else {
