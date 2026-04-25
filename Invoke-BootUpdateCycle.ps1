@@ -458,16 +458,35 @@ function New-SystemRestorePoint {
 
 #region Pending Reboot Detection
 function Test-PendingReboot {
+    <# Comprehensive pending-reboot detection based on Boxstarter/Brian Wilhite's
+       Get-PendingReboot approach.  Checks every OS-level signal that a reboot is needed. #>
     $tests = @(
-        @{ Name = 'CBS'; Test = { Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing' -Name 'RebootPending' -EA Ignore } },
-        @{ Name = 'WU'; Test = { Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update' -Name 'RebootRequired' -EA Ignore } },
-        @{ Name = 'FileRename'; Test = { Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name 'PendingFileRenameOperations' -EA Ignore } },
+        @{ Name = 'CBS'; Test = {
+            Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
+        }},
+        @{ Name = 'WU'; Test = {
+            Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+        }},
+        @{ Name = 'FileRename'; Test = {
+            $val = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name 'PendingFileRenameOperations' -EA Ignore
+            $val -and $val.PendingFileRenameOperations.Count -gt 0
+        }},
         @{ Name = 'ComputerRename'; Test = {
             $r = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName' -EA Ignore
             $a = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ActiveComputerName' -EA Ignore
-            if ($r -and $a -and $r.ComputerName -ne $a.ComputerName) { $true } else { $null }
+            $r -and $a -and $r.ComputerName -ne $a.ComputerName
         }},
-        @{ Name = 'JoinDomain'; Test = { Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon' -Name 'JoinDomain' -EA Ignore } }
+        @{ Name = 'JoinDomain'; Test = {
+            (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon' -Name 'JoinDomain' -EA Ignore) -or
+            (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon' -Name 'AvoidSpnSet' -EA Ignore)
+        }},
+        @{ Name = 'SCCM'; Test = {
+            try {
+                $ccm = Invoke-CimMethod -Namespace 'root\ccm\ClientSDK' -ClassName 'CCM_ClientUtilities' `
+                    -MethodName 'DetermineIfRebootPending' -EA Stop
+                $ccm -and ($ccm.ReturnValue -eq 0) -and ($ccm.IsHardRebootPending -or $ccm.RebootPending)
+            } catch { $false }  <# SCCM client not installed — expected on most workstations #>
+        }}
     )
     @($tests | ForEach-Object { if (& $_.Test) { [pscustomobject]@{ Source = $_.Name; Status = 'Pending' } } })
 }
