@@ -1,0 +1,16 @@
+# Dev scratch files
+scratch.ps1
+
+# Temp cleanup utilities (not part of the tool)
+DEL_ALL*.CMD
+
+# Claude Code local settings
+.claude/
+
+# Runtime artifacts (generated in ProgramData, not here, but just in case)
+*.state.json
+*.state.json.tmp
+*.state.json.corrupt-*.json
+BootUpdateCycle.log
+BootUpdateCycle.*.log
+BootUpdateCycle.history.json
