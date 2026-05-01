@@ -14,3 +14,8 @@ DEL_ALL*.CMD
 BootUpdateCycle.log
 BootUpdateCycle.*.log
 BootUpdateCycle.history.json
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
