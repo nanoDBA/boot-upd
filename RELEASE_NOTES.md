@@ -1,8 +1,24 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.5
+**Current Version:** v2.5.6
 **Release Date:** 2026-05-02
 **Status:** STABLE
+
+---
+
+## v2.5.6 (2026-05-02)
+
+**Win11 cmd and Server 2016 splash visibility fix.** Replaced glyph-dependent BOOT art with native PowerShell background-color cells made from ordinary spaces.
+
+### Fixes
+
+- Main BOOT wordmark now renders as colored background blocks via `Write-Host -BackgroundColor`, avoiding cmd.exe/font paths that drop Unicode block glyphs to blank space.
+- Keeps the BBS/NFO frame and compact startup status flow from v2.5.5.
+- Removes the fragile UTF-8 glyph capability branch that looked valid by codepage but failed visually in Windows 11 cmd.
+
+### Compatibility
+
+- No parameter or schema changes. Drop-in replacement for v2.5.5.
 
 ---
 

@@ -141,7 +141,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 3 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.5' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.6' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 
 <# Force UTF-8 console I/O so box-drawing/block chars (BBS splash) render in cmd.exe regardless of system code page.
    chcp 65001 sets conhost interpretation; [Console]::OutputEncoding makes .NET write proper UTF-8 bytes. #>
@@ -2200,57 +2200,70 @@ function Send-RebootWarning {
    and do NOT go to the log file — the log stays clean and greppable.  #>
 
 function Show-StartupArt {
-    <# BBS-inspired ANSI splash. Uses gradient block characters when UTF-8 output
-       is active, with an ASCII-only fallback for hostile legacy consoles. #>
+    <# BBS-inspired splash. The wordmark uses native PowerShell background
+       colors over plain spaces, avoiding Unicode glyph and ANSI/VT dependencies
+       for older consoles such as Windows Server 2016 cmd.exe. #>
 
-    $e = [char]27
-    $cy = "$e[96m"; $bl = "$e[94m"; $mg = "$e[95m"
-    $wh = "$e[97m"; $dk = "$e[90m"; $yl = "$e[93m"; $gn = "$e[92m"
-    $B  = "$e[1m";  $r  = "$e[0m"
-
-    $useBlockArt = $false
-    try { $useBlockArt = ([Console]::OutputEncoding.CodePage -eq 65001) } catch { }
+    function Write-CellRow {
+        param([Parameter(Mandatory)][string]$Pattern)
+        Write-Host '  ::' -NoNewline -ForegroundColor DarkGray
+        Write-Host '   ' -NoNewline
+        foreach ($ch in $Pattern.ToCharArray()) {
+            switch ($ch) {
+                'C' { Write-Host '  ' -NoNewline -BackgroundColor Cyan }
+                'W' { Write-Host '  ' -NoNewline -BackgroundColor White }
+                'M' { Write-Host '  ' -NoNewline -BackgroundColor Magenta }
+                'B' { Write-Host '  ' -NoNewline -BackgroundColor Blue }
+                default { Write-Host '  ' -NoNewline }
+            }
+        }
+        Write-Host ''
+    }
 
     Write-Host ""
-    if ($useBlockArt) {
-        $top = "$dk░▒$bl▓$mg█$cy$B$('▀' * 54)$r$mg█$bl▓$dk▒░$r"
-        $bot = "$dk░▒$bl▓$mg█$cy$B$('▄' * 54)$r$mg█$bl▓$dk▒░$r"
-
-        Write-Host "  $top"
-        Write-Host "  $dk▒$r $mg$B BOOT UPDATE CYCLE$r $dk//$r $wh unattended patch board$r $dk//$r $yl v$($script:BootUpdateCycleVersion)$r"
-        Write-Host "  $dk▒$r"
-        Write-Host "  $dk▒$r   $cy$B █████╗   █████╗   █████╗  █████████╗$r"
-        Write-Host "  $dk▒$r   $cy$B ██╔═██╗ ██╔═██╗ ██╔═██╗ ╚══██╔══╝$r"
-        Write-Host "  $dk▒$r   $wh$B █████╔╝ ██║ ██║ ██║ ██║    ██║$r"
-        Write-Host "  $dk▒$r   $cy$B ██╔═██╗ ██║ ██║ ██║ ██║    ██║$r"
-        Write-Host "  $dk▒$r   $cy$B █████╔╝ ╚████╔╝ ╚████╔╝    ██║$r"
-        Write-Host "  $dk▒$r   $cy$B ╚════╝   ╚═══╝   ╚═══╝     ╚═╝$r"
-        Write-Host "  $dk▒$r"
-        Write-Host "  $dk▒$r $gn [sysop]$r $wh update cycle$r   $gn [carrier]$r $mg updates you can sleep through$r"
-        Write-Host "  $bot"
-    } else {
-        $rule = "$cy$B$('=' * 66)$r"
-        Write-Host "  ${dk}.:$rule${dk}:.$r"
-        Write-Host "  ${dk}::$r $mg$B BOOT UPDATE CYCLE$r $dk//$r $wh unattended patch board$r $dk//$r $yl v$($script:BootUpdateCycleVersion)$r"
-        Write-Host "  ${dk}::$r"
-        Write-Host "  ${dk}::$r   $cy$B .----.   .----.   .----.  .--------.$r"
-        Write-Host "  ${dk}::$r   $cy$B | .-. \ /  __  \ /  __  \ '--.  .--'$r"
-        Write-Host "  ${dk}::$r   $wh$B | '--' || |  | || |  | |    |  |$r"
-        Write-Host "  ${dk}::$r   $cy$B | .-. < | |  | || |  | |    |  |$r"
-        Write-Host "  ${dk}::$r   $cy$B | '--' |\  '--' /\  '--' /   |  |$r"
-        Write-Host "  ${dk}::$r   $cy$B '----'  '------'  '------'   '--'$r"
-        Write-Host "  ${dk}::$r"
-        Write-Host "  ${dk}::$r $gn [sysop]$r $wh update cycle$r   $gn [carrier]$r $mg updates you can sleep through$r"
-        Write-Host "  ${dk}'::$rule${dk}::'$r"
-    }
+    Write-Host '  .:' -NoNewline -ForegroundColor DarkGray
+    Write-Host ('=' * 60) -NoNewline -ForegroundColor Cyan
+    Write-Host ':.' -ForegroundColor DarkGray
+    Write-Host '  :: ' -NoNewline -ForegroundColor DarkGray
+    Write-Host 'BOOT UPDATE CYCLE' -NoNewline -ForegroundColor Magenta
+    Write-Host ' // ' -NoNewline -ForegroundColor DarkGray
+    Write-Host 'unattended patch board' -NoNewline -ForegroundColor White
+    Write-Host ' // ' -NoNewline -ForegroundColor DarkGray
+    Write-Host "v$($script:BootUpdateCycleVersion)" -ForegroundColor Yellow
+    Write-Host '  ::' -ForegroundColor DarkGray
+    Write-CellRow 'CCCC..MMMM..MMMM..WWWWW'
+    Write-CellRow 'CBBCC.MBBBM.MBBBM...W..'
+    Write-CellRow 'CBBCC.MBBBM.MBBBM...W..'
+    Write-CellRow 'CCCC..MBBBM.MBBBM...W..'
+    Write-CellRow 'CBBCC.MBBBM.MBBBM...W..'
+    Write-CellRow 'CBBCC.MBBBM.MBBBM...W..'
+    Write-CellRow 'CCCC..MMMM..MMMM....W..'
+    Write-Host '  ::' -ForegroundColor DarkGray
+    Write-Host '  :: ' -NoNewline -ForegroundColor DarkGray
+    Write-Host '[sysop]' -NoNewline -ForegroundColor Green
+    Write-Host ' update cycle   ' -NoNewline -ForegroundColor White
+    Write-Host '[carrier]' -NoNewline -ForegroundColor Green
+    Write-Host ' updates you can sleep through' -ForegroundColor Magenta
+    Write-Host "  '::" -NoNewline -ForegroundColor DarkGray
+    Write-Host ('=' * 60) -NoNewline -ForegroundColor Cyan
+    Write-Host "::'" -ForegroundColor DarkGray
     Write-Host ""
 }
 
 function Show-CycleStartStatus {
     param([string]$Verb, [string]$SessionId, [int]$Iteration, [int]$MaxIterations, [string]$Context, [string]$Window = '')
-    $e = [char]27; $cy = "$e[36m"; $dk = "$e[90m"; $wh = "$e[97m"; $gn = "$e[92m"; $r = "$e[0m"
-    Write-Host "$dk  [$gn$Verb$dk]$wh Session: $SessionId $dk|$wh Iteration: $Iteration/$MaxIterations $dk|$wh Context: $Context$r"
-    if (-not [string]::IsNullOrWhiteSpace($Window)) { Write-Host "$dk  [$cy window $dk]$wh $Window$r" }
+    Write-Host '  [' -NoNewline -ForegroundColor DarkGray
+    Write-Host $Verb -NoNewline -ForegroundColor Green
+    Write-Host '] ' -NoNewline -ForegroundColor DarkGray
+    Write-Host "Session: $SessionId " -NoNewline -ForegroundColor White
+    Write-Host '| ' -NoNewline -ForegroundColor DarkGray
+    Write-Host "Iteration: $Iteration/$MaxIterations " -NoNewline -ForegroundColor White
+    Write-Host '| ' -NoNewline -ForegroundColor DarkGray
+    Write-Host "Context: $Context" -ForegroundColor White
+    if (-not [string]::IsNullOrWhiteSpace($Window)) {
+        Write-Host '  [window] ' -NoNewline -ForegroundColor DarkCyan
+        Write-Host $Window -ForegroundColor White
+    }
     Write-Host ""
 }
 
