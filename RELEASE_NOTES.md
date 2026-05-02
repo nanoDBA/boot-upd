@@ -1,8 +1,56 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.4.0  
-**Release Date:** 2026-04-25  
+**Current Version:** v2.5.0
+**Release Date:** 2026-05-02
 **Status:** STABLE
+
+---
+
+## v2.5.0 (2026-05-02)
+
+**Major feature release.** Concurrency safety, BitLocker support, parallelized cohort, four new update phases, extension-hook system, self-update, and remote configuration. All 25 open issues from the 2026-05 code review closed across seven coordinated phases. State schema v2 → v3 with automatic migration; all changes backwards-compatible.
+
+### New features
+
+- **Named-mutex concurrency guard** (`Global\BootUpdateCycle`). A duplicate orchestrator instance now logs and exits cleanly instead of racing on `$state.Iteration` and `shutdown.exe`. `AbandonedMutexException` from a crashed prior owner is recovered.
+- **BitLocker suspend across reboot.** New `Suspend-BitLockerForReboot` runs `Suspend-BitLocker -RebootCount 1` (with `manage-bde.exe` fallback) immediately before `shutdown.exe /r`. Eliminates the recovery-prompt stall on protected machines. New `-SkipBitLocker` switch.
+- **Parallel cohort.** Pip, Npm, Scoop, DotnetTools, and Vscode now run concurrently via `Start-ThreadJob`. ~30-40% wall-clock savings on the user-package phase.
+- **Parallel Winget scopes.** `--scope user` and `--scope machine` run concurrently in user context (sequential fallback under SYSTEM and when `ExcludePatterns` is active).
+- **Defender signature update phase** (default ON, `-SkipDefender` to disable). Runs after Windows Update.
+- **Driver/firmware update phase** (opt-in, `-IncludeDriverUpdates` / `-IncludeFirmwareUpdates`). Honors regex-escaped `ExcludePatterns`.
+- **WSL kernel + distro phase** (opt-in, `-UpdateWsl`). Runs `wsl --update` plus per-distro apt/dnf/pacman. SYSTEM-context skipped.
+- **Container image refresh + prune** (opt-in, `-UpdateContainers`). Detects Docker or Podman, pulls all non-`<none>` images unique-deduped, then `system prune -f`. SYSTEM-context skipped.
+- **Metered connection detection.** WinRT `GetConnectionCost` with CIM fallback. Aborts cleanly via `exit 0` (not the error path) unless `-AllowMetered` is set.
+- **Pre-flight network cache.** DNS + TCP probes cached in state for 5 minutes. Saves ~5-10s per iteration on slow networks. Cleared on reboot.
+- **Cycle-level hooks.** New `-PreCycleScript` / `-PostCycleScript` parameters dot-source user .ps1 files at cycle entry and at successful-completion / max-iterations paths.
+- **Per-phase hooks via `hooks.psd1`.** Sidecar file with 30 named scriptblocks (Before/After x 15 phases). Loaded at script start; failures are logged and never crash the cycle.
+- **Self-update from GitHub releases** (default ON, `-DisableSelfUpdate` to disable). User-context only. Checks the `latest` release, validates the downloaded asset parses, optionally verifies SHA256 from a sibling asset or release body, atomically replaces the live script, and re-execs with the original parameters.
+- **Remote configuration URL.** New `-ConfigUrl` parameter pulls a JSON config; supported keys override `$script:*` defaults only when the user did not pass them on the command line. Successful fetches are cached at `ProgramData\BootUpdateCycle\remote-config.cache.json`.
+
+### Bug fixes
+
+- `$SkipDotnetTools` now defaults to `$true` (matches documented OFF default; was running by accident).
+- `shutdown.exe /c` comment is quoted (PS7.0-7.2 Legacy native-arg passing).
+- pip per-package upgrade quotes the package name and applies `ExcludePatterns`.
+- Windows Update `NotTitle` regex-escapes user-supplied `ExcludePatterns` (no more silent over-exclusion or parse errors).
+- `Set-BootUpdateState` clears stale `.tmp` from a prior failed write and surfaces `Move-Item` failures via the logger.
+- `Save-CycleHistory` writes atomically and tolerates a corrupted/empty history file (try/catch around `ConvertFrom-Json`).
+- `$state.Iteration++` and the state write now happen AFTER the maintenance-window gate — narrow windows no longer burn iteration slots on misses.
+- `Register-BootUpdateTaskForReboot` no longer early-returns when the task already exists; `Register-ScheduledTask -Force` always rewrites the action with the current arguments.
+- `Update-BootUpdateStateSchema` warns and backs up state files written by a future schema version (`<path>.future-vN.bak`).
+- `Repair-AwsTooling.ps1` passes its multi-line scriptblock to `pwsh.exe` via `-EncodedCommand` (newlines no longer drop across `CreateProcess`).
+- `Send-MailMessage -AsJob` is awaited with a 30-second timeout, errors logged, and the job removed (no more job-object leak / silent SMTP failures).
+
+### State schema
+
+- Bumped v2 → v3. Adds `DefenderDone`, `DriverFirmwareDone`, `WslDone`, `ContainersDone`, `LastPreflightNetworkOk`, `LastPreflightNetworkAt`. Migration is automatic and idempotent.
+- Forward-compat guard added: a state file at `v > $script:BootUpdateStateSchemaVersion` is backed up to `<path>.future-vN.bak` before the script proceeds.
+
+### Compatibility
+
+- New optional parameters; no removals or renames.
+- `$SkipDotnetTools` default flipped from running → skipped, restoring documented behavior.
+- All existing call sites and scheduled-task arg propagations updated.
 
 ---
 
