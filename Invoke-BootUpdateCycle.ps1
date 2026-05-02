@@ -141,7 +141,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 3 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.2' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.3' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 
 <# Force UTF-8 console I/O so box-drawing/block chars (BBS splash) render in cmd.exe regardless of system code page.
    chcp 65001 sets conhost interpretation; [Console]::OutputEncoding makes .NET write proper UTF-8 bytes. #>
@@ -2201,25 +2201,8 @@ function Send-RebootWarning {
 
 function Show-StartupArt {
     <# BBS-inspired ANSI splash, kept ASCII-only so cmd.exe renders it cleanly
-       even when UTF-8 or box-drawing glyph support is inconsistent. #>
-    <# Belt-and-suspenders codepage flip: the script-start try/catch may have run
-       before the console was fully attached (cmd → pwsh launch race), and chcp.com
-       with redirected output occasionally no-ops on legacy conhost.  Calling the
-       Win32 API directly here is idempotent and ensures box-drawing/block chars
-       render even if the earlier setup didn't take. #>
-    try {
-        if (-not ('BBSConsole.Cp' -as [type])) {
-            Add-Type -Namespace BBSConsole -Name Cp -MemberDefinition @'
-[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError=true)]
-public static extern bool SetConsoleOutputCP(uint codePage);
-[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError=true)]
-public static extern bool SetConsoleCP(uint codePage);
-'@ -ErrorAction Stop
-        }
-        [BBSConsole.Cp]::SetConsoleOutputCP(65001) | Out-Null
-        [BBSConsole.Cp]::SetConsoleCP(65001)       | Out-Null
-        [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-    } catch { <# no console attached or P/Invoke blocked — proceed and let chars fall back #> }
+       even when UTF-8 or box-drawing glyph support is inconsistent. Width stays
+       below 80 columns so legacy 80x24 consoles do not wrap the banner. #>
 
     $e = [char]27
     $art = "$e[96m"; $bar2 = "$e[94m"; $tag = "$e[95m"

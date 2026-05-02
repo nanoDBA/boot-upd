@@ -1,8 +1,23 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.2
+**Current Version:** v2.5.3
 **Release Date:** 2026-05-02
 **Status:** STABLE
+
+---
+
+## v2.5.3 (2026-05-02)
+
+**Splash compatibility cleanup.** Applied the practical constraints from OmniJeff's `ascii-art` skill guidance: ASCII-only art, simple retro characters, and an 80-column-safe banner.
+
+### Fixes
+
+- Removed the now-unnecessary `Show-StartupArt` Unicode codepage P/Invoke path; the splash no longer depends on box-drawing or block glyph support.
+- Documented the banner's 80-column constraint in the splash comment.
+
+### Compatibility
+
+- No parameter or schema changes. Drop-in replacement for v2.5.2.
 
 ---
 
