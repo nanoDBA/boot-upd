@@ -55,6 +55,7 @@ param(
     [switch]$SkipVscode,
     [switch]$SkipRestorePoint,
     [switch]$SkipHealthCheck,
+    [switch]$SkipBitLocker,
     [switch]$StagedRollout,           # Run one package manager per boot instead of all at once
     [switch]$Force,
     [ValidateScript({ $_ -eq '' -or $_ -match '^https?://' })]
@@ -88,7 +89,9 @@ $script:SkipDotnetTools       = $SkipDotnetTools
 $script:SkipVscode            = $SkipVscode
 $script:SkipRestorePoint      = $SkipRestorePoint
 $script:SkipHealthCheck       = $SkipHealthCheck
+$script:SkipBitLocker         = $SkipBitLocker
 $script:StagedRollout         = $StagedRollout.IsPresent
+$script:BootUpdateMutex       = $null
 $script:ExcludePatterns       = $ExcludePatterns
 $script:WebhookUrl            = $WebhookUrl
 $script:NotifyEmail           = $NotifyEmail
@@ -1374,6 +1377,55 @@ function Register-BootUpdateTaskForReboot {
         -Description 'Boot update loop: patches everything, reboots until clean.' -Force | Out-Null
     Write-Log "Scheduled task registered: $taskName (SYSTEM at startup)"
 }
+
+function Suspend-BitLockerForReboot {
+    <# Suspends BitLocker protection for exactly one reboot so the unattended loop
+       doesn't land at a recovery prompt.  Best-effort — never throws. #>
+    try {
+        if ($script:SkipBitLocker) {
+            Write-Log 'BitLocker suspend skipped (-SkipBitLocker).'
+            return
+        }
+
+        $protectedVolumes = Get-BitLockerVolume -ErrorAction Stop |
+            Where-Object { $_.ProtectionStatus -eq 'On' }
+
+        if (-not $protectedVolumes) {
+            Write-Log 'BitLocker: no protected volumes found — nothing to suspend.'
+            return
+        }
+
+        foreach ($vol in $protectedVolumes) {
+            $drive = $vol.MountPoint
+            $suspended = $false
+
+            # Primary path: BitLocker cmdlet (preferred — returns structured objects)
+            try {
+                $vol | Suspend-BitLocker -RebootCount 1 -ErrorAction Stop | Out-Null
+                Write-Log "BitLocker suspended for 1 reboot on $drive"
+                $suspended = $true
+            } catch {
+                Write-Log "BitLocker cmdlet failed on $drive (${_}); trying manage-bde fallback." -Level Warn
+            }
+
+            # Fallback: manage-bde.exe (available even when the PS module is broken)
+            if (-not $suspended) {
+                try {
+                    $bdeOut = & manage-bde.exe -protectors -disable $drive -RebootCount 1 2>&1
+                    if ($LASTEXITCODE -eq 0) {
+                        Write-Log "BitLocker suspended via manage-bde on $drive"
+                    } else {
+                        Write-Log "manage-bde failed on $drive (exit $LASTEXITCODE): $bdeOut" -Level Warn
+                    }
+                } catch {
+                    Write-Log "manage-bde.exe unavailable on ${drive}: $_" -Level Warn
+                }
+            }
+        }
+    } catch {
+        Write-Log "Suspend-BitLockerForReboot: unexpected error: $_" -Level Warn
+    }
+}
 #endregion
 
 #region Notifications
@@ -1950,6 +2002,7 @@ function Invoke-BootUpdateCycle {
                 "Next run as SYSTEM (scheduled task)"
             )
 
+            Suspend-BitLockerForReboot
             $shutdownComment = 'Boot Update Cycle: Applying updates (forced reboot).'
             Write-Log "Initiating forced shutdown /r /f /t $($script:RebootDelaySec)"
             if ($PSCmdlet.ShouldProcess('Windows', 'Restart computer')) {
@@ -2029,4 +2082,36 @@ function Invoke-BootUpdateCycle {
 
 <# Entry point #>
 if ($Force) { $ConfirmPreference = 'None' }
+
+<# Named-mutex guard — prevents two instances racing on a fast boot (9ls).
+   AbandonedMutexException means the prior owner crashed without releasing; we inherit ownership. #>
+try {
+    $script:BootUpdateMutex = [System.Threading.Mutex]::new($false, 'Global\BootUpdateCycle')
+    $acquired = $false
+    try {
+        $acquired = $script:BootUpdateMutex.WaitOne(0)
+    } catch [System.Threading.AbandonedMutexException] {
+        Write-Log 'Named mutex was abandoned (previous instance exited uncleanly). Claiming ownership.' -Level Warn
+        $acquired = $true
+    }
+    if (-not $acquired) {
+        Write-Log 'Another BootUpdateCycle instance is already running (mutex held). Exiting.' -Level Warn
+        $script:BootUpdateMutex.Dispose()
+        $script:BootUpdateMutex = $null
+        exit 0
+    }
+} catch {
+    Write-Log "Named mutex acquisition failed (non-fatal): $_" -Level Warn
+    $script:BootUpdateMutex = $null
+}
+
+<# Release mutex on any exit path, including exit 0/1 inside the function #>
+Register-EngineEvent -SourceIdentifier 'PowerShell.Exiting' -Action {
+    if ($script:BootUpdateMutex) {
+        try { $script:BootUpdateMutex.ReleaseMutex() } catch { }
+        $script:BootUpdateMutex.Dispose()
+        $script:BootUpdateMutex = $null
+    }
+} | Out-Null
+
 Invoke-BootUpdateCycle
