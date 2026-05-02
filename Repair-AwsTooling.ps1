@@ -237,8 +237,9 @@ catch {
 }
 '@
         
+        $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($scriptBlock))
         $proc = Start-Process pwsh.exe -ArgumentList @(
-            '-NoProfile', '-NonInteractive', '-Command', $scriptBlock
+            '-NoProfile', '-NonInteractive', '-EncodedCommand', $encodedCommand
         ) -Wait -PassThru -NoNewWindow
         
         if ($proc.ExitCode -ne 0) {

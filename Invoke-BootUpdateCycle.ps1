@@ -51,7 +51,7 @@ param(
     [switch]$SkipAwsTooling,
     [switch]$SkipPowerShellModules,
     [switch]$SkipScoop,
-    [switch]$SkipDotnetTools,
+    [switch]$SkipDotnetTools = $true,
     [switch]$SkipVscode,
     [switch]$SkipRestorePoint,
     [switch]$SkipHealthCheck,
@@ -182,6 +182,13 @@ function Update-BootUpdateStateSchema {
     $props = $State.PSObject.Properties.Name
     $ver = if ($props -contains 'StateVersion') { [int]$State.StateVersion } else { 1 }
 
+    <# Forward-compat guard: state written by a newer script version — back it up and warn #>
+    if ($ver -gt $script:BootUpdateStateSchemaVersion) {
+        $bakPath = $script:StatePath -replace '\.json$', ".future-v$ver.bak"
+        Write-Log "WARNING: State file has schema version $ver but this script only knows v$($script:BootUpdateStateSchemaVersion). Saving backup to $bakPath before proceeding." -Level Warn
+        try { Copy-Item -Path $script:StatePath -Destination $bakPath -Force -EA SilentlyContinue } catch { }
+    }
+
     <# v1 -> v2: rename inconsistent phase flags #>
     if ($ver -lt 2) {
         if (($props -contains 'WindowsUpdate') -and ($props -notcontains 'WindowsUpdateDone')) {
@@ -257,10 +264,18 @@ function Set-BootUpdateState {
     if ($WhatIfPreference) { return }
     $State.LastRun = (Get-Date).ToUniversalTime().ToString('o')
     $tmpPath = $script:StatePath + '.tmp'
+    <# Remove any pre-existing .tmp left by a prior failed write #>
+    if (Test-Path $tmpPath) { Remove-Item $tmpPath -Force -EA SilentlyContinue }
     try {
         $json = $State | ConvertTo-Json -Depth 10
         [System.IO.File]::WriteAllText($tmpPath, $json, [System.Text.Encoding]::UTF8)
-        Move-Item -Path $tmpPath -Destination $script:StatePath -Force -ErrorAction Stop
+        try {
+            Move-Item -Path $tmpPath -Destination $script:StatePath -Force -ErrorAction Stop
+        } catch {
+            Write-Log "Failed to promote state file (Move-Item): $_" -Level Error
+            if (Test-Path $tmpPath) { Remove-Item $tmpPath -Force -EA SilentlyContinue }
+            throw
+        }
     } catch {
         Write-Log "Failed to write state: $_" -Level Error
         if (Test-Path $tmpPath) { Remove-Item $tmpPath -Force -EA SilentlyContinue }
@@ -314,9 +329,19 @@ function Save-CycleHistory {
         Total = $s.Winget + $s.Chocolatey + $s.WindowsUpdate + $s.Pip + $s.Npm + $s.Office365 + $s.PowerShellModules + $s.Scoop + $s.DotnetTools + $s.Vscode
     }
     $history = @()
-    if (Test-Path $script:HistoryPath) { $history = @(Get-Content $script:HistoryPath -Raw | ConvertFrom-Json) }
+    if (Test-Path $script:HistoryPath) {
+        try {
+            $history = @(Get-Content $script:HistoryPath -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop)
+        } catch {
+            Write-Log "History file unreadable, starting fresh: $_" -Level Warn
+            $history = @()
+        }
+    }
     $history = @($entry) + $history | Select-Object -First $script:MaxHistoryEntries
-    $history | ConvertTo-Json -Depth 5 | Set-Content $script:HistoryPath -Force
+    $histTmpPath = $script:HistoryPath + '.tmp'
+    if (Test-Path $histTmpPath) { Remove-Item $histTmpPath -Force -EA SilentlyContinue }
+    $history | ConvertTo-Json -Depth 5 | Set-Content $histTmpPath -Force
+    Move-Item -Path $histTmpPath -Destination $script:HistoryPath -Force
 }
 #endregion
 
@@ -855,7 +880,7 @@ function Install-WindowsUpdates {
     Import-Module PSWindowsUpdate -Force
     Write-Log 'Checking for Windows Updates (excluding SQL Server)...'
     $params = @{
-        AcceptAll = $true; Install = $true; NotTitle = ((@('SQL') + $script:ExcludePatterns) -join '|')
+        AcceptAll = $true; Install = $true; NotTitle = ((@('SQL') + ($script:ExcludePatterns | ForEach-Object { [regex]::Escape($_) })) -join '|')
         RootCategories = @('Security Updates','Critical Updates','Definition Updates')
         AutoReboot = $false; Confirm = $false; IgnoreReboot = $true
     }
@@ -886,8 +911,16 @@ function Update-PipPackages {
         & python -m pip install --upgrade pip 2>&1 | ForEach-Object { Write-Log $_ }
         $outdated = @(& pip list --outdated --format=json 2>$null | ConvertFrom-Json -EA SilentlyContinue)
         foreach ($pkg in $outdated) {
+            $matchedPattern = $null
+            foreach ($pattern in $script:ExcludePatterns) {
+                if ($pkg.name.IndexOf($pattern, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { $matchedPattern = $pattern; break }
+            }
+            if ($matchedPattern) {
+                Write-Log "Pip: skipping $($pkg.name) (excluded by pattern '$matchedPattern')"
+                continue
+            }
             Write-Log "Upgrading: $($pkg.name)"
-            & pip install --upgrade $pkg.name 2>&1 | ForEach-Object { Write-Log $_ }
+            & pip install --upgrade "$($pkg.name)" 2>&1 | ForEach-Object { Write-Log $_ }
             $count++
         }
     } else {
@@ -1302,10 +1335,6 @@ function Unregister-BootUpdateTask {
 
 function Register-BootUpdateTaskForReboot {
     $taskName = 'BootUpdateCycle'
-    if (Get-ScheduledTask -TaskName $taskName -EA SilentlyContinue) {
-        Write-Log 'Scheduled task already registered (post-reboot iteration)'
-        return
-    }
     $pwshPath = (Get-Command pwsh -EA SilentlyContinue).Source
     if (-not $pwshPath) { $pwshPath = "$env:ProgramFiles\PowerShell\7\pwsh.exe" }
     $scriptPath = Join-Path $PSScriptRoot 'Invoke-BootUpdateCycle.ps1'
@@ -1518,8 +1547,12 @@ function Send-EmailNotification {
         if ($script:SmtpCredential) {
             $mailParams['Credential'] = $script:SmtpCredential
         }
-        Send-MailMessage @mailParams -AsJob | Out-Null
+        $mailJob = Send-MailMessage @mailParams -AsJob
         Write-Log "Notification: email job queued to $($script:NotifyEmail)"
+        $null = Wait-Job -Job $mailJob -Timeout 30
+        $jobErrors = @(Receive-Job -Job $mailJob -ErrorAction SilentlyContinue -ErrorVariable receiveErrs 2>$null)
+        if ($receiveErrs) { Write-Log "Notification: email job errors: $($receiveErrs -join '; ')" -Level Warn }
+        Remove-Job -Job $mailJob -Force
     } catch {
         Write-Log "Notification: email failed: $_" -Level Warn
     }
@@ -1658,10 +1691,9 @@ function Invoke-BootUpdateCycle {
     Invoke-LogRotation
 
     $state = Get-BootUpdateState
-    $state.Iteration++
     $isFirstIteration = -not $state.StartTime
     if ($isFirstIteration) { $state.StartTime = Get-Date -Format 'o' }
-    Set-BootUpdateState -State $state
+    $pendingIteration = $state.Iteration + 1
 
     $sessionId = ([datetime]$state.StartTime).ToString('yyyy-MM-dd HH:mm:ss')
     $cycleVerb = if ($isFirstIteration) { 'STARTED' } else { 'RESUMED (after reboot)' }
@@ -1677,7 +1709,7 @@ function Invoke-BootUpdateCycle {
     $bannerInfo = [System.Collections.Generic.List[string]]@(
         "$cycleVerb"
         "Session:    $sessionId"
-        "Iteration:  $($state.Iteration) of $MaxIterations"
+        "Iteration:  $pendingIteration of $MaxIterations"
         "Context:    $context"
     )
     if ($script:MaintenanceWindowStart -ge 0) {
@@ -1686,17 +1718,21 @@ function Invoke-BootUpdateCycle {
     Show-CycleBanner -Title $bannerTitle -AnsiColor "$([char]27)[36m" -Info $bannerInfo.ToArray()
     <# Log file: clean greppable entry #>
     $whatIfTag = if ($WhatIfPreference) { ' [WHATIF]' } else { '' }
-    Write-Log "BOOT UPDATE CYCLE$whatIfTag $cycleVerb | Session: $sessionId | Iteration: $($state.Iteration)/$MaxIterations | Context: $context"
+    Write-Log "BOOT UPDATE CYCLE$whatIfTag $cycleVerb | Session: $sessionId | Iteration: $pendingIteration/$MaxIterations | Context: $context"
     if ($script:MaintenanceWindowStart -ge 0) { Write-Log "Maintenance window: $($script:MaintenanceWindowStart):00 - $($script:MaintenanceWindowEnd):00" -Level Info }
 
     <# Event Log: cycle started #>
-    Write-EventLogEntry -EventId 1002 -Message "Boot Update Cycle $cycleVerb`nSession: $sessionId`nIteration: $($state.Iteration) of $MaxIterations"
+    Write-EventLogEntry -EventId 1002 -Message "Boot Update Cycle $cycleVerb`nSession: $sessionId`nIteration: $pendingIteration of $MaxIterations"
 
     <# Maintenance window gate — exit clean (task survives) if outside configured window #>
     if (-not (Test-MaintenanceWindow)) {
         Write-Log "Outside maintenance window ($($script:MaintenanceWindowStart):00 - $($script:MaintenanceWindowEnd):00). Current hour: $((Get-Date).Hour). Deferring." -Level Warn
         exit 0
     }
+
+    <# Commit iteration increment only after maintenance window gate passes #>
+    $state.Iteration++
+    Set-BootUpdateState -State $state
 
     <# Pre-flight checks (every iteration — disk/network can change between reboots) #>
     $preflight = Test-PreFlightChecks -Force:$Force
@@ -1917,7 +1953,7 @@ function Invoke-BootUpdateCycle {
             $shutdownComment = 'Boot Update Cycle: Applying updates (forced reboot).'
             Write-Log "Initiating forced shutdown /r /f /t $($script:RebootDelaySec)"
             if ($PSCmdlet.ShouldProcess('Windows', 'Restart computer')) {
-                & shutdown.exe /r /f /t $script:RebootDelaySec /c $shutdownComment /d p:2:17
+                & shutdown.exe /r /f /t $script:RebootDelaySec /c "$shutdownComment" /d p:2:17
                 Write-Log 'Shutdown scheduled. Exiting; will resume after reboot.'
                 exit 0
             }
