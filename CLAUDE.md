@@ -114,6 +114,67 @@ Remove-Item "$env:ProgramData\BootUpdateCycle" -Recurse -Force
 | `IncludeFirmwareUpdates` | `$false` | Opt-in: install firmware updates via PSWindowsUpdate |
 | `UpdateWsl` | `$false` | Opt-in: update WSL kernel and distro packages (user-scoped) |
 | `UpdateContainers` | `$false` | Opt-in: pull updated Docker/Podman images and prune (user-scoped) |
+| `PreCycleScript` | `''` | Path to a .ps1 hook executed after pre-flight, before the first phase |
+| `PostCycleScript` | `''` | Path to a .ps1 hook executed after the final phase, before reboot decision |
+| `HooksConfig` | `hooks.psd1` (sidecar) | Path to PSD1 sidecar with per-phase scriptblock hooks |
+
+## Extension Hooks
+
+Two complementary hook mechanisms allow you to extend the orchestrator without modifying it.
+
+### Cycle-level hooks (`-PreCycleScript` / `-PostCycleScript`)
+
+Pass the path to a `.ps1` file. The script is dot-sourced (not spawned), so it runs in the same scope as the orchestrator.
+
+- **PreCycle** fires after pre-flight checks pass and after the max-iterations safety check, immediately before the first update phase. It does NOT fire on abort paths (mutex collision, metered connection abort, pre-flight hard block).
+- **PostCycle** fires after the final phase completes, before the reboot/completion decision is made. It fires on: normal cycle completion (no pending reboots), and max-iterations exceeded termination. It does NOT fire on the reboot path (the next boot is a new cycle invocation).
+
+If the path does not exist, a Warn is logged and execution continues. Exceptions in the hook are caught and logged at Warn — they never abort the cycle.
+
+### Per-phase hooks (`hooks.psd1` sidecar)
+
+Create a file named `hooks.psd1` in the same directory as `Invoke-BootUpdateCycle.ps1` (or pass `-HooksConfig` with an alternate path). The file must evaluate to a hashtable of scriptblocks:
+
+```powershell
+@{
+    BeforeWinget            = { Write-Host 'About to run Winget' }
+    AfterWinget             = { Write-Host 'Winget done' }
+    BeforeChoco             = { ... }
+    AfterChoco              = { ... }
+    BeforeWindowsUpdate     = { ... }
+    AfterWindowsUpdate      = { ... }
+    BeforeDefender          = { ... }
+    AfterDefender           = { ... }
+    BeforeDriverFirmware    = { ... }
+    AfterDriverFirmware     = { ... }
+    BeforeAwsTooling        = { ... }
+    AfterAwsTooling         = { ... }
+    BeforeOffice365         = { ... }
+    AfterOffice365          = { ... }
+    BeforePowerShellModules = { ... }
+    AfterPowerShellModules  = { ... }
+    BeforeWsl               = { ... }
+    AfterWsl                = { ... }
+    BeforeContainers        = { ... }
+    AfterContainers         = { ... }
+    # Parallel cohort — hooks fire on the parent thread (approximate order)
+    BeforePip         = { ... }; AfterPip         = { ... }
+    BeforeNpm         = { ... }; AfterNpm         = { ... }
+    BeforeScoop       = { ... }; AfterScoop       = { ... }
+    BeforeDotnetTools = { ... }; AfterDotnetTools = { ... }
+    BeforeVscode      = { ... }; AfterVscode      = { ... }
+}
+```
+
+Only keys present in the hashtable are called. Missing keys are silently skipped. Exceptions are caught and logged at Warn.
+
+**Parallel cohort note:** Pip, Npm, Scoop, DotnetTools, and Vscode run as ThreadJob workers in isolated runspaces. Their Before hooks fire on the parent thread before the job batch launches; their After hooks fire on the parent thread as each job result is collected. This is approximate — not guaranteed to interleave with the actual job execution timeline.
+
+### Scope and safety
+
+All hooks (both cycle-level and per-phase) run in the same PowerShell scope as the orchestrator. They can read `$state`, `$script:PackageTimeoutMinutes`, `$script:LogPath`, and all other `$script:*` variables. Mutations are possible but unsupported — the orchestrator's state machine is authoritative.
+
+The `hooks.psd1` file is evaluated as a scriptblock, not parsed in safe mode, so it can contain full PowerShell expressions. Treat it as local privileged code.
 
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->

@@ -73,7 +73,10 @@ param(
     [int]$MaintenanceWindowStart = -1,  # Hour of day (0-23) when updates may begin. -1 = no window enforced.
     [ValidateRange(-1, 23)]
     [int]$MaintenanceWindowEnd   = -1,  # Hour of day when updates must stop. -1 = no window enforced.
-    [switch]$AllowMetered                # Allow updates on metered connections (cellular hotspot). Default: abort on metered.
+    [switch]$AllowMetered,               # Allow updates on metered connections (cellular hotspot). Default: abort on metered.
+    [string]$PreCycleScript  = '',       # Path to a .ps1 hook executed after pre-flight, before the first phase (74r)
+    [string]$PostCycleScript = '',       # Path to a .ps1 hook executed after the final phase, before reboot decision (74r)
+    [string]$HooksConfig     = (Join-Path $PSScriptRoot 'hooks.psd1')  # Sidecar PSD1 with per-phase hook scriptblocks (b3w)
 )
 
 $ErrorActionPreference = 'Stop'
@@ -111,6 +114,27 @@ $script:SmtpCredential        = $SmtpCredential
 $script:MaintenanceWindowStart = $MaintenanceWindowStart
 $script:MaintenanceWindowEnd   = $MaintenanceWindowEnd
 $script:AllowMetered           = $AllowMetered
+$script:PreCycleScript         = $PreCycleScript
+$script:PostCycleScript        = $PostCycleScript
+$script:HooksConfig            = $HooksConfig
+$script:PhaseHooks             = @{}
+
+<# Load per-phase hooks sidecar (hooks.psd1) at script start.
+   Evaluated as a scriptblock so values remain actual scriptblocks (Import-PowerShellDataFile
+   strips them to strings in safe-mode).  SECURITY: file is local user-controlled code. #>
+if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $script:HooksConfig)) {
+    try {
+        $script:PhaseHooks = & ([scriptblock]::Create((Get-Content $script:HooksConfig -Raw)))
+        if ($script:PhaseHooks -isnot [hashtable]) {
+            Write-Host "[WARN] hooks.psd1 did not return a hashtable — hooks disabled."
+            $script:PhaseHooks = @{}
+        }
+    } catch {
+        Write-Host "[WARN] hooks.psd1 failed to load: $_ — per-phase hooks disabled."
+        $script:PhaseHooks = @{}
+    }
+}
+
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 3 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.4.0' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 
@@ -2254,6 +2278,70 @@ function Write-PhaseSkip {
 }
 #endregion
 
+#region Extension Hooks
+<#
+    74r — Cycle-level hooks: -PreCycleScript / -PostCycleScript
+    b3w — Per-phase hooks:   hooks.psd1 sidecar loaded into $script:PhaseHooks
+
+    Hook scripts run in the SAME scope as the orchestrator so they can read $state and
+    $script:* variables.  Mutations are possible but unsupported — treat as read-only.
+    All hook failures are logged at Warn level; the cycle continues regardless.
+#>
+
+function Invoke-Hook {
+    <#
+    .SYNOPSIS
+        Executes a cycle-level hook script (.ps1) with best-effort error handling.
+    .PARAMETER Path
+        Absolute or relative path to a .ps1 file.  Empty/null/whitespace = no-op.
+    .PARAMETER HookName
+        Friendly name used in log messages (e.g. 'PreCycle', 'PostCycle').
+    #>
+    param(
+        [string]$Path,
+        [Parameter(Mandatory)][string]$HookName
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
+
+    if (-not (Test-Path $Path)) {
+        Write-Log "Hook [$HookName]: file not found at '$Path' — skipping." -Level Warn
+        return
+    }
+
+    try {
+        $resolvedPath = (Resolve-Path $Path).Path
+        Write-Log "Hook [$HookName]: executing '$resolvedPath'"
+        . $resolvedPath
+        Write-Log "Hook [$HookName]: completed."
+    } catch {
+        Write-Log "Hook [$HookName]: error during execution — $_" -Level Warn
+    }
+}
+
+function Invoke-PhaseHook {
+    <#
+    .SYNOPSIS
+        Fires a named per-phase hook scriptblock from $script:PhaseHooks with best-effort error handling.
+    .PARAMETER EventName
+        Key in $script:PhaseHooks hashtable, e.g. 'BeforeWinget', 'AfterChoco'.
+    #>
+    param([Parameter(Mandatory)][string]$EventName)
+
+    if (-not $script:PhaseHooks.ContainsKey($EventName)) { return }
+    $sb = $script:PhaseHooks[$EventName]
+    if ($sb -isnot [scriptblock]) { return }
+
+    try {
+        Write-Log "PhaseHook [$EventName]: executing"
+        & $sb
+        Write-Log "PhaseHook [$EventName]: completed."
+    } catch {
+        Write-Log "PhaseHook [$EventName]: error — $_" -Level Warn
+    }
+}
+#endregion
+
 #region Main Orchestration
 function Invoke-BootUpdateCycle {
     Invoke-LogRotation
@@ -2311,16 +2399,21 @@ function Invoke-BootUpdateCycle {
         exit 1
     }
 
-    <# Max iterations safety valve #>
+    <# Max iterations safety valve — PostCycle fires here so callers get a final callback even on cap-exceeded exit #>
     if ($state.Iteration -gt $MaxIterations) {
         Write-Log "Max iterations ($MaxIterations) exceeded. Stopping." -Level Error
         Write-EventLogEntry -EventId 1003 -EntryType Error -Message "Cycle stopped: exceeded $MaxIterations iterations.`nSession: $sessionId"
+        Invoke-Hook -Path $script:PostCycleScript -HookName 'PostCycle'
         if (-not $WhatIfPreference) { Unregister-BootUpdateTask; Clear-BootUpdateState }
         return
     }
 
     <# Crash recovery #>
     $null = Test-CrashRecovery -State $state
+
+    <# PreCycle hook — runs after pre-flight passes and max-iterations check, before the first phase.
+       Not called on aborted paths (metered/pre-flight abort) or mutex-collision exits. #>
+    Invoke-Hook -Path $script:PreCycleScript -HookName 'PreCycle'
 
     $pending = Test-PendingReboot
     if ($pending) { $pending | ForEach-Object { Write-Log "Pending reboot: $($_.Source)" -Level Warn } }
@@ -2456,6 +2549,9 @@ function Invoke-BootUpdateCycle {
             $state.LastPhaseStarted = $phase.Name; $state.LastPhaseTimestamp = Get-Date -Format 'o'; $state.Phase = $phase.Name
             Set-BootUpdateState -State $state
 
+            <# Per-phase hook — Before<Name> (b3w) #>
+            Invoke-PhaseHook -EventName "Before$($phase.Name)"
+
             try {
                 <# ShouldProcess guard: in WhatIf mode the phase Action is NOT invoked #>
                 if ($PSCmdlet.ShouldProcess($phase.Name, "Run $($phase.Name) updates")) {
@@ -2485,6 +2581,9 @@ function Invoke-BootUpdateCycle {
                 $state.($phase.Flag) = $true  <# fail-forward #>
             }
             Set-BootUpdateState -State $state
+
+            <# Per-phase hook — After<Name> (b3w) #>
+            Invoke-PhaseHook -EventName "After$($phase.Name)"
         }  <# end foreach sequential phase #>
 
         <# ── Parallel cohort: Pip / Npm / Scoop / DotnetTools / Vscode ──
@@ -2639,6 +2738,10 @@ function Invoke-BootUpdateCycle {
                 return @{ Phase='Vscode'; Success=$true; Count=$count; LogLines=$log.ToArray() }
             }
 
+            <# Before<Phase> hooks for parallel cohort phases — fired on the parent thread before jobs launch.
+               Thread jobs run in isolated runspaces so Invoke-PhaseHook cannot be called from inside them. #>
+            foreach ($cp in $pendingCohort) { Invoke-PhaseHook -EventName "Before$($cp.Name)" }
+
             <# Launch one ThreadJob per enabled pending phase #>
             $cohortJobs = [System.Collections.Generic.List[object]]::new()
             foreach ($cp in $pendingCohort) {
@@ -2696,6 +2799,8 @@ function Invoke-BootUpdateCycle {
                 Write-PhaseResult -Num $phaseNum -Total $enabledPhases.Count -Name $phaseName -Success $jr.Success -Minutes $elapsed.TotalMinutes -Count $jr.Count
                 Write-Log "<<< [parallel] $phaseName - DONE ($($jr.Count) pkg)"
                 Write-EventLogEntry -EventId 1004 -Message "$phaseName complete: $($jr.Count) packages (parallel cohort)"
+                <# After<Phase> hook — fired on the parent thread as each result is collected (approximate order). #>
+                Invoke-PhaseHook -EventName "After$phaseName"
             }
 
             <# Atomic state write — one write covers all five cohort phases #>
@@ -2815,6 +2920,10 @@ function Invoke-BootUpdateCycle {
         Write-Log "Info: View trends with: Show-BootUpdateHistory.ps1 -Format Graph"
 
         Save-CycleHistory -State $state -Duration $duration
+
+        <# PostCycle hook — cycle complete, no pending reboots, before self-removal (74r) #>
+        Invoke-Hook -Path $script:PostCycleScript -HookName 'PostCycle'
+
         if (-not $WhatIfPreference) {
             <# Build enriched summary data: per-manager counts + scalar metrics for webhook/email #>
             $summaryData = [pscustomobject]@{
