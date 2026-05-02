@@ -1,8 +1,24 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.4
+**Current Version:** v2.5.5
 **Release Date:** 2026-05-02
 **Status:** STABLE
+
+---
+
+## v2.5.5 (2026-05-02)
+
+**Splash and startup flow refinement.** Restored real BBS gradient block styling when UTF-8 console output is active, while keeping an ASCII fallback for legacy consoles.
+
+### Fixes
+
+- Added a gradient block splash path using `░▒▓█` framing and heavier BOOT lettering for consoles running UTF-8.
+- Kept the ASCII-only splash fallback for constrained legacy output.
+- Replaced the immediate second startup banner with a compact cycle status strip so the splash is not undermined by duplicate framing.
+
+### Compatibility
+
+- No parameter or schema changes. Drop-in replacement for v2.5.4.
 
 ---
 

@@ -141,7 +141,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 3 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.4' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.5' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 
 <# Force UTF-8 console I/O so box-drawing/block chars (BBS splash) render in cmd.exe regardless of system code page.
    chcp 65001 sets conhost interpretation; [Console]::OutputEncoding makes .NET write proper UTF-8 bytes. #>
@@ -2200,30 +2200,57 @@ function Send-RebootWarning {
    and do NOT go to the log file — the log stays clean and greppable.  #>
 
 function Show-StartupArt {
-    <# BBS-inspired ANSI splash, kept ASCII-only so cmd.exe renders it cleanly
-       even when UTF-8 or box-drawing glyph support is inconsistent. Width stays
-       below 80 columns so legacy 80x24 consoles do not wrap the banner. #>
+    <# BBS-inspired ANSI splash. Uses gradient block characters when UTF-8 output
+       is active, with an ASCII-only fallback for hostile legacy consoles. #>
 
     $e = [char]27
     $cy = "$e[96m"; $bl = "$e[94m"; $mg = "$e[95m"
     $wh = "$e[97m"; $dk = "$e[90m"; $yl = "$e[93m"; $gn = "$e[92m"
     $B  = "$e[1m";  $r  = "$e[0m"
 
-    $rule = "$cy$B$('=' * 66)$r"
+    $useBlockArt = $false
+    try { $useBlockArt = ([Console]::OutputEncoding.CodePage -eq 65001) } catch { }
 
     Write-Host ""
-    Write-Host "  ${dk}.:$rule${dk}:.$r"
-    Write-Host "  ${dk}::$r $mg$B BOOT UPDATE CYCLE$r $dk//$r $wh unattended patch board$r $dk//$r $yl v$($script:BootUpdateCycleVersion)$r"
-    Write-Host "  ${dk}::$r"
-    Write-Host "  ${dk}::$r   $cy$B .----.   .----.   .----.  .--------.$r"
-    Write-Host "  ${dk}::$r   $cy$B | .-. \ /  __  \ /  __  \ '--.  .--'$r"
-    Write-Host "  ${dk}::$r   $wh$B | '--' || |  | || |  | |    |  |$r"
-    Write-Host "  ${dk}::$r   $cy$B | .-. < | |  | || |  | |    |  |$r"
-    Write-Host "  ${dk}::$r   $cy$B | '--' |\  '--' /\  '--' /   |  |$r"
-    Write-Host "  ${dk}::$r   $cy$B '----'  '------'  '------'   '--'$r"
-    Write-Host "  ${dk}::$r"
-    Write-Host "  ${dk}::$r $gn [sysop]$r $wh update cycle$r   $gn [carrier]$r $mg updates you can sleep through$r"
-    Write-Host "  ${dk}'::$rule${dk}::'$r"
+    if ($useBlockArt) {
+        $top = "$dk░▒$bl▓$mg█$cy$B$('▀' * 54)$r$mg█$bl▓$dk▒░$r"
+        $bot = "$dk░▒$bl▓$mg█$cy$B$('▄' * 54)$r$mg█$bl▓$dk▒░$r"
+
+        Write-Host "  $top"
+        Write-Host "  $dk▒$r $mg$B BOOT UPDATE CYCLE$r $dk//$r $wh unattended patch board$r $dk//$r $yl v$($script:BootUpdateCycleVersion)$r"
+        Write-Host "  $dk▒$r"
+        Write-Host "  $dk▒$r   $cy$B █████╗   █████╗   █████╗  █████████╗$r"
+        Write-Host "  $dk▒$r   $cy$B ██╔═██╗ ██╔═██╗ ██╔═██╗ ╚══██╔══╝$r"
+        Write-Host "  $dk▒$r   $wh$B █████╔╝ ██║ ██║ ██║ ██║    ██║$r"
+        Write-Host "  $dk▒$r   $cy$B ██╔═██╗ ██║ ██║ ██║ ██║    ██║$r"
+        Write-Host "  $dk▒$r   $cy$B █████╔╝ ╚████╔╝ ╚████╔╝    ██║$r"
+        Write-Host "  $dk▒$r   $cy$B ╚════╝   ╚═══╝   ╚═══╝     ╚═╝$r"
+        Write-Host "  $dk▒$r"
+        Write-Host "  $dk▒$r $gn [sysop]$r $wh update cycle$r   $gn [carrier]$r $mg updates you can sleep through$r"
+        Write-Host "  $bot"
+    } else {
+        $rule = "$cy$B$('=' * 66)$r"
+        Write-Host "  ${dk}.:$rule${dk}:.$r"
+        Write-Host "  ${dk}::$r $mg$B BOOT UPDATE CYCLE$r $dk//$r $wh unattended patch board$r $dk//$r $yl v$($script:BootUpdateCycleVersion)$r"
+        Write-Host "  ${dk}::$r"
+        Write-Host "  ${dk}::$r   $cy$B .----.   .----.   .----.  .--------.$r"
+        Write-Host "  ${dk}::$r   $cy$B | .-. \ /  __  \ /  __  \ '--.  .--'$r"
+        Write-Host "  ${dk}::$r   $wh$B | '--' || |  | || |  | |    |  |$r"
+        Write-Host "  ${dk}::$r   $cy$B | .-. < | |  | || |  | |    |  |$r"
+        Write-Host "  ${dk}::$r   $cy$B | '--' |\  '--' /\  '--' /   |  |$r"
+        Write-Host "  ${dk}::$r   $cy$B '----'  '------'  '------'   '--'$r"
+        Write-Host "  ${dk}::$r"
+        Write-Host "  ${dk}::$r $gn [sysop]$r $wh update cycle$r   $gn [carrier]$r $mg updates you can sleep through$r"
+        Write-Host "  ${dk}'::$rule${dk}::'$r"
+    }
+    Write-Host ""
+}
+
+function Show-CycleStartStatus {
+    param([string]$Verb, [string]$SessionId, [int]$Iteration, [int]$MaxIterations, [string]$Context, [string]$Window = '')
+    $e = [char]27; $cy = "$e[36m"; $dk = "$e[90m"; $wh = "$e[97m"; $gn = "$e[92m"; $r = "$e[0m"
+    Write-Host "$dk  [$gn$Verb$dk]$wh Session: $SessionId $dk|$wh Iteration: $Iteration/$MaxIterations $dk|$wh Context: $Context$r"
+    if (-not [string]::IsNullOrWhiteSpace($Window)) { Write-Host "$dk  [$cy window $dk]$wh $Window$r" }
     Write-Host ""
 }
 
@@ -2629,21 +2656,12 @@ function Invoke-BootUpdateCycle {
        self-update chatter; honor that flag and clear it so post-reboot resumes still splash. #>
     if (-not $script:_splashShown) { Show-StartupArt }
     $script:_splashShown = $false
-    $bannerTitle = if ($WhatIfPreference) {
-        "B O O T   U P D A T E   C Y C L E      [WHATIF - NO CHANGES]    v$($script:BootUpdateCycleVersion)"
-    } else {
-        "B O O T   U P D A T E   C Y C L E                           v$($script:BootUpdateCycleVersion)"
-    }
-    $bannerInfo = [System.Collections.Generic.List[string]]@(
-        "$cycleVerb"
-        "Session:    $sessionId"
-        "Iteration:  $pendingIteration of $MaxIterations"
-        "Context:    $context"
-    )
+    $statusVerb = if ($WhatIfPreference) { "$cycleVerb [WHATIF]" } else { $cycleVerb }
+    $windowText = ''
     if ($script:MaintenanceWindowStart -ge 0) {
-        $bannerInfo.Add("Window:     $($script:MaintenanceWindowStart):00 - $($script:MaintenanceWindowEnd):00")
+        $windowText = "$($script:MaintenanceWindowStart):00 - $($script:MaintenanceWindowEnd):00"
     }
-    Show-CycleBanner -Title $bannerTitle -AnsiColor "$([char]27)[36m" -Info $bannerInfo.ToArray()
+    Show-CycleStartStatus -Verb $statusVerb -SessionId $sessionId -Iteration $pendingIteration -MaxIterations $MaxIterations -Context $context -Window $windowText
     <# Log file: clean greppable entry #>
     $whatIfTag = if ($WhatIfPreference) { ' [WHATIF]' } else { '' }
     Write-Log "BOOT UPDATE CYCLE$whatIfTag $cycleVerb | Session: $sessionId | Iteration: $pendingIteration/$MaxIterations | Context: $context"
