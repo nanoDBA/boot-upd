@@ -1,8 +1,23 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.1
+**Current Version:** v2.5.2
 **Release Date:** 2026-05-02
 **Status:** STABLE
+
+---
+
+## v2.5.2 (2026-05-02)
+
+**Splash compatibility fix.** Replaced the fragile Unicode BBS splash with a static ASCII-only BOOT banner.
+
+### Fixes
+
+- Startup art now renders cleanly in legacy `cmd.exe` consoles even when Unicode block and box-drawing glyphs fail.
+- Keeps the BBS-style neon ANSI look, but removes animation and palette rotation.
+
+### Compatibility
+
+- No parameter or schema changes. Drop-in replacement for v2.5.1.
 
 ---
 
