@@ -2205,7 +2205,9 @@ function Show-StartupArt {
        UTF-8 console encoding is forced at script start; on cmd.exe this requires
        chcp 65001 to also have run, which we attempt at top of file. #>
     $e = [char]27
-    <# Curated neon palettes — each is (art, bar-accent, tagline) #>
+    <# Six curated neon palettes; each splash invocation rotates through ALL six
+       so every row of the BBS block prints in a different hue (rainbow gradient).
+       The starting palette is randomized so back-to-back runs don't look identical. #>
     $palettes = @(
         @{ art = '96'; bar = '94'; tag = '93' }   # Cyan / Blue / Yellow (original)
         @{ art = '92'; bar = '96'; tag = '93' }   # Green / Cyan / Yellow
@@ -2214,7 +2216,8 @@ function Show-StartupArt {
         @{ art = '94'; bar = '92'; tag = '95' }   # Blue / Green / Magenta
         @{ art = '91'; bar = '93'; tag = '96' }   # Red / Yellow / Cyan
     )
-    $p = $palettes[(Get-Random -Maximum $palettes.Count)]
+    $start = Get-Random -Maximum $palettes.Count
+    $p     = $palettes[$start]
 
     $art = "$e[$($p.art)m"; $bar2 = "$e[$($p.bar)m"; $tag = "$e[$($p.tag)m"
     $wh = "$e[97m"; $dk = "$e[90m"; $mg = "$e[95m"
@@ -2222,15 +2225,24 @@ function Show-StartupArt {
 
     $barLine = "$dk░▒$bar2▓$mg█$art$B$('═' * 56)$r$mg█$bar2▓$dk▒░$r"
 
+    <# Per-row palette rotation: each of the 6 BBS rows uses the next palette's
+       art color, producing a rainbow effect across the block letters. #>
+    $rows = @(
+        '    ██████╗  ██████╗  ██████╗ ████████╗'
+        '    ██╔══██╗██╔═══██╗██╔═══██╗╚══██╔══╝'
+        '    ██████╔╝██║   ██║██║   ██║   ██║'
+        '    ██╔══██╗██║   ██║██║   ██║   ██║'
+        '    ██████╔╝╚██████╔╝╚██████╔╝   ██║'
+        '    ╚═════╝  ╚═════╝  ╚═════╝    ╚═╝'
+    )
+
     Write-Host ""
     Write-Host "  $barLine"
     Write-Host ""
-    Write-Host "  $art$B    ██████╗  ██████╗  ██████╗ ████████╗$r"
-    Write-Host "  $art$B    ██╔══██╗██╔═══██╗██╔═══██╗╚══██╔══╝$r"
-    Write-Host "  $art$B    ██████╔╝██║   ██║██║   ██║   ██║$r"
-    Write-Host "  $art$B    ██╔══██╗██║   ██║██║   ██║   ██║$r"
-    Write-Host "  $art$B    ██████╔╝╚██████╔╝╚██████╔╝   ██║$r"
-    Write-Host "  $art$B    ╚═════╝  ╚═════╝  ╚═════╝    ╚═╝$r"
+    for ($i = 0; $i -lt $rows.Count; $i++) {
+        $rowColor = "$e[$($palettes[($start + $i) % $palettes.Count].art)m"
+        Write-Host "  $rowColor$B$($rows[$i])$r"
+    }
     Write-Host ""
     Write-Host "  $wh$B    U P D A T E $dk·$wh C Y C L E$r                     $dk v$($script:BootUpdateCycleVersion)$r"
     Write-Host ""
@@ -2638,8 +2650,10 @@ function Invoke-BootUpdateCycle {
     $cycleVerb = if ($isFirstIteration) { 'STARTED' } else { 'RESUMED (after reboot)' }
     $context = if (([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value) -eq 'S-1-5-18') { 'SYSTEM (scheduled task)' } else { "$env:USERNAME (user context)" }
 
-    <# Console: BBS splash on every run #>
-    Show-StartupArt
+    <# Console: BBS splash on every run.  Entry-point may have already shown it before
+       self-update chatter; honor that flag and clear it so post-reboot resumes still splash. #>
+    if (-not $script:_splashShown) { Show-StartupArt }
+    $script:_splashShown = $false
     $bannerTitle = if ($WhatIfPreference) {
         "B O O T   U P D A T E   C Y C L E      [WHATIF - NO CHANGES]    v$($script:BootUpdateCycleVersion)"
     } else {
@@ -3265,6 +3279,12 @@ Register-EngineEvent -SourceIdentifier 'PowerShell.Exiting' -Action {
         $script:BootUpdateMutex = $null
     }
 } | Out-Null
+
+<# Render splash BEFORE self-update / remote-config chatter so the BBS art is the
+   first thing on screen and never gets pushed off the visible viewport on small
+   consoles.  Invoke-BootUpdateCycle skips its own splash call when this flag is set. #>
+Show-StartupArt
+$script:_splashShown = $true
 
 <# lz1: Self-update — runs after mutex, before pre-flight. Skips under SYSTEM.
    If a newer version is downloaded and validated, re-execs and never returns.
