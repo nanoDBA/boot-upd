@@ -60,14 +60,18 @@ Remove-Item "$env:ProgramData\BootUpdateCycle" -Recurse -Force
 2. Winget (`winget upgrade --all --scope user` then `--scope machine`) — smart idle-aware timeout
 3. Chocolatey (`choco upgrade all -y`)
 4. Windows Update (PSWindowsUpdate module, excludes SQL Server)
-5. AWS tooling repair (off by default, `-SkipAwsTooling:$false` to enable)
-6. pip global packages (on by default, `-SkipPip` to disable)
-7. npm global packages (on by default, `-SkipNpm` to disable)
-8. Office 365 Click-to-Run (on by default, `-SkipOffice365` to disable)
-9. PowerShell modules via `Update-Module` (on by default, `-SkipPowerShellModules` to disable)
-10. Scoop packages (on by default, `-SkipScoop` to disable; user-scoped, skipped under SYSTEM)
-11. .NET global tools (OFF by default — high risk; `-SkipDotnetTools:$false` to enable)
-12. VS Code extensions (on by default, `-SkipVscode` to disable; user-scoped, skipped under SYSTEM)
+5. Driver/Firmware updates via PSWindowsUpdate (OFF by default — opt-in; `-IncludeDriverUpdates` / `-IncludeFirmwareUpdates`)
+6. AWS tooling repair (off by default, `-SkipAwsTooling:$false` to enable)
+7. Defender signature update (on by default, `-SkipDefender` to disable)
+8. pip global packages (on by default, `-SkipPip` to disable)
+9. npm global packages (on by default, `-SkipNpm` to disable)
+10. Office 365 Click-to-Run (on by default, `-SkipOffice365` to disable)
+11. PowerShell modules via `Update-Module` (on by default, `-SkipPowerShellModules` to disable)
+12. WSL kernel + distro updates (OFF by default — opt-in; `-UpdateWsl`; user-scoped, skipped under SYSTEM)
+13. Docker/Podman image refresh + prune (OFF by default — opt-in; `-UpdateContainers`; user-scoped, skipped under SYSTEM)
+14. Scoop packages (on by default, `-SkipScoop` to disable; user-scoped, skipped under SYSTEM)
+15. .NET global tools (OFF by default — high risk; `-SkipDotnetTools:$false` to enable)
+16. VS Code extensions (on by default, `-SkipVscode` to disable; user-scoped, skipped under SYSTEM)
 
 **Note:** Winget runs first for cleanest environment before Chocolatey potentially locks installers.
 
@@ -91,7 +95,7 @@ Remove-Item "$env:ProgramData\BootUpdateCycle" -Recurse -Force
 - **Invoke.ps1**: Self-contained orchestrator; can register its own scheduled task for reboot without needing Register.ps1
 - Log filters: spinner chars (`| / - \`), Unicode box-drawing/progress bars, download progress lines, source refresh messages
 - Update functions return `@{ Success = [bool]; Count = [int] }` — Success=$true means "don't retry" (fail-forward pattern)
-- State schema v2: all phase flags use `*Done` suffix consistently; versioned with auto-migration
+- State schema v3: all phase flags use `*Done` suffix consistently; versioned with auto-migration (v1→v2→v3)
 
 ## Key Config Options
 
@@ -105,6 +109,11 @@ Remove-Item "$env:ProgramData\BootUpdateCycle" -Recurse -Force
 | `SkipScoop` | `$false` | Disable Scoop updates (user-scoped) |
 | `SkipDotnetTools` | `$true` | .NET global tools (OFF — high risk) |
 | `SkipVscode` | `$false` | Disable VS Code extension updates (user-scoped) |
+| `SkipDefender` | `$false` | Disable Defender signature refresh |
+| `IncludeDriverUpdates` | `$false` | Opt-in: install driver updates via PSWindowsUpdate |
+| `IncludeFirmwareUpdates` | `$false` | Opt-in: install firmware updates via PSWindowsUpdate |
+| `UpdateWsl` | `$false` | Opt-in: update WSL kernel and distro packages (user-scoped) |
+| `UpdateContainers` | `$false` | Opt-in: pull updated Docker/Podman images and prune (user-scoped) |
 
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->

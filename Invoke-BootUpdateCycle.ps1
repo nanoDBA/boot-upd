@@ -53,6 +53,11 @@ param(
     [switch]$SkipScoop,
     [switch]$SkipDotnetTools = $true,
     [switch]$SkipVscode,
+    [switch]$SkipDefender,                # Defender signature update (default: runs)
+    [switch]$IncludeDriverUpdates,        # Driver updates via PSWindowsUpdate (default: opt-in, off)
+    [switch]$IncludeFirmwareUpdates,      # Firmware updates via PSWindowsUpdate (default: opt-in, off)
+    [switch]$UpdateWsl,                   # WSL kernel + distro updates (default: opt-in, off)
+    [switch]$UpdateContainers,            # Docker/Podman image refresh + prune (default: opt-in, off)
     [switch]$SkipRestorePoint,
     [switch]$SkipHealthCheck,
     [switch]$SkipBitLocker,
@@ -87,6 +92,11 @@ $script:SkipPowerShellModules = $SkipPowerShellModules
 $script:SkipScoop             = $SkipScoop
 $script:SkipDotnetTools       = $SkipDotnetTools
 $script:SkipVscode            = $SkipVscode
+$script:SkipDefender          = $SkipDefender
+$script:IncludeDriverUpdates  = $IncludeDriverUpdates
+$script:IncludeFirmwareUpdates = $IncludeFirmwareUpdates
+$script:UpdateWsl             = $UpdateWsl
+$script:UpdateContainers      = $UpdateContainers
 $script:SkipRestorePoint      = $SkipRestorePoint
 $script:SkipHealthCheck       = $SkipHealthCheck
 $script:SkipBitLocker         = $SkipBitLocker
@@ -99,7 +109,7 @@ $script:SmtpServer            = $SmtpServer
 $script:SmtpCredential        = $SmtpCredential
 $script:MaintenanceWindowStart = $MaintenanceWindowStart
 $script:MaintenanceWindowEnd   = $MaintenanceWindowEnd
-Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 2 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 3 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.4.0' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 
 <# Force UTF-8 console I/O so box-drawing/block chars (BBS splash) render in cmd.exe regardless of system code page.
@@ -172,9 +182,14 @@ function New-BootUpdateStateV2 {
         ScoopDone             = $false
         DotnetToolsDone       = $false
         VscodeDone            = $false
+        DefenderDone          = $false
+        DriverFirmwareDone    = $false
+        WslDone               = $false
+        ContainersDone        = $false
         Summary               = [pscustomobject]@{
             Winget = 0; Chocolatey = 0; WindowsUpdate = 0; Pip = 0; Npm = 0; Office365 = 0
             PowerShellModules = 0; Scoop = 0; DotnetTools = 0; Vscode = 0
+            Defender = 0; DriverFirmware = 0; Wsl = 0; Containers = 0
             HealthFailed = 0
         }
     }
@@ -204,12 +219,20 @@ function Update-BootUpdateStateSchema {
         if ($props -contains 'AwsTooling') { $State.PSObject.Properties.Remove('AwsTooling') }
     }
 
+    <# v2 -> v3: add Defender, DriverFirmware, Wsl, Containers phase flags #>
+    if ($ver -lt 3) {
+        $props = $State.PSObject.Properties.Name
+        foreach ($f in @('DefenderDone','DriverFirmwareDone','WslDone','ContainersDone')) {
+            if ($props -notcontains $f) { $State | Add-Member -NotePropertyName $f -NotePropertyValue $false -Force }
+        }
+    }
+
     $props = $State.PSObject.Properties.Name
     <# Add-if-missing: crash recovery, new phase flags #>
     foreach ($f in @('LastPhaseStarted','LastPhaseTimestamp','StagedNextPhase')) {
         if ($props -notcontains $f) { $State | Add-Member -NotePropertyName $f -NotePropertyValue $null -Force }
     }
-    foreach ($f in @('WindowsUpdateDone','AwsToolingDone','PowerShellModulesDone','ScoopDone','DotnetToolsDone','VscodeDone')) {
+    foreach ($f in @('WindowsUpdateDone','AwsToolingDone','PowerShellModulesDone','ScoopDone','DotnetToolsDone','VscodeDone','DefenderDone','DriverFirmwareDone','WslDone','ContainersDone')) {
         if ($props -notcontains $f) { $State | Add-Member -NotePropertyName $f -NotePropertyValue $false -Force }
     }
 
@@ -218,6 +241,7 @@ function Update-BootUpdateStateSchema {
         $State.Summary = [pscustomobject]@{
             Winget = 0; Chocolatey = 0; WindowsUpdate = 0; Pip = 0; Npm = 0; Office365 = 0
             PowerShellModules = 0; Scoop = 0; DotnetTools = 0; Vscode = 0
+            Defender = 0; DriverFirmware = 0; Wsl = 0; Containers = 0
             HealthFailed = 0
         }
     } elseif ($State.Summary -is [hashtable]) {
@@ -228,11 +252,13 @@ function Update-BootUpdateStateSchema {
             Npm = [int]($ht['Npm'] ?? 0); Office365 = [int]($ht['Office365'] ?? 0)
             PowerShellModules = [int]($ht['PowerShellModules'] ?? 0); Scoop = [int]($ht['Scoop'] ?? 0)
             DotnetTools = [int]($ht['DotnetTools'] ?? 0); Vscode = [int]($ht['Vscode'] ?? 0)
+            Defender = [int]($ht['Defender'] ?? 0); DriverFirmware = [int]($ht['DriverFirmware'] ?? 0)
+            Wsl = [int]($ht['Wsl'] ?? 0); Containers = [int]($ht['Containers'] ?? 0)
             HealthFailed = [int]($ht['HealthFailed'] ?? 0)
         }
     } else {
         $sp = $State.Summary.PSObject.Properties.Name
-        foreach ($k in @('PowerShellModules','Scoop','DotnetTools','Vscode')) {
+        foreach ($k in @('PowerShellModules','Scoop','DotnetTools','Vscode','Defender','DriverFirmware','Wsl','Containers')) {
             if ($sp -notcontains $k) { $State.Summary | Add-Member -NotePropertyName $k -NotePropertyValue 0 -Force }
         }
         if ($null -eq $State.Summary.HealthFailed) {
@@ -301,6 +327,7 @@ function Test-CrashRecovery {
         Winget='WingetDone'; Chocolatey='ChocolateyDone'; WindowsUpdate='WindowsUpdateDone'
         AwsTooling='AwsToolingDone'; Pip='PipDone'; Npm='NpmDone'; Office365='Office365Done'
         PowerShellModules='PowerShellModulesDone'; Scoop='ScoopDone'; DotnetTools='DotnetToolsDone'; Vscode='VscodeDone'
+        Defender='DefenderDone'; DriverFirmware='DriverFirmwareDone'; Wsl='WslDone'; Containers='ContainersDone'
     }
     <# 'ParallelCohort' is a sentinel written when the five-phase parallel cohort starts.
        Crash recovery for this group is handled per-phase (each has its own *Done flag);
@@ -1009,6 +1036,313 @@ function Install-WindowsUpdates {
     return @{ Success = $true; Count = $count }
 }
 
+function Install-DriverFirmwareUpdates {
+    <#
+    .SYNOPSIS
+        Installs driver and/or firmware updates via PSWindowsUpdate.
+    .NOTES
+        Only runs if -IncludeDriverUpdates or -IncludeFirmwareUpdates is specified.
+        Mirrors the PSWindowsUpdate load pattern used by Install-WindowsUpdates.
+        Returns @{ Success=[bool]; Count=[int] } — Success=$true always (fail-forward).
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param()
+    if (-not $script:IncludeDriverUpdates -and -not $script:IncludeFirmwareUpdates) {
+        Write-Log 'Driver/Firmware updates: skipped (neither -IncludeDriverUpdates nor -IncludeFirmwareUpdates specified).'
+        return @{ Success = $true; Count = 0 }
+    }
+    if (-not (Get-Module -ListAvailable PSWindowsUpdate)) {
+        Write-Log 'Installing PSWindowsUpdate module...'
+        Install-Module PSWindowsUpdate -Force -Scope AllUsers -AllowClobber
+    }
+    Import-Module PSWindowsUpdate -Force
+    $count = 0
+    $excludeTitle = ((@('SQL') + ($script:ExcludePatterns | ForEach-Object { [regex]::Escape($_) })) -join '|')
+
+    if ($script:IncludeDriverUpdates) {
+        Write-Log 'Checking for Driver updates via PSWindowsUpdate...'
+        if ($PSCmdlet.ShouldProcess('Windows Update - Drivers', 'Install driver updates')) {
+            try {
+                Get-WindowsUpdate -Category 'Drivers' -AcceptAll -Install -IgnoreReboot `
+                    -NotTitle $excludeTitle -AutoReboot:$false -Confirm:$false -Verbose 4>&1 | ForEach-Object {
+                    $line = $_.ToString()
+                    if ($line -eq 'System.__ComObject') { return }
+                    if ($_ -match 'Installed|Downloaded') { $count++ }
+                    Write-Log $line
+                }
+            } catch { Write-Log "Driver updates error: $_" -Level Warn }
+        } else {
+            Write-Log '  [WHATIF] Would run: Get-WindowsUpdate -Category Drivers -AcceptAll -Install -IgnoreReboot'
+        }
+    }
+
+    if ($script:IncludeFirmwareUpdates) {
+        Write-Log 'Checking for Firmware updates via PSWindowsUpdate...'
+        if ($PSCmdlet.ShouldProcess('Windows Update - Firmware', 'Install firmware updates')) {
+            try {
+                Get-WindowsUpdate -Category 'Firmware' -AcceptAll -Install -IgnoreReboot `
+                    -NotTitle $excludeTitle -AutoReboot:$false -Confirm:$false -Verbose 4>&1 | ForEach-Object {
+                    $line = $_.ToString()
+                    if ($line -eq 'System.__ComObject') { return }
+                    if ($_ -match 'Installed|Downloaded') { $count++ }
+                    Write-Log $line
+                }
+            } catch { Write-Log "Firmware updates error: $_" -Level Warn }
+        } else {
+            Write-Log '  [WHATIF] Would run: Get-WindowsUpdate -Category Firmware -AcceptAll -Install -IgnoreReboot'
+        }
+    }
+
+    Write-Log "Driver/Firmware updates: $count installed."
+    return @{ Success = $true; Count = $count }
+}
+
+function Update-DefenderSignatures {
+    <#
+    .SYNOPSIS
+        Refreshes Windows Defender antivirus signatures from Microsoft Update Server.
+    .NOTES
+        Non-Windows or missing MpComputerStatus: skipped gracefully.
+        Failures are advisory — always returns Success=$true (fail-forward).
+        Signatures do not trigger a reboot; Count=1 signals the phase ran.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param()
+    if ($script:SkipDefender) {
+        Write-Log 'Defender signature update: skipped (-SkipDefender).'
+        return @{ Success = $true; Count = 0 }
+    }
+    if (-not $IsWindows) {
+        Write-Log 'Defender signature update: skipped (not Windows).'
+        return @{ Success = $true; Count = 0 }
+    }
+    if (-not (Get-Command Get-MpComputerStatus -EA SilentlyContinue)) {
+        Write-Log 'Defender signature update: skipped (Get-MpComputerStatus not available — Defender may be disabled or absent).' -Level Warn
+        return @{ Success = $true; Count = 0 }
+    }
+    Write-Log 'Updating Windows Defender signatures...'
+    if ($PSCmdlet.ShouldProcess('Windows Defender', 'Update-MpSignature -UpdateSource MicrosoftUpdateServer')) {
+        try {
+            Update-MpSignature -UpdateSource MicrosoftUpdateServer -ErrorAction Stop
+            $mpStatus = Get-MpComputerStatus -ErrorAction SilentlyContinue
+            if ($mpStatus) {
+                $lastUpdated = $mpStatus.AntivirusSignatureLastUpdated
+                Write-Log "Defender signatures updated. Last updated: $lastUpdated"
+            } else {
+                Write-Log 'Defender signatures update-MpSignature completed.'
+            }
+            return @{ Success = $true; Count = 1 }
+        } catch {
+            Write-Log "Defender signature update failed (non-fatal): $_" -Level Warn
+            return @{ Success = $true; Count = 0 }
+        }
+    } else {
+        Write-Log '  [WHATIF] Would run: Update-MpSignature -UpdateSource MicrosoftUpdateServer'
+        return @{ Success = $true; Count = 0 }
+    }
+}
+
+function Update-WslKernelAndDistros {
+    <#
+    .SYNOPSIS
+        Updates the WSL kernel and runs package manager upgrades inside each distro.
+    .NOTES
+        Skipped under SYSTEM context (WSL is user-scoped).
+        Skipped if wsl.exe is not found.
+        Returns @{ Success=[bool]; Count=[int] } — Count = number of distros updated.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param()
+    $isSystem = ([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value -eq 'S-1-5-18')
+    if ($isSystem) {
+        Write-Log 'WSL update: skipped (SYSTEM context — WSL is user-scoped).' -Level Warn
+        return @{ Success = $true; Count = 0 }
+    }
+    if (-not $script:UpdateWsl) {
+        Write-Log 'WSL update: skipped (use -UpdateWsl to enable).'
+        return @{ Success = $true; Count = 0 }
+    }
+    if (-not (Get-Command wsl -EA SilentlyContinue)) {
+        Write-Log 'WSL update: wsl.exe not found — WSL not installed, skipping.'
+        return @{ Success = $true; Count = 0 }
+    }
+
+    Write-Log 'Updating WSL kernel...'
+    if ($PSCmdlet.ShouldProcess('WSL', 'wsl --update --no-distribution')) {
+        try {
+            $kernelOut = & wsl --update --no-distribution 2>&1
+            $kernelOut | ForEach-Object { Write-Log $_.ToString() }
+            if ($LASTEXITCODE -ne 0) {
+                Write-Log "WSL kernel update exited with code $LASTEXITCODE (advisory — continuing)." -Level Warn
+            } else {
+                Write-Log 'WSL kernel update completed.'
+            }
+        } catch {
+            Write-Log "WSL kernel update error (advisory): $_" -Level Warn
+        }
+    } else {
+        Write-Log '  [WHATIF] Would run: wsl --update --no-distribution'
+    }
+
+    <# Enumerate distros #>
+    $distros = @()
+    try {
+        $listOut = & wsl --list --quiet 2>&1
+        $distros = @($listOut | ForEach-Object { $_.ToString().Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    } catch {
+        Write-Log "WSL distro enumeration failed: $_" -Level Warn
+        return @{ Success = $true; Count = 0 }
+    }
+
+    if ($distros.Count -eq 0) {
+        Write-Log 'WSL: no distros found.'
+        return @{ Success = $true; Count = 0 }
+    }
+    Write-Log "WSL: found $($distros.Count) distro(s): $($distros -join ', ')"
+
+    $updatedCount = 0
+    foreach ($distro in $distros) {
+        Write-Log "WSL: updating distro [$distro]..."
+        if (-not $PSCmdlet.ShouldProcess("WSL distro: $distro", 'Run package manager upgrade')) {
+            Write-Log "  [WHATIF] Would run package upgrades in distro: $distro"
+            continue
+        }
+        try {
+            <# Detect package manager — try apt-get first, then dnf, then pacman #>
+            $hasApt = $null
+            try { $hasApt = & wsl -d $distro -u root -- which apt-get 2>&1; $hasApt = ($LASTEXITCODE -eq 0) } catch { $hasApt = $false }
+
+            if ($hasApt) {
+                Write-Log "  [$distro] Using apt-get"
+                $upgradeOut = & wsl -d $distro -u root -- sh -c 'DEBIAN_FRONTEND=noninteractive apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y' 2>&1
+                $upgradeOut | ForEach-Object { Write-Log "  [$distro] $($_.ToString())" }
+                $updatedCount++
+                continue
+            }
+
+            $hasDnf = $null
+            try { $hasDnf = & wsl -d $distro -u root -- which dnf 2>&1; $hasDnf = ($LASTEXITCODE -eq 0) } catch { $hasDnf = $false }
+
+            if ($hasDnf) {
+                Write-Log "  [$distro] Using dnf"
+                $upgradeOut = & wsl -d $distro -u root -- dnf upgrade -y 2>&1
+                $upgradeOut | ForEach-Object { Write-Log "  [$distro] $($_.ToString())" }
+                $updatedCount++
+                continue
+            }
+
+            $hasPacman = $null
+            try { $hasPacman = & wsl -d $distro -u root -- which pacman 2>&1; $hasPacman = ($LASTEXITCODE -eq 0) } catch { $hasPacman = $false }
+
+            if ($hasPacman) {
+                Write-Log "  [$distro] Using pacman"
+                $upgradeOut = & wsl -d $distro -u root -- pacman -Syu --noconfirm 2>&1
+                $upgradeOut | ForEach-Object { Write-Log "  [$distro] $($_.ToString())" }
+                $updatedCount++
+                continue
+            }
+
+            Write-Log "  [$distro] No recognized package manager (apt-get/dnf/pacman) found — skipping." -Level Warn
+        } catch {
+            Write-Log "  [$distro] Update error (advisory): $_" -Level Warn
+        }
+    }
+
+    Write-Log "WSL: $updatedCount distro(s) updated."
+    return @{ Success = $true; Count = $updatedCount }
+}
+
+function Update-ContainerImages {
+    <#
+    .SYNOPSIS
+        Pulls updated images for all running/known Docker or Podman images, then prunes dangling layers.
+    .NOTES
+        Skipped under SYSTEM context (Docker/Podman are user-scoped in common setups).
+        Detects docker first, then podman — uses the first one found.
+        Returns @{ Success=[bool]; Count=[int] } — Count = successful pulls.
+        Never throws.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param()
+    $isSystem = ([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value -eq 'S-1-5-18')
+    if ($isSystem) {
+        Write-Log 'Container image update: skipped (SYSTEM context).' -Level Warn
+        return @{ Success = $true; Count = 0 }
+    }
+    if (-not $script:UpdateContainers) {
+        Write-Log 'Container image update: skipped (use -UpdateContainers to enable).'
+        return @{ Success = $true; Count = 0 }
+    }
+
+    <# Detect runtime: docker first, then podman #>
+    $runtime = $null
+    $dockerCmd = Get-Command docker -EA SilentlyContinue
+    if ($dockerCmd) { $runtime = 'docker' }
+    else {
+        $podmanCmd = Get-Command podman -EA SilentlyContinue
+        if ($podmanCmd) { $runtime = 'podman' }
+    }
+    if (-not $runtime) {
+        Write-Log 'Container image update: neither docker nor podman found — skipping.'
+        return @{ Success = $true; Count = 0 }
+    }
+    Write-Log "Container image update: using [$runtime]"
+
+    $successfulPulls = 0
+    try {
+        <# Enumerate unique non-<none> images #>
+        $imageList = @()
+        try {
+            $rawImages = & $runtime images --format '{{.Repository}}:{{.Tag}}' 2>&1
+            $imageList = @($rawImages |
+                ForEach-Object { $_.ToString().Trim() } |
+                Where-Object { $_ -notmatch '<none>' -and -not [string]::IsNullOrWhiteSpace($_) } |
+                Select-Object -Unique)
+        } catch {
+            Write-Log "Container image enumeration failed: $_" -Level Warn
+            return @{ Success = $true; Count = 0 }
+        }
+
+        if ($imageList.Count -eq 0) {
+            Write-Log "Container image update: no images found."
+            return @{ Success = $true; Count = 0 }
+        }
+        Write-Log "Container image update: $($imageList.Count) image(s) to refresh"
+
+        foreach ($image in $imageList) {
+            if (-not $PSCmdlet.ShouldProcess($image, "$runtime pull")) {
+                Write-Log "  [WHATIF] Would run: $runtime pull $image"
+                continue
+            }
+            Write-Log "  Pulling: $image"
+            try {
+                $pullOut = & $runtime pull $image 2>&1
+                $pullOut | ForEach-Object { Write-Log "    $($_.ToString())" }
+                if ($LASTEXITCODE -eq 0) {
+                    $successfulPulls++
+                } else {
+                    Write-Log "  Pull failed for $image (exit $LASTEXITCODE) — continuing." -Level Warn
+                }
+            } catch {
+                Write-Log "  Pull error for ${image}: $_ — continuing." -Level Warn
+            }
+        }
+
+        <# Prune dangling layers — best-effort, ignore exit code #>
+        if ($PSCmdlet.ShouldProcess('container system', "$runtime system prune -f")) {
+            Write-Log "Container prune: $runtime system prune -f"
+            try { & $runtime system prune -f 2>&1 | ForEach-Object { Write-Log "  $($_.ToString())" } } catch { }
+        } else {
+            Write-Log "  [WHATIF] Would run: $runtime system prune -f"
+        }
+    } catch {
+        Write-Log "Container image update: unexpected error (non-fatal): $_" -Level Warn
+    }
+
+    Write-Log "Container image update: $successfulPulls image(s) successfully refreshed."
+    return @{ Success = $true; Count = $successfulPulls }
+}
+
 function Update-PipPackages {
     [CmdletBinding(SupportsShouldProcess)]
     param()
@@ -1462,6 +1796,11 @@ function Register-BootUpdateTaskForReboot {
     if ($script:SkipScoop)            { $taskArgs += '-SkipScoop' }
     if ($script:SkipDotnetTools)      { $taskArgs += '-SkipDotnetTools' }
     if ($script:SkipVscode)           { $taskArgs += '-SkipVscode' }
+    if ($script:SkipDefender)         { $taskArgs += '-SkipDefender' }
+    if ($script:IncludeDriverUpdates) { $taskArgs += '-IncludeDriverUpdates' }
+    if ($script:IncludeFirmwareUpdates) { $taskArgs += '-IncludeFirmwareUpdates' }
+    if ($script:UpdateWsl)            { $taskArgs += '-UpdateWsl' }
+    if ($script:UpdateContainers)     { $taskArgs += '-UpdateContainers' }
     if ($script:SkipRestorePoint)     { $taskArgs += '-SkipRestorePoint' }
     if ($script:SkipHealthCheck)      { $taskArgs += '-SkipHealthCheck' }
     if ($script:StagedRollout)        { $taskArgs += '-StagedRollout' }
@@ -1924,19 +2263,23 @@ function Invoke-BootUpdateCycle {
     <# ---- Phase counter for progress display ---- #>
     <# Sequential phases: must run one at a time due to installer locks / OS mutexes.
        Parallel cohort (below): pip, npm, scoop, dotnet-tools, vscode — no shared package locks. #>
+    $isSystemCtx = ([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value -eq 'S-1-5-18')
     $allPhases = @(
-        @{ Name='Winget';            Flag='WingetDone';            Key='Winget';            Skip=$false;                     Action={ Update-WingetPackages } }
-        @{ Name='Chocolatey';        Flag='ChocolateyDone';        Key='Chocolatey';        Skip=$false;                     Action={ Update-ChocolateyPackages } }
-        @{ Name='WindowsUpdate';     Flag='WindowsUpdateDone';     Key='WindowsUpdate';     Skip=$false;                     Action={ Install-WindowsUpdates } }
-        @{ Name='AwsTooling';        Flag='AwsToolingDone';        Key=$null;               Skip=[bool]$SkipAwsTooling;      Action={ $r = Repair-AwsTooling; @{ Success = $r; Count = 0 } } }
-        @{ Name='Office365';         Flag='Office365Done';         Key='Office365';         Skip=[bool]$SkipOffice365;       Action={ Update-Office365 } }
-        @{ Name='PowerShellModules'; Flag='PowerShellModulesDone'; Key='PowerShellModules'; Skip=[bool]$SkipPowerShellModules; Action={ Update-PowerShellModules } }
+        @{ Name='Winget';            Flag='WingetDone';            Key='Winget';            Skip=$false;                                                                       Action={ Update-WingetPackages } }
+        @{ Name='Chocolatey';        Flag='ChocolateyDone';        Key='Chocolatey';        Skip=$false;                                                                       Action={ Update-ChocolateyPackages } }
+        @{ Name='WindowsUpdate';     Flag='WindowsUpdateDone';     Key='WindowsUpdate';     Skip=$false;                                                                       Action={ Install-WindowsUpdates } }
+        @{ Name='DriverFirmware';    Flag='DriverFirmwareDone';    Key='DriverFirmware';    Skip=(-not ($IncludeDriverUpdates -or $IncludeFirmwareUpdates));                    Action={ Install-DriverFirmwareUpdates } }
+        @{ Name='AwsTooling';        Flag='AwsToolingDone';        Key=$null;               Skip=[bool]$SkipAwsTooling;                                                        Action={ $r = Repair-AwsTooling; @{ Success = $r; Count = 0 } } }
+        @{ Name='Defender';          Flag='DefenderDone';          Key='Defender';          Skip=[bool]$SkipDefender;                                                          Action={ Update-DefenderSignatures } }
+        @{ Name='Office365';         Flag='Office365Done';         Key='Office365';         Skip=[bool]$SkipOffice365;                                                         Action={ Update-Office365 } }
+        @{ Name='PowerShellModules'; Flag='PowerShellModulesDone'; Key='PowerShellModules'; Skip=[bool]$SkipPowerShellModules;                                                 Action={ Update-PowerShellModules } }
+        @{ Name='Wsl';               Flag='WslDone';               Key='Wsl';               Skip=(-not $UpdateWsl -or $isSystemCtx);                                           Action={ Update-WslKernelAndDistros } }
+        @{ Name='Containers';        Flag='ContainersDone';        Key='Containers';        Skip=(-not $UpdateContainers -or $isSystemCtx);                                    Action={ Update-ContainerImages } }
     )
 
     <# Parallel cohort: pip / npm / scoop / dotnet-tools / vscode — independent, no shared locks.
        Each entry includes an Action for staged-rollout compatibility (single-phase sequential execution).
        SYSTEM-context skips (Scoop, Vscode) are checked both here (Skip flag) and inside each Action. #>
-    $isSystemCtx = ([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value -eq 'S-1-5-18')
     $parallelCohort = @(
         @{ Name='Pip';         Flag='PipDone';         Key='Pip';         Skip=[bool]$SkipPip;                              Action={ Update-PipPackages } }
         @{ Name='Npm';         Flag='NpmDone';         Key='Npm';         Skip=[bool]$SkipNpm;                              Action={ Update-NpmPackages } }
@@ -2323,6 +2666,7 @@ function Invoke-BootUpdateCycle {
             $state.WingetDone = $false; $state.ChocolateyDone = $false; $state.WindowsUpdateDone = $false
             $state.AwsToolingDone = $false; $state.PipDone = $false; $state.NpmDone = $false; $state.Office365Done = $false
             $state.PowerShellModulesDone = $false; $state.ScoopDone = $false; $state.DotnetToolsDone = $false; $state.VscodeDone = $false
+            $state.DefenderDone = $false; $state.DriverFirmwareDone = $false; $state.WslDone = $false; $state.ContainersDone = $false
         }
         $state.LastPhaseStarted = $null; $state.LastPhaseTimestamp = $null; $state.Phase = 'Rebooting'
         Set-BootUpdateState -State $state
