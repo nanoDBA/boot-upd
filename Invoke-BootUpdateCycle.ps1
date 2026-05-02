@@ -302,6 +302,13 @@ function Test-CrashRecovery {
         AwsTooling='AwsToolingDone'; Pip='PipDone'; Npm='NpmDone'; Office365='Office365Done'
         PowerShellModules='PowerShellModulesDone'; Scoop='ScoopDone'; DotnetTools='DotnetToolsDone'; Vscode='VscodeDone'
     }
+    <# 'ParallelCohort' is a sentinel written when the five-phase parallel cohort starts.
+       Crash recovery for this group is handled per-phase (each has its own *Done flag);
+       the cohort re-launches only phases where Done=false, so no special recovery is needed. #>
+    if ($State.LastPhaseStarted -eq 'ParallelCohort' -or $State.LastPhaseStarted -eq 'CohortDone') {
+        Write-Log "Crash recovery: previous run was in parallel cohort — individual phase flags will gate re-execution." -Level Warn
+        return $false
+    }
     $flagName = $phaseToFlag[$State.LastPhaseStarted]
     if (-not $flagName) {
         Write-Log "Crash recovery: unknown phase '$($State.LastPhaseStarted)' in state file — ignoring." -Level Warn
@@ -676,6 +683,105 @@ function Update-WingetPackages {
     else { $scopes = @('user', 'machine'); Write-Log 'User context: updating BOTH user + machine scopes' }
 
     $totalCount = 0; $anyTimeout = $false
+
+    <# ── Fast path (no ExcludePatterns): run user + machine scopes in parallel via ThreadJob ──
+       Each job launches winget upgrade --all in a child pwsh.exe and captures output to a temp
+       file (same technique as Invoke-PackageManagerWithTimeout).  Results are collected on the
+       parent thread after both jobs complete or the combined hard timeout fires.
+       The filtered path (ExcludePatterns active) stays sequential — per-package iteration is
+       order-sensitive and scopes cannot safely enumerate the same winget DB concurrently. #>
+    if ($script:ExcludePatterns.Count -eq 0 -and $scopes.Count -gt 1) {
+        Write-Log 'Winget: running user + machine scopes in parallel (no ExcludePatterns)'
+        if ($PSCmdlet.ShouldProcess('Winget (user + machine parallel)', 'Run Winget upgrades for both scopes concurrently')) {
+            $hardTimeoutSec = $TimeoutMinutes * 60
+
+            <# Launch one ThreadJob per scope.  Each job: spawns a child pwsh.exe, waits for it,
+               returns @{ Scope; Lines; TimedOut; Count }.  The child writes output to a temp file
+               to avoid interleaved console writes between the two parallel jobs. #>
+            $wingetJobSb = {
+                param($Scope, $WingetPath, $TimeoutSec)
+                $tmpOut = [System.IO.Path]::GetTempFileName()
+                $childScript = "& '$($WingetPath -replace "'","''")' upgrade --all --scope $Scope --accept-source-agreements --accept-package-agreements --disable-interactivity --no-vt 2>&1 | ForEach-Object { `$_.ToString() } | Out-File -FilePath '$($tmpOut -replace "'","''")' -Encoding UTF8 -Append"
+                $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($childScript))
+                $pw = (Get-Command pwsh -ErrorAction SilentlyContinue)?.Source
+                if (-not $pw) { $pw = Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe' }
+                $proc = [System.Diagnostics.Process]::Start([System.Diagnostics.ProcessStartInfo]@{
+                    FileName        = $pw
+                    Arguments       = "-NoProfile -NonInteractive -EncodedCommand $encoded"
+                    UseShellExecute = $false
+                    CreateNoWindow  = $true
+                })
+                $timedOut = $false
+                if ($proc) {
+                    $exited = $proc.WaitForExit($TimeoutSec * 1000)
+                    if (-not $exited) {
+                        try { $proc.Kill($true) } catch { try { $proc.Kill() } catch { } }
+                        $timedOut = $true
+                    }
+                }
+                $lines = @()
+                if (Test-Path $tmpOut) {
+                    $lines = @(Get-Content $tmpOut -Encoding UTF8 -ErrorAction SilentlyContinue)
+                    Remove-Item $tmpOut -Force -ErrorAction SilentlyContinue
+                }
+                $count = @($lines | Where-Object { $_ -match 'Successfully installed' }).Count
+                return @{ Scope = $Scope; Lines = $lines; TimedOut = $timedOut; Count = $count }
+            }
+            $scopeJobs = foreach ($sc in $scopes) {
+                Start-ThreadJob -ScriptBlock $wingetJobSb -ArgumentList $sc, $wingetPath, $hardTimeoutSec
+            }
+
+            <# Wait for both jobs; combined ceiling = hard timeout + 60s grace #>
+            $combinedTimeoutSec = $hardTimeoutSec + 60
+            $null = Wait-Job -Job $scopeJobs -Timeout $combinedTimeoutSec
+
+            foreach ($job in $scopeJobs) {
+                $jr = $null
+                try { $jr = Receive-Job -Job $job -ErrorAction SilentlyContinue } catch { }
+                Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+
+                if ($null -eq $jr) {
+                    Write-Log 'Winget parallel job returned no result (likely timed out at Wait-Job level)' -Level Warn
+                    $anyTimeout = $true
+                    continue
+                }
+
+                $sc = $jr.Scope
+                Write-Log "--- Winget upgrade (--scope $sc) [parallel] ---"
+                $installBlocked = $false
+                foreach ($line in $jr.Lines) {
+                    if ($line -match 'install.+in progress|in progress.+install|0x8A15') { $installBlocked = $true; Write-Log $line -Level Warn }
+                    elseif ($line -match 'Successfully installed') { Write-Log $line }
+                    else { Write-Log $line }
+                }
+                if ($jr.TimedOut) {
+                    Write-Log "Winget ($sc): Hard timeout ($TimeoutMinutes min). Will retry next boot." -Level Warn
+                    $anyTimeout = $true
+                }
+                <# Retry if blocked — sequential, after parallel phase completes #>
+                if ($installBlocked -and -not $jr.TimedOut) {
+                    Write-Log "Winget ($sc) blocked by another install. Waiting 30s, retrying once..." -Level Warn
+                    Start-Sleep -Seconds 30
+                    $retryResult = Invoke-PackageManagerWithTimeout -Name "Winget-$sc-retry" -ScriptBlock {
+                        param($wp, $sc2)
+                        & $wp upgrade --all --scope $sc2 --accept-source-agreements --accept-package-agreements --disable-interactivity --no-vt 2>&1
+                    } -ArgumentList @($wingetPath, $sc) -IdleTimeoutMinutes 5 -HardTimeoutMinutes $TimeoutMinutes
+                    $retryCount = 0
+                    foreach ($line in $retryResult.Output) { if ($line -match 'Successfully installed') { $retryCount++ }; Write-Log $line }
+                    $totalCount += $retryCount
+                    if ($retryResult.TimedOut) { $anyTimeout = $true }
+                }
+                $totalCount += $jr.Count
+                Write-Log "--- Winget ($sc): $($jr.Count) package(s) updated ---"
+            }
+        } else {
+            Write-Log '  [WHATIF] Would run: winget upgrade --all --scope user (parallel)'
+            Write-Log '  [WHATIF] Would run: winget upgrade --all --scope machine (parallel)'
+        }
+        return @{ Success = (-not $anyTimeout); Count = $totalCount }
+    }
+
+    <# ── Sequential path: single scope (SYSTEM: machine only) OR ExcludePatterns active ── #>
     foreach ($scope in $scopes) {
         Write-Log "--- Winget upgrade (--scope $scope) ---"
         if ($PSCmdlet.ShouldProcess("Winget ($scope)", "Run Winget $scope-scope upgrades")) {
@@ -1816,20 +1922,32 @@ function Invoke-BootUpdateCycle {
     }
 
     <# ---- Phase counter for progress display ---- #>
+    <# Sequential phases: must run one at a time due to installer locks / OS mutexes.
+       Parallel cohort (below): pip, npm, scoop, dotnet-tools, vscode — no shared package locks. #>
     $allPhases = @(
         @{ Name='Winget';            Flag='WingetDone';            Key='Winget';            Skip=$false;                     Action={ Update-WingetPackages } }
         @{ Name='Chocolatey';        Flag='ChocolateyDone';        Key='Chocolatey';        Skip=$false;                     Action={ Update-ChocolateyPackages } }
         @{ Name='WindowsUpdate';     Flag='WindowsUpdateDone';     Key='WindowsUpdate';     Skip=$false;                     Action={ Install-WindowsUpdates } }
         @{ Name='AwsTooling';        Flag='AwsToolingDone';        Key=$null;               Skip=[bool]$SkipAwsTooling;      Action={ $r = Repair-AwsTooling; @{ Success = $r; Count = 0 } } }
-        @{ Name='Pip';               Flag='PipDone';               Key='Pip';               Skip=[bool]$SkipPip;             Action={ Update-PipPackages } }
-        @{ Name='Npm';               Flag='NpmDone';               Key='Npm';               Skip=[bool]$SkipNpm;             Action={ Update-NpmPackages } }
         @{ Name='Office365';         Flag='Office365Done';         Key='Office365';         Skip=[bool]$SkipOffice365;       Action={ Update-Office365 } }
         @{ Name='PowerShellModules'; Flag='PowerShellModulesDone'; Key='PowerShellModules'; Skip=[bool]$SkipPowerShellModules; Action={ Update-PowerShellModules } }
-        @{ Name='Scoop';             Flag='ScoopDone';             Key='Scoop';             Skip=[bool]$SkipScoop;           Action={ Update-ScoopPackages } }
-        @{ Name='DotnetTools';       Flag='DotnetToolsDone';       Key='DotnetTools';       Skip=[bool]$SkipDotnetTools;     Action={ Update-DotnetTools } }
-        @{ Name='Vscode';            Flag='VscodeDone';            Key='Vscode';            Skip=[bool]$SkipVscode;          Action={ Update-VscodeExtensions } }
     )
-    $enabledPhases = @($allPhases | Where-Object { -not $_.Skip })
+
+    <# Parallel cohort: pip / npm / scoop / dotnet-tools / vscode — independent, no shared locks.
+       Each entry includes an Action for staged-rollout compatibility (single-phase sequential execution).
+       SYSTEM-context skips (Scoop, Vscode) are checked both here (Skip flag) and inside each Action. #>
+    $isSystemCtx = ([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value -eq 'S-1-5-18')
+    $parallelCohort = @(
+        @{ Name='Pip';         Flag='PipDone';         Key='Pip';         Skip=[bool]$SkipPip;                              Action={ Update-PipPackages } }
+        @{ Name='Npm';         Flag='NpmDone';         Key='Npm';         Skip=[bool]$SkipNpm;                              Action={ Update-NpmPackages } }
+        @{ Name='Scoop';       Flag='ScoopDone';       Key='Scoop';       Skip=([bool]$SkipScoop -or $isSystemCtx);         Action={ Update-ScoopPackages } }
+        @{ Name='DotnetTools'; Flag='DotnetToolsDone'; Key='DotnetTools'; Skip=[bool]$SkipDotnetTools;                      Action={ Update-DotnetTools } }
+        @{ Name='Vscode';      Flag='VscodeDone';      Key='Vscode';      Skip=([bool]$SkipVscode -or $isSystemCtx);        Action={ Update-VscodeExtensions } }
+    )
+
+    <# $allPhases + $parallelCohort combined — used for staged rollout and $enabledPhases count #>
+    $allPhasesFlat = $allPhases + $parallelCohort
+    $enabledPhases = @($allPhasesFlat | Where-Object { -not $_.Skip })
     $phaseNum = 0
 
     <# ---- Staged rollout: one phase per boot; or all phases in one boot (default) ---- #>
@@ -1841,14 +1959,14 @@ function Invoke-BootUpdateCycle {
         $targetPhase = $null
 
         if (-not [string]::IsNullOrWhiteSpace($state.StagedNextPhase)) {
-            $candidate = $allPhases | Where-Object { $_.Name -eq $state.StagedNextPhase } | Select-Object -First 1
+            $candidate = $allPhasesFlat | Where-Object { $_.Name -eq $state.StagedNextPhase } | Select-Object -First 1
             if ($candidate -and (-not $candidate.Skip) -and (-not [bool]$state.($candidate.Flag))) {
                 $targetPhase = $candidate
             }
         }
 
         if (-not $targetPhase) {
-            $targetPhase = $allPhases | Where-Object { (-not $_.Skip) -and (-not [bool]$state.($_.Flag)) } | Select-Object -First 1
+            $targetPhase = $allPhasesFlat | Where-Object { (-not $_.Skip) -and (-not [bool]$state.($_.Flag)) } | Select-Object -First 1
         }
 
         if ($targetPhase) {
@@ -1900,58 +2018,283 @@ function Invoke-BootUpdateCycle {
             Write-Log 'Staged rollout: all phases already complete for this cycle.' -Level Info
         }
     } else {
-        <# Non-staged mode: iterate all phases in sequence (v2.0 behaviour preserved) #>
+        <# Non-staged mode: sequential phases then parallel cohort (v2.0 flow preserved for sequential; cohort parallelized) #>
     }
 
-    if (-not $script:StagedRollout) { foreach ($phase in $allPhases) {
-        if ($phase.Skip) {
-            Write-PhaseSkip -Name $phase.Name
-            Write-Log "  [SKIP] $($phase.Name) (disabled)"
-            continue
-        }
-        if ($state.($phase.Flag)) { $phaseNum++; continue }  <# Already done this iteration #>
-
-        $phaseNum++
-
-        <# Console: styled phase header #>
-        Write-PhaseHeader -Num $phaseNum -Total $enabledPhases.Count -Name $phase.Name
-        Write-Log ">>> [$phaseNum/$($enabledPhases.Count)] $($phase.Name) - STARTING"
-        $phaseStart = Get-Date
-
-        <# Crash-recovery markers: write intent before execution (skipped in WhatIf) #>
-        $state.LastPhaseStarted = $phase.Name; $state.LastPhaseTimestamp = Get-Date -Format 'o'; $state.Phase = $phase.Name
-        Set-BootUpdateState -State $state
-
-        try {
-            <# ShouldProcess guard: in WhatIf mode the phase Action is NOT invoked #>
-            if ($PSCmdlet.ShouldProcess($phase.Name, "Run $($phase.Name) updates")) {
-                $r = & $phase.Action
-            } else {
-                Write-Log "  [WHATIF] Would execute phase: $($phase.Name)"
-                $r = @{ Success = $true; Count = 0 }
+    if (-not $script:StagedRollout) {
+        <# ── Sequential phases (Winget, Chocolatey, WindowsUpdate, AwsTooling, Office365, PowerShellModules) ── #>
+        foreach ($phase in $allPhases) {
+            if ($phase.Skip) {
+                Write-PhaseSkip -Name $phase.Name
+                Write-Log "  [SKIP] $($phase.Name) (disabled)"
+                continue
             }
-            $state.($phase.Flag) = $r.Success
-            $phaseCount = if ($phase.Key -and $r.Count) { $state.Summary.($phase.Key) += $r.Count; $r.Count } else { 0 }
-            $elapsed = (Get-Date) - $phaseStart
+            if ($state.($phase.Flag)) { $phaseNum++; continue }  <# Already done this iteration #>
 
-            <# Console: styled result #>
-            Write-PhaseResult -Num $phaseNum -Total $enabledPhases.Count -Name $phase.Name -Success $true -Minutes $elapsed.TotalMinutes -Count $phaseCount
-            Write-Log "<<< [$phaseNum/$($enabledPhases.Count)] $($phase.Name) - DONE ($([math]::Round($elapsed.TotalMinutes, 1)) min, $phaseCount pkg)"
-            Write-EventLogEntry -EventId 1004 -Message "$($phase.Name) complete: $phaseCount packages in $([math]::Round($elapsed.TotalMinutes,1)) min"
-        } catch {
-            $elapsed = (Get-Date) - $phaseStart
+            $phaseNum++
 
-            <# Console: styled failure #>
-            Write-PhaseResult -Num $phaseNum -Total $enabledPhases.Count -Name $phase.Name -Success $false -Minutes $elapsed.TotalMinutes
-            Write-Log "<<< [$phaseNum/$($enabledPhases.Count)] $($phase.Name) - FAILED ($([math]::Round($elapsed.TotalMinutes, 1)) min)" -Level Error
-            Write-Log "  Error: $_" -Level Error
-            if ($_.Exception.StackTrace) { Write-Log "  Stack: $($_.Exception.StackTrace)" -Level Error }
-            if ($_.Exception.InnerException) { Write-Log "  Inner: $($_.Exception.InnerException.Message)" -Level Error }
-            Write-EventLogEntry -EventId 1003 -EntryType Error -Message "$($phase.Name) failed: $_"
-            $state.($phase.Flag) = $true  <# fail-forward #>
+            <# Console: styled phase header #>
+            Write-PhaseHeader -Num $phaseNum -Total $enabledPhases.Count -Name $phase.Name
+            Write-Log ">>> [$phaseNum/$($enabledPhases.Count)] $($phase.Name) - STARTING"
+            $phaseStart = Get-Date
+
+            <# Crash-recovery markers: write intent before execution (skipped in WhatIf) #>
+            $state.LastPhaseStarted = $phase.Name; $state.LastPhaseTimestamp = Get-Date -Format 'o'; $state.Phase = $phase.Name
+            Set-BootUpdateState -State $state
+
+            try {
+                <# ShouldProcess guard: in WhatIf mode the phase Action is NOT invoked #>
+                if ($PSCmdlet.ShouldProcess($phase.Name, "Run $($phase.Name) updates")) {
+                    $r = & $phase.Action
+                } else {
+                    Write-Log "  [WHATIF] Would execute phase: $($phase.Name)"
+                    $r = @{ Success = $true; Count = 0 }
+                }
+                $state.($phase.Flag) = $r.Success
+                $phaseCount = if ($phase.Key -and $r.Count) { $state.Summary.($phase.Key) += $r.Count; $r.Count } else { 0 }
+                $elapsed = (Get-Date) - $phaseStart
+
+                <# Console: styled result #>
+                Write-PhaseResult -Num $phaseNum -Total $enabledPhases.Count -Name $phase.Name -Success $true -Minutes $elapsed.TotalMinutes -Count $phaseCount
+                Write-Log "<<< [$phaseNum/$($enabledPhases.Count)] $($phase.Name) - DONE ($([math]::Round($elapsed.TotalMinutes, 1)) min, $phaseCount pkg)"
+                Write-EventLogEntry -EventId 1004 -Message "$($phase.Name) complete: $phaseCount packages in $([math]::Round($elapsed.TotalMinutes,1)) min"
+            } catch {
+                $elapsed = (Get-Date) - $phaseStart
+
+                <# Console: styled failure #>
+                Write-PhaseResult -Num $phaseNum -Total $enabledPhases.Count -Name $phase.Name -Success $false -Minutes $elapsed.TotalMinutes
+                Write-Log "<<< [$phaseNum/$($enabledPhases.Count)] $($phase.Name) - FAILED ($([math]::Round($elapsed.TotalMinutes, 1)) min)" -Level Error
+                Write-Log "  Error: $_" -Level Error
+                if ($_.Exception.StackTrace) { Write-Log "  Stack: $($_.Exception.StackTrace)" -Level Error }
+                if ($_.Exception.InnerException) { Write-Log "  Inner: $($_.Exception.InnerException.Message)" -Level Error }
+                Write-EventLogEntry -EventId 1003 -EntryType Error -Message "$($phase.Name) failed: $_"
+                $state.($phase.Flag) = $true  <# fail-forward #>
+            }
+            Set-BootUpdateState -State $state
+        }  <# end foreach sequential phase #>
+
+        <# ── Parallel cohort: Pip / Npm / Scoop / DotnetTools / Vscode ──
+           These five phases share no package locks and have no inter-dependencies.
+           Each is launched as a Start-ThreadJob.  Because thread jobs run in a separate runspace,
+           the parent's function definitions are unavailable, so each job carries a self-contained
+           scriptblock.  Log lines are accumulated in the result and replayed on the parent thread
+           via Write-Log after all jobs complete.  State is written ONCE atomically after the cohort.
+
+           Crash-recovery: phases already marked Done in $state are skipped (not re-launched). #>
+
+        $pendingCohort = @($parallelCohort | Where-Object { (-not $_.Skip) -and (-not [bool]$state.($_.Flag)) })
+
+        if ($pendingCohort.Count -gt 0) {
+            $cohortStart = Get-Date
+            Write-Log "--- Parallel cohort: $($pendingCohort.Count) phase(s): $(($pendingCohort | ForEach-Object { $_.Name }) -join ', ') ---"
+
+            <# Mark crash-recovery intent for the whole cohort as a group #>
+            $state.LastPhaseStarted = 'ParallelCohort'; $state.LastPhaseTimestamp = Get-Date -Format 'o'; $state.Phase = 'ParallelCohort'
+            Set-BootUpdateState -State $state
+
+            <# Shared values to pass into thread jobs via $using: #>
+            $cohortExcludePatterns = $script:ExcludePatterns
+            $cohortWhatIf          = [bool]$WhatIfPreference
+            $cohortTimeoutSec      = $script:PackageTimeoutMinutes * 60
+
+            <# Per-phase self-contained scriptblocks.
+               Each returns: @{ Phase=[string]; Success=[bool]; Count=[int]; LogLines=[string[]] }
+               Write-Log is NOT called inside jobs — lines are collected and replayed by the parent. #>
+
+            $pipSb = {
+                param($ExcludePatterns, $IsWhatIf)
+                $log = [System.Collections.Generic.List[string]]::new()
+                $count = 0
+                $pip = Get-Command pip -ErrorAction SilentlyContinue
+                if (-not $pip) { $log.Add('[Warn] pip not found, skipping.'); return @{ Phase='Pip'; Success=$true; Count=0; LogLines=$log.ToArray() } }
+                $log.Add('Updating pip packages...')
+                if ($IsWhatIf) {
+                    $log.Add('  [WHATIF] Would run: pip install --upgrade <outdated packages>')
+                    return @{ Phase='Pip'; Success=$true; Count=0; LogLines=$log.ToArray() }
+                }
+                try {
+                    & python -m pip install --upgrade pip 2>&1 | ForEach-Object { $log.Add($_.ToString()) }
+                    $outdated = @(& pip list --outdated --format=json 2>$null | ConvertFrom-Json -ErrorAction SilentlyContinue)
+                    foreach ($pkg in $outdated) {
+                        $matchedPattern = $null
+                        foreach ($pattern in $ExcludePatterns) {
+                            if ($pkg.name.IndexOf($pattern, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { $matchedPattern = $pattern; break }
+                        }
+                        if ($matchedPattern) { $log.Add("Pip: skipping $($pkg.name) (excluded by pattern '$matchedPattern')"); continue }
+                        $log.Add("Upgrading: $($pkg.name)")
+                        & pip install --upgrade "$($pkg.name)" 2>&1 | ForEach-Object { $log.Add($_.ToString()) }
+                        $count++
+                    }
+                } catch { $log.Add("[Error] pip: $_") }
+                return @{ Phase='Pip'; Success=$true; Count=$count; LogLines=$log.ToArray() }
+            }
+
+            $npmSb = {
+                param($IsWhatIf)
+                $log = [System.Collections.Generic.List[string]]::new()
+                $count = 0
+                $npm = Get-Command npm -ErrorAction SilentlyContinue
+                if (-not $npm) { $log.Add('[Warn] npm not found, skipping.'); return @{ Phase='Npm'; Success=$true; Count=0; LogLines=$log.ToArray() } }
+                $log.Add('Updating npm global packages...')
+                if ($IsWhatIf) {
+                    $log.Add('  [WHATIF] Would run: npm update -g')
+                    return @{ Phase='Npm'; Success=$true; Count=0; LogLines=$log.ToArray() }
+                }
+                try {
+                    & npm update -g 2>&1 | ForEach-Object { if ($_ -match 'added|updated') { $count++ }; $log.Add($_.ToString()) }
+                } catch { $log.Add("[Error] npm: $_") }
+                return @{ Phase='Npm'; Success=$true; Count=$count; LogLines=$log.ToArray() }
+            }
+
+            $scoopSb = {
+                param($IsWhatIf)
+                $log = [System.Collections.Generic.List[string]]::new()
+                $count = 0
+                $isSystem = ([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value -eq 'S-1-5-18')
+                if ($isSystem) { $log.Add('[Warn] Scoop skipped: SYSTEM context (user-scoped).'); return @{ Phase='Scoop'; Success=$true; Count=0; LogLines=$log.ToArray() } }
+                $scoop = Get-Command scoop -ErrorAction SilentlyContinue
+                if (-not $scoop) { $log.Add('[Warn] Scoop not found, skipping.'); return @{ Phase='Scoop'; Success=$true; Count=0; LogLines=$log.ToArray() } }
+                $log.Add('Updating Scoop...')
+                if ($IsWhatIf) {
+                    $log.Add('  [WHATIF] Would run: scoop update && scoop update *')
+                    return @{ Phase='Scoop'; Success=$true; Count=0; LogLines=$log.ToArray() }
+                }
+                try {
+                    & scoop update 2>&1 | ForEach-Object { $log.Add($_.ToString()) }
+                    $log.Add('Updating all Scoop packages...')
+                    & scoop update * 2>&1 | ForEach-Object {
+                        if ($_ -match '^\s*\S+:\s+\S+\s+->\s+\S+') { $count++ }
+                        $log.Add($_.ToString())
+                    }
+                    $log.Add("Scoop: $count package(s) updated.")
+                } catch { $log.Add("[Error] Scoop: $_") }
+                return @{ Phase='Scoop'; Success=$true; Count=$count; LogLines=$log.ToArray() }
+            }
+
+            $dotnetSb = {
+                param($IsWhatIf)
+                $log = [System.Collections.Generic.List[string]]::new()
+                $count = 0
+                $dotnet = Get-Command dotnet -ErrorAction SilentlyContinue
+                if (-not $dotnet) { $log.Add('[Warn] dotnet not found, skipping.'); return @{ Phase='DotnetTools'; Success=$true; Count=0; LogLines=$log.ToArray() } }
+                $log.Add('*** DOTNET TOOLS UPDATE - HIGH RISK ***')
+                $log.Add('    May break SDK-dependent builds. To disable: -SkipDotnetTools')
+                try {
+                    $listOutput = & dotnet tool list --global 2>&1
+                    $tools = @($listOutput | Select-Object -Skip 2 | Where-Object { $_ -match '^\S' } | ForEach-Object { ($_ -split '\s+')[0] } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+                    if ($tools.Count -eq 0) { $log.Add('No .NET global tools found.'); return @{ Phase='DotnetTools'; Success=$true; Count=0; LogLines=$log.ToArray() } }
+                    $log.Add("Found $($tools.Count) tool(s): $($tools -join ', ')")
+                    foreach ($tool in $tools) {
+                        $log.Add("Updating: $tool")
+                        if ($IsWhatIf) { $log.Add("  [WHATIF] Would run: dotnet tool update --global $tool"); continue }
+                        try {
+                            $output = & dotnet tool update --global $tool 2>&1
+                            $output | ForEach-Object { $log.Add($_.ToString()) }
+                            if ($output -match 'was successfully updated') { $count++ }
+                        } catch { $log.Add("  $tool error: $_") }
+                    }
+                    $log.Add("dotnet tools: $count updated.")
+                } catch { $log.Add("[Error] dotnet tools: $_") }
+                return @{ Phase='DotnetTools'; Success=$true; Count=$count; LogLines=$log.ToArray() }
+            }
+
+            $vscodeSb = {
+                param($IsWhatIf)
+                $log = [System.Collections.Generic.List[string]]::new()
+                $count = 0
+                $isSystem = ([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value -eq 'S-1-5-18')
+                if ($isSystem) { $log.Add('[Warn] VS Code skipped: SYSTEM context (per-user).'); return @{ Phase='Vscode'; Success=$true; Count=0; LogLines=$log.ToArray() } }
+                $codeCmd = Get-Command code -ErrorAction SilentlyContinue
+                if (-not $codeCmd) { $codeCmd = Get-Command code-insiders -ErrorAction SilentlyContinue }
+                if (-not $codeCmd) { $log.Add('[Warn] VS Code not found, skipping.'); return @{ Phase='Vscode'; Success=$true; Count=0; LogLines=$log.ToArray() } }
+                $log.Add("Updating VS Code extensions via: $($codeCmd.Name)")
+                if ($IsWhatIf) {
+                    $log.Add('  [WHATIF] Would run: code --update-extensions')
+                    return @{ Phase='Vscode'; Success=$true; Count=0; LogLines=$log.ToArray() }
+                }
+                try {
+                    $output = & $codeCmd.Name --update-extensions 2>&1
+                    $output | ForEach-Object { $log.Add($_.ToString()) }
+                    $count = @($output | Where-Object { $_ -match '(?i)updating extension|updated to version' }).Count
+                    if ($count -eq 0) {
+                        $upToDate = $output | Where-Object { $_ -match '(?i)already installed|up.to.date' }
+                        if ($upToDate) { $log.Add('VS Code extensions: all up to date.'); $count = 0 }
+                        else { $log.Add('VS Code extensions: update ran (exact count unavailable).'); $count = 1 }
+                    } else { $log.Add("VS Code extensions: $count updated.") }
+                } catch { $log.Add("[Error] VS Code: $_") }
+                return @{ Phase='Vscode'; Success=$true; Count=$count; LogLines=$log.ToArray() }
+            }
+
+            <# Launch one ThreadJob per enabled pending phase #>
+            $cohortJobs = [System.Collections.Generic.List[object]]::new()
+            foreach ($cp in $pendingCohort) {
+                $job = switch ($cp.Name) {
+                    'Pip'         { Start-ThreadJob -ScriptBlock $pipSb    -ArgumentList $cohortExcludePatterns, $cohortWhatIf }
+                    'Npm'         { Start-ThreadJob -ScriptBlock $npmSb    -ArgumentList $cohortWhatIf }
+                    'Scoop'       { Start-ThreadJob -ScriptBlock $scoopSb  -ArgumentList $cohortWhatIf }
+                    'DotnetTools' { Start-ThreadJob -ScriptBlock $dotnetSb -ArgumentList $cohortWhatIf }
+                    'Vscode'      { Start-ThreadJob -ScriptBlock $vscodeSb -ArgumentList $cohortWhatIf }
+                }
+                if ($job) {
+                    $job | Add-Member -NotePropertyName 'PhaseName' -NotePropertyValue $cp.Name -Force
+                    $cohortJobs.Add($job)
+                }
+            }
+
+            <# Wait for all cohort jobs; timeout = sum of individual ceilings (5 * PackageTimeoutMinutes) #>
+            $cohortTimeoutSec = [math]::Max($cohortTimeoutSec, $script:PackageTimeoutMinutes * 60 * $pendingCohort.Count)
+            if ($cohortJobs.Count -gt 0) {
+                $null = Wait-Job -Job $cohortJobs -Timeout $cohortTimeoutSec
+            }
+
+            <# Collect results, replay logs, update state — one atomic write at the end #>
+            foreach ($job in $cohortJobs) {
+                $phaseName = $job.PhaseName
+                $phaseDefn = $parallelCohort | Where-Object { $_.Name -eq $phaseName } | Select-Object -First 1
+
+                $jr = $null
+                try { $jr = Receive-Job -Job $job -ErrorAction SilentlyContinue } catch { }
+                $jobState = $job.State
+                Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+
+                if ($null -eq $jr -or $jobState -notin @('Completed','Failed')) {
+                    Write-Log "[$phaseName] Thread job did not complete (state: $jobState) — marking done (fail-forward)" -Level Warn
+                    $state.($phaseDefn.Flag) = $true
+                    continue
+                }
+
+                <# Replay log lines through Write-Log on the parent thread #>
+                foreach ($line in $jr.LogLines) {
+                    $lvl = if ($line -match '^\[Warn\]') { 'Warn' }
+                          elseif ($line -match '^\[Error\]') { 'Error' }
+                          else { 'Info' }
+                    $cleanLine = $line -replace '^\[(Warn|Error)\]\s*', ''
+                    Write-Log $cleanLine -Level $lvl
+                }
+
+                $state.($phaseDefn.Flag) = $jr.Success
+                if ($phaseDefn.Key -and $jr.Count) {
+                    $state.Summary.($phaseDefn.Key) += $jr.Count
+                }
+
+                $phaseNum++
+                $elapsed = (Get-Date) - $cohortStart
+                Write-PhaseResult -Num $phaseNum -Total $enabledPhases.Count -Name $phaseName -Success $jr.Success -Minutes $elapsed.TotalMinutes -Count $jr.Count
+                Write-Log "<<< [parallel] $phaseName - DONE ($($jr.Count) pkg)"
+                Write-EventLogEntry -EventId 1004 -Message "$phaseName complete: $($jr.Count) packages (parallel cohort)"
+            }
+
+            <# Atomic state write — one write covers all five cohort phases #>
+            $state.LastPhaseStarted = $null; $state.LastPhaseTimestamp = $null; $state.Phase = 'CohortDone'
+            Set-BootUpdateState -State $state
+
+            $cohortElapsed = (Get-Date) - $cohortStart
+            Write-Log "--- Parallel cohort complete in $([math]::Round($cohortElapsed.TotalMinutes, 1)) min ---"
+
+        } else {
+            Write-Log '--- Parallel cohort: all phases already done or skipped ---'
         }
-        Set-BootUpdateState -State $state
-    } }  <# end foreach ($phase in $allPhases) / end if (-not $script:StagedRollout) #>
+    }  <# end if (-not $script:StagedRollout) #>
 
     <# ---- Post-update health check ---- #>
     $healthCheck = if ($script:SkipHealthCheck) { $null } else { Test-PostUpdateHealth }
@@ -2020,7 +2363,7 @@ function Invoke-BootUpdateCycle {
             <# Staged mode: check whether any enabled phases remain undone.
                If yes, stay registered and exit clean — next boot picks up the next phase.
                If no, fall through to normal cycle-complete cleanup. #>
-            $remainingPhases = @($allPhases | Where-Object { (-not $_.Skip) -and (-not [bool]$state.($_.Flag)) })
+            $remainingPhases = @($allPhasesFlat | Where-Object { (-not $_.Skip) -and (-not [bool]$state.($_.Flag)) })
             if ($remainingPhases.Count -gt 0) {
                 $nextPhase = $remainingPhases[0]
                 $state.StagedNextPhase = $nextPhase.Name
