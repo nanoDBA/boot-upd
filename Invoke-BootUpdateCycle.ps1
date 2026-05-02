@@ -141,7 +141,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 3 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.3' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.4' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 
 <# Force UTF-8 console I/O so box-drawing/block chars (BBS splash) render in cmd.exe regardless of system code page.
    chcp 65001 sets conhost interpretation; [Console]::OutputEncoding makes .NET write proper UTF-8 bytes. #>
@@ -2205,30 +2205,25 @@ function Show-StartupArt {
        below 80 columns so legacy 80x24 consoles do not wrap the banner. #>
 
     $e = [char]27
-    $art = "$e[96m"; $bar2 = "$e[94m"; $tag = "$e[95m"
-    $wh = "$e[97m"; $dk = "$e[90m"; $yl = "$e[93m"
+    $cy = "$e[96m"; $bl = "$e[94m"; $mg = "$e[95m"
+    $wh = "$e[97m"; $dk = "$e[90m"; $yl = "$e[93m"; $gn = "$e[92m"
     $B  = "$e[1m";  $r  = "$e[0m"
 
-    $top    = "${dk}..:$bar2//$art$B==============================$bar2\\${dk}:..$r"
-    $bottom = "${dk}'':$bar2\\$art$B==============================$bar2//${dk}:.''$r"
+    $rule = "$cy$B$('=' * 66)$r"
 
     Write-Host ""
-    Write-Host "  $top"
-    Write-Host "  ${dk}:: $wh$B B O O T   U P D A T E   C Y C L E ${dk}::$r  $dk v$($script:BootUpdateCycleVersion)$r"
-    Write-Host "  $bottom"
-    Write-Host ""
-    Write-Host "  $art$B  ########    #######     #######    ########$r"
-    Write-Host "  $art$B  ##     ##  ##     ##   ##     ##      ##   $r"
-    Write-Host "  $art$B  ##     ##  ##     ##   ##     ##      ##   $r"
-    Write-Host "  $wh$B   ########   ##     ##   ##     ##      ##   $r"
-    Write-Host "  $art$B  ##     ##  ##     ##   ##     ##      ##   $r"
-    Write-Host "  $art$B  ##     ##  ##     ##   ##     ##      ##   $r"
-    Write-Host "  $art$B  ########    #######     #######       ##   $r"
-    Write-Host ""
-    Write-Host "  $dk[ $yl$B* $dk]$tag Updating all the things so you don't have to.$r"
-    Write-Host "  $dk[ $yl$B* $dk]$wh Static BBS splash. No animation. No fuss.$r"
-    Write-Host ""
-    Write-Host "  $top"
+    Write-Host "  ${dk}.:$rule${dk}:.$r"
+    Write-Host "  ${dk}::$r $mg$B BOOT UPDATE CYCLE$r $dk//$r $wh unattended patch board$r $dk//$r $yl v$($script:BootUpdateCycleVersion)$r"
+    Write-Host "  ${dk}::$r"
+    Write-Host "  ${dk}::$r   $cy$B .----.   .----.   .----.  .--------.$r"
+    Write-Host "  ${dk}::$r   $cy$B | .-. \ /  __  \ /  __  \ '--.  .--'$r"
+    Write-Host "  ${dk}::$r   $wh$B | '--' || |  | || |  | |    |  |$r"
+    Write-Host "  ${dk}::$r   $cy$B | .-. < | |  | || |  | |    |  |$r"
+    Write-Host "  ${dk}::$r   $cy$B | '--' |\  '--' /\  '--' /   |  |$r"
+    Write-Host "  ${dk}::$r   $cy$B '----'  '------'  '------'   '--'$r"
+    Write-Host "  ${dk}::$r"
+    Write-Host "  ${dk}::$r $gn [sysop]$r $wh update cycle$r   $gn [carrier]$r $mg updates you can sleep through$r"
+    Write-Host "  ${dk}'::$rule${dk}::'$r"
     Write-Host ""
 }
 

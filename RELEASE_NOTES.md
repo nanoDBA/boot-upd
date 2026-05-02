@@ -1,8 +1,24 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.3
+**Current Version:** v2.5.4
 **Release Date:** 2026-05-02
 **Status:** STABLE
+
+---
+
+## v2.5.4 (2026-05-02)
+
+**Splash redesign.** Replaced the plain block-letter splash with a more distinctive static BBS/NFO-style BOOT screen.
+
+### Fixes
+
+- Uses a custom framed composition instead of generic hash-block lettering.
+- Keeps the startup splash ASCII-only, ANSI-colored, dependency-free, and below 80 visible columns.
+- Preserves the no-animation startup behavior.
+
+### Compatibility
+
+- No parameter or schema changes. Drop-in replacement for v2.5.3.
 
 ---
 
