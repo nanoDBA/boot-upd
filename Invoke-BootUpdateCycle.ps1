@@ -2204,10 +2204,29 @@ function Show-StartupArt {
        separators.  Evokes the ACiD/iCE era login screens of the early '90s.
        UTF-8 console encoding is forced at script start; on cmd.exe this requires
        chcp 65001 to also have run, which we attempt at top of file. #>
+    <# Belt-and-suspenders codepage flip: the script-start try/catch may have run
+       before the console was fully attached (cmd → pwsh launch race), and chcp.com
+       with redirected output occasionally no-ops on legacy conhost.  Calling the
+       Win32 API directly here is idempotent and ensures box-drawing/block chars
+       render even if the earlier setup didn't take. #>
+    try {
+        if (-not ('BBSConsole.Cp' -as [type])) {
+            Add-Type -Namespace BBSConsole -Name Cp -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError=true)]
+public static extern bool SetConsoleOutputCP(uint codePage);
+[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError=true)]
+public static extern bool SetConsoleCP(uint codePage);
+'@ -ErrorAction Stop
+        }
+        [BBSConsole.Cp]::SetConsoleOutputCP(65001) | Out-Null
+        [BBSConsole.Cp]::SetConsoleCP(65001)       | Out-Null
+        [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+    } catch { <# no console attached or P/Invoke blocked — proceed and let chars fall back #> }
+
     $e = [char]27
-    <# Six curated neon palettes; each splash invocation rotates through ALL six
-       so every row of the BBS block prints in a different hue (rainbow gradient).
-       The starting palette is randomized so back-to-back runs don't look identical. #>
+    <# Curated neon palettes — each is (art, bar-accent, tagline).  One palette
+       is picked per invocation so each run gets a fresh themed look without
+       flashing multiple colors within a single splash. #>
     $palettes = @(
         @{ art = '96'; bar = '94'; tag = '93' }   # Cyan / Blue / Yellow (original)
         @{ art = '92'; bar = '96'; tag = '93' }   # Green / Cyan / Yellow
@@ -2216,8 +2235,7 @@ function Show-StartupArt {
         @{ art = '94'; bar = '92'; tag = '95' }   # Blue / Green / Magenta
         @{ art = '91'; bar = '93'; tag = '96' }   # Red / Yellow / Cyan
     )
-    $start = Get-Random -Maximum $palettes.Count
-    $p     = $palettes[$start]
+    $p = $palettes[(Get-Random -Maximum $palettes.Count)]
 
     $art = "$e[$($p.art)m"; $bar2 = "$e[$($p.bar)m"; $tag = "$e[$($p.tag)m"
     $wh = "$e[97m"; $dk = "$e[90m"; $mg = "$e[95m"
@@ -2225,24 +2243,15 @@ function Show-StartupArt {
 
     $barLine = "$dk░▒$bar2▓$mg█$art$B$('═' * 56)$r$mg█$bar2▓$dk▒░$r"
 
-    <# Per-row palette rotation: each of the 6 BBS rows uses the next palette's
-       art color, producing a rainbow effect across the block letters. #>
-    $rows = @(
-        '    ██████╗  ██████╗  ██████╗ ████████╗'
-        '    ██╔══██╗██╔═══██╗██╔═══██╗╚══██╔══╝'
-        '    ██████╔╝██║   ██║██║   ██║   ██║'
-        '    ██╔══██╗██║   ██║██║   ██║   ██║'
-        '    ██████╔╝╚██████╔╝╚██████╔╝   ██║'
-        '    ╚═════╝  ╚═════╝  ╚═════╝    ╚═╝'
-    )
-
     Write-Host ""
     Write-Host "  $barLine"
     Write-Host ""
-    for ($i = 0; $i -lt $rows.Count; $i++) {
-        $rowColor = "$e[$($palettes[($start + $i) % $palettes.Count].art)m"
-        Write-Host "  $rowColor$B$($rows[$i])$r"
-    }
+    Write-Host "  $art$B    ██████╗  ██████╗  ██████╗ ████████╗$r"
+    Write-Host "  $art$B    ██╔══██╗██╔═══██╗██╔═══██╗╚══██╔══╝$r"
+    Write-Host "  $art$B    ██████╔╝██║   ██║██║   ██║   ██║$r"
+    Write-Host "  $art$B    ██╔══██╗██║   ██║██║   ██║   ██║$r"
+    Write-Host "  $art$B    ██████╔╝╚██████╔╝╚██████╔╝   ██║$r"
+    Write-Host "  $art$B    ╚═════╝  ╚═════╝  ╚═════╝    ╚═╝$r"
     Write-Host ""
     Write-Host "  $wh$B    U P D A T E $dk·$wh C Y C L E$r                     $dk v$($script:BootUpdateCycleVersion)$r"
     Write-Host ""
