@@ -1,8 +1,23 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.0
+**Current Version:** v2.5.1
 **Release Date:** 2026-05-02
 **Status:** STABLE
+
+---
+
+## v2.5.1 (2026-05-02)
+
+**Splash render fix.** The BBS startup splash was rendering as blank space on legacy `cmd.exe` consoles because `chcp.com 65001 > $null 2>&1` at script start was silently no-opping when stdout was redirected, leaving the console at CP437/CP1252 — which strips Unicode box-drawing/block-element chars (U+2500–U+259F) to nothing.
+
+### Fixes
+
+- `Show-StartupArt` now calls `kernel32!SetConsoleOutputCP(65001)` and `SetConsoleCP(65001)` directly via P/Invoke right before drawing, plus re-asserts `[Console]::OutputEncoding = UTF-8`. Idempotent and reliable regardless of how the parent process was launched.
+- Reverted the v2.5.1-rc per-row palette rotation. Each splash invocation again picks one random palette from the constrained six-theme set and uses it across all 6 BBS rows.
+
+### Compatibility
+
+- No parameter or schema changes. Drop-in replacement for v2.5.0.
 
 ---
 
