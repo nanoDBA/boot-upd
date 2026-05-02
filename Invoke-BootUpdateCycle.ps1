@@ -2200,10 +2200,8 @@ function Send-RebootWarning {
    and do NOT go to the log file — the log stays clean and greppable.  #>
 
 function Show-StartupArt {
-    <# BBS-inspired ANSI splash — ░▒▓█ gradient borders, neon palette, interpunct
-       separators.  Evokes the ACiD/iCE era login screens of the early '90s.
-       UTF-8 console encoding is forced at script start; on cmd.exe this requires
-       chcp 65001 to also have run, which we attempt at top of file. #>
+    <# BBS-inspired ANSI splash, kept ASCII-only so cmd.exe renders it cleanly
+       even when UTF-8 or box-drawing glyph support is inconsistent. #>
     <# Belt-and-suspenders codepage flip: the script-start try/catch may have run
        before the console was fully attached (cmd → pwsh launch race), and chcp.com
        with redirected output occasionally no-ops on legacy conhost.  Calling the
@@ -2224,40 +2222,30 @@ public static extern bool SetConsoleCP(uint codePage);
     } catch { <# no console attached or P/Invoke blocked — proceed and let chars fall back #> }
 
     $e = [char]27
-    <# Curated neon palettes — each is (art, bar-accent, tagline).  One palette
-       is picked per invocation so each run gets a fresh themed look without
-       flashing multiple colors within a single splash. #>
-    $palettes = @(
-        @{ art = '96'; bar = '94'; tag = '93' }   # Cyan / Blue / Yellow (original)
-        @{ art = '92'; bar = '96'; tag = '93' }   # Green / Cyan / Yellow
-        @{ art = '95'; bar = '94'; tag = '96' }   # Magenta / Blue / Cyan
-        @{ art = '93'; bar = '95'; tag = '92' }   # Yellow / Magenta / Green
-        @{ art = '94'; bar = '92'; tag = '95' }   # Blue / Green / Magenta
-        @{ art = '91'; bar = '93'; tag = '96' }   # Red / Yellow / Cyan
-    )
-    $p = $palettes[(Get-Random -Maximum $palettes.Count)]
-
-    $art = "$e[$($p.art)m"; $bar2 = "$e[$($p.bar)m"; $tag = "$e[$($p.tag)m"
-    $wh = "$e[97m"; $dk = "$e[90m"; $mg = "$e[95m"
+    $art = "$e[96m"; $bar2 = "$e[94m"; $tag = "$e[95m"
+    $wh = "$e[97m"; $dk = "$e[90m"; $yl = "$e[93m"
     $B  = "$e[1m";  $r  = "$e[0m"
 
-    $barLine = "$dk░▒$bar2▓$mg█$art$B$('═' * 56)$r$mg█$bar2▓$dk▒░$r"
+    $top    = "${dk}..:$bar2//$art$B==============================$bar2\\${dk}:..$r"
+    $bottom = "${dk}'':$bar2\\$art$B==============================$bar2//${dk}:.''$r"
 
     Write-Host ""
-    Write-Host "  $barLine"
+    Write-Host "  $top"
+    Write-Host "  ${dk}:: $wh$B B O O T   U P D A T E   C Y C L E ${dk}::$r  $dk v$($script:BootUpdateCycleVersion)$r"
+    Write-Host "  $bottom"
     Write-Host ""
-    Write-Host "  $art$B    ██████╗  ██████╗  ██████╗ ████████╗$r"
-    Write-Host "  $art$B    ██╔══██╗██╔═══██╗██╔═══██╗╚══██╔══╝$r"
-    Write-Host "  $art$B    ██████╔╝██║   ██║██║   ██║   ██║$r"
-    Write-Host "  $art$B    ██╔══██╗██║   ██║██║   ██║   ██║$r"
-    Write-Host "  $art$B    ██████╔╝╚██████╔╝╚██████╔╝   ██║$r"
-    Write-Host "  $art$B    ╚═════╝  ╚═════╝  ╚═════╝    ╚═╝$r"
+    Write-Host "  $art$B  ########    #######     #######    ########$r"
+    Write-Host "  $art$B  ##     ##  ##     ##   ##     ##      ##   $r"
+    Write-Host "  $art$B  ##     ##  ##     ##   ##     ##      ##   $r"
+    Write-Host "  $wh$B   ########   ##     ##   ##     ##      ##   $r"
+    Write-Host "  $art$B  ##     ##  ##     ##   ##     ##      ##   $r"
+    Write-Host "  $art$B  ##     ##  ##     ##   ##     ##      ##   $r"
+    Write-Host "  $art$B  ########    #######     #######       ##   $r"
     Write-Host ""
-    Write-Host "  $wh$B    U P D A T E $dk·$wh C Y C L E$r                     $dk v$($script:BootUpdateCycleVersion)$r"
+    Write-Host "  $dk[ $yl$B* $dk]$tag Updating all the things so you don't have to.$r"
+    Write-Host "  $dk[ $yl$B* $dk]$wh Static BBS splash. No animation. No fuss.$r"
     Write-Host ""
-    Write-Host "  $barLine"
-    Write-Host ""
-    Write-Host "  $tag    $dk·$tag Updating all the things so you don't have to. $dk·$r"
+    Write-Host "  $top"
     Write-Host ""
 }
 
