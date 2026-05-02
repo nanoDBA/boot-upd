@@ -72,7 +72,8 @@ param(
     [ValidateRange(-1, 23)]
     [int]$MaintenanceWindowStart = -1,  # Hour of day (0-23) when updates may begin. -1 = no window enforced.
     [ValidateRange(-1, 23)]
-    [int]$MaintenanceWindowEnd   = -1   # Hour of day when updates must stop. -1 = no window enforced.
+    [int]$MaintenanceWindowEnd   = -1,  # Hour of day when updates must stop. -1 = no window enforced.
+    [switch]$AllowMetered                # Allow updates on metered connections (cellular hotspot). Default: abort on metered.
 )
 
 $ErrorActionPreference = 'Stop'
@@ -109,6 +110,7 @@ $script:SmtpServer            = $SmtpServer
 $script:SmtpCredential        = $SmtpCredential
 $script:MaintenanceWindowStart = $MaintenanceWindowStart
 $script:MaintenanceWindowEnd   = $MaintenanceWindowEnd
+$script:AllowMetered           = $AllowMetered
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 3 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.4.0' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 
@@ -186,6 +188,8 @@ function New-BootUpdateStateV2 {
         DriverFirmwareDone    = $false
         WslDone               = $false
         ContainersDone        = $false
+        LastPreflightNetworkOk = $null
+        LastPreflightNetworkAt = $null
         Summary               = [pscustomobject]@{
             Winget = 0; Chocolatey = 0; WindowsUpdate = 0; Pip = 0; Npm = 0; Office365 = 0
             PowerShellModules = 0; Scoop = 0; DotnetTools = 0; Vscode = 0
@@ -228,8 +232,8 @@ function Update-BootUpdateStateSchema {
     }
 
     $props = $State.PSObject.Properties.Name
-    <# Add-if-missing: crash recovery, new phase flags #>
-    foreach ($f in @('LastPhaseStarted','LastPhaseTimestamp','StagedNextPhase')) {
+    <# Add-if-missing: crash recovery, new phase flags, network-check cache #>
+    foreach ($f in @('LastPhaseStarted','LastPhaseTimestamp','StagedNextPhase','LastPreflightNetworkOk','LastPreflightNetworkAt')) {
         if ($props -notcontains $f) { $State | Add-Member -NotePropertyName $f -NotePropertyValue $null -Force }
     }
     foreach ($f in @('WindowsUpdateDone','AwsToolingDone','PowerShellModulesDone','ScoopDone','DotnetToolsDone','VscodeDone','DefenderDone','DriverFirmwareDone','WslDone','ContainersDone')) {
@@ -385,7 +389,10 @@ function Save-CycleHistory {
 #region Pre-flight Checks
 function Test-PreFlightChecks {
     [CmdletBinding()]
-    param([switch]$Force)
+    param(
+        [switch]$Force,
+        [pscustomobject]$State = $null
+    )
 
     $warnings = [System.Collections.Generic.List[string]]::new()
     $errors   = [System.Collections.Generic.List[string]]::new()
@@ -403,23 +410,87 @@ function Test-PreFlightChecks {
         elseif ($freeGB -lt 10) { Add-Warning "LOW DISK: ${freeGB}GB free on $env:SystemDrive (recommend 10+)" }
     } catch { Add-Warning "Disk check failed: $_" }
 
-    <# Network #>
-    try {
-        $dnsOk = $false
-        try { $null = [System.Net.Dns]::GetHostAddresses('github.com'); $dnsOk = $true; Write-Log 'Network: DNS OK' }
-        catch { Add-Warning "Network: DNS failed ($_)" }
-        if ($dnsOk) {
-            foreach ($target in @(@{H='chocolatey.org';P=443}, @{H='github.com';P=443})) {
-                try {
-                    $tcp = [System.Net.Sockets.TcpClient]::new()
-                    $connected = $tcp.ConnectAsync($target.H, $target.P).Wait(5000)
-                    $tcp.Close()
-                    if ($connected) { Write-Log "Network: $($target.H):$($target.P) OK" }
-                    else { Add-Warning "Network: $($target.H) unreachable" }
-                } catch { Add-Warning "Network: $($target.H) error: $_" }
-            }
+    <# Network — with 5-minute within-cycle cache to avoid 5-10s TCP probes on every iteration.
+       Cache is cleared on reboot (LastPreflightNetworkAt reset in phase-reset block) so a fresh
+       boot always re-probes. Failures are never cached — we want fast retry on transient drops. #>
+    $networkCacheHit = $false
+    if ($null -ne $State) {
+        $cachedAt  = if ($State.LastPreflightNetworkAt) { try { [datetime]$State.LastPreflightNetworkAt } catch { $null } } else { $null }
+        $cachedOk  = if ($null -ne $State.LastPreflightNetworkOk) { [bool]$State.LastPreflightNetworkOk } else { $false }
+        if ($cachedAt -and $cachedOk -and ((Get-Date) - $cachedAt) -lt [TimeSpan]::FromMinutes(5)) {
+            Write-Log "Pre-flight network: cached OK from $($cachedAt.ToString('HH:mm:ss')) (skipping probes)"
+            $networkCacheHit = $true
         }
-    } catch { Add-Warning "Network checks failed: $_" }
+    }
+
+    if (-not $networkCacheHit) {
+        $networkProbeOk = $false
+        try {
+            $dnsOk = $false
+            try { $null = [System.Net.Dns]::GetHostAddresses('github.com'); $dnsOk = $true; Write-Log 'Network: DNS OK' }
+            catch { Add-Warning "Network: DNS failed ($_)" }
+            $allTcpOk = $true
+            if ($dnsOk) {
+                foreach ($target in @(@{H='chocolatey.org';P=443}, @{H='github.com';P=443})) {
+                    try {
+                        $tcp = [System.Net.Sockets.TcpClient]::new()
+                        $connected = $tcp.ConnectAsync($target.H, $target.P).Wait(5000)
+                        $tcp.Close()
+                        if ($connected) { Write-Log "Network: $($target.H):$($target.P) OK" }
+                        else { Add-Warning "Network: $($target.H) unreachable"; $allTcpOk = $false }
+                    } catch { Add-Warning "Network: $($target.H) error: $_"; $allTcpOk = $false }
+                }
+            }
+            $networkProbeOk = $dnsOk -and $allTcpOk
+        } catch { Add-Warning "Network checks failed: $_" }
+
+        <# Persist probe result only when OK — failed results are not cached so next iteration re-probes #>
+        if ($null -ne $State -and $networkProbeOk) {
+            $State.LastPreflightNetworkOk = $true
+            $State.LastPreflightNetworkAt = (Get-Date).ToString('o')
+            Set-BootUpdateState -State $State
+        }
+    }
+
+    <# Metered connection detection — abort by default; $AllowMetered overrides.
+       WinRT API is preferred; falls back to CIM on Server Core where WinRT may be unavailable. #>
+    $meteredDetected = $false
+    $meteredDetectionFailed = $false
+    try {
+        $null = [Windows.Networking.Connectivity.NetworkInformation, Windows.Networking.Connectivity, ContentType=WindowsRuntime]
+        $cp   = [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()
+        if ($cp) {
+            $cost = $cp.GetConnectionCost()
+            $meteredDetected = $cost.NetworkCostType -ne 'Unrestricted'
+        }
+    } catch {
+        <# WinRT load failed (Server Core, older build, or no COM registration) — fall back to CIM #>
+        try {
+            $profiles = Get-NetConnectionProfile -EA Stop | Where-Object { $_.IPv4Connectivity -eq 'Internet' -or $_.IPv6Connectivity -eq 'Internet' }
+            foreach ($prof in $profiles) {
+                $cimProf = Get-CimInstance -Namespace root\StandardCimv2 -ClassName MSFT_NetConnectionProfile `
+                    -Filter "Name='$($prof.Name)'" -EA SilentlyContinue
+                <# NetworkCategory 1 = Private, 2 = DomainAuthenticated, 3 = Public; metered is a separate IsMetered field #>
+                if ($cimProf -and $cimProf.PSObject.Properties['IsMetered'] -and $cimProf.IsMetered) {
+                    $meteredDetected = $true; break
+                }
+            }
+        } catch {
+            Write-Log "Metered connection check failed (both WinRT and CIM): $_ — skipping check" -Level Warn
+            $meteredDetectionFailed = $true
+        }
+    }
+
+    if (-not $meteredDetectionFailed -and $meteredDetected) {
+        if ($script:AllowMetered) {
+            Write-Log 'Network: metered connection detected — proceeding anyway (-AllowMetered)' -Level Warn
+        } else {
+            Write-Log 'Network: metered connection detected — aborting to avoid cellular data usage. Use -AllowMetered to override.' -Level Warn
+            exit 0
+        }
+    } elseif (-not $meteredDetectionFailed) {
+        Write-Log 'Network: connection is unmetered'
+    }
 
     <# Conflicting installers #>
     try {
@@ -2232,7 +2303,7 @@ function Invoke-BootUpdateCycle {
     Set-BootUpdateState -State $state
 
     <# Pre-flight checks (every iteration — disk/network can change between reboots) #>
-    $preflight = Test-PreFlightChecks -Force:$Force
+    $preflight = Test-PreFlightChecks -Force:$Force -State $state
     if (-not $preflight.CanProceed) {
         Write-Log 'Update cycle aborted by pre-flight checks.' -Level Error
         Write-EventLogEntry -EventId 1003 -EntryType Error -Message "Cycle aborted by pre-flight checks.`nErrors: $($preflight.Errors -join '; ')"
@@ -2669,6 +2740,8 @@ function Invoke-BootUpdateCycle {
             $state.DefenderDone = $false; $state.DriverFirmwareDone = $false; $state.WslDone = $false; $state.ContainersDone = $false
         }
         $state.LastPhaseStarted = $null; $state.LastPhaseTimestamp = $null; $state.Phase = 'Rebooting'
+        <# Clear network cache so the post-reboot iteration always re-probes from a clean boot state #>
+        $state.LastPreflightNetworkAt = $null; $state.LastPreflightNetworkOk = $null
         Set-BootUpdateState -State $state
 
         <# Guard task registration and reboot — neither must fire in WhatIf mode #>
