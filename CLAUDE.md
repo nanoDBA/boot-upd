@@ -117,6 +117,16 @@ Remove-Item "$env:ProgramData\BootUpdateCycle" -Recurse -Force
 | `PreCycleScript` | `''` | Path to a .ps1 hook executed after pre-flight, before the first phase |
 | `PostCycleScript` | `''` | Path to a .ps1 hook executed after the final phase, before reboot decision |
 | `HooksConfig` | `hooks.psd1` (sidecar) | Path to PSD1 sidecar with per-phase scriptblock hooks |
+| `DisableSelfUpdate` | `$false` | Suppress GitHub self-update (lz1); also via `BOOT_UPDATE_NO_SELF_UPDATE` env var |
+| `ConfigUrl` | `''` | URL to fleet-wide JSON config overrides (jzw). Empty = disabled. |
+
+## Self-Update (lz1)
+
+`Invoke-BootUpdateCycle.ps1` can update itself from the canonical GitHub release at `https://github.com/nanoDBA/boot-upd`. On each user-context run (never under SYSTEM), it queries the GitHub Releases API, compares the latest tag to `$script:BootUpdateCycleVersion`, and — if a newer version is available — downloads the `Invoke-BootUpdateCycle.ps1` asset, validates it with `[scriptblock]::Create()`, checks SHA256 if metadata is present, then atomically replaces the live file (backing up to `.bak`) and re-execs `pwsh -NoProfile -File` with the same arguments. If anything fails the current version continues. Disable with `-DisableSelfUpdate` or the `BOOT_UPDATE_NO_SELF_UPDATE` environment variable (for test environments).
+
+## Remote Configuration (jzw)
+
+Pass `-ConfigUrl <https://...>` to supply a fleet-wide JSON config override URL. `Get-RemoteConfig` fetches the URL (10 s timeout) and caches the result to `$env:ProgramData\BootUpdateCycle\remote-config.cache.json`. On network failure it falls back to the cache. `Apply-RemoteConfig` then overwrites any `$script:*` variable whose matching key appears in the JSON, **except** keys the operator explicitly passed on the command line (user always wins). Supported JSON keys: `ExcludePatterns`, `MaxIterations`, `RebootDelaySec`, `PackageTimeoutMinutes`, `MaintenanceWindowStart`, `MaintenanceWindowEnd`, `SkipPip`, `SkipNpm`, `SkipScoop`, `SkipDotnetTools`, `SkipVscode`, `SkipPowerShellModules`, `SkipOffice365`, `SkipAwsTooling`, `SkipDefender`, `SkipBitLocker`, `SkipRestorePoint`, `SkipHealthCheck`, `IncludeDriverUpdates`, `IncludeFirmwareUpdates`, `UpdateWsl`, `UpdateContainers`, `AllowMetered`, `DisableSelfUpdate`, `StagedRollout`.
 
 ## Extension Hooks
 

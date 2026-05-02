@@ -76,7 +76,10 @@ param(
     [switch]$AllowMetered,               # Allow updates on metered connections (cellular hotspot). Default: abort on metered.
     [string]$PreCycleScript  = '',       # Path to a .ps1 hook executed after pre-flight, before the first phase (74r)
     [string]$PostCycleScript = '',       # Path to a .ps1 hook executed after the final phase, before reboot decision (74r)
-    [string]$HooksConfig     = (Join-Path $PSScriptRoot 'hooks.psd1')  # Sidecar PSD1 with per-phase hook scriptblocks (b3w)
+    [string]$HooksConfig     = (Join-Path $PSScriptRoot 'hooks.psd1'),  # Sidecar PSD1 with per-phase hook scriptblocks (b3w)
+    [switch]$DisableSelfUpdate,          # Suppress self-update from GitHub releases (lz1). Default: self-update runs.
+    [ValidateScript({ $_ -eq '' -or $_ -match '^https?://' })]
+    [string]$ConfigUrl       = ''        # URL for remote JSON config overrides (jzw). Empty = disabled.
 )
 
 $ErrorActionPreference = 'Stop'
@@ -118,6 +121,8 @@ $script:PreCycleScript         = $PreCycleScript
 $script:PostCycleScript        = $PostCycleScript
 $script:HooksConfig            = $HooksConfig
 $script:PhaseHooks             = @{}
+$script:DisableSelfUpdate      = $DisableSelfUpdate
+$script:ConfigUrl              = $ConfigUrl
 
 <# Load per-phase hooks sidecar (hooks.psd1) at script start.
    Evaluated as a scriptblock so values remain actual scriptblocks (Import-PowerShellDataFile
@@ -2342,6 +2347,284 @@ function Invoke-PhaseHook {
 }
 #endregion
 
+#region Fleet Management
+
+<# Update-OrchestratorSelf (lz1)
+   Downloads the latest Invoke-BootUpdateCycle.ps1 from the canonical GitHub release,
+   validates it, and re-execs into the new version.  Only runs in user context (never
+   SYSTEM).  Best-effort: all failure paths log and return — never throw. #>
+function Update-OrchestratorSelf {
+    param(
+        <# Script-level $PSBoundParameters must be forwarded explicitly so the re-launch
+           can reproduce the caller's explicit switches/values across the process boundary. #>
+        [hashtable]$ScriptBoundParams = @{}
+    )
+    try {
+        <# Guard: never self-update under SYSTEM scheduled task context #>
+        $isSystem = ([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value -eq 'S-1-5-18')
+        if ($isSystem) {
+            Write-Log 'Self-update: skipped in SYSTEM context.' -Level Info
+            return
+        }
+
+        <# Guard: env-var escape hatch for test environments #>
+        if (-not [string]::IsNullOrEmpty($env:BOOT_UPDATE_NO_SELF_UPDATE)) {
+            Write-Log 'Self-update: disabled via BOOT_UPDATE_NO_SELF_UPDATE env var.' -Level Info
+            return
+        }
+
+        <# Guard: explicit -DisableSelfUpdate switch #>
+        if ($script:DisableSelfUpdate) {
+            Write-Log 'Self-update: disabled via -DisableSelfUpdate switch.' -Level Info
+            return
+        }
+
+        Write-Log 'Self-update: checking for newer release on GitHub...' -Level Info
+
+        $releaseInfo = $null
+        try {
+            $releaseInfo = Invoke-RestMethod `
+                -Uri 'https://api.github.com/repos/nanoDBA/boot-upd/releases/latest' `
+                -TimeoutSec 15 `
+                -Headers @{ 'User-Agent' = 'BootUpdateCycle' } `
+                -ErrorAction Stop
+        } catch {
+            Write-Log "Self-update: could not reach GitHub releases API — $_" -Level Warn
+            return
+        }
+
+        $tagName = $releaseInfo.tag_name -replace '^v', ''
+        if ([string]::IsNullOrWhiteSpace($tagName)) {
+            Write-Log 'Self-update: could not parse tag_name from release response.' -Level Warn
+            return
+        }
+
+        <# Compare semver: if remote <= current, nothing to do #>
+        $current = $script:BootUpdateCycleVersion
+        try {
+            $remoteVer  = [System.Version]::new($tagName)
+            $currentVer = [System.Version]::new($current)
+        } catch {
+            Write-Log "Self-update: version parse failed (remote='$tagName', current='$current') — $_" -Level Warn
+            return
+        }
+
+        if ($remoteVer -le $currentVer) {
+            Write-Log "Self-update: already on latest ($current)." -Level Info
+            return
+        }
+
+        Write-Log "Self-update: newer release found — $current -> $tagName. Downloading..." -Level Info
+
+        <# Locate the Invoke-BootUpdateCycle.ps1 asset in the release #>
+        $asset = $releaseInfo.assets | Where-Object { $_.name -eq 'Invoke-BootUpdateCycle.ps1' } | Select-Object -First 1
+        if (-not $asset) {
+            Write-Log "Self-update: release $tagName has no 'Invoke-BootUpdateCycle.ps1' asset. Skipping." -Level Warn
+            return
+        }
+
+        <# Look for a sibling SHA256 asset or a SHA256 hex in the release body #>
+        $expectedSha = $null
+        $shaAsset = $releaseInfo.assets | Where-Object { $_.name -eq 'Invoke-BootUpdateCycle.ps1.sha256' } | Select-Object -First 1
+        if ($shaAsset) {
+            try {
+                $shaContent = Invoke-RestMethod -Uri $shaAsset.browser_download_url -TimeoutSec 15 -Headers @{ 'User-Agent' = 'BootUpdateCycle' } -ErrorAction Stop
+                $expectedSha = ($shaContent -split '\s+')[0].Trim().ToUpperInvariant()
+            } catch {
+                Write-Log "Self-update: failed to fetch .sha256 asset — $_" -Level Warn
+            }
+        }
+
+        if (-not $expectedSha -and -not [string]::IsNullOrWhiteSpace($releaseInfo.body)) {
+            <# Try to find a SHA256 hex near the asset filename in the release body #>
+            if ($releaseInfo.body -match '(?i)Invoke-BootUpdateCycle\.ps1[^\n]*?([0-9a-fA-F]{64})') {
+                $expectedSha = $matches[1].ToUpperInvariant()
+            } elseif ($releaseInfo.body -match '([0-9a-fA-F]{64})') {
+                $expectedSha = $matches[1].ToUpperInvariant()
+            }
+        }
+
+        <# Download to temp file #>
+        $tempPath = [System.IO.Path]::GetTempFileName() -replace '\.tmp$', '.ps1'
+        try {
+            Invoke-WebRequest `
+                -Uri $asset.browser_download_url `
+                -OutFile $tempPath `
+                -TimeoutSec 60 `
+                -Headers @{ 'User-Agent' = 'BootUpdateCycle' } `
+                -ErrorAction Stop
+        } catch {
+            Write-Log "Self-update: download failed — $_" -Level Warn
+            if (Test-Path $tempPath) { Remove-Item $tempPath -Force -ErrorAction SilentlyContinue }
+            return
+        }
+
+        <# Validate: must parse as valid PowerShell #>
+        try {
+            $null = [scriptblock]::Create((Get-Content $tempPath -Raw -ErrorAction Stop))
+        } catch {
+            Write-Log "Self-update: downloaded script failed PowerShell parse check — $_. Aborting update." -Level Error
+            Remove-Item $tempPath -Force -ErrorAction SilentlyContinue
+            return
+        }
+
+        <# SHA256 integrity check #>
+        if ($expectedSha) {
+            $actualSha = (Get-FileHash -Path $tempPath -Algorithm SHA256).Hash.ToUpperInvariant()
+            if ($actualSha -ne $expectedSha) {
+                Write-Log "Self-update: SHA256 mismatch! Expected=$expectedSha Actual=$actualSha. Aborting update." -Level Error
+                Remove-Item $tempPath -Force -ErrorAction SilentlyContinue
+                return
+            }
+            Write-Log "Self-update: SHA256 verified ($actualSha)." -Level Info
+        } else {
+            Write-Log 'Self-update: release provides no SHA256 — skipping integrity check.' -Level Warn
+        }
+
+        <# Atomic replace: backup then move #>
+        $livePath = $PSCommandPath   # The running script file
+        $bakPath  = "$livePath.bak"
+        try {
+            Copy-Item -Path $livePath -Destination $bakPath -Force -ErrorAction Stop
+            Move-Item -Path $tempPath -Destination $livePath -Force -ErrorAction Stop
+        } catch {
+            Write-Log "Self-update: atomic replace failed — $_" -Level Error
+            if (Test-Path $tempPath) { Remove-Item $tempPath -Force -ErrorAction SilentlyContinue }
+            return
+        }
+
+        Write-Log "Self-update: successfully updated to $tagName. Re-executing new version..." -Level Info
+
+        <# Re-exec: build argument list, preserving caller's explicit params #>
+        $relaunchArgs = [System.Collections.Generic.List[string]]::new()
+        foreach ($p in $ScriptBoundParams.GetEnumerator()) {
+            if ($p.Value -is [switch]) {
+                if ($p.Value.IsPresent) { $relaunchArgs.Add("-$($p.Key)") }
+            } elseif ($p.Value -is [string[]]) {
+                foreach ($v in $p.Value) { $relaunchArgs.Add("-$($p.Key)"); $relaunchArgs.Add($v) }
+            } elseif ($p.Value -is [pscredential]) {
+                <# Cannot pass credential over process boundary — skip; caller must re-supply if needed #>
+                Write-Log 'Self-update: -SmtpCredential cannot be forwarded to re-launched process.' -Level Warn
+            } else {
+                $relaunchArgs.Add("-$($p.Key)")
+                $relaunchArgs.Add("$($p.Value)")
+            }
+        }
+
+        & pwsh -NoProfile -File $livePath @relaunchArgs
+        exit $LASTEXITCODE
+
+    } catch {
+        Write-Log "Self-update: unexpected error — $_" -Level Warn
+    }
+}
+
+<# Get-RemoteConfig (jzw)
+   Fetches a JSON config from $script:ConfigUrl and returns a PSCustomObject whose
+   top-level keys override local defaults for any param NOT explicitly supplied by the
+   user.  Falls back to the last-cached response on network failure.
+   Returns $null when ConfigUrl is empty or on unrecoverable failure. #>
+function Get-RemoteConfig {
+    $url = $script:ConfigUrl
+    if ([string]::IsNullOrWhiteSpace($url)) { return $null }
+
+    $cacheDir  = Join-Path $env:ProgramData 'BootUpdateCycle'
+    $cachePath = Join-Path $cacheDir 'remote-config.cache.json'
+
+    $parsed = $null
+    try {
+        $response = Invoke-RestMethod `
+            -Uri $url `
+            -TimeoutSec 10 `
+            -Headers @{ 'User-Agent' = 'BootUpdateCycle' } `
+            -ErrorAction Stop
+
+        if ($response -isnot [pscustomobject] -and $response -isnot [hashtable]) {
+            Write-Log "Remote config: response from '$url' is not a JSON object. Ignoring." -Level Warn
+            $parsed = $null
+        } else {
+            $parsed = $response
+            <# Cache successful response #>
+            try {
+                if (-not (Test-Path $cacheDir)) { $null = New-Item -ItemType Directory -Path $cacheDir -Force }
+                $parsed | ConvertTo-Json -Depth 5 | Set-Content -Path $cachePath -Encoding UTF8 -Force
+            } catch {
+                Write-Log "Remote config: failed to cache response — $_" -Level Warn
+            }
+        }
+    } catch {
+        Write-Log "Remote config: fetch from '$url' failed — $_" -Level Warn
+
+        <# Fallback: use last-known cached config #>
+        if (Test-Path $cachePath) {
+            try {
+                $cached = Get-Content $cachePath -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
+                Write-Log 'Remote config: using last-known cached config.' -Level Warn
+                $parsed = $cached
+            } catch {
+                Write-Log "Remote config: cache exists but failed to parse — $_" -Level Warn
+                return $null
+            }
+        } else {
+            Write-Log 'Remote config: no cache available. Proceeding with local defaults.' -Level Warn
+            return $null
+        }
+    }
+
+    return $parsed
+}
+
+<# Apply-RemoteConfig
+   Walks top-level keys of $RemoteConfig and overwrites $script:<key> for any key
+   that was NOT explicitly passed by the user on the command line.
+   $UserBoundParams must be the script-level $PSBoundParameters hashtable.
+   Supported keys mirror the boolean/int/string params documented in CLAUDE.md. #>
+function Apply-RemoteConfig {
+    param(
+        [pscustomobject]$RemoteConfig,
+        [hashtable]$UserBoundParams = @{}
+    )
+    if ($null -eq $RemoteConfig) { return }
+
+    $supportedKeys = @(
+        'ExcludePatterns', 'MaxIterations', 'RebootDelaySec', 'PackageTimeoutMinutes',
+        'MaintenanceWindowStart', 'MaintenanceWindowEnd',
+        'SkipPip', 'SkipNpm', 'SkipScoop', 'SkipDotnetTools', 'SkipVscode',
+        'SkipPowerShellModules', 'SkipOffice365', 'SkipAwsTooling',
+        'SkipDefender', 'SkipBitLocker', 'SkipRestorePoint', 'SkipHealthCheck',
+        'IncludeDriverUpdates', 'IncludeFirmwareUpdates',
+        'UpdateWsl', 'UpdateContainers', 'AllowMetered', 'DisableSelfUpdate',
+        'StagedRollout'
+    )
+
+    $overridden = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($key in $supportedKeys) {
+        <# User always wins — skip any key the caller passed explicitly #>
+        if ($UserBoundParams.ContainsKey($key)) { continue }
+
+        $remoteProps = $RemoteConfig.PSObject.Properties.Name
+        if ($remoteProps -notcontains $key) { continue }
+
+        $remoteVal = $RemoteConfig.$key
+        if ($null -eq $remoteVal) { continue }
+
+        try {
+            Set-Variable -Name $key -Value $remoteVal -Scope Script -Force -ErrorAction Stop
+            $overridden.Add($key)
+        } catch {
+            Write-Log "Remote config: could not apply key '$key' — $_" -Level Warn
+        }
+    }
+
+    if ($overridden.Count -gt 0) {
+        Write-Log "Remote config: overrode $($overridden.Count) setting(s): $($overridden -join ', ')." -Level Info
+    } else {
+        Write-Log 'Remote config: no local settings overridden (all already set by user or key absent).' -Level Info
+    }
+}
+#endregion
+
 #region Main Orchestration
 function Invoke-BootUpdateCycle {
     Invoke-LogRotation
@@ -2982,5 +3265,15 @@ Register-EngineEvent -SourceIdentifier 'PowerShell.Exiting' -Action {
         $script:BootUpdateMutex = $null
     }
 } | Out-Null
+
+<# lz1: Self-update — runs after mutex, before pre-flight. Skips under SYSTEM.
+   If a newer version is downloaded and validated, re-execs and never returns.
+   $PSBoundParameters is captured at script scope (before the function call). #>
+Update-OrchestratorSelf -ScriptBoundParams $PSBoundParameters
+
+<# jzw: Remote config — fetch fleet-wide overrides from $ConfigUrl and apply any
+   key NOT explicitly passed by the user.  No-op when ConfigUrl is empty. #>
+$script:_remoteConfig = Get-RemoteConfig
+Apply-RemoteConfig -RemoteConfig $script:_remoteConfig -UserBoundParams $PSBoundParameters
 
 Invoke-BootUpdateCycle
