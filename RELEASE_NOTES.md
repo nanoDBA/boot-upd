@@ -14,6 +14,7 @@
 
 - Chocolatey download progress no longer floods the log: `choco upgrade` now runs with `--no-progress`, and the `Write-Log` filter drops any `Progress:` line (previously only `Progress: ...% - Saving` was filtered). A single git.install download had produced hundreds of identical `Progress: Downloading git.install ... 1%` entries.
 - `Write-Log` now collapses consecutive duplicate lines from any phase: the first occurrence logs normally, repeats are counted, and one `(previous line repeated N more times)` summary is emitted when the message changes.
+- `Deploy-BootUpdateCycle.ps1` now self-updates the SOURCE copy of `Invoke-BootUpdateCycle.ps1` from the latest GitHub release before deploying (parse + SHA256 validation, atomic replace with `.bak`, `BOOT_UPDATE_NO_SELF_UPDATE` opt-out). Previously Invoke's self-update only patched the live ProgramData copy, which Deploy overwrote with the stale source on every run.
 
 ### upd.cmd improvements
 
