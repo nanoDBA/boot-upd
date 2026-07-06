@@ -141,7 +141,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 3 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.6' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.7' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 
 <# Force UTF-8 console I/O so box-drawing/block chars (BBS splash) render in cmd.exe regardless of system code page.
    chcp 65001 sets conhost interpretation; [Console]::OutputEncoding makes .NET write proper UTF-8 bytes. #>
@@ -153,6 +153,9 @@ try {
 } catch { <# no console attached (SYSTEM scheduled task) — ignore #> }
 
 #region Logging
+$script:LastLogMessage = $null
+$script:LastLogRepeatCount = 0
+
 function Invoke-LogRotation {
     if (-not (Test-Path $script:LogPath)) { return }
     $logFile = Get-Item $script:LogPath
@@ -177,8 +180,24 @@ function Write-Log {
     if ($Message -match '^\s+\d+(\.\d+)?\s*[KMG]?\s*(B|K|M)\s*\.{2,}$') { return }
     if ($Message -match '^-{5,}.*\d+\.\d+.*[KMG]?B.*eta') { return }
     if ($Message -match '^\s*━+|^\s*\|█+') { return }
-    if ($Message -match 'Progress:\s*\d+%\s*-\s*Saving') { return }
+    if ($Message -match '^\s*Progress:') { return }
     if ($Message -match 'is currently in use\.\s*Retry the operation after closing') { return }
+
+    <# Collapse consecutive duplicate lines (installer progress spam that survives the
+       pattern filters above). First occurrence logs normally; repeats are counted and
+       summarized as one line when the message finally changes. #>
+    $trimmedMsg = $Message.TrimEnd()
+    if ($trimmedMsg -eq $script:LastLogMessage) {
+        $script:LastLogRepeatCount++
+        return
+    }
+    if ($script:LastLogRepeatCount -gt 0) {
+        $repeatEntry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [Info] (previous line repeated $($script:LastLogRepeatCount) more time$(if ($script:LastLogRepeatCount -ne 1) { 's' }))"
+        Add-Content -Path $script:LogPath -Value $repeatEntry -Force
+        Write-Host $repeatEntry
+    }
+    $script:LastLogMessage = $trimmedMsg
+    $script:LastLogRepeatCount = 0
 
     $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $entry = "[$ts] [$Level] $Message"
@@ -1051,7 +1070,7 @@ function Update-ChocolateyPackages {
     if ($PSCmdlet.ShouldProcess('Chocolatey', 'Run choco upgrade all')) {
         if ($script:ExcludePatterns.Count -eq 0) {
             <# Fast path: no exclusions #>
-            & choco upgrade all -y 2>&1 | ForEach-Object {
+            & choco upgrade all -y --no-progress 2>&1 | ForEach-Object {
                 if ($_ -match 'upgraded (\d+)/\d+ package') { $count = [int]$Matches[1] }
                 Write-Log $_
             }
@@ -1089,7 +1108,7 @@ function Update-ChocolateyPackages {
 
             foreach ($pkgName in $toUpgrade) {
                 Write-Log "Chocolatey: Upgrading $pkgName"
-                & choco upgrade $pkgName -y 2>&1 | ForEach-Object {
+                & choco upgrade $pkgName -y --no-progress 2>&1 | ForEach-Object {
                     if ($_ -match 'upgraded (\d+)/\d+ package|Software installed') { $count++ }
                     Write-Log $_
                 }
@@ -1097,7 +1116,7 @@ function Update-ChocolateyPackages {
         }
     } else {
         if ($script:ExcludePatterns.Count -eq 0) {
-            Write-Log '  [WHATIF] Would run: choco upgrade all -y'
+            Write-Log '  [WHATIF] Would run: choco upgrade all -y --no-progress'
         } else {
             Write-Log '  [WHATIF] Would run: choco outdated --limit-output, then upgrade each non-excluded package individually'
             Write-Log "  [WHATIF] ExcludePatterns: $($script:ExcludePatterns -join ', ')"

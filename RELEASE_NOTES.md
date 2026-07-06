@@ -1,8 +1,30 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.6
-**Release Date:** 2026-05-02
+**Current Version:** v2.5.7
+**Release Date:** 2026-07-06
 **Status:** STABLE
+
+---
+
+## v2.5.7 (2026-07-06)
+
+**Log spam elimination and upd.cmd hardening.**
+
+### Fixes
+
+- Chocolatey download progress no longer floods the log: `choco upgrade` now runs with `--no-progress`, and the `Write-Log` filter drops any `Progress:` line (previously only `Progress: ...% - Saving` was filtered). A single git.install download had produced hundreds of identical `Progress: Downloading git.install ... 1%` entries.
+- `Write-Log` now collapses consecutive duplicate lines from any phase: the first occurrence logs normally, repeats are counted, and one `(previous line repeated N more times)` summary is emitted when the message changes.
+
+### upd.cmd improvements
+
+- `upd /?` (also `-h`, `--help`) prints usage.
+- The delay argument is validated as a whole number before elevating; bad input exits with code 1 and a clear message.
+- Verifies `pwsh` is on PATH and `Deploy-BootUpdateCycle.ps1` exists next to the launcher before doing anything, with clear errors instead of a silently vanishing window.
+- Startup banner now echoes the effective reboot delay.
+
+### Compatibility
+
+- No parameter or schema changes. Drop-in replacement for v2.5.6.
 
 ---
 
