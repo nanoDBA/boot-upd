@@ -126,6 +126,73 @@ $sourceInvoke = Join-Path $PSScriptRoot 'Invoke-BootUpdateCycle.ps1'
 if (-not (Test-Path $sourceInvoke)) {
     throw "Source script not found: $sourceInvoke  (Deploy and Invoke must be in the same directory)"
 }
+
+<# Self-update the SOURCE copy from GitHub before deploying (lz1 companion).
+   Invoke's own self-update only replaces the live ProgramData copy — without this
+   step, every deploy re-copies the stale source and re-downloads the same update.
+   Updating the source here makes the update stick and skips the redundant download.
+   Best-effort: any failure logs a warning and deploys the existing source. #>
+if ([string]::IsNullOrEmpty($env:BOOT_UPDATE_NO_SELF_UPDATE)) {
+    try {
+        $srcRaw = Get-Content $sourceInvoke -Raw -ErrorAction Stop
+        $currentVer = $null
+        if ($srcRaw -match "BootUpdateCycleVersion'\s*-Value\s*'([\d.]+)'") {
+            $currentVer = [System.Version]::new($matches[1])
+        }
+        if (-not $currentVer) { throw "could not parse BootUpdateCycleVersion from $sourceInvoke" }
+
+        Write-Host "Source self-update: local v$currentVer — checking GitHub for newer release..."
+        $releaseInfo = Invoke-RestMethod `
+            -Uri 'https://api.github.com/repos/nanoDBA/boot-upd/releases/latest' `
+            -TimeoutSec 15 `
+            -Headers @{ 'User-Agent' = 'BootUpdateCycle' } `
+            -ErrorAction Stop
+        $remoteVer = [System.Version]::new(($releaseInfo.tag_name -replace '^v', ''))
+
+        if ($remoteVer -le $currentVer) {
+            Write-Host "Source self-update: already on latest (v$currentVer)."
+        } else {
+            $asset = $releaseInfo.assets | Where-Object { $_.name -eq 'Invoke-BootUpdateCycle.ps1' } | Select-Object -First 1
+            if (-not $asset) { throw "release $($releaseInfo.tag_name) has no 'Invoke-BootUpdateCycle.ps1' asset" }
+
+            Write-Host "Source self-update: v$currentVer -> v$remoteVer. Downloading..." -ForegroundColor Cyan
+            $tempPath = [System.IO.Path]::GetTempFileName() -replace '\.tmp$', '.ps1'
+            Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $tempPath `
+                -TimeoutSec 60 -Headers @{ 'User-Agent' = 'BootUpdateCycle' } -ErrorAction Stop
+
+            <# Validate: must parse as PowerShell #>
+            $null = [scriptblock]::Create((Get-Content $tempPath -Raw -ErrorAction Stop))
+
+            <# SHA256 integrity check when the release ships one #>
+            $expectedSha = $null
+            $shaAsset = $releaseInfo.assets | Where-Object { $_.name -eq 'Invoke-BootUpdateCycle.ps1.sha256' } | Select-Object -First 1
+            if ($shaAsset) {
+                $shaContent = Invoke-RestMethod -Uri $shaAsset.browser_download_url -TimeoutSec 15 -Headers @{ 'User-Agent' = 'BootUpdateCycle' } -ErrorAction Stop
+                $expectedSha = ($shaContent -split '\s+')[0].Trim().ToUpperInvariant()
+            } elseif ($releaseInfo.body -match '(?i)Invoke-BootUpdateCycle\.ps1[^\n]*?([0-9a-fA-F]{64})') {
+                $expectedSha = $matches[1].ToUpperInvariant()
+            }
+            if ($expectedSha) {
+                $actualSha = (Get-FileHash -Path $tempPath -Algorithm SHA256).Hash.ToUpperInvariant()
+                if ($actualSha -ne $expectedSha) { throw "SHA256 mismatch (expected=$expectedSha actual=$actualSha)" }
+                Write-Host "Source self-update: SHA256 verified."
+            } else {
+                Write-Host 'Source self-update: release provides no SHA256 — skipping integrity check.' -ForegroundColor Yellow
+            }
+
+            <# Atomic replace with backup #>
+            Copy-Item $sourceInvoke "$sourceInvoke.bak" -Force -ErrorAction Stop
+            Move-Item $tempPath $sourceInvoke -Force -ErrorAction Stop
+            Write-Host "Source self-update: source updated to v$remoteVer (backup: Invoke-BootUpdateCycle.ps1.bak)" -ForegroundColor Green
+        }
+    } catch {
+        Write-Host "Source self-update: skipped — $_" -ForegroundColor Yellow
+        if ($tempPath -and (Test-Path $tempPath)) { Remove-Item $tempPath -Force -ErrorAction SilentlyContinue }
+    }
+} else {
+    Write-Host 'Source self-update: disabled via BOOT_UPDATE_NO_SELF_UPDATE env var.'
+}
+
 $scriptPath = Join-Path $installDir 'Invoke-BootUpdateCycle.ps1'
 Copy-Item $sourceInvoke $scriptPath -Force
 Write-Host "Deployed: $scriptPath"
