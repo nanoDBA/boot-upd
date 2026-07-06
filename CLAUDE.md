@@ -36,7 +36,9 @@ Windows boot-time update automation. Runs package managers (Winget, Chocolatey, 
 |------|---------|
 | `Deploy-BootUpdateCycle.ps1` | **Primary entry point** - paste-to-deploy single file |
 | `Invoke-BootUpdateCycle.ps1` | Full-featured orchestrator (reference implementation) |
+| `upd.cmd` | Launcher: `upd [delay_seconds \| splash]`; self-elevates, self-adds to PATH |
 | `Repair-AwsTooling.ps1` | Optional AWS CLI v2 + AWS.Tools module maintenance |
+| `tools/New-Release.ps1` | Release helper: validates tag/version/parse, publishes script assets + `.sha256` sidecars |
 
 ## Common Operations
 
@@ -93,7 +95,9 @@ Remove-Item "$env:ProgramData\BootUpdateCycle" -Recurse -Force
 - All scripts require PowerShell 7+ and elevation
 - **Deploy.ps1**: Copies Invoke.ps1 from source dir to ProgramData (no more embedded here-string duplication). Direct first run (user context), then SYSTEM scheduled task for post-reboot
 - **Invoke.ps1**: Self-contained orchestrator; can register its own scheduled task for reboot without needing Register.ps1
-- Log filters: spinner chars (`| / - \`), Unicode box-drawing/progress bars, download progress lines, source refresh messages
+- Log filters: spinner chars (`| / - \`), Unicode box-drawing/progress bars, any `Progress:` line, download progress lines, source refresh messages; consecutive duplicate lines collapse into one `(previous line repeated N more times)` summary
+- Progress suppressed at the source too: `choco upgrade ... --no-progress`, `winget ... --disable-interactivity --no-vt`
+- **Splash** (see bd memory `do-not-modify-ascii-art-splash-banner-screens`): theme 0 (neon gradient VT) is default; `BOOT_UPDATE_SPLASH_THEME=0|1|2` switches; `upd splash` / `-PreviewSplash` previews all three without running updates. Wordmark cells must stay spaces+background-color only (no Unicode glyphs). README embeds pixel-true SVGs at `docs/img/splash-theme{0,1,2}.svg`
 - Update functions return `@{ Success = [bool]; Count = [int] }` — Success=$true means "don't retry" (fail-forward pattern)
 - State schema v3: all phase flags use `*Done` suffix consistently; versioned with auto-migration (v1→v2→v3)
 
@@ -123,6 +127,12 @@ Remove-Item "$env:ProgramData\BootUpdateCycle" -Recurse -Force
 ## Self-Update (lz1)
 
 `Invoke-BootUpdateCycle.ps1` can update itself from the canonical GitHub release at `https://github.com/nanoDBA/boot-upd`. On each user-context run (never under SYSTEM), it queries the GitHub Releases API, compares the latest tag to `$script:BootUpdateCycleVersion`, and — if a newer version is available — downloads the `Invoke-BootUpdateCycle.ps1` asset, validates it with `[scriptblock]::Create()`, checks SHA256 if metadata is present, then atomically replaces the live file (backing up to `.bak`) and re-execs `pwsh -NoProfile -File` with the same arguments. If anything fails the current version continues. Disable with `-DisableSelfUpdate` or the `BOOT_UPDATE_NO_SELF_UPDATE` environment variable (for test environments).
+
+**Deploy source self-update:** `Deploy-BootUpdateCycle.ps1` additionally refreshes the SOURCE copies of both `Invoke-BootUpdateCycle.ps1` and `Deploy-BootUpdateCycle.ps1` (itself) from the latest release before deploying — same validation (parse + SHA256 + atomic replace with `.bak`), same `BOOT_UPDATE_NO_SELF_UPDATE` opt-out. Without this, every deploy would re-copy the stale source and re-download the same update. `upd.cmd` is intentionally NOT auto-updated (cmd reads batch files incrementally; replacing a running one is unsafe).
+
+## Releasing
+
+Use `tools/New-Release.ps1 -Tag vX.Y.Z -Title '...' -Notes '...'` (or `-NotesPath`). It verifies the tag matches Invoke's embedded version, parse-checks both scripts, and publishes them with `.sha256` sidecar assets — the sidecars are what activate the SHA256 integrity checks in both self-update paths. Also bump `RELEASE_NOTES.md` and commit before releasing.
 
 ## Remote Configuration (jzw)
 
@@ -233,3 +243,16 @@ bd close <id>         # Complete work
 - NEVER say "ready to push when you are" - YOU must push
 - If push fails, resolve and retry until it succeeds
 <!-- END BEADS INTEGRATION -->
+
+
+<!-- BEGIN CROSS_PROJECT_MAP_POINTER -->
+## Cross-project map
+
+Workspace-wide knowledge file: `C:\Users\LarsR\OneDrive\!Repos\skillz\cross-project-map.md` (OneDrive-synced, surfaces across machines). Indexes all active Claude Code projects on this laptop plus the reusable skills exposed by each project's `.claude/skills/` folder.
+
+**Use for**: project-spanning facts, cross-referencing skills from other projects, recording decisions/conventions that affect multiple projects.
+
+**Do NOT use for**: project-internal task state (use `bd` here), local code conventions (use this project's other docs).
+
+Per-project `bd` remains authoritative for project-internal state. The skillz file is the shared layer above that.
+<!-- END CROSS_PROJECT_MAP_POINTER -->

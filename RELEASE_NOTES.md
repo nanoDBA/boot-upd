@@ -1,8 +1,24 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.12
+**Current Version:** v2.5.13
 **Release Date:** 2026-07-06
 **Status:** STABLE
+
+---
+
+## v2.5.13 (2026-07-06)
+
+**Self-update hardening.**
+
+### Changes
+
+- Releases now ship `.sha256` sidecar assets for both scripts (via new `tools/New-Release.ps1` helper), activating the SHA256 integrity checks that already existed in both self-update paths but had never fired.
+- `Deploy-BootUpdateCycle.ps1` now also self-updates its own source copy from the latest release (previously only Invoke's source was refreshed). Same parse + SHA256 validation, atomic replace with `.bak`, `BOOT_UPDATE_NO_SELF_UPDATE` opt-out. `upd.cmd` is intentionally not auto-updated (replacing a running batch file is unsafe).
+- CLAUDE.md documentation caught up: splash themes/preview, log-filter and `--no-progress` conventions, dual source self-update, release procedure.
+
+### Compatibility
+
+- No parameter or schema changes. Drop-in replacement for v2.5.12.
 
 ---
 

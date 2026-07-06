@@ -152,38 +152,49 @@ if ([string]::IsNullOrEmpty($env:BOOT_UPDATE_NO_SELF_UPDATE)) {
         if ($remoteVer -le $currentVer) {
             Write-Host "Source self-update: already on latest (v$currentVer)."
         } else {
-            $asset = $releaseInfo.assets | Where-Object { $_.name -eq 'Invoke-BootUpdateCycle.ps1' } | Select-Object -First 1
-            if (-not $asset) { throw "release $($releaseInfo.tag_name) has no 'Invoke-BootUpdateCycle.ps1' asset" }
+            Write-Host "Source self-update: v$currentVer -> v$remoteVer." -ForegroundColor Cyan
+            <# Update both source scripts. Replacing this running Deploy script is safe:
+               pwsh parsed the whole file at startup, so the new copy applies next run. #>
+            foreach ($assetName in @('Invoke-BootUpdateCycle.ps1', 'Deploy-BootUpdateCycle.ps1')) {
+                $asset = $releaseInfo.assets | Where-Object { $_.name -eq $assetName } | Select-Object -First 1
+                if (-not $asset) {
+                    if ($assetName -eq 'Invoke-BootUpdateCycle.ps1') { throw "release $($releaseInfo.tag_name) has no '$assetName' asset" }
+                    Write-Host "Source self-update: release has no '$assetName' asset - skipping it." -ForegroundColor Yellow
+                    continue
+                }
 
-            Write-Host "Source self-update: v$currentVer -> v$remoteVer. Downloading..." -ForegroundColor Cyan
-            $tempPath = [System.IO.Path]::GetTempFileName() -replace '\.tmp$', '.ps1'
-            Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $tempPath `
-                -TimeoutSec 60 -Headers @{ 'User-Agent' = 'BootUpdateCycle' } -ErrorAction Stop
+                Write-Host "Source self-update: downloading $assetName..."
+                $tempPath = [System.IO.Path]::GetTempFileName() -replace '\.tmp$', '.ps1'
+                Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $tempPath `
+                    -TimeoutSec 60 -Headers @{ 'User-Agent' = 'BootUpdateCycle' } -ErrorAction Stop
 
-            <# Validate: must parse as PowerShell #>
-            $null = [scriptblock]::Create((Get-Content $tempPath -Raw -ErrorAction Stop))
+                <# Validate: must parse as PowerShell #>
+                $null = [scriptblock]::Create((Get-Content $tempPath -Raw -ErrorAction Stop))
 
-            <# SHA256 integrity check when the release ships one #>
-            $expectedSha = $null
-            $shaAsset = $releaseInfo.assets | Where-Object { $_.name -eq 'Invoke-BootUpdateCycle.ps1.sha256' } | Select-Object -First 1
-            if ($shaAsset) {
-                $shaContent = Invoke-RestMethod -Uri $shaAsset.browser_download_url -TimeoutSec 15 -Headers @{ 'User-Agent' = 'BootUpdateCycle' } -ErrorAction Stop
-                $expectedSha = ($shaContent -split '\s+')[0].Trim().ToUpperInvariant()
-            } elseif ($releaseInfo.body -match '(?i)Invoke-BootUpdateCycle\.ps1[^\n]*?([0-9a-fA-F]{64})') {
-                $expectedSha = $matches[1].ToUpperInvariant()
+                <# SHA256 integrity check when the release ships one #>
+                $expectedSha = $null
+                $shaAsset = $releaseInfo.assets | Where-Object { $_.name -eq "$assetName.sha256" } | Select-Object -First 1
+                if ($shaAsset) {
+                    $shaContent = Invoke-RestMethod -Uri $shaAsset.browser_download_url -TimeoutSec 15 -Headers @{ 'User-Agent' = 'BootUpdateCycle' } -ErrorAction Stop
+                    $expectedSha = ($shaContent -split '\s+')[0].Trim().ToUpperInvariant()
+                } elseif ($releaseInfo.body -match "(?i)$([regex]::Escape($assetName))[^\n]*?([0-9a-fA-F]{64})") {
+                    $expectedSha = $matches[1].ToUpperInvariant()
+                }
+                if ($expectedSha) {
+                    $actualSha = (Get-FileHash -Path $tempPath -Algorithm SHA256).Hash.ToUpperInvariant()
+                    if ($actualSha -ne $expectedSha) { throw "SHA256 mismatch for $assetName (expected=$expectedSha actual=$actualSha)" }
+                    Write-Host "Source self-update: $assetName SHA256 verified."
+                } else {
+                    Write-Host "Source self-update: release provides no SHA256 for $assetName - skipping integrity check." -ForegroundColor Yellow
+                }
+
+                <# Atomic replace with backup #>
+                $target = Join-Path $PSScriptRoot $assetName
+                Copy-Item $target "$target.bak" -Force -ErrorAction Stop
+                Move-Item $tempPath $target -Force -ErrorAction Stop
+                Write-Host "Source self-update: $assetName updated (backup: $assetName.bak)" -ForegroundColor Green
             }
-            if ($expectedSha) {
-                $actualSha = (Get-FileHash -Path $tempPath -Algorithm SHA256).Hash.ToUpperInvariant()
-                if ($actualSha -ne $expectedSha) { throw "SHA256 mismatch (expected=$expectedSha actual=$actualSha)" }
-                Write-Host "Source self-update: SHA256 verified."
-            } else {
-                Write-Host 'Source self-update: release provides no SHA256 — skipping integrity check.' -ForegroundColor Yellow
-            }
-
-            <# Atomic replace with backup #>
-            Copy-Item $sourceInvoke "$sourceInvoke.bak" -Force -ErrorAction Stop
-            Move-Item $tempPath $sourceInvoke -Force -ErrorAction Stop
-            Write-Host "Source self-update: source updated to v$remoteVer (backup: Invoke-BootUpdateCycle.ps1.bak)" -ForegroundColor Green
+            Write-Host "Source self-update: source updated to v$remoteVer." -ForegroundColor Green
         }
     } catch {
         Write-Host "Source self-update: skipped — $_" -ForegroundColor Yellow
