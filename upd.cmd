@@ -1,9 +1,10 @@
 @echo off
 :: Quick launcher for Deploy-BootUpdateCycle.ps1
-:: Usage: upd [delay_seconds]
-::   upd       - immediate reboot (0 sec delay)
-::   upd 30    - 30 second delay before reboot
-::   upd /?    - show this help
+:: Usage: upd [delay_seconds | splash]
+::   upd        - immediate reboot (0 sec delay)
+::   upd 30     - 30 second delay before reboot
+::   upd splash - preview all splash themes, no updates
+::   upd /?     - show this help
 :: Self-adds to system PATH on first run (idempotent)
 :: Can be run from: elevated cmd, Run dialog (Ctrl+Shift+Enter), or double-click
 setlocal EnableDelayedExpansion
@@ -13,9 +14,14 @@ if /i "%~1"=="/?" goto :help
 if /i "%~1"=="-h" goto :help
 if /i "%~1"=="--help" goto :help
 
-:: Validate optional delay argument (digits only) BEFORE elevating
+:: Validate optional argument BEFORE elevating: "splash" or a numeric delay
 set "DELAY=0"
+set "MODE=run"
 if "%~1"=="" goto :argok
+if /i "%~1"=="splash" (
+    set "MODE=splash"
+    goto :argok
+)
 echo %~1| findstr /r /x "[0-9][0-9]*" >nul
 if errorlevel 1 goto :badarg
 set "DELAY=%~1"
@@ -37,7 +43,7 @@ if %errorlevel% neq 0 (
     if "%~1"=="" (
         powershell -NoProfile -Command "Start-Process -Verb RunAs -FilePath '%~f0'"
     ) else (
-        powershell -NoProfile -Command "Start-Process -Verb RunAs -FilePath '%~f0' -ArgumentList '%DELAY%'"
+        powershell -NoProfile -Command "Start-Process -Verb RunAs -FilePath '%~f0' -ArgumentList '%~1'"
     )
     exit /b
 )
@@ -53,6 +59,18 @@ if not exist "%SCRIPT_DIR%\Deploy-BootUpdateCycle.ps1" (
     echo ERROR: Deploy-BootUpdateCycle.ps1 not found in "%SCRIPT_DIR%"
     pause
     exit /b 1
+)
+
+:: Splash preview mode - render all splash themes and exit, no updates
+if /i "%MODE%"=="splash" (
+    if not exist "%SCRIPT_DIR%\Invoke-BootUpdateCycle.ps1" (
+        echo ERROR: Invoke-BootUpdateCycle.ps1 not found in "%SCRIPT_DIR%"
+        pause
+        exit /b 1
+    )
+    pwsh -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%\Invoke-BootUpdateCycle.ps1" -PreviewSplash
+    pause
+    exit /b 0
 )
 
 :: Check Machine PATH via registry (not process PATH) to avoid stale-inherit false negatives
@@ -89,9 +107,10 @@ exit /b %errorlevel%
 :help
 echo upd - Boot Update Cycle launcher
 echo.
-echo Usage: upd [delay_seconds]
+echo Usage: upd [delay_seconds ^| splash]
 echo   upd        Run update cycle, immediate reboot if needed
 echo   upd 30     Run update cycle, 30 second warning before reboot
+echo   upd splash Preview all splash screen themes (no updates)
 echo   upd /?     Show this help
 echo.
 echo Self-elevates via UAC if not already admin.

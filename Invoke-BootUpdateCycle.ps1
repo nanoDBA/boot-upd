@@ -79,7 +79,8 @@ param(
     [string]$HooksConfig     = (Join-Path $PSScriptRoot 'hooks.psd1'),  # Sidecar PSD1 with per-phase hook scriptblocks (b3w)
     [switch]$DisableSelfUpdate,          # Suppress self-update from GitHub releases (lz1). Default: self-update runs.
     [ValidateScript({ $_ -eq '' -or $_ -match '^https?://' })]
-    [string]$ConfigUrl       = ''        # URL for remote JSON config overrides (jzw). Empty = disabled.
+    [string]$ConfigUrl       = '',       # URL for remote JSON config overrides (jzw). Empty = disabled.
+    [switch]$PreviewSplash               # Render all splash themes and exit (no updates). Also via `upd splash`.
 )
 
 $ErrorActionPreference = 'Stop'
@@ -141,7 +142,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 3 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.9' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.10' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 
 <# Force UTF-8 console I/O so box-drawing/block chars (BBS splash) render in cmd.exe regardless of system code page.
    chcp 65001 sets conhost interpretation; [Console]::OutputEncoding makes .NET write proper UTF-8 bytes. #>
@@ -3386,6 +3387,21 @@ function Invoke-BootUpdateCycle {
 
 <# Entry point #>
 if ($Force) { $ConfirmPreference = 'None' }
+
+<# Splash preview mode: render every theme and exit. No mutex, no state, no
+   updates — safe to run alongside a live cycle. Reachable via `upd splash`. #>
+if ($PreviewSplash) {
+    $savedTheme = $env:BOOT_UPDATE_SPLASH_THEME
+    $themeNames = @('neon gradient', 'outline dither', 'classic 16-color / non-VT fallback')
+    foreach ($t in 0, 1, 2) {
+        Write-Host ''
+        Write-Host "  -- splash theme $t : $($themeNames[$t]) --  (pin with BOOT_UPDATE_SPLASH_THEME=$t)" -ForegroundColor DarkGray
+        $env:BOOT_UPDATE_SPLASH_THEME = "$t"
+        Show-StartupArt
+    }
+    $env:BOOT_UPDATE_SPLASH_THEME = $savedTheme
+    exit 0
+}
 
 <# Named-mutex guard — prevents two instances racing on a fast boot (9ls).
    AbandonedMutexException means the prior owner crashed without releasing; we inherit ownership. #>

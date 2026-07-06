@@ -1,8 +1,18 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.9
+**Current Version:** v2.5.10
 **Release Date:** 2026-07-06
 **Status:** STABLE
+
+---
+
+## v2.5.10 (2026-07-06)
+
+**Splash preview mode.** `Invoke-BootUpdateCycle.ps1 -PreviewSplash` renders all three splash themes (labeled, with the `BOOT_UPDATE_SPLASH_THEME` pin hint) and exits — no mutex, no state, no updates. `upd splash` reaches it from cmd/Run dialog (self-elevates, pauses so the window stays open).
+
+### Compatibility
+
+- New optional switch only. No schema changes. Drop-in replacement for v2.5.9.
 
 ---
 
