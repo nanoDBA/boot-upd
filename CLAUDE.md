@@ -89,7 +89,10 @@ Remove-Item "$env:ProgramData\BootUpdateCycle" -Recurse -Force
 - **Log rotation**: 5 MB max per log, keeps 3 archives
 - **History tracking**: `BootUpdateCycle.history.json` stores last 50 cycle summaries with package counts
 - **Completion notifications**: BurntToast toast (user mode) and Windows Event Log (Application log, source: `BootUpdateCycle`)
-- **Reboot warnings**: `shutdown.exe /r /t 120` with native Windows countdown dialog; users can abort with `shutdown /a`
+- **Reboot warnings**: `shutdown.exe /g /t 120` with native Windows countdown dialog; users can abort with `shutdown /a`. `/g` leverages ARSO (Automatic Restart Sign-On) to sign the user back in and restart registered apps where supported — no stored password; degrades to a plain restart otherwise
+- **Pending-reboot detail**: `Test-PendingReboot` logs WHY each signal is pending (e.g. FileRename op count + sample paths) and warns when consecutive reboots are driven by the identical signal set (stale-signal loop indicator)
+- **WU self-healing**: 2+ consecutive Windows Update failures (sidecar-file streak, survives reboots) trigger a one-per-streak component reset (SoftwareDistribution/catroot2 rename); DISM left manual
+- **WU prefetch**: Windows Update scan+download runs as a background job during Winget/Chocolatey; install stays sequential and collects the prefetch first
 - **DirectFirstRun mode** (default): First run executes in user console for user-scope winget access; task registered only if reboot needed
 
 ## Conventions

@@ -142,7 +142,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 3 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.14' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.15' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 
 <# Force UTF-8 console I/O so box-drawing/block chars (BBS splash) render in cmd.exe regardless of system code page.
    chcp 65001 sets conhost interpretation; [Console]::OutputEncoding makes .NET write proper UTF-8 bytes. #>
@@ -239,6 +239,7 @@ function New-BootUpdateStateV2 {
         ContainersDone        = $false
         LastPreflightNetworkOk = $null
         LastPreflightNetworkAt = $null
+        LastRebootSignals     = $null
         Summary               = [pscustomobject]@{
             Winget = 0; Chocolatey = 0; WindowsUpdate = 0; Pip = 0; Npm = 0; Office365 = 0
             PowerShellModules = 0; Scoop = 0; DotnetTools = 0; Vscode = 0
@@ -282,7 +283,7 @@ function Update-BootUpdateStateSchema {
 
     $props = $State.PSObject.Properties.Name
     <# Add-if-missing: crash recovery, new phase flags, network-check cache #>
-    foreach ($f in @('LastPhaseStarted','LastPhaseTimestamp','StagedNextPhase','LastPreflightNetworkOk','LastPreflightNetworkAt')) {
+    foreach ($f in @('LastPhaseStarted','LastPhaseTimestamp','StagedNextPhase','LastPreflightNetworkOk','LastPreflightNetworkAt','LastRebootSignals')) {
         if ($props -notcontains $f) { $State | Add-Member -NotePropertyName $f -NotePropertyValue $null -Force }
     }
     foreach ($f in @('WindowsUpdateDone','AwsToolingDone','PowerShellModulesDone','ScoopDone','DotnetToolsDone','VscodeDone','DefenderDone','DriverFirmwareDone','WslDone','ContainersDone')) {
@@ -651,36 +652,48 @@ function New-SystemRestorePoint {
 #region Pending Reboot Detection
 function Test-PendingReboot {
     <# Comprehensive pending-reboot detection based on Boxstarter/Brian Wilhite's
-       Get-PendingReboot approach.  Checks every OS-level signal that a reboot is needed. #>
-    $tests = @(
-        @{ Name = 'CBS'; Test = {
-            Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
-        }},
-        @{ Name = 'WU'; Test = {
-            Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
-        }},
-        @{ Name = 'FileRename'; Test = {
-            $val = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name 'PendingFileRenameOperations' -EA Ignore
-            $val -and $val.PendingFileRenameOperations.Count -gt 0
-        }},
-        @{ Name = 'ComputerRename'; Test = {
-            $r = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName' -EA Ignore
-            $a = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ActiveComputerName' -EA Ignore
-            $r -and $a -and $r.ComputerName -ne $a.ComputerName
-        }},
-        @{ Name = 'JoinDomain'; Test = {
-            (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon' -Name 'JoinDomain' -EA Ignore) -or
-            (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon' -Name 'AvoidSpnSet' -EA Ignore)
-        }},
-        @{ Name = 'SCCM'; Test = {
-            try {
-                $ccm = Invoke-CimMethod -Namespace 'root\ccm\ClientSDK' -ClassName 'CCM_ClientUtilities' `
-                    -MethodName 'DetermineIfRebootPending' -EA Stop
-                $ccm -and ($ccm.ReturnValue -eq 0) -and ($ccm.IsHardRebootPending -or $ccm.RebootPending)
-            } catch { $false }  <# SCCM client not installed — expected on most workstations #>
-        }}
-    )
-    @($tests | ForEach-Object { if (& $_.Test) { [pscustomobject]@{ Source = $_.Name; Status = 'Pending' } } })
+       Get-PendingReboot approach.  Checks every OS-level signal that a reboot is
+       needed and reports per-signal detail (the "why") so stale signals — the
+       classic cause of reboot loops — are diagnosable straight from the log. #>
+    $results = [System.Collections.Generic.List[object]]::new()
+    $report = { param($Source, $Detail) $results.Add([pscustomobject]@{ Source = $Source; Status = 'Pending'; Detail = $Detail }) }
+
+    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') {
+        & $report 'CBS' 'Component Based Servicing: RebootPending key present'
+    }
+    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\PackagesPending') {
+        & $report 'CBS-Packages' 'Component Based Servicing: PackagesPending key present (servicing stack has staged packages)'
+    }
+    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') {
+        & $report 'WU' 'Windows Update: RebootRequired key present'
+    }
+    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\PostRebootReporting') {
+        & $report 'WU-PostReboot' 'Windows Update: PostRebootReporting key present (WU wants a post-reboot report pass)'
+    }
+    $val = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name 'PendingFileRenameOperations' -EA Ignore
+    if ($val -and $val.PendingFileRenameOperations.Count -gt 0) {
+        $entries = @($val.PendingFileRenameOperations | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        $sample = @($entries | Select-Object -First 3 | ForEach-Object { $_ -replace '^[!*\d]*\\\?\?\\', '' })
+        & $report 'FileRename' "$($entries.Count) pending file rename op(s); e.g. $($sample -join '; ')"
+    }
+    $r = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName' -EA Ignore
+    $a = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ActiveComputerName' -EA Ignore
+    if ($r -and $a -and $r.ComputerName -ne $a.ComputerName) {
+        & $report 'ComputerRename' "active '$($a.ComputerName)' -> pending '$($r.ComputerName)'"
+    }
+    if ((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon' -Name 'JoinDomain' -EA Ignore) -or
+        (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon' -Name 'AvoidSpnSet' -EA Ignore)) {
+        & $report 'JoinDomain' 'Netlogon JoinDomain/AvoidSpnSet value present (pending domain join)'
+    }
+    try {
+        $ccm = Invoke-CimMethod -Namespace 'root\ccm\ClientSDK' -ClassName 'CCM_ClientUtilities' `
+            -MethodName 'DetermineIfRebootPending' -EA Stop
+        if ($ccm -and ($ccm.ReturnValue -eq 0) -and ($ccm.IsHardRebootPending -or $ccm.RebootPending)) {
+            & $report 'SCCM' "CCM client: hard=$($ccm.IsHardRebootPending) soft=$($ccm.RebootPending)"
+        }
+    } catch { }  <# SCCM client not installed — expected on most workstations #>
+
+    return @($results)
 }
 #endregion
 
@@ -1126,6 +1139,33 @@ function Update-ChocolateyPackages {
     return @{ Success = $true; Count = $count }
 }
 
+function Repair-WindowsUpdateComponents {
+    <#
+    .SYNOPSIS
+        Standard Windows Update component reset: stop WU services, rename
+        SoftwareDistribution and catroot2, restart services.
+    .NOTES
+        Escalation remedy — invoked only after repeated consecutive WU phase
+        failures (see Install-WindowsUpdates). DISM /RestoreHealth is deliberately
+        NOT run automatically (can take 30+ min); the log says so if failures persist.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param()
+    Write-Log 'WU remediation: resetting Windows Update components (SoftwareDistribution / catroot2)...' -Level Warn
+    if (-not $PSCmdlet.ShouldProcess('Windows Update components', 'Stop services, rename SoftwareDistribution/catroot2, restart')) { return }
+    $svcs = @('wuauserv', 'cryptsvc', 'bits', 'msiserver')
+    foreach ($s in $svcs) { try { Stop-Service $s -Force -ErrorAction SilentlyContinue } catch { } }
+    $stamp = Get-Date -Format 'yyyyMMddHHmmss'
+    foreach ($dir in @("$env:windir\SoftwareDistribution", "$env:windir\System32\catroot2")) {
+        if (Test-Path $dir) {
+            try { Rename-Item $dir "$dir.$stamp.bak" -ErrorAction Stop; Write-Log "  renamed: $dir -> $dir.$stamp.bak" }
+            catch { Write-Log "  could not rename ${dir}: $_" -Level Warn }
+        }
+    }
+    foreach ($s in $svcs) { try { Start-Service $s -ErrorAction SilentlyContinue } catch { } }
+    Write-Log 'WU remediation: component reset complete. If failures persist, run DISM /Online /Cleanup-Image /RestoreHealth manually.'
+}
+
 function Install-WindowsUpdates {
     [CmdletBinding(SupportsShouldProcess)]
     param()
@@ -1134,6 +1174,36 @@ function Install-WindowsUpdates {
         Install-Module PSWindowsUpdate -Force -Scope AllUsers -AllowClobber
     }
     Import-Module PSWindowsUpdate -Force
+
+    <# Consecutive-failure streak persists across reboots in a sidecar file (no state
+       schema change). At 2+ consecutive failures, run the component reset once per
+       streak; a successful pass clears both the streak and the remediated marker. #>
+    $streakPath = Join-Path (Split-Path $script:StatePath) 'BootUpdateCycle.wu-failstreak.txt'
+    $remediatedMarker = "$streakPath.remediated"
+    $streak = 0
+    if (Test-Path $streakPath) { try { $streak = [int](Get-Content $streakPath -ErrorAction Stop) } catch { $streak = 0 } }
+    if ($streak -ge 2 -and -not (Test-Path $remediatedMarker)) {
+        Write-Log "Windows Update has failed $streak consecutive time(s) — escalating to component reset." -Level Warn
+        Repair-WindowsUpdateComponents
+        if (-not $WhatIfPreference) { New-Item -ItemType File -Path $remediatedMarker -Force | Out-Null }
+    }
+
+    <# Collect the background prefetch job (2uj) before installing, if one is running #>
+    if ($script:WuPrefetchJob) {
+        Write-Log 'Waiting for background Windows Update download to finish...'
+        $done = Wait-Job $script:WuPrefetchJob -Timeout ($script:PackageTimeoutMinutes * 60)
+        if ($done) {
+            $dlLines = @(Receive-Job $script:WuPrefetchJob -ErrorAction SilentlyContinue)
+            $dlCount = @($dlLines | Where-Object { $_ -match 'Downloaded' }).Count
+            Write-Log "Windows Update prefetch: complete ($dlCount downloaded while other phases ran)."
+        } else {
+            Write-Log 'Windows Update prefetch still running at install time — stopping it and proceeding.' -Level Warn
+            Stop-Job $script:WuPrefetchJob -ErrorAction SilentlyContinue
+        }
+        Remove-Job $script:WuPrefetchJob -Force -ErrorAction SilentlyContinue
+        $script:WuPrefetchJob = $null
+    }
+
     Write-Log 'Checking for Windows Updates (excluding SQL Server)...'
     $params = @{
         AcceptAll = $true; Install = $true; NotTitle = ((@('SQL') + ($script:ExcludePatterns | ForEach-Object { [regex]::Escape($_) })) -join '|')
@@ -1141,6 +1211,7 @@ function Install-WindowsUpdates {
         AutoReboot = $false; Confirm = $false; IgnoreReboot = $true
     }
     $count = 0
+    $failed = $false
     if ($PSCmdlet.ShouldProcess('Windows Update', 'Install available updates')) {
         try {
             Get-WindowsUpdate @params -Verbose 4>&1 | ForEach-Object {
@@ -1149,7 +1220,17 @@ function Install-WindowsUpdates {
                 if ($_ -match 'Installed|Downloaded') { $count++ }
                 Write-Log $line
             }
-        } catch { Write-Log "Windows Update error: $_" -Level Error }
+        } catch { $failed = $true; Write-Log "Windows Update error: $_" -Level Error }
+
+        <# Update the failure streak (skipped in WhatIf — no real attempt was made) #>
+        try {
+            if ($failed) {
+                Set-Content -Path $streakPath -Value ([string]($streak + 1)) -Force
+                Write-Log "Windows Update failure streak: $($streak + 1)." -Level Warn
+            } else {
+                Remove-Item $streakPath, $remediatedMarker -Force -ErrorAction SilentlyContinue
+            }
+        } catch { }
     } else {
         Write-Log '  [WHATIF] Would run: Get-WindowsUpdate (install all, exclude SQL)'
     }
@@ -2852,8 +2933,32 @@ function Invoke-BootUpdateCycle {
     Invoke-Hook -Path $script:PreCycleScript -HookName 'PreCycle'
 
     $pending = Test-PendingReboot
-    if ($pending) { $pending | ForEach-Object { Write-Log "Pending reboot: $($_.Source)" -Level Warn } }
+    if ($pending) { $pending | ForEach-Object { Write-Log "Pending reboot: $($_.Source) — $($_.Detail)" -Level Warn } }
     else { Write-Log 'No pending reboots at start of iteration' }
+
+    <# ── Windows Update prefetch (2uj): scan + DOWNLOAD in a background child process
+       while Winget/Chocolatey run. Downloads ride BITS — no msiexec/CBS contention.
+       The INSTALL step stays in the sequential chain; Install-WindowsUpdates collects
+       this job before installing. Skipped when: staged rollout (WU may not run this
+       boot), WhatIf, WU already done, or PSWindowsUpdate not yet installed (the module
+       install belongs to the WU phase — no racing it from here). #>
+    $script:WuPrefetchJob = $null
+    if (-not $script:StagedRollout -and -not $WhatIfPreference -and -not $state.WindowsUpdateDone -and (Get-Module -ListAvailable PSWindowsUpdate)) {
+        try {
+            $prefetchNotTitle = ((@('SQL') + ($script:ExcludePatterns | ForEach-Object { [regex]::Escape($_) })) -join '|')
+            $script:WuPrefetchJob = Start-Job -ScriptBlock {
+                param($NotTitle)
+                Import-Module PSWindowsUpdate -Force
+                Get-WindowsUpdate -AcceptAll -Download -NotTitle $NotTitle `
+                    -RootCategories @('Security Updates','Critical Updates','Definition Updates') `
+                    -IgnoreReboot -Confirm:$false 2>&1 | ForEach-Object { $_.ToString() }
+            } -ArgumentList $prefetchNotTitle
+            Write-Log 'Windows Update prefetch: scan + download started in background (install stays sequential).'
+        } catch {
+            Write-Log "Windows Update prefetch failed to start (non-fatal): $_" -Level Warn
+            $script:WuPrefetchJob = $null
+        }
+    }
 
     <# System restore point — first iteration only; skipped on SYSTEM, Server SKUs, -SkipRestorePoint, or WhatIf #>
     if ($isFirstIteration) {
@@ -3405,7 +3510,17 @@ function Invoke-BootUpdateCycle {
     $pending = if ($WhatIfPreference) { @() } else { Test-PendingReboot }
     if ($pending) {
         Write-Log 'Pending reboot after updates: YES' -Level Warn
-        $pending | ForEach-Object { Write-Log "  - $($_.Source)" -Level Warn }
+        $pending | ForEach-Object { Write-Log "  - $($_.Source): $($_.Detail)" -Level Warn }
+
+        <# Stale-signal loop visibility: if this reboot is driven by exactly the same
+           signal set as the previous one, say so — PendingFileRenameOperations in
+           particular can be perpetually repopulated by AV/installers and is the
+           classic cause of running to the max-iterations backstop. #>
+        $signalKey = (($pending | ForEach-Object { $_.Source } | Sort-Object) -join ',')
+        if ($state.LastRebootSignals -and $signalKey -eq $state.LastRebootSignals) {
+            Write-Log "Same reboot-signal set as the previous reboot ($signalKey). If this repeats to the max-iterations limit, one of these signals is likely stale or perpetually repopulated — see the per-signal detail above." -Level Warn
+        }
+        $state.LastRebootSignals = $signalKey
 
         <# Reset phase Done flags for next iteration.
            Staged mode: reset ONLY the current phase's flag — completed phases are not re-run
@@ -3446,9 +3561,14 @@ function Invoke-BootUpdateCycle {
 
             Suspend-BitLockerForReboot
             $shutdownComment = 'Boot Update Cycle: Applying updates (forced reboot).'
-            Write-Log "Initiating forced shutdown /r /f /t $($script:RebootDelaySec)"
+            <# /g instead of /r: leverages Windows ARSO (Automatic Restart Sign-On) —
+               winlogon signs the last interactive user back in after the reboot and
+               restarts registered apps, with NO stored password. Where ARSO is
+               unavailable (domain policy DisableAutomaticRestartSignOn, some SKUs)
+               /g degrades gracefully to a plain restart. Abort still works: shutdown /a #>
+            Write-Log "Initiating forced shutdown /g /f /t $($script:RebootDelaySec) (ARSO restart — signs user back in where supported)"
             if ($PSCmdlet.ShouldProcess('Windows', 'Restart computer')) {
-                & shutdown.exe /r /f /t $script:RebootDelaySec /c "$shutdownComment" /d p:2:17
+                & shutdown.exe /g /f /t $script:RebootDelaySec /c "$shutdownComment" /d p:2:17
                 Write-Log 'Shutdown scheduled. Exiting; will resume after reboot.'
                 exit 0
             }

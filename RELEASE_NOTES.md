@@ -1,8 +1,26 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.14
+**Current Version:** v2.5.15
 **Release Date:** 2026-07-06
 **Status:** STABLE
+
+---
+
+## v2.5.15 (2026-07-06)
+
+**Reboot-loop diagnosability, WU self-healing, WU prefetch, ARSO restart.**
+
+### Changes
+
+- **Per-signal pending-reboot detail (juw):** `Test-PendingReboot` now reports WHY each signal is pending (FileRename count + sample paths, active→pending computer name, CCM hard/soft flags) and adds two signals: CBS `PackagesPending` and WU `PostRebootReporting`. If a reboot is driven by the exact same signal set as the previous reboot, the log calls out a likely stale/perpetually-repopulated signal (the classic `PendingFileRenameOperations` loop).
+- **WU remediation escalation (gxo):** after 2+ consecutive Windows Update phase failures (streak survives reboots via a sidecar file), the standard component reset runs once per streak — stop wuauserv/cryptsvc/bits/msiserver, rename SoftwareDistribution + catroot2, restart. DISM /RestoreHealth is deliberately left manual.
+- **WU download prefetch (2uj):** Windows Update scan+download starts as a background child process right after the pending-reboot check and runs while Winget/Chocolatey execute (BITS downloads — no msiexec/CBS contention). The install step stays sequential and collects the prefetch first. Skipped in staged rollout/WhatIf/module-missing cases.
+- **ARSO restart:** reboots now use `shutdown /g` instead of `/r` — Windows Automatic Restart Sign-On signs the last interactive user back in and restarts registered apps, with no stored password. Degrades gracefully to a plain restart where ARSO is unavailable. `shutdown /a` still aborts.
+- State gains `LastRebootSignals` (add-if-missing migration; no schema version bump).
+
+### Compatibility
+
+- No parameter changes. Drop-in replacement for v2.5.14.
 
 ---
 
