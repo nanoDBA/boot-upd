@@ -141,7 +141,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 3 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.7' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.8' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 
 <# Force UTF-8 console I/O so box-drawing/block chars (BBS splash) render in cmd.exe regardless of system code page.
    chcp 65001 sets conhost interpretation; [Console]::OutputEncoding makes .NET write proper UTF-8 bytes. #>
@@ -2241,7 +2241,7 @@ function Show-StartupArt {
 
     Write-Host ""
     Write-Host '  .:' -NoNewline -ForegroundColor DarkGray
-    Write-Host ('=' * 60) -NoNewline -ForegroundColor Cyan
+    Write-Host ('=' * 66) -NoNewline -ForegroundColor Cyan
     Write-Host ':.' -ForegroundColor DarkGray
     Write-Host '  :: ' -NoNewline -ForegroundColor DarkGray
     Write-Host 'BOOT UPDATE CYCLE' -NoNewline -ForegroundColor Magenta
@@ -2250,13 +2250,78 @@ function Show-StartupArt {
     Write-Host ' // ' -NoNewline -ForegroundColor DarkGray
     Write-Host "v$($script:BootUpdateCycleVersion)" -ForegroundColor Yellow
     Write-Host '  ::' -ForegroundColor DarkGray
-    Write-CellRow 'CCCC..MMMM..MMMM..WWWWW'
-    Write-CellRow 'CBBCC.MBBBM.MBBBM...W..'
-    Write-CellRow 'CBBCC.MBBBM.MBBBM...W..'
-    Write-CellRow 'CCCC..MBBBM.MBBBM...W..'
-    Write-CellRow 'CBBCC.MBBBM.MBBBM...W..'
-    Write-CellRow 'CBBCC.MBBBM.MBBBM...W..'
-    Write-CellRow 'CCCC..MMMM..MMMM....W..'
+
+    <# 24-bit VT gradient wordmark where supported (Win10 1703+/Win11 conhost and
+       Windows Terminal). Still spaces + background color only — no Unicode glyphs —
+       so the cmd.exe glyph-drop failure mode from pre-2.5.6 cannot recur. Legacy
+       consoles (Server 2016, no VT) fall back to the 16-color block wordmark. #>
+    $vtOk = $false
+    try {
+        $vtOk = $Host.UI.SupportsVirtualTerminal -and ([System.Environment]::OSVersion.Version.Build -ge 15063)
+    } catch { }
+
+    if ($vtOk) {
+        $e = [char]27
+        <# Per-letter neon gradients (top-left -> bottom-right), echoing the demoscene
+           palette: cyan B, magenta O, blue/violet O, acid-green T. #>
+        $letters = @(
+            @{ W = 7; From = @(80,255,230);  To = @(0,140,190);  Rows = @('#######','##...##','##...##','######.','##...##','##...##','##...##','#######') }
+            @{ W = 7; From = @(255,90,205);  To = @(175,0,115);  Rows = @('.#####.','##...##','##...##','##...##','##...##','##...##','##...##','.#####.') }
+            @{ W = 7; From = @(95,115,255);  To = @(155,60,255); Rows = @('.#####.','##...##','##...##','##...##','##...##','##...##','##...##','.#####.') }
+            @{ W = 7; From = @(75,255,145);  To = @(190,255,70); Rows = @('#######','#######','..###..','..###..','..###..','..###..','..###..','..###..') }
+        )
+        for ($row = 0; $row -lt 8; $row++) {
+            $sb = [System.Text.StringBuilder]::new()
+            [void]$sb.Append("$e[90m  ::$e[0m   ")
+            for ($li = 0; $li -lt $letters.Count; $li++) {
+                $L = $letters[$li]
+                $bits = $L.Rows[$row]
+                for ($col = 0; $col -lt $L.W; $col++) {
+                    if ($bits[$col] -eq '#') {
+                        <# Diagonal gradient + CRT scanline (odd rows dimmer) + deterministic dither #>
+                        $t = ($row / 7.0) * 0.72 + ($col / [double]($L.W - 1)) * 0.28
+                        $shade = if ($row % 2 -eq 1) { 0.78 } else { 1.0 }
+                        $shade *= 1.0 + ((($row * 31 + $col * 17 + $li * 7) % 7) - 3) * 0.02
+                        $rgb = for ($k = 0; $k -lt 3; $k++) {
+                            [int][Math]::Max(0, [Math]::Min(255, ($L.From[$k] + ($L.To[$k] - $L.From[$k]) * $t) * $shade))
+                        }
+                        [void]$sb.Append("$e[48;2;$($rgb[0]);$($rgb[1]);$($rgb[2])m  ")
+                    } else {
+                        [void]$sb.Append("$e[0m  ")
+                    }
+                }
+                [void]$sb.Append("$e[0m  ")
+            }
+            [void]$sb.Append("$e[0m")
+            Write-Host $sb.ToString()
+        }
+        <# Phosphor reflection: dim echo of each letter's bottom row #>
+        $sb = [System.Text.StringBuilder]::new()
+        [void]$sb.Append("$e[90m  ::$e[0m   ")
+        for ($li = 0; $li -lt $letters.Count; $li++) {
+            $L = $letters[$li]
+            $bits = $L.Rows[7]
+            for ($col = 0; $col -lt $L.W; $col++) {
+                if ($bits[$col] -eq '#') {
+                    $rgb = for ($k = 0; $k -lt 3; $k++) { [int]($L.To[$k] * 0.16) }
+                    [void]$sb.Append("$e[48;2;$($rgb[0]);$($rgb[1]);$($rgb[2])m  ")
+                } else {
+                    [void]$sb.Append("$e[0m  ")
+                }
+            }
+            [void]$sb.Append("$e[0m  ")
+        }
+        [void]$sb.Append("$e[0m")
+        Write-Host $sb.ToString()
+    } else {
+        Write-CellRow 'CCCC..MMMM..MMMM..WWWWW'
+        Write-CellRow 'CBBCC.MBBBM.MBBBM...W..'
+        Write-CellRow 'CBBCC.MBBBM.MBBBM...W..'
+        Write-CellRow 'CCCC..MBBBM.MBBBM...W..'
+        Write-CellRow 'CBBCC.MBBBM.MBBBM...W..'
+        Write-CellRow 'CBBCC.MBBBM.MBBBM...W..'
+        Write-CellRow 'CCCC..MMMM..MMMM....W..'
+    }
     Write-Host '  ::' -ForegroundColor DarkGray
     Write-Host '  :: ' -NoNewline -ForegroundColor DarkGray
     Write-Host '[sysop]' -NoNewline -ForegroundColor Green
@@ -2264,7 +2329,7 @@ function Show-StartupArt {
     Write-Host '[carrier]' -NoNewline -ForegroundColor Green
     Write-Host ' updates you can sleep through' -ForegroundColor Magenta
     Write-Host "  '::" -NoNewline -ForegroundColor DarkGray
-    Write-Host ('=' * 60) -NoNewline -ForegroundColor Cyan
+    Write-Host ('=' * 66) -NoNewline -ForegroundColor Cyan
     Write-Host "::'" -ForegroundColor DarkGray
     Write-Host ""
 }

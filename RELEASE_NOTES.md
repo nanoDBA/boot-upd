@@ -1,8 +1,20 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.7
+**Current Version:** v2.5.8
 **Release Date:** 2026-07-06
 **Status:** STABLE
+
+---
+
+## v2.5.8 (2026-07-06)
+
+**Neon gradient splash.** The BOOT wordmark now renders as 24-bit ANSI/VT gradient cells — per-letter demoscene gradients (cyan B, magenta O, blue/violet O, acid-green T), CRT scanlines (odd rows dimmed), deterministic dither, and a phosphor reflection row under the letters. The BBS frame, sysop/carrier tagline, and metadata header are unchanged.
+
+### Compatibility
+
+- Still spaces + background color only — no Unicode glyphs — so the pre-2.5.6 cmd.exe glyph-drop failure mode cannot recur.
+- Consoles without VT truecolor (Server 2016, pre-Win10 1703) automatically fall back to the v2.5.6 16-color block wordmark.
+- No parameter or schema changes. Drop-in replacement for v2.5.7.
 
 ---
 
