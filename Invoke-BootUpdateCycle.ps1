@@ -141,7 +141,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 3 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.8' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.9' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 
 <# Force UTF-8 console I/O so box-drawing/block chars (BBS splash) render in cmd.exe regardless of system code page.
    chcp 65001 sets conhost interpretation; [Console]::OutputEncoding makes .NET write proper UTF-8 bytes. #>
@@ -2260,7 +2260,16 @@ function Show-StartupArt {
         $vtOk = $Host.UI.SupportsVirtualTerminal -and ([System.Environment]::OSVersion.Version.Build -ge 15063)
     } catch { }
 
+    <# Theme rotation: each run cycles through splash variants (0 = neon gradient,
+       1 = bright-rim outline with dithered fill, 2 = classic 16-color blocks).
+       Pin one with BOOT_UPDATE_SPLASH_THEME=0|1|2. Non-VT consoles always get 2. #>
+    $theme = 2
     if ($vtOk) {
+        if ($env:BOOT_UPDATE_SPLASH_THEME -match '^[0-2]$') { $theme = [int]$env:BOOT_UPDATE_SPLASH_THEME }
+        else { $theme = [int](([datetimeoffset](Get-Date)).ToUnixTimeSeconds() % 3) }
+    }
+
+    if ($theme -le 1) {
         $e = [char]27
         <# Per-letter neon gradients (top-left -> bottom-right), echoing the demoscene
            palette: cyan B, magenta O, blue/violet O, acid-green T. #>
@@ -2270,20 +2279,50 @@ function Show-StartupArt {
             @{ W = 7; From = @(95,115,255);  To = @(155,60,255); Rows = @('.#####.','##...##','##...##','##...##','##...##','##...##','##...##','.#####.') }
             @{ W = 7; From = @(75,255,145);  To = @(190,255,70); Rows = @('#######','#######','..###..','..###..','..###..','..###..','..###..','..###..') }
         )
+        <# Glitch-confetti gutter cell: deterministic sparse colored cells flanking
+           the wordmark (demoscene side-column noise). Returns a 2-char cell. #>
+        $confetti = {
+            param([int]$Seed)
+            $h = $Seed % 11
+            if ($h -lt (3 + $theme * 2)) {
+                $c = $letters[$Seed % 4].To
+                $dim = 0.22 + $h * 0.07
+                "$e[48;2;$([int]($c[0]*$dim));$([int]($c[1]*$dim));$([int]($c[2]*$dim))m  $e[0m"
+            } else { '  ' }
+        }
+
         for ($row = 0; $row -lt 8; $row++) {
             $sb = [System.Text.StringBuilder]::new()
-            [void]$sb.Append("$e[90m  ::$e[0m   ")
+            [void]$sb.Append("$e[90m  ::$e[0m ")
+            [void]$sb.Append((& $confetti ($row * 53 + 7))).Append((& $confetti ($row * 31 + 2))).Append(' ')
             for ($li = 0; $li -lt $letters.Count; $li++) {
                 $L = $letters[$li]
                 $bits = $L.Rows[$row]
                 for ($col = 0; $col -lt $L.W; $col++) {
                     if ($bits[$col] -eq '#') {
-                        <# Diagonal gradient + CRT scanline (odd rows dimmer) + deterministic dither #>
-                        $t = ($row / 7.0) * 0.72 + ($col / [double]($L.W - 1)) * 0.28
-                        $shade = if ($row % 2 -eq 1) { 0.78 } else { 1.0 }
-                        $shade *= 1.0 + ((($row * 31 + $col * 17 + $li * 7) % 7) - 3) * 0.02
-                        $rgb = for ($k = 0; $k -lt 3; $k++) {
-                            [int][Math]::Max(0, [Math]::Min(255, ($L.From[$k] + ($L.To[$k] - $L.From[$k]) * $t) * $shade))
+                        if ($theme -eq 0) {
+                            <# Neon: diagonal gradient + CRT scanline (odd rows dimmer) + dither + bevel #>
+                            $t = ($row / 7.0) * 0.72 + ($col / [double]($L.W - 1)) * 0.28
+                            $shade = if ($row % 2 -eq 1) { 0.78 } else { 1.0 }
+                            $shade *= 1.0 + ((($row * 31 + $col * 17 + $li * 7) % 7) - 3) * 0.02
+                            if ($row -eq 0 -or $L.Rows[$row - 1][$col] -ne '#') { $shade *= 1.25 }
+                            elseif ($row -eq 7 -or $L.Rows[$row + 1][$col] -ne '#') { $shade *= 0.55 }
+                            $rgb = for ($k = 0; $k -lt 3; $k++) {
+                                [int][Math]::Max(0, [Math]::Min(255, ($L.From[$k] + ($L.To[$k] - $L.From[$k]) * $t) * $shade))
+                            }
+                        } else {
+                            <# Outline: full-brightness rim around every edge (including
+                               counter holes), dark checkerboard-dithered interior #>
+                            $edge = ($row -eq 0 -or $L.Rows[$row - 1][$col] -ne '#') -or
+                                    ($row -eq 7 -or $L.Rows[$row + 1][$col] -ne '#') -or
+                                    ($col -eq 0 -or $bits[$col - 1] -ne '#') -or
+                                    ($col -eq ($L.W - 1) -or $bits[$col + 1] -ne '#')
+                            if ($edge) {
+                                $rgb = $L.From
+                            } else {
+                                $dim = if ((($row + $col) % 2) -eq 0) { 0.42 } else { 0.26 }
+                                $rgb = for ($k = 0; $k -lt 3; $k++) { [int]($L.To[$k] * $dim) }
+                            }
                         }
                         [void]$sb.Append("$e[48;2;$($rgb[0]);$($rgb[1]);$($rgb[2])m  ")
                     } else {
@@ -2292,12 +2331,13 @@ function Show-StartupArt {
                 }
                 [void]$sb.Append("$e[0m  ")
             }
+            [void]$sb.Append((& $confetti ($row * 47 + 5))).Append((& $confetti ($row * 29 + 11)))
             [void]$sb.Append("$e[0m")
             Write-Host $sb.ToString()
         }
         <# Phosphor reflection: dim echo of each letter's bottom row #>
         $sb = [System.Text.StringBuilder]::new()
-        [void]$sb.Append("$e[90m  ::$e[0m   ")
+        [void]$sb.Append("$e[90m  ::$e[0m      ")
         for ($li = 0; $li -lt $letters.Count; $li++) {
             $L = $letters[$li]
             $bits = $L.Rows[7]
@@ -2328,6 +2368,14 @@ function Show-StartupArt {
     Write-Host ' update cycle   ' -NoNewline -ForegroundColor White
     Write-Host '[carrier]' -NoNewline -ForegroundColor Green
     Write-Host ' updates you can sleep through' -ForegroundColor Magenta
+    Write-Host '  :: ' -NoNewline -ForegroundColor DarkGray
+    Write-Host '[board]' -NoNewline -ForegroundColor Green
+    Write-Host ' nanoDBA/boot-upd' -NoNewline -ForegroundColor Cyan
+    Write-Host '        [motd]' -NoNewline -ForegroundColor Green
+    Write-Host ' run upd as admin, walk away' -ForegroundColor White
+    Write-Host '  :: ' -NoNewline -ForegroundColor DarkGray
+    Write-Host '[log]' -NoNewline -ForegroundColor Green
+    Write-Host "   $($script:LogPath)" -ForegroundColor DarkCyan
     Write-Host "  '::" -NoNewline -ForegroundColor DarkGray
     Write-Host ('=' * 66) -NoNewline -ForegroundColor Cyan
     Write-Host "::'" -ForegroundColor DarkGray

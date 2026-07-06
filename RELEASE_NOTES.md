@@ -1,8 +1,24 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.8
+**Current Version:** v2.5.9
 **Release Date:** 2026-07-06
 **Status:** STABLE
+
+---
+
+## v2.5.9 (2026-07-06)
+
+**Rotating splash themes.** Each run cycles through three wordmark variants: (0) neon gradient with scanlines/dither/bevel, (1) bright-rim outline with checkerboard-dithered fill and denser glitch confetti, (2) classic 16-color blocks. Pin one with `BOOT_UPDATE_SPLASH_THEME=0|1|2`.
+
+### Additions
+
+- Glitch-confetti gutters flanking the wordmark (deterministic, sparse colored cells in the letter palette).
+- Bevel on the neon theme: bright lip on top edges, dark shadow on bottom edges.
+- BBS-style metadata footer: `[board] nanoDBA/boot-upd`, `[motd]`, and `[log]` (live log path) lines under the sysop/carrier tagline.
+
+### Compatibility
+
+- Non-VT consoles always get the classic block theme. Still spaces + background color only. No parameter or schema changes.
 
 ---
 
