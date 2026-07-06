@@ -68,12 +68,15 @@ param(
     [string]$NotifyEmail      = '',   # SMTP recipient email address
     [string]$SmtpServer       = '',   # SMTP relay hostname (e.g., smtp.office365.com)
     [pscredential]$SmtpCredential = $null,  # SMTP credential (PSCredential object for authenticated relay)
-    [string[]]$ExcludePatterns = @(),  # Package name/ID patterns to skip (substring match, case-insensitive)
+    [string[]]$ExcludePatterns = @(),  # Package name/ID patterns to skip (substring, or wildcard if * / ? present; case-insensitive)
+    [string[]]$IncludePatterns = @(),  # Allowlist mode: when non-empty, ONLY matching packages update (winget/choco/pip filtered paths)
     [ValidateRange(-1, 23)]
     [int]$MaintenanceWindowStart = -1,  # Hour of day (0-23) when updates may begin. -1 = no window enforced.
     [ValidateRange(-1, 23)]
     [int]$MaintenanceWindowEnd   = -1,  # Hour of day when updates must stop. -1 = no window enforced.
     [switch]$AllowMetered,               # Allow updates on metered connections (cellular hotspot). Default: abort on metered.
+    [ValidateSet('Full','SuccessOnly','ErrorsOnly','None')]
+    [string]$NotificationLevel = 'Full', # Gate toast/webhook/email noise: Full | SuccessOnly | ErrorsOnly | None (event log always written)
     [string]$PreCycleScript  = '',       # Path to a .ps1 hook executed after pre-flight, before the first phase (74r)
     [string]$PostCycleScript = '',       # Path to a .ps1 hook executed after the final phase, before reboot decision (74r)
     [string]$HooksConfig     = (Join-Path $PSScriptRoot 'hooks.psd1'),  # Sidecar PSD1 with per-phase hook scriptblocks (b3w)
@@ -111,6 +114,8 @@ $script:SkipBitLocker         = $SkipBitLocker
 $script:StagedRollout         = $StagedRollout.IsPresent
 $script:BootUpdateMutex       = $null
 $script:ExcludePatterns       = $ExcludePatterns
+$script:IncludePatterns       = $IncludePatterns
+$script:NotificationLevel     = $NotificationLevel
 $script:WebhookUrl            = $WebhookUrl
 $script:NotifyEmail           = $NotifyEmail
 $script:SmtpServer            = $SmtpServer
@@ -142,7 +147,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 3 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.15' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.16' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 
 <# Force UTF-8 console I/O so box-drawing/block chars (BBS splash) render in cmd.exe regardless of system code page.
    chcp 65001 sets conhost interpretation; [Console]::OutputEncoding makes .NET write proper UTF-8 bytes. #>
@@ -649,6 +654,54 @@ function New-SystemRestorePoint {
 }
 #endregion
 
+#region Package Filtering
+function Test-PackageExcluded {
+    <#
+    .SYNOPSIS
+        Central exclude/include filter for package names/IDs.
+    .OUTPUTS
+        The reason string when the package should be SKIPPED, else $null.
+    .NOTES
+        ExcludePatterns: wildcard match (-like) when the pattern contains * or ?,
+        legacy case-insensitive substring otherwise. IncludePatterns (allowlist),
+        when non-empty, skips anything that matches no include pattern.
+    #>
+    param([Parameter(Mandatory)][string]$Name)
+    foreach ($pattern in $script:ExcludePatterns) {
+        if ($pattern -match '[\*\?]') {
+            if ($Name -like $pattern) { return "excluded by pattern '$pattern'" }
+        } elseif ($Name.IndexOf($pattern, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            return "excluded by pattern '$pattern'"
+        }
+    }
+    if ($script:IncludePatterns.Count -gt 0) {
+        foreach ($pattern in $script:IncludePatterns) {
+            if ($pattern -match '[\*\?]') {
+                if ($Name -like $pattern) { return $null }
+            } elseif ($Name.IndexOf($pattern, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                return $null
+            }
+        }
+        return 'not in IncludePatterns allowlist'
+    }
+    return $null
+}
+#endregion
+
+#region Notification Gating
+function Test-NotificationAllowed {
+    <# Gates BurntToast/webhook/email noise by -NotificationLevel. Windows Event Log
+       entries are NOT gated — they remain the always-on audit trail. #>
+    param([Parameter(Mandatory)][ValidateSet('Success','Error','Progress')][string]$Kind)
+    switch ($script:NotificationLevel) {
+        'None'        { return $false }
+        'ErrorsOnly'  { return ($Kind -eq 'Error') }
+        'SuccessOnly' { return ($Kind -eq 'Success') }
+        default       { return $true }
+    }
+}
+#endregion
+
 #region Pending Reboot Detection
 function Test-PendingReboot {
     <# Comprehensive pending-reboot detection based on Boxstarter/Brian Wilhite's
@@ -850,8 +903,8 @@ function Update-WingetPackages {
        parent thread after both jobs complete or the combined hard timeout fires.
        The filtered path (ExcludePatterns active) stays sequential — per-package iteration is
        order-sensitive and scopes cannot safely enumerate the same winget DB concurrently. #>
-    if ($script:ExcludePatterns.Count -eq 0 -and $scopes.Count -gt 1) {
-        Write-Log 'Winget: running user + machine scopes in parallel (no ExcludePatterns)'
+    if ($script:ExcludePatterns.Count -eq 0 -and $script:IncludePatterns.Count -eq 0 -and $scopes.Count -gt 1) {
+        Write-Log 'Winget: running user + machine scopes in parallel (no package filters)'
         if ($PSCmdlet.ShouldProcess('Winget (user + machine parallel)', 'Run Winget upgrades for both scopes concurrently')) {
             $hardTimeoutSec = $TimeoutMinutes * 60
 
@@ -946,8 +999,8 @@ function Update-WingetPackages {
         Write-Log "--- Winget upgrade (--scope $scope) ---"
         if ($PSCmdlet.ShouldProcess("Winget ($scope)", "Run Winget $scope-scope upgrades")) {
 
-            if ($script:ExcludePatterns.Count -eq 0) {
-                <# Fast path: no exclusions — use --all for best performance #>
+            if ($script:ExcludePatterns.Count -eq 0 -and $script:IncludePatterns.Count -eq 0) {
+                <# Fast path: no package filters — use --all for best performance #>
                 $result = Invoke-PackageManagerWithTimeout -Name "Winget-$scope" -ScriptBlock {
                     param($wp, $sc)
                     & $wp upgrade --all --scope $sc --accept-source-agreements --accept-package-agreements --disable-interactivity --no-vt 2>&1
@@ -1030,15 +1083,12 @@ function Update-WingetPackages {
                 }
                 Write-Log "Winget ($scope): $($packageIds.Count) package(s) available for upgrade"
 
-                <# Apply exclusion filter #>
+                <# Apply exclusion/allowlist filter #>
                 $toUpgrade = @()
                 foreach ($pkgId in $packageIds) {
-                    $matchedPattern = $null
-                    foreach ($pattern in $script:ExcludePatterns) {
-                        if ($pkgId.IndexOf($pattern, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { $matchedPattern = $pattern; break }
-                    }
-                    if ($matchedPattern) {
-                        Write-Log "Excluded by pattern '$matchedPattern': $pkgId" -Level Info
+                    $skipReason = Test-PackageExcluded -Name $pkgId
+                    if ($skipReason) {
+                        Write-Log "Skipped ($skipReason): $pkgId" -Level Info
                     } else {
                         $toUpgrade += $pkgId
                     }
@@ -1062,7 +1112,7 @@ function Update-WingetPackages {
             }
 
         } else {
-            if ($script:ExcludePatterns.Count -eq 0) {
+            if ($script:ExcludePatterns.Count -eq 0 -and $script:IncludePatterns.Count -eq 0) {
                 Write-Log "  [WHATIF] Would run: winget upgrade --all --scope $scope"
             } else {
                 Write-Log "  [WHATIF] Would run: winget list --upgrade-available --scope $scope, then upgrade each non-excluded package individually"
@@ -1082,8 +1132,8 @@ function Update-ChocolateyPackages {
     Write-Log 'Updating Chocolatey packages...'
     $count = 0
     if ($PSCmdlet.ShouldProcess('Chocolatey', 'Run choco upgrade all')) {
-        if ($script:ExcludePatterns.Count -eq 0) {
-            <# Fast path: no exclusions #>
+        if ($script:ExcludePatterns.Count -eq 0 -and $script:IncludePatterns.Count -eq 0) {
+            <# Fast path: no package filters #>
             & choco upgrade all -y --no-progress 2>&1 | ForEach-Object {
                 if ($_ -match 'upgraded (\d+)/\d+ package') { $count = [int]$Matches[1] }
                 Write-Log $_
@@ -1108,12 +1158,9 @@ function Update-ChocolateyPackages {
                 if ($line -notmatch '\|') { continue }
                 $pkgName = ($line -split '\|')[0].Trim()
                 if (-not $pkgName) { continue }
-                $matchedPattern = $null
-                foreach ($pattern in $script:ExcludePatterns) {
-                    if ($pkgName.IndexOf($pattern, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { $matchedPattern = $pattern; break }
-                }
-                if ($matchedPattern) {
-                    Write-Log "Excluded by pattern '$matchedPattern': $pkgName" -Level Info
+                $skipReason = Test-PackageExcluded -Name $pkgName
+                if ($skipReason) {
+                    Write-Log "Skipped ($skipReason): $pkgName" -Level Info
                 } else {
                     $toUpgrade += $pkgName
                 }
@@ -1129,7 +1176,7 @@ function Update-ChocolateyPackages {
             }
         }
     } else {
-        if ($script:ExcludePatterns.Count -eq 0) {
+        if ($script:ExcludePatterns.Count -eq 0 -and $script:IncludePatterns.Count -eq 0) {
             Write-Log '  [WHATIF] Would run: choco upgrade all -y --no-progress'
         } else {
             Write-Log '  [WHATIF] Would run: choco outdated --limit-output, then upgrade each non-excluded package individually'
@@ -1555,12 +1602,9 @@ function Update-PipPackages {
         & python -m pip install --upgrade pip 2>&1 | ForEach-Object { Write-Log $_ }
         $outdated = @(& pip list --outdated --format=json 2>$null | ConvertFrom-Json -EA SilentlyContinue)
         foreach ($pkg in $outdated) {
-            $matchedPattern = $null
-            foreach ($pattern in $script:ExcludePatterns) {
-                if ($pkg.name.IndexOf($pattern, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { $matchedPattern = $pattern; break }
-            }
-            if ($matchedPattern) {
-                Write-Log "Pip: skipping $($pkg.name) (excluded by pattern '$matchedPattern')"
+            $skipReason = Test-PackageExcluded -Name $pkg.name
+            if ($skipReason) {
+                Write-Log "Pip: skipping $($pkg.name) ($skipReason)"
                 continue
             }
             Write-Log "Upgrading: $($pkg.name)"
@@ -1970,11 +2014,29 @@ function Test-MaintenanceWindow {
 
 #region Task Management
 function Unregister-BootUpdateTask {
-    $taskName = 'BootUpdateCycle'
-    if (Get-ScheduledTask -TaskName $taskName -EA SilentlyContinue) {
-        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
-        Write-Log 'Scheduled task removed.'
+    foreach ($taskName in @('BootUpdateCycle', 'BootUpdateCycleFallback')) {
+        if (Get-ScheduledTask -TaskName $taskName -EA SilentlyContinue) {
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+            Write-Log "Scheduled task removed: $taskName"
+        }
     }
+}
+
+function Test-ArsoAvailable {
+    <# Best-effort check that Windows ARSO (Automatic Restart Sign-On) will sign the
+       current user back in after `shutdown /g`. No stored password involved — winlogon
+       handles the resume. Returns $false under SYSTEM (no interactive user to resume),
+       when the DisableAutomaticRestartSignOn policy is set, or when the user opted out
+       (Settings > Accounts > Sign-in options). #>
+    try {
+        $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+        if ($identity.User.Value -eq 'S-1-5-18') { return $false }
+        $pol = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -EA Ignore
+        if ($pol -and ($pol.PSObject.Properties.Name -contains 'DisableAutomaticRestartSignOn') -and ([int]$pol.DisableAutomaticRestartSignOn -eq 1)) { return $false }
+        $arso = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\UserARSO\$($identity.User.Value)" -EA Ignore
+        if ($arso -and ($arso.PSObject.Properties.Name -contains 'OptOut') -and ([int]$arso.OptOut -eq 1)) { return $false }
+        return $true
+    } catch { return $false }
 }
 
 function Register-BootUpdateTaskForReboot {
@@ -2014,14 +2076,44 @@ function Register-BootUpdateTaskForReboot {
         $patternStr = ($script:ExcludePatterns | ForEach-Object { "'$($_ -replace "'", "''")'" }) -join ','
         $taskArgs += "-ExcludePatterns @($patternStr)"
     }
+    if ($script:IncludePatterns.Count -gt 0) {
+        $patternStr = ($script:IncludePatterns | ForEach-Object { "'$($_ -replace "'", "''")'" }) -join ','
+        $taskArgs += "-IncludePatterns @($patternStr)"
+    }
+    if ($script:NotificationLevel -ne 'Full') { $taskArgs += "-NotificationLevel $($script:NotificationLevel)" }
     $argString = $taskArgs -join ' '
     $action   = New-ScheduledTaskAction -Execute $pwshPath -Argument $argString -WorkingDirectory $PSScriptRoot
-    $trigger  = New-ScheduledTaskTrigger -AtStartup
-    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 4)
-    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings `
-        -Description 'Boot update loop: patches everything, reboots until clean.' -Force | Out-Null
-    Write-Log "Scheduled task registered: $taskName (SYSTEM at startup)"
+
+    <# ARSO user-context resume (2ql): reboots use `shutdown /g`, so where ARSO is
+       available winlogon signs the user back in — the primary task then triggers at
+       that logon and runs in USER context, so user-scoped phases (winget user scope,
+       Scoop, VS Code, WSL, containers) run on EVERY iteration, not just the first.
+       A SYSTEM fallback task with a 3-minute startup delay covers the case where
+       ARSO does not sign the user in; the named mutex arbitrates if both fire
+       (second instance exits immediately) and phase Done-flags prevent double work.
+       Without ARSO, the single SYSTEM-at-startup task is registered as before. #>
+    if (Test-ArsoAvailable) {
+        $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+        $userTrigger   = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
+        $userPrincipal = New-ScheduledTaskPrincipal -UserId $currentUser -LogonType Interactive -RunLevel Highest
+        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $userTrigger -Principal $userPrincipal -Settings $settings `
+            -Description 'Boot update loop: patches everything, reboots until clean. (user context via ARSO)' -Force | Out-Null
+        Write-Log "Scheduled task registered: $taskName ($currentUser at logon — ARSO resume)"
+
+        $fbTrigger = New-ScheduledTaskTrigger -AtStartup
+        $fbTrigger.Delay = 'PT3M'
+        $fbPrincipal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+        Register-ScheduledTask -TaskName 'BootUpdateCycleFallback' -Action $action -Trigger $fbTrigger -Principal $fbPrincipal -Settings $settings `
+            -Description 'Boot update loop fallback: runs as SYSTEM if ARSO sign-on does not occur.' -Force | Out-Null
+        Write-Log 'Scheduled task registered: BootUpdateCycleFallback (SYSTEM at startup +3min, mutex-arbitrated)'
+    } else {
+        $trigger  = New-ScheduledTaskTrigger -AtStartup
+        $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings `
+            -Description 'Boot update loop: patches everything, reboots until clean.' -Force | Out-Null
+        Write-Log "Scheduled task registered: $taskName (SYSTEM at startup — ARSO unavailable)"
+    }
 }
 
 function Suspend-BitLockerForReboot {
@@ -2257,7 +2349,14 @@ function Send-EmailNotification {
 }
 
 function Send-CompletionNotification {
-    param([string]$Title, [string]$Message, [pscustomobject]$Data = $null)
+    param([string]$Title, [string]$Message, [pscustomobject]$Data = $null,
+          [ValidateSet('Success','Error','Progress')][string]$Kind = 'Success')
+    <# Event log is always written (audit trail); everything else honors -NotificationLevel #>
+    if (-not (Test-NotificationAllowed -Kind $Kind)) {
+        Write-EventLogEntry -EventId 1000 -Message "$Title`n$Message"
+        Write-Log "Notifications suppressed (NotificationLevel=$($script:NotificationLevel), kind=$Kind); event log entry written."
+        return
+    }
     Write-Log 'Sending completion notifications...'
     <# msg.exe broadcast #>
     try {
@@ -2288,8 +2387,10 @@ function Send-RebootWarning {
     param([int]$SecondsUntilReboot = 120)
     $msgFull = "Boot Update Cycle needs to reboot.`nReboot in: $SecondsUntilReboot seconds`nTo cancel: shutdown /a"
     Write-Log 'Sending reboot warnings...'
+    <# Toast is gated as Progress noise; the native shutdown countdown dialog and the
+       event log entry are NOT gated — the abort window must stay discoverable. #>
     $isSystem = ([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value -eq 'S-1-5-18')
-    if (-not $isSystem) {
+    if (-not $isSystem -and (Test-NotificationAllowed -Kind Progress)) {
         try { if (Get-Module -ListAvailable BurntToast) { Import-Module BurntToast -Force; New-BurntToastNotification -Text 'System Reboot Warning', $msgFull -AppLogo $null -Sound 'Alarm' } } catch { }
     }
     Write-EventLogEntry -EventId 1001 -EntryType Warning -Message $msgFull
@@ -2828,7 +2929,8 @@ function Apply-RemoteConfig {
     if ($null -eq $RemoteConfig) { return }
 
     $supportedKeys = @(
-        'ExcludePatterns', 'MaxIterations', 'RebootDelaySec', 'PackageTimeoutMinutes',
+        'ExcludePatterns', 'IncludePatterns', 'NotificationLevel',
+        'MaxIterations', 'RebootDelaySec', 'PackageTimeoutMinutes',
         'MaintenanceWindowStart', 'MaintenanceWindowEnd',
         'SkipPip', 'SkipNpm', 'SkipScoop', 'SkipDotnetTools', 'SkipVscode',
         'SkipPowerShellModules', 'SkipOffice365', 'SkipAwsTooling',
@@ -2920,6 +3022,7 @@ function Invoke-BootUpdateCycle {
     if ($state.Iteration -gt $MaxIterations) {
         Write-Log "Max iterations ($MaxIterations) exceeded. Stopping." -Level Error
         Write-EventLogEntry -EventId 1003 -EntryType Error -Message "Cycle stopped: exceeded $MaxIterations iterations.`nSession: $sessionId"
+        Send-CompletionNotification -Kind Error -Title 'Boot Update Cycle STOPPED' -Message "Exceeded $MaxIterations iterations with reboots still pending. Check $($script:LogPath) — a stale reboot signal is the usual cause."
         Invoke-Hook -Path $script:PostCycleScript -HookName 'PostCycle'
         if (-not $WhatIfPreference) { Unregister-BootUpdateTask; Clear-BootUpdateState }
         return
@@ -3161,7 +3264,23 @@ function Invoke-BootUpdateCycle {
                Write-Log is NOT called inside jobs — lines are collected and replayed by the parent. #>
 
             $pipSb = {
-                param($ExcludePatterns, $IsWhatIf)
+                param($ExcludePatterns, $IsWhatIf, $IncludePatterns = @())
+                <# Inline copy of Test-PackageExcluded semantics (isolated runspace) #>
+                $testExcluded = {
+                    param($Name)
+                    foreach ($p in $ExcludePatterns) {
+                        if ($p -match '[\*\?]') { if ($Name -like $p) { return "excluded by pattern '$p'" } }
+                        elseif ($Name.IndexOf($p, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { return "excluded by pattern '$p'" }
+                    }
+                    if (@($IncludePatterns).Count -gt 0) {
+                        foreach ($p in $IncludePatterns) {
+                            if ($p -match '[\*\?]') { if ($Name -like $p) { return $null } }
+                            elseif ($Name.IndexOf($p, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { return $null }
+                        }
+                        return 'not in IncludePatterns allowlist'
+                    }
+                    return $null
+                }
                 $log = [System.Collections.Generic.List[string]]::new()
                 $count = 0
                 $pip = Get-Command pip -ErrorAction SilentlyContinue
@@ -3175,11 +3294,8 @@ function Invoke-BootUpdateCycle {
                     & python -m pip install --upgrade pip 2>&1 | ForEach-Object { $log.Add($_.ToString()) }
                     $outdated = @(& pip list --outdated --format=json 2>$null | ConvertFrom-Json -ErrorAction SilentlyContinue)
                     foreach ($pkg in $outdated) {
-                        $matchedPattern = $null
-                        foreach ($pattern in $ExcludePatterns) {
-                            if ($pkg.name.IndexOf($pattern, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { $matchedPattern = $pattern; break }
-                        }
-                        if ($matchedPattern) { $log.Add("Pip: skipping $($pkg.name) (excluded by pattern '$matchedPattern')"); continue }
+                        $skipReason = & $testExcluded $pkg.name
+                        if ($skipReason) { $log.Add("Pip: skipping $($pkg.name) ($skipReason)"); continue }
                         $log.Add("Upgrading: $($pkg.name)")
                         & pip install --upgrade "$($pkg.name)" 2>&1 | ForEach-Object { $log.Add($_.ToString()) }
                         $count++
@@ -3425,7 +3541,7 @@ function Invoke-BootUpdateCycle {
             $cohortJobs = [System.Collections.Generic.List[object]]::new()
             foreach ($cp in $pendingCohort) {
                 $job = switch ($cp.Name) {
-                    'Pip'               { Start-ThreadJob -ScriptBlock $pipSb       -ArgumentList $cohortExcludePatterns, $cohortWhatIf }
+                    'Pip'               { Start-ThreadJob -ScriptBlock $pipSb       -ArgumentList $cohortExcludePatterns, $cohortWhatIf, $script:IncludePatterns }
                     'Npm'               { Start-ThreadJob -ScriptBlock $npmSb       -ArgumentList $cohortWhatIf }
                     'Scoop'             { Start-ThreadJob -ScriptBlock $scoopSb     -ArgumentList $cohortWhatIf }
                     'DotnetTools'       { Start-ThreadJob -ScriptBlock $dotnetSb    -ArgumentList $cohortWhatIf }
@@ -3547,10 +3663,12 @@ function Invoke-BootUpdateCycle {
             Send-RebootWarning -SecondsUntilReboot $script:RebootDelaySec
 
             <# Notify operators that a reboot is imminent (best-effort; never throws) #>
-            Send-WebhookNotification `
-                -Title   "Boot Update Cycle: Rebooting ($env:COMPUTERNAME)" `
-                -Message "Iteration $($state.Iteration) complete. Rebooting in $($script:RebootDelaySec)s to apply updates. Cycle will resume after boot." `
-                -Data    @{}
+            if (Test-NotificationAllowed -Kind Progress) {
+                Send-WebhookNotification `
+                    -Title   "Boot Update Cycle: Rebooting ($env:COMPUTERNAME)" `
+                    -Message "Iteration $($state.Iteration) complete. Rebooting in $($script:RebootDelaySec)s to apply updates. Cycle will resume after boot." `
+                    -Data    @{}
+            }
 
             <# Console: styled reboot banner #>
             Show-CycleBanner -Title 'R E B O O T I N G . . .' -AnsiColor "$([char]27)[33m" -Info @(

@@ -221,15 +221,16 @@ foreach ($companion in @('Repair-AwsTooling.ps1')) {
 $uninstallScript = @'
 #requires -RunAsAdministrator
 param([switch]$RemoveFolder)
-<# Uninstall: stops task, removes task. Use -RemoveFolder to also delete logs/history. #>
-$taskName = 'BootUpdateCycle'
-$task = Get-ScheduledTask -TaskName $taskName -EA SilentlyContinue
-if ($task) {
-    if ($task.State -eq 'Running') { Stop-ScheduledTask -TaskName $taskName; Write-Host "Task stopped." }
-    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
-    Write-Host "Task '$taskName' removed." -ForegroundColor Green
-} else {
-    Write-Host "Task '$taskName' not found." -ForegroundColor Yellow
+<# Uninstall: stops task, removes task (incl. ARSO fallback). Use -RemoveFolder to also delete logs/history. #>
+foreach ($taskName in @('BootUpdateCycle', 'BootUpdateCycleFallback')) {
+    $task = Get-ScheduledTask -TaskName $taskName -EA SilentlyContinue
+    if ($task) {
+        if ($task.State -eq 'Running') { Stop-ScheduledTask -TaskName $taskName; Write-Host "Task stopped: $taskName" }
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+        Write-Host "Task '$taskName' removed." -ForegroundColor Green
+    } else {
+        Write-Host "Task '$taskName' not found." -ForegroundColor Yellow
+    }
 }
 if ($RemoveFolder) {
     $targetDir = $PSScriptRoot
@@ -264,16 +265,18 @@ Write-Host "Deployed: $uninstallPath"
 #>
 $taskName = 'BootUpdateCycle'
 
-<# Stop and remove existing task from previous runs #>
-$existingTask = Get-ScheduledTask -TaskName $taskName -EA SilentlyContinue
-if ($existingTask) {
-    if ($existingTask.State -eq 'Running') {
-        Stop-ScheduledTask -TaskName $taskName
-        Write-Host "Stopped running task: $taskName" -ForegroundColor Yellow
-        Start-Sleep -Seconds 2
+<# Stop and remove existing tasks from previous runs (incl. ARSO fallback) #>
+foreach ($tn in @('BootUpdateCycle', 'BootUpdateCycleFallback')) {
+    $existingTask = Get-ScheduledTask -TaskName $tn -EA SilentlyContinue
+    if ($existingTask) {
+        if ($existingTask.State -eq 'Running') {
+            Stop-ScheduledTask -TaskName $tn
+            Write-Host "Stopped running task: $tn" -ForegroundColor Yellow
+            Start-Sleep -Seconds 2
+        }
+        Unregister-ScheduledTask -TaskName $tn -Confirm:$false
+        Write-Host "Removed existing task: $tn"
     }
-    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
-    Write-Host "Removed existing task: $taskName"
 }
 
 <# Reset state on re-deploy (fresh cycle) #>

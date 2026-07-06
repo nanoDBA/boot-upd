@@ -1,8 +1,36 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.15
+**Current Version:** v2.5.16
 **Release Date:** 2026-07-06
 **Status:** STABLE
+
+---
+
+## v2.5.16 (2026-07-06)
+
+**ARSO user-context resume + wildcard/allowlist filters + notification levels.**
+
+### ARSO user-context resume (2ql)
+
+Where Windows ARSO (Automatic Restart Sign-On) is available — not SYSTEM, `DisableAutomaticRestartSignOn` policy unset, user not opted out — the post-reboot task is now registered as the **user at logon** instead of SYSTEM at startup. Combined with v2.5.15's `shutdown /g`, the user is signed back in automatically and the cycle resumes in **user context**, so user-scoped phases (winget user scope, Scoop, VS Code extensions, WSL, containers) run on **every** iteration, not just the first. No password is ever stored — winlogon handles the resume.
+
+- Fallback: a `BootUpdateCycleFallback` SYSTEM task (startup + 3 min) covers the case where ARSO doesn't sign the user in; the named mutex arbitrates if both fire and phase flags prevent duplicate work.
+- Without ARSO, the classic single SYSTEM-at-startup task is registered as before.
+- `Uninstall.ps1`, re-deploys, and self-destruct remove both tasks.
+
+### Package filters (6sh, from Winget-AutoUpdate)
+
+- `ExcludePatterns` now supports wildcards (`Mozilla.Firefox*`, `*.Beta`) alongside legacy substrings.
+- New `-IncludePatterns` allowlist mode: when non-empty, ONLY matching packages update (winget/choco/pip filtered paths; exclude wins over include).
+- Both flow through remote config (`ConfigUrl`) and the post-reboot task arguments.
+
+### Notification levels (6sh)
+
+New `-NotificationLevel Full|SuccessOnly|ErrorsOnly|None` gates toast/webhook/email/msg.exe noise. Event log entries and the native shutdown countdown are never gated. Max-iterations exit now sends an Error-kind notification (visible under `ErrorsOnly`).
+
+### Compatibility
+
+- New optional parameters only. Drop-in replacement for v2.5.15.
 
 ---
 

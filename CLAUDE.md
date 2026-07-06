@@ -94,6 +94,8 @@ Remove-Item "$env:ProgramData\BootUpdateCycle" -Recurse -Force
 - **WU self-healing**: 2+ consecutive Windows Update failures (sidecar-file streak, survives reboots) trigger a one-per-streak component reset (SoftwareDistribution/catroot2 rename); DISM left manual
 - **WU prefetch**: Windows Update scan+download runs as a background job during Winget/Chocolatey; install stays sequential and collects the prefetch first
 - **DirectFirstRun mode** (default): First run executes in user console for user-scope winget access; task registered only if reboot needed
+- **ARSO user-context resume**: where Windows ARSO is available (checked via `Test-ArsoAvailable`: not SYSTEM, `DisableAutomaticRestartSignOn` policy unset, user not opted out), the post-reboot task is registered as the USER at logon — `shutdown /g` signs them back in, so user-scoped phases run on EVERY iteration. A `BootUpdateCycleFallback` SYSTEM task (startup +3 min, mutex-arbitrated) covers ARSO no-shows; without ARSO the classic SYSTEM-at-startup task is used. `Unregister-BootUpdateTask` and `Uninstall.ps1` remove both tasks
+- **Package filters**: `ExcludePatterns` accepts wildcards (`Mozilla.Firefox*`) or plain substrings; `IncludePatterns` flips to allowlist mode (exclude wins over include). Central matcher: `Test-PackageExcluded` (pip cohort scriptblock carries an inline copy)
 
 ## Conventions
 
@@ -123,6 +125,8 @@ Remove-Item "$env:ProgramData\BootUpdateCycle" -Recurse -Force
 | `IncludeFirmwareUpdates` | `$false` | Opt-in: install firmware updates via PSWindowsUpdate |
 | `UpdateWsl` | `$false` | Opt-in: update WSL kernel and distro packages (user-scoped) |
 | `UpdateContainers` | `$false` | Opt-in: pull updated Docker/Podman images and prune (user-scoped) |
+| `IncludePatterns` | `@()` | Allowlist mode: when non-empty, ONLY matching packages update (winget/choco/pip filtered paths) |
+| `NotificationLevel` | `Full` | Gate toast/webhook/email noise: `Full \| SuccessOnly \| ErrorsOnly \| None` (event log always written) |
 | `PreCycleScript` | `''` | Path to a .ps1 hook executed after pre-flight, before the first phase |
 | `PostCycleScript` | `''` | Path to a .ps1 hook executed after the final phase, before reboot decision |
 | `HooksConfig` | `hooks.psd1` (sidecar) | Path to PSD1 sidecar with per-phase scriptblock hooks |
@@ -141,7 +145,7 @@ Use `tools/New-Release.ps1 -Tag vX.Y.Z -Title '...' -Notes '...'` (or `-NotesPat
 
 ## Remote Configuration (jzw)
 
-Pass `-ConfigUrl <https://...>` to supply a fleet-wide JSON config override URL. `Get-RemoteConfig` fetches the URL (10 s timeout) and caches the result to `$env:ProgramData\BootUpdateCycle\remote-config.cache.json`. On network failure it falls back to the cache. `Apply-RemoteConfig` then overwrites any `$script:*` variable whose matching key appears in the JSON, **except** keys the operator explicitly passed on the command line (user always wins). Supported JSON keys: `ExcludePatterns`, `MaxIterations`, `RebootDelaySec`, `PackageTimeoutMinutes`, `MaintenanceWindowStart`, `MaintenanceWindowEnd`, `SkipPip`, `SkipNpm`, `SkipScoop`, `SkipDotnetTools`, `SkipVscode`, `SkipPowerShellModules`, `SkipOffice365`, `SkipAwsTooling`, `SkipDefender`, `SkipBitLocker`, `SkipRestorePoint`, `SkipHealthCheck`, `IncludeDriverUpdates`, `IncludeFirmwareUpdates`, `UpdateWsl`, `UpdateContainers`, `AllowMetered`, `DisableSelfUpdate`, `StagedRollout`.
+Pass `-ConfigUrl <https://...>` to supply a fleet-wide JSON config override URL. `Get-RemoteConfig` fetches the URL (10 s timeout) and caches the result to `$env:ProgramData\BootUpdateCycle\remote-config.cache.json`. On network failure it falls back to the cache. `Apply-RemoteConfig` then overwrites any `$script:*` variable whose matching key appears in the JSON, **except** keys the operator explicitly passed on the command line (user always wins). Supported JSON keys: `ExcludePatterns`, `IncludePatterns`, `NotificationLevel`, `MaxIterations`, `RebootDelaySec`, `PackageTimeoutMinutes`, `MaintenanceWindowStart`, `MaintenanceWindowEnd`, `SkipPip`, `SkipNpm`, `SkipScoop`, `SkipDotnetTools`, `SkipVscode`, `SkipPowerShellModules`, `SkipOffice365`, `SkipAwsTooling`, `SkipDefender`, `SkipBitLocker`, `SkipRestorePoint`, `SkipHealthCheck`, `IncludeDriverUpdates`, `IncludeFirmwareUpdates`, `UpdateWsl`, `UpdateContainers`, `AllowMetered`, `DisableSelfUpdate`, `StagedRollout`.
 
 ## Extension Hooks
 
