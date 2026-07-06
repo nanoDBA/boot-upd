@@ -1,0 +1,147 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="650" height="279" viewBox="0 0 650 279" font-family="'Cascadia Mono','Consolas','DejaVu Sans Mono',monospace" font-size="14">
+<rect width="650" height="279" rx="8" fill="#0C0C0C"/>
+<text x="14" y="25" fill="#767676" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  .:</text>
+<text x="47.6" y="25" fill="#61D6D6" textLength="554.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">==================================================================</text>
+<text x="602" y="25" fill="#767676" textLength="16.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">:.</text>
+<text x="14" y="42" fill="#767676" textLength="42" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  :: </text>
+<text x="56" y="42" fill="#B4009E" textLength="142.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">BOOT UPDATE CYCLE</text>
+<text x="198.8" y="42" fill="#767676" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> // </text>
+<text x="232.4" y="42" fill="#F2F2F2" textLength="184.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">unattended patch board</text>
+<text x="417.2" y="42" fill="#767676" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> // </text>
+<text x="450.8" y="42" fill="#F9F1A5" textLength="58.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">v2.5.10</text>
+<text x="14" y="59" fill="#767676" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  ::</text>
+<text x="14" y="76" fill="#767676" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  ::</text>
+<rect x="72.8" y="63" width="16.8" height="17" fill="#61D6D6" shape-rendering="crispEdges"/>
+<rect x="89.6" y="63" width="16.8" height="17" fill="#61D6D6" shape-rendering="crispEdges"/>
+<rect x="106.4" y="63" width="16.8" height="17" fill="#61D6D6" shape-rendering="crispEdges"/>
+<rect x="123.2" y="63" width="16.8" height="17" fill="#61D6D6" shape-rendering="crispEdges"/>
+<rect x="173.6" y="63" width="16.8" height="17" fill="#B4009E" shape-rendering="crispEdges"/>
+<rect x="190.4" y="63" width="16.8" height="17" fill="#B4009E" shape-rendering="crispEdges"/>
+<rect x="207.2" y="63" width="16.8" height="17" fill="#B4009E" shape-rendering="crispEdges"/>
+<rect x="224" y="63" width="16.8" height="17" fill="#B4009E" shape-rendering="crispEdges"/>
+<rect x="274.4" y="63" width="16.8" height="17" fill="#B4009E" shape-rendering="crispEdges"/>
+<rect x="291.2" y="63" width="16.8" height="17" fill="#B4009E" shape-rendering="crispEdges"/>
+<rect x="308" y="63" width="16.8" height="17" fill="#B4009E" shape-rendering="crispEdges"/>
+<rect x="324.8" y="63" width="16.8" height="17" fill="#B4009E" shape-rendering="crispEdges"/>
+<rect x="375.2" y="63" width="16.8" height="17" fill="#F2F2F2" shape-rendering="crispEdges"/>
+<rect x="392" y="63" width="16.8" height="17" fill="#F2F2F2" shape-rendering="crispEdges"/>
+<rect x="408.8" y="63" width="16.8" height="17" fill="#F2F2F2" shape-rendering="crispEdges"/>
+<rect x="425.6" y="63" width="16.8" height="17" fill="#F2F2F2" shape-rendering="crispEdges"/>
+<rect x="442.4" y="63" width="16.8" height="17" fill="#F2F2F2" shape-rendering="crispEdges"/>
+<text x="14" y="93" fill="#767676" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  ::</text>
+<rect x="72.8" y="80" width="16.8" height="17" fill="#61D6D6" shape-rendering="crispEdges"/>
+<rect x="89.6" y="80" width="16.8" height="17" fill="#3B78FF" shape-rendering="crispEdges"/>
+<rect x="106.4" y="80" width="16.8" height="17" fill="#3B78FF" shape-rendering="crispEdges"/>
+<rect x="123.2" y="80" width="16.8" height="17" fill="#61D6D6" shape-rendering="crispEdges"/>
+<rect x="140" y="80" width="16.8" height="17" fill="#61D6D6" shape-rendering="crispEdges"/>
+<rect x="173.6" y="80" width="16.8" height="17" fill="#B4009E" shape-rendering="crispEdges"/>
+<rect x="190.4" y="80" width="16.8" height="17" fill="#3B78FF" shape-rendering="crispEdges"/>
+<rect x="207.2" y="80" width="16.8" height="17" fill="#3B78FF" shape-rendering="crispEdges"/>
+<rect x="224" y="80" width="16.8" height="17" fill="#3B78FF" shape-rendering="crispEdges"/>
+<rect x="240.8" y="80" width="16.8" height="17" fill="#B4009E" shape-rendering="crispEdges"/>
+<rect x="274.4" y="80" width="16.8" height="17" fill="#B4009E" shape-rendering="crispEdges"/>
+<rect x="291.2" y="80" width="16.8" height="17" fill="#3B78FF" shape-rendering="crispEdges"/>
+<rect x="308" y="80" width="16.8" height="17" fill="#3B78FF" shape-rendering="crispEdges"/>
+<rect x="324.8" y="80" width="16.8" height="17" fill="#3B78FF" shape-rendering="crispEdges"/>
+<rect x="341.6" y="80" width="16.8" height="17" fill="#B4009E" shape-rendering="crispEdges"/>
+<rect x="408.8" y="80" width="16.8" height="17" fill="#F2F2F2" shape-rendering="crispEdges"/>
+<text x="14" y="110" fill="#767676" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  ::</text>
+<rect x="72.8" y="97" width="16.8" height="17" fill="#61D6D6" shape-rendering="crispEdges"/>
+<rect x="89.6" y="97" width="16.8" height="17" fill="#3B78FF" shape-rendering="crispEdges"/>
+<rect x="106.4" y="97" width="16.8" height="17" fill="#3B78FF" shape-rendering="crispEdges"/>
+<rect x="123.2" y="97" width="16.8" height="17" fill="#61D6D6" shape-rendering="crispEdges"/>
+<rect x="140" y="97" width="16.8" height="17" fill="#61D6D6" shape-rendering="crispEdges"/>
+<rect x="173.6" y="97" width="16.8" height="17" fill="#B4009E" shape-rendering="crispEdges"/>
+<rect x="190.4" y="97" width="16.8" height="17" fill="#3B78FF" shape-rendering="crispEdges"/>
+<rect x="207.2" y="97" width="16.8" height="17" fill="#3B78FF" shape-rendering="crispEdges"/>
+<rect x="224" y="97" width="16.8" height="17" fill="#3B78FF" shape-rendering="crispEdges"/>
+<rect x="240.8" y="97" width="16.8" height="17" fill="#B4009E" shape-rendering="crispEdges"/>
+<rect x="274.4" y="97" width="16.8" height="17" fill="#B4009E" shape-rendering="crispEdges"/>
+<rect x="291.2" y="97" width="16.8" height="17" fill="#3B78FF" shape-rendering="crispEdges"/>
+<rect x="308" y="97" width="16.8" height="17" fill="#3B78FF" shape-rendering="crispEdges"/>
+<rect x="324.8" y="97" width="16.8" height="17" fill="#3B78FF" shape-rendering="crispEdges"/>
+<rect x="341.6" y="97" width="16.8" height="17" fill="#B4009E" shape-rendering="crispEdges"/>
+<rect x="408.8" y="97" width="16.8" height="17" fill="#F2F2F2" shape-rendering="crispEdges"/>
+<text x="14" y="127" fill="#767676" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  ::</text>
+<rect x="72.8" y="114" width="16.8" height="17" fill="#61D6D6" shape-rendering="crispEdges"/>
+<rect x="89.6" y="114" width="16.8" height="17" fill="#61D6D6" shape-rendering="crispEdges"/>
+<rect x="106.4" y="114" width="16.8" height="17" fill="#61D6D6" shape-rendering="crispEdges"/>
+<rect x="123.2" y="114" width="16.8" height="17" fill="#61D6D6" shape-rendering="crispEdges"/>
+<rect x="173.6" y="114" width="16.8" height="17" fill="#B4009E" shape-rendering="crispEdges"/>
+<rect x="190.4" y="114" width="16.8" height="17" fill="#3B78FF" shape-rendering="crispEdges"/>
+<rect x="207.2" y="114" width="16.8" height="17" fill="#3B78FF" shape-rendering="crispEdges"/>
+<rect x="224" y="114" width="16.8" height="17" fill="#3B78FF" shape-rendering="crispEdges"/>
+<rect x="240.8" y="114" width="16.8" height="17" fill="#B4009E" shape-rendering="crispEdges"/>
+<rect x="274.4" y="114" width="16.8" height="17" fill="#B4009E" shape-rendering="crispEdges"/>
+<rect x="291.2" y="114" width="16.8" height="17" fill="#3B78FF" shape-rendering="crispEdges"/>
+<rect x="308" y="114" width="16.8" height="17" fill="#3B78FF" shape-rendering="crispEdges"/>
+<rect x="324.8" y="114" width="16.8" height="17" fill="#3B78FF" shape-rendering="crispEdges"/>
+<rect x="341.6" y="114" width="16.8" height="17" fill="#B4009E" shape-rendering="crispEdges"/>
+<rect x="408.8" y="114" width="16.8" height="17" fill="#F2F2F2" shape-rendering="crispEdges"/>
+<text x="14" y="144" fill="#767676" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  ::</text>
+<rect x="72.8" y="131" width="16.8" height="17" fill="#61D6D6" shape-rendering="crispEdges"/>
+<rect x="89.6" y="131" width="16.8" height="17" fill="#3B78FF" shape-rendering="crispEdges"/>
+<rect x="106.4" y="131" width="16.8" height="17" fill="#3B78FF" shape-rendering="crispEdges"/>
+<rect x="123.2" y="131" width="16.8" height="17" fill="#61D6D6" shape-rendering="crispEdges"/>
+<rect x="140" y="131" width="16.8" height="17" fill="#61D6D6" shape-rendering="crispEdges"/>
+<rect x="173.6" y="131" width="16.8" height="17" fill="#B4009E" shape-rendering="crispEdges"/>
+<rect x="190.4" y="131" width="16.8" height="17" fill="#3B78FF" shape-rendering="crispEdges"/>
+<rect x="207.2" y="131" width="16.8" height="17" fill="#3B78FF" shape-rendering="crispEdges"/>
+<rect x="224" y="131" width="16.8" height="17" fill="#3B78FF" shape-rendering="crispEdges"/>
+<rect x="240.8" y="131" width="16.8" height="17" fill="#B4009E" shape-rendering="crispEdges"/>
+<rect x="274.4" y="131" width="16.8" height="17" fill="#B4009E" shape-rendering="crispEdges"/>
+<rect x="291.2" y="131" width="16.8" height="17" fill="#3B78FF" shape-rendering="crispEdges"/>
+<rect x="308" y="131" width="16.8" height="17" fill="#3B78FF" shape-rendering="crispEdges"/>
+<rect x="324.8" y="131" width="16.8" height="17" fill="#3B78FF" shape-rendering="crispEdges"/>
+<rect x="341.6" y="131" width="16.8" height="17" fill="#B4009E" shape-rendering="crispEdges"/>
+<rect x="408.8" y="131" width="16.8" height="17" fill="#F2F2F2" shape-rendering="crispEdges"/>
+<text x="14" y="161" fill="#767676" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  ::</text>
+<rect x="72.8" y="148" width="16.8" height="17" fill="#61D6D6" shape-rendering="crispEdges"/>
+<rect x="89.6" y="148" width="16.8" height="17" fill="#3B78FF" shape-rendering="crispEdges"/>
+<rect x="106.4" y="148" width="16.8" height="17" fill="#3B78FF" shape-rendering="crispEdges"/>
+<rect x="123.2" y="148" width="16.8" height="17" fill="#61D6D6" shape-rendering="crispEdges"/>
+<rect x="140" y="148" width="16.8" height="17" fill="#61D6D6" shape-rendering="crispEdges"/>
+<rect x="173.6" y="148" width="16.8" height="17" fill="#B4009E" shape-rendering="crispEdges"/>
+<rect x="190.4" y="148" width="16.8" height="17" fill="#3B78FF" shape-rendering="crispEdges"/>
+<rect x="207.2" y="148" width="16.8" height="17" fill="#3B78FF" shape-rendering="crispEdges"/>
+<rect x="224" y="148" width="16.8" height="17" fill="#3B78FF" shape-rendering="crispEdges"/>
+<rect x="240.8" y="148" width="16.8" height="17" fill="#B4009E" shape-rendering="crispEdges"/>
+<rect x="274.4" y="148" width="16.8" height="17" fill="#B4009E" shape-rendering="crispEdges"/>
+<rect x="291.2" y="148" width="16.8" height="17" fill="#3B78FF" shape-rendering="crispEdges"/>
+<rect x="308" y="148" width="16.8" height="17" fill="#3B78FF" shape-rendering="crispEdges"/>
+<rect x="324.8" y="148" width="16.8" height="17" fill="#3B78FF" shape-rendering="crispEdges"/>
+<rect x="341.6" y="148" width="16.8" height="17" fill="#B4009E" shape-rendering="crispEdges"/>
+<rect x="408.8" y="148" width="16.8" height="17" fill="#F2F2F2" shape-rendering="crispEdges"/>
+<text x="14" y="178" fill="#767676" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  ::</text>
+<rect x="72.8" y="165" width="16.8" height="17" fill="#61D6D6" shape-rendering="crispEdges"/>
+<rect x="89.6" y="165" width="16.8" height="17" fill="#61D6D6" shape-rendering="crispEdges"/>
+<rect x="106.4" y="165" width="16.8" height="17" fill="#61D6D6" shape-rendering="crispEdges"/>
+<rect x="123.2" y="165" width="16.8" height="17" fill="#61D6D6" shape-rendering="crispEdges"/>
+<rect x="173.6" y="165" width="16.8" height="17" fill="#B4009E" shape-rendering="crispEdges"/>
+<rect x="190.4" y="165" width="16.8" height="17" fill="#B4009E" shape-rendering="crispEdges"/>
+<rect x="207.2" y="165" width="16.8" height="17" fill="#B4009E" shape-rendering="crispEdges"/>
+<rect x="224" y="165" width="16.8" height="17" fill="#B4009E" shape-rendering="crispEdges"/>
+<rect x="274.4" y="165" width="16.8" height="17" fill="#B4009E" shape-rendering="crispEdges"/>
+<rect x="291.2" y="165" width="16.8" height="17" fill="#B4009E" shape-rendering="crispEdges"/>
+<rect x="308" y="165" width="16.8" height="17" fill="#B4009E" shape-rendering="crispEdges"/>
+<rect x="324.8" y="165" width="16.8" height="17" fill="#B4009E" shape-rendering="crispEdges"/>
+<rect x="408.8" y="165" width="16.8" height="17" fill="#F2F2F2" shape-rendering="crispEdges"/>
+<text x="14" y="195" fill="#767676" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  ::</text>
+<text x="14" y="212" fill="#767676" textLength="42" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  :: </text>
+<text x="56" y="212" fill="#16C60C" textLength="58.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">[sysop]</text>
+<text x="114.8" y="212" fill="#F2F2F2" textLength="134.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> update cycle   </text>
+<text x="249.2" y="212" fill="#16C60C" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">[carrier]</text>
+<text x="324.8" y="212" fill="#B4009E" textLength="252" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> updates you can sleep through</text>
+<text x="14" y="229" fill="#767676" textLength="42" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  :: </text>
+<text x="56" y="229" fill="#16C60C" textLength="58.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">[board]</text>
+<text x="114.8" y="229" fill="#61D6D6" textLength="142.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> nanoDBA/boot-upd</text>
+<text x="257.6" y="229" fill="#16C60C" textLength="117.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">        [motd]</text>
+<text x="375.2" y="229" fill="#F2F2F2" textLength="235.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> run upd as admin, walk away</text>
+<text x="14" y="246" fill="#767676" textLength="42" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  :: </text>
+<text x="56" y="246" fill="#16C60C" textLength="42" lengthAdjust="spacingAndGlyphs" xml:space="preserve">[log]</text>
+<text x="98" y="246" fill="#3A96DD" textLength="445.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">   C:\ProgramData\BootUpdateCycle\BootUpdateCycle.log</text>
+<text x="14" y="263" fill="#767676" textLength="42" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  &apos;::</text>
+<text x="56" y="263" fill="#61D6D6" textLength="554.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">==================================================================</text>
+<text x="610.4" y="263" fill="#767676" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">::&apos;</text>
+</svg>
+

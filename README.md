@@ -4,6 +4,19 @@
 
 A Windows boot-time automation tool that runs every package manager you have, reboots when updates require it, and repeats until no pending reboots remain — then self-destructs. Solves the "restart required" whack-a-mole problem once and for all.
 
+![Boot Update Cycle splash — neon gradient theme](docs/img/splash-theme0.svg)
+
+The BBS-style splash rotates between three themes each run (`upd splash` previews them all; pin one with `BOOT_UPDATE_SPLASH_THEME=0|1|2`):
+
+<details>
+<summary>The other two themes</summary>
+
+![Outline dither theme](docs/img/splash-theme1.svg)
+
+![Classic 16-color theme (also the non-VT console fallback)](docs/img/splash-theme2.svg)
+
+</details>
+
 ## What it updates
 
 | Phase | Package Manager | Default | Notes |

@@ -1,8 +1,18 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.10
+**Current Version:** v2.5.11
 **Release Date:** 2026-07-06
 **Status:** STABLE
+
+---
+
+## v2.5.11 (2026-07-06)
+
+**Splash art in README.** Pixel-true SVG renders of all three splash themes (`docs/img/splash-theme{0,1,2}.svg`), generated from the actual `Show-StartupArt` ANSI output, embedded in the README — neon gradient as the hero image, the other two collapsible.
+
+### Compatibility
+
+- Docs/assets only; no functional changes. Drop-in replacement for v2.5.10.
 
 ---
 
