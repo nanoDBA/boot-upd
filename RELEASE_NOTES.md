@@ -1,8 +1,18 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.11
+**Current Version:** v2.5.12
 **Release Date:** 2026-07-06
 **Status:** STABLE
+
+---
+
+## v2.5.12 (2026-07-06)
+
+**Splash defaults to neon gradient.** No more per-run rotation — theme 0 (neon gradient) is the default on VT consoles. `BOOT_UPDATE_SPLASH_THEME=0|1|2` still switches themes, `upd splash` still previews all three, and non-VT consoles still get the classic blocks.
+
+### Compatibility
+
+- No parameter or schema changes. Drop-in replacement for v2.5.11.
 
 ---
 

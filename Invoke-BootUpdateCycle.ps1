@@ -142,7 +142,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 3 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.11' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.12' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 
 <# Force UTF-8 console I/O so box-drawing/block chars (BBS splash) render in cmd.exe regardless of system code page.
    chcp 65001 sets conhost interpretation; [Console]::OutputEncoding makes .NET write proper UTF-8 bytes. #>
@@ -2261,13 +2261,13 @@ function Show-StartupArt {
         $vtOk = $Host.UI.SupportsVirtualTerminal -and ([System.Environment]::OSVersion.Version.Build -ge 15063)
     } catch { }
 
-    <# Theme rotation: each run cycles through splash variants (0 = neon gradient,
-       1 = bright-rim outline with dithered fill, 2 = classic 16-color blocks).
-       Pin one with BOOT_UPDATE_SPLASH_THEME=0|1|2. Non-VT consoles always get 2. #>
+    <# Splash theme (0 = neon gradient [default], 1 = bright-rim outline with
+       dithered fill, 2 = classic 16-color blocks). Override with
+       BOOT_UPDATE_SPLASH_THEME=0|1|2. Non-VT consoles always get 2. #>
     $theme = 2
     if ($vtOk) {
+        $theme = 0
         if ($env:BOOT_UPDATE_SPLASH_THEME -match '^[0-2]$') { $theme = [int]$env:BOOT_UPDATE_SPLASH_THEME }
-        else { $theme = [int](([datetimeoffset](Get-Date)).ToUnixTimeSeconds() % 3) }
     }
 
     if ($theme -le 1) {

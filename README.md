@@ -6,7 +6,7 @@ A Windows boot-time automation tool that runs every package manager you have, re
 
 ![Boot Update Cycle splash — neon gradient theme](docs/img/splash-theme0.svg)
 
-The BBS-style splash rotates between three themes each run (`upd splash` previews them all; pin one with `BOOT_UPDATE_SPLASH_THEME=0|1|2`):
+The BBS-style splash defaults to the neon gradient theme above; two more ship with it (`upd splash` previews them all; switch with `BOOT_UPDATE_SPLASH_THEME=0|1|2`):
 
 <details>
 <summary>The other two themes</summary>
