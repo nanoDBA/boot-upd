@@ -77,6 +77,8 @@ Remove-Item "$env:ProgramData\BootUpdateCycle" -Recurse -Force
 
 **Note:** Winget runs first for cleanest environment before Chocolatey potentially locks installers.
 
+**Parallelism:** Winget/Chocolatey/WindowsUpdate/DriverFirmware/AwsTooling run sequentially (they contend for the msiexec mutex or CBS/TrustedInstaller); Wsl/Containers sequential out of caution. Everything else — pip, npm, Scoop, .NET tools, VS Code, **Defender, Office 365, PowerShell modules** — runs concurrently as the ThreadJob parallel cohort after the sequential chain. In the cohort, Defender uses `MpCmdRun.exe -SignatureUpdate -MMPC` (process-based; the Defender PS module's WinPS-compat remoting is not ThreadJob-safe). Staged rollout still runs every phase one-per-boot via the original functions.
+
 ## Additional Features
 
 - **Pre-flight checks**: Validates disk space (>5GB), network, battery, conflicting installers, WU service before each iteration
@@ -163,32 +165,29 @@ Create a file named `hooks.psd1` in the same directory as `Invoke-BootUpdateCycl
     AfterChoco              = { ... }
     BeforeWindowsUpdate     = { ... }
     AfterWindowsUpdate      = { ... }
-    BeforeDefender          = { ... }
-    AfterDefender           = { ... }
     BeforeDriverFirmware    = { ... }
     AfterDriverFirmware     = { ... }
     BeforeAwsTooling        = { ... }
     AfterAwsTooling         = { ... }
-    BeforeOffice365         = { ... }
-    AfterOffice365          = { ... }
-    BeforePowerShellModules = { ... }
-    AfterPowerShellModules  = { ... }
     BeforeWsl               = { ... }
     AfterWsl                = { ... }
     BeforeContainers        = { ... }
     AfterContainers         = { ... }
     # Parallel cohort — hooks fire on the parent thread (approximate order)
-    BeforePip         = { ... }; AfterPip         = { ... }
-    BeforeNpm         = { ... }; AfterNpm         = { ... }
-    BeforeScoop       = { ... }; AfterScoop       = { ... }
-    BeforeDotnetTools = { ... }; AfterDotnetTools = { ... }
-    BeforeVscode      = { ... }; AfterVscode      = { ... }
+    BeforePip               = { ... }; AfterPip               = { ... }
+    BeforeNpm               = { ... }; AfterNpm               = { ... }
+    BeforeScoop             = { ... }; AfterScoop             = { ... }
+    BeforeDotnetTools       = { ... }; AfterDotnetTools       = { ... }
+    BeforeVscode            = { ... }; AfterVscode            = { ... }
+    BeforeDefender          = { ... }; AfterDefender          = { ... }
+    BeforeOffice365         = { ... }; AfterOffice365         = { ... }
+    BeforePowerShellModules = { ... }; AfterPowerShellModules = { ... }
 }
 ```
 
 Only keys present in the hashtable are called. Missing keys are silently skipped. Exceptions are caught and logged at Warn.
 
-**Parallel cohort note:** Pip, Npm, Scoop, DotnetTools, and Vscode run as ThreadJob workers in isolated runspaces. Their Before hooks fire on the parent thread before the job batch launches; their After hooks fire on the parent thread as each job result is collected. This is approximate — not guaranteed to interleave with the actual job execution timeline.
+**Parallel cohort note:** Pip, Npm, Scoop, DotnetTools, Vscode, Defender, Office365, and PowerShellModules run as ThreadJob workers in isolated runspaces. Their Before hooks fire on the parent thread before the job batch launches; their After hooks fire on the parent thread as each job result is collected. This is approximate — not guaranteed to interleave with the actual job execution timeline.
 
 ### Scope and safety
 

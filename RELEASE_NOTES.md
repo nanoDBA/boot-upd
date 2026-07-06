@@ -1,8 +1,25 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.13
+**Current Version:** v2.5.14
 **Release Date:** 2026-07-06
 **Status:** STABLE
+
+---
+
+## v2.5.14 (2026-07-06)
+
+**Wider parallel cohort — faster cycles.** Defender, Office 365, and PowerShell modules move from the sequential chain into the ThreadJob parallel cohort (now 8 phases wide), overlapping with pip/npm/Scoop/.NET tools/VS Code. None of the three touch msiexec or CBS, so they cannot conflict with the sequential installers. Typical saving: the full serial time of those three phases per iteration (often 5–15 min).
+
+### Details
+
+- Defender in the cohort uses process-based `MpCmdRun.exe -SignatureUpdate -MMPC` instead of `Update-MpSignature` (the Defender module's WinPS-compat remoting is not safe to share across ThreadJob runspaces).
+- Sequential chain is now: Winget → Chocolatey → Windows Update → Driver/Firmware → AWS tooling → WSL → Containers (msiexec/CBS contention, or opt-in caution).
+- Staged rollout (`-StagedRollout`) is unaffected — it still runs one phase per boot via the original functions.
+- Crash recovery, per-phase hooks, state flags, and summary counts unchanged.
+
+### Compatibility
+
+- No parameter or schema changes. Drop-in replacement for v2.5.13.
 
 ---
 

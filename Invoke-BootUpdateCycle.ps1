@@ -142,7 +142,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 3 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.13' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.14' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 
 <# Force UTF-8 console I/O so box-drawing/block chars (BBS splash) render in cmd.exe regardless of system code page.
    chcp 65001 sets conhost interpretation; [Console]::OutputEncoding makes .NET write proper UTF-8 bytes. #>
@@ -2861,8 +2861,10 @@ function Invoke-BootUpdateCycle {
     }
 
     <# ---- Phase counter for progress display ---- #>
-    <# Sequential phases: must run one at a time due to installer locks / OS mutexes.
-       Parallel cohort (below): pip, npm, scoop, dotnet-tools, vscode — no shared package locks. #>
+    <# Sequential phases: must run one at a time — Winget/Chocolatey/WindowsUpdate/
+       DriverFirmware/AwsTooling all contend for the msiexec mutex or CBS/TrustedInstaller;
+       Wsl/Containers stay sequential out of caution (opt-in, network/VM heavy).
+       Parallel cohort (below): everything with no shared installer locks. #>
     $isSystemCtx = ([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value -eq 'S-1-5-18')
     $allPhases = @(
         @{ Name='Winget';            Flag='WingetDone';            Key='Winget';            Skip=$false;                                                                       Action={ Update-WingetPackages } }
@@ -2870,22 +2872,25 @@ function Invoke-BootUpdateCycle {
         @{ Name='WindowsUpdate';     Flag='WindowsUpdateDone';     Key='WindowsUpdate';     Skip=$false;                                                                       Action={ Install-WindowsUpdates } }
         @{ Name='DriverFirmware';    Flag='DriverFirmwareDone';    Key='DriverFirmware';    Skip=(-not ($IncludeDriverUpdates -or $IncludeFirmwareUpdates));                    Action={ Install-DriverFirmwareUpdates } }
         @{ Name='AwsTooling';        Flag='AwsToolingDone';        Key=$null;               Skip=[bool]$SkipAwsTooling;                                                        Action={ $r = Repair-AwsTooling; @{ Success = $r; Count = 0 } } }
-        @{ Name='Defender';          Flag='DefenderDone';          Key='Defender';          Skip=[bool]$SkipDefender;                                                          Action={ Update-DefenderSignatures } }
-        @{ Name='Office365';         Flag='Office365Done';         Key='Office365';         Skip=[bool]$SkipOffice365;                                                         Action={ Update-Office365 } }
-        @{ Name='PowerShellModules'; Flag='PowerShellModulesDone'; Key='PowerShellModules'; Skip=[bool]$SkipPowerShellModules;                                                 Action={ Update-PowerShellModules } }
         @{ Name='Wsl';               Flag='WslDone';               Key='Wsl';               Skip=(-not $UpdateWsl -or $isSystemCtx);                                           Action={ Update-WslKernelAndDistros } }
         @{ Name='Containers';        Flag='ContainersDone';        Key='Containers';        Skip=(-not $UpdateContainers -or $isSystemCtx);                                    Action={ Update-ContainerImages } }
     )
 
-    <# Parallel cohort: pip / npm / scoop / dotnet-tools / vscode — independent, no shared locks.
-       Each entry includes an Action for staged-rollout compatibility (single-phase sequential execution).
+    <# Parallel cohort: pip / npm / scoop / dotnet-tools / vscode / defender / office365 /
+       powershell-modules — independent, no shared installer locks (no msiexec, no CBS):
+       Defender uses MpCmdRun.exe, Office365 uses the ClickToRun service, PS modules are
+       PSGallery file copies. Each entry includes an Action for staged-rollout compatibility
+       (single-phase sequential execution uses the original function on the parent thread).
        SYSTEM-context skips (Scoop, Vscode) are checked both here (Skip flag) and inside each Action. #>
     $parallelCohort = @(
-        @{ Name='Pip';         Flag='PipDone';         Key='Pip';         Skip=[bool]$SkipPip;                              Action={ Update-PipPackages } }
-        @{ Name='Npm';         Flag='NpmDone';         Key='Npm';         Skip=[bool]$SkipNpm;                              Action={ Update-NpmPackages } }
-        @{ Name='Scoop';       Flag='ScoopDone';       Key='Scoop';       Skip=([bool]$SkipScoop -or $isSystemCtx);         Action={ Update-ScoopPackages } }
-        @{ Name='DotnetTools'; Flag='DotnetToolsDone'; Key='DotnetTools'; Skip=[bool]$SkipDotnetTools;                      Action={ Update-DotnetTools } }
-        @{ Name='Vscode';      Flag='VscodeDone';      Key='Vscode';      Skip=([bool]$SkipVscode -or $isSystemCtx);        Action={ Update-VscodeExtensions } }
+        @{ Name='Pip';               Flag='PipDone';               Key='Pip';               Skip=[bool]$SkipPip;                              Action={ Update-PipPackages } }
+        @{ Name='Npm';               Flag='NpmDone';               Key='Npm';               Skip=[bool]$SkipNpm;                              Action={ Update-NpmPackages } }
+        @{ Name='Scoop';             Flag='ScoopDone';             Key='Scoop';             Skip=([bool]$SkipScoop -or $isSystemCtx);         Action={ Update-ScoopPackages } }
+        @{ Name='DotnetTools';       Flag='DotnetToolsDone';       Key='DotnetTools';       Skip=[bool]$SkipDotnetTools;                      Action={ Update-DotnetTools } }
+        @{ Name='Vscode';            Flag='VscodeDone';            Key='Vscode';            Skip=([bool]$SkipVscode -or $isSystemCtx);        Action={ Update-VscodeExtensions } }
+        @{ Name='Defender';          Flag='DefenderDone';          Key='Defender';          Skip=[bool]$SkipDefender;                         Action={ Update-DefenderSignatures } }
+        @{ Name='Office365';         Flag='Office365Done';         Key='Office365';         Skip=[bool]$SkipOffice365;                        Action={ Update-Office365 } }
+        @{ Name='PowerShellModules'; Flag='PowerShellModulesDone'; Key='PowerShellModules'; Skip=[bool]$SkipPowerShellModules;                Action={ Update-PowerShellModules } }
     )
 
     <# $allPhases + $parallelCohort combined — used for staged rollout and $enabledPhases count #>
@@ -2965,7 +2970,7 @@ function Invoke-BootUpdateCycle {
     }
 
     if (-not $script:StagedRollout) {
-        <# ── Sequential phases (Winget, Chocolatey, WindowsUpdate, AwsTooling, Office365, PowerShellModules) ── #>
+        <# ── Sequential phases (Winget, Chocolatey, WindowsUpdate, DriverFirmware, AwsTooling, Wsl, Containers) ── #>
         foreach ($phase in $allPhases) {
             if ($phase.Skip) {
                 Write-PhaseSkip -Name $phase.Name
@@ -3022,8 +3027,8 @@ function Invoke-BootUpdateCycle {
             Invoke-PhaseHook -EventName "After$($phase.Name)"
         }  <# end foreach sequential phase #>
 
-        <# ── Parallel cohort: Pip / Npm / Scoop / DotnetTools / Vscode ──
-           These five phases share no package locks and have no inter-dependencies.
+        <# ── Parallel cohort: Pip / Npm / Scoop / DotnetTools / Vscode / Defender / Office365 / PowerShellModules ──
+           These phases share no installer locks (no msiexec, no CBS) and have no inter-dependencies.
            Each is launched as a Start-ThreadJob.  Because thread jobs run in a separate runspace,
            the parent's function definitions are unavailable, so each job carries a self-contained
            scriptblock.  Log lines are accumulated in the result and replayed on the parent thread
@@ -3174,6 +3179,139 @@ function Invoke-BootUpdateCycle {
                 return @{ Phase='Vscode'; Success=$true; Count=$count; LogLines=$log.ToArray() }
             }
 
+            $defenderSb = {
+                param($IsWhatIf)
+                <# Process-based (MpCmdRun.exe) rather than Update-MpSignature: the Defender
+                   PS module rides Windows PowerShell compat remoting, which is not safe to
+                   share across ThreadJob runspaces. Fail-forward: always Success=$true. #>
+                $log = [System.Collections.Generic.List[string]]::new()
+                $mpCmdRun = Join-Path $env:ProgramFiles 'Windows Defender\MpCmdRun.exe'
+                if (-not (Test-Path $mpCmdRun)) { $log.Add('[Warn] Defender skipped: MpCmdRun.exe not found (Defender may be disabled or absent).'); return @{ Phase='Defender'; Success=$true; Count=0; LogLines=$log.ToArray() } }
+                $log.Add('Updating Windows Defender signatures...')
+                if ($IsWhatIf) {
+                    $log.Add('  [WHATIF] Would run: MpCmdRun.exe -SignatureUpdate -MMPC')
+                    return @{ Phase='Defender'; Success=$true; Count=0; LogLines=$log.ToArray() }
+                }
+                try {
+                    & $mpCmdRun -SignatureUpdate -MMPC 2>&1 | ForEach-Object { $log.Add($_.ToString()) }
+                    if ($LASTEXITCODE -eq 0) {
+                        $log.Add('Defender signatures updated.')
+                        return @{ Phase='Defender'; Success=$true; Count=1; LogLines=$log.ToArray() }
+                    }
+                    $log.Add("[Warn] Defender signature update exit code $LASTEXITCODE (non-fatal).")
+                } catch { $log.Add("[Warn] Defender signature update failed (non-fatal): $_") }
+                return @{ Phase='Defender'; Success=$true; Count=0; LogLines=$log.ToArray() }
+            }
+
+            $office365Sb = {
+                param($IsWhatIf)
+                $log = [System.Collections.Generic.List[string]]::new()
+                $c2rClient = "${env:ProgramFiles}\Common Files\Microsoft Shared\ClickToRun\OfficeC2RClient.exe"
+                if (-not (Test-Path $c2rClient)) { $log.Add('[Warn] Office 365 C2R not found, skipping.'); return @{ Phase='Office365'; Success=$true; Count=0; LogLines=$log.ToArray() } }
+                $log.Add('Updating Office 365 (Click-to-Run)...')
+                if ($IsWhatIf) {
+                    $log.Add('  [WHATIF] Would run: OfficeC2RClient.exe /update user')
+                    return @{ Phase='Office365'; Success=$true; Count=0; LogLines=$log.ToArray() }
+                }
+                try {
+                    & $c2rClient /update user updatepromptuser=false forceappshutdown=true displaylevel=false 2>&1 | ForEach-Object { $log.Add($_.ToString()) }
+                    $log.Add('Office 365 update triggered (may complete in background)')
+                    return @{ Phase='Office365'; Success=$true; Count=1; LogLines=$log.ToArray() }
+                } catch { $log.Add("[Error] Office 365: $_") }
+                return @{ Phase='Office365'; Success=$true; Count=0; LogLines=$log.ToArray() }
+            }
+
+            $psModulesSb = {
+                param($IsWhatIf, $TimeoutMinutes)
+                <# Mirrors Update-PowerShellModules: PSResourceGet bulk path with legacy
+                   Update-Module fallback. The inner Start-Job (child process) pattern is
+                   preserved — nested process jobs are safe from a ThreadJob runspace. #>
+                $log = [System.Collections.Generic.List[string]]::new()
+                $count = 0
+                $log.Add('Checking installed PowerShell modules...')
+                try {
+                    $usePSResourceGet = [bool](Get-Command Update-PSResource -ErrorAction SilentlyContinue)
+                    $throttle = [Math]::Min(8, [Math]::Max(2, [Environment]::ProcessorCount))
+                    if ($usePSResourceGet) {
+                        $log.Add('Using PSResourceGet (Update-PSResource) for bulk module update...')
+                        $installed = Get-InstalledPSResource -Scope AllUsers -ErrorAction SilentlyContinue
+                        if (-not $installed) { $installed = Get-InstalledPSResource -ErrorAction SilentlyContinue }
+                        $moduleNames = @($installed | Where-Object {
+                            $_.Name -notlike 'Microsoft.PowerShell.*' -and
+                            $_.Name -notlike 'AWS.Tools.*' -and
+                            $_.Name -ne 'Az' -and
+                            $_.Type -eq 'Module'
+                        } | Select-Object -ExpandProperty Name -Unique)
+                        if (-not $moduleNames) { $log.Add('No updatable modules found.'); return @{ Phase='PowerShellModules'; Success=$true; Count=0; LogLines=$log.ToArray() } }
+                        $log.Add("Found $($moduleNames.Count) module(s) to update.")
+                        if ($IsWhatIf) { $log.Add("  [WHATIF] Would run: Update-PSResource for $($moduleNames.Count) modules"); return @{ Phase='PowerShellModules'; Success=$true; Count=0; LogLines=$log.ToArray() } }
+                        $log.Add("Running parallel updates (throttle: $throttle)...")
+                        $job = Start-Job -ScriptBlock {
+                            param($Names, $Throttle)
+                            $Names | ForEach-Object -ThrottleLimit $Throttle -Parallel {
+                                $n = $_
+                                try {
+                                    $before = (Get-InstalledPSResource -Name $n -EA SilentlyContinue | Sort-Object Version -Descending | Select-Object -First 1).Version
+                                    Update-PSResource -Name $n -Scope AllUsers -TrustRepository -AcceptLicense -Quiet -EA Stop
+                                    $after = (Get-InstalledPSResource -Name $n -EA SilentlyContinue | Sort-Object Version -Descending | Select-Object -First 1).Version
+                                    if ($after -and $before -and $after -gt $before) { "UPDATED|$n|$before|$after" }
+                                } catch { "ERROR|$n|$_" }
+                            }
+                        } -ArgumentList (,$moduleNames), $throttle
+                    } else {
+                        $log.Add('PSResourceGet not available - falling back to parallel Update-Module...')
+                        $installed = Get-InstalledModule -ErrorAction SilentlyContinue
+                        if (-not $installed) { $log.Add('[Warn] No user-installed modules found.'); return @{ Phase='PowerShellModules'; Success=$true; Count=0; LogLines=$log.ToArray() } }
+                        $modules = @($installed | Where-Object {
+                            $_.Name -notlike 'Microsoft.PowerShell.*' -and
+                            $_.Name -notlike 'AWS.Tools.*' -and
+                            $_.Name -ne 'Az'
+                        })
+                        if (-not $modules) { $log.Add('Only built-in modules found.'); return @{ Phase='PowerShellModules'; Success=$true; Count=0; LogLines=$log.ToArray() } }
+                        $log.Add("Found $($modules.Count) module(s) to check.")
+                        if ($IsWhatIf) { $log.Add("  [WHATIF] Would run: Update-Module for $($modules.Count) modules"); return @{ Phase='PowerShellModules'; Success=$true; Count=0; LogLines=$log.ToArray() } }
+                        $modulePairs = $modules | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Version = $_.Version.ToString() } }
+                        $log.Add("Running parallel updates (throttle: $throttle)...")
+                        $job = Start-Job -ScriptBlock {
+                            param($Pairs, $Throttle)
+                            $Pairs | ForEach-Object -ThrottleLimit $Throttle -Parallel {
+                                $n = $_.Name; $curVer = $_.Version
+                                try {
+                                    Update-Module -Name $n -Force -EA Stop *> $null
+                                    $newVer = (Get-InstalledModule -Name $n -EA SilentlyContinue).Version.ToString()
+                                    if ($newVer -and ($newVer -ne $curVer)) { "UPDATED|$n|$curVer|$newVer" }
+                                } catch {
+                                    if ($_ -match 'already the latest') { return }
+                                    "ERROR|$n|$_"
+                                }
+                            }
+                        } -ArgumentList (,$modulePairs), $throttle
+                    }
+
+                    $done = $job | Wait-Job -Timeout ($TimeoutMinutes * 60)
+                    if (-not $done) {
+                        $log.Add("[Warn] TIMEOUT: module bulk update exceeded ${TimeoutMinutes}m")
+                        try { Get-Process -Id $job.ChildJobs[0].ProcessId -EA SilentlyContinue | Stop-Process -Force -EA SilentlyContinue } catch { }
+                        $job | Stop-Job -PassThru | Remove-Job -Force
+                    } else {
+                        $results = @(Receive-Job $job -ErrorAction SilentlyContinue)
+                        $jobFailed = $job.State -eq 'Failed'
+                        Remove-Job $job -Force
+                        foreach ($line in $results) {
+                            if ($line -is [string] -and $line -match '^UPDATED\|(.+)\|(.+)\|(.+)$') {
+                                $log.Add("  $($Matches[1]): $($Matches[2]) -> $($Matches[3])")
+                                $count++
+                            } elseif ($line -is [string] -and $line -match '^ERROR\|(.+)\|(.+)$') {
+                                $log.Add("[Warn]   $($Matches[1]) error: $($Matches[2])")
+                            }
+                        }
+                        if ($jobFailed) { $log.Add('[Warn] Module bulk update job reported failure') }
+                    }
+                    $log.Add("PowerShell modules: $count updated.")
+                } catch { $log.Add("[Error] PowerShell modules: $_") }
+                return @{ Phase='PowerShellModules'; Success=$true; Count=$count; LogLines=$log.ToArray() }
+            }
+
             <# Before<Phase> hooks for parallel cohort phases — fired on the parent thread before jobs launch.
                Thread jobs run in isolated runspaces so Invoke-PhaseHook cannot be called from inside them. #>
             foreach ($cp in $pendingCohort) { Invoke-PhaseHook -EventName "Before$($cp.Name)" }
@@ -3182,11 +3320,14 @@ function Invoke-BootUpdateCycle {
             $cohortJobs = [System.Collections.Generic.List[object]]::new()
             foreach ($cp in $pendingCohort) {
                 $job = switch ($cp.Name) {
-                    'Pip'         { Start-ThreadJob -ScriptBlock $pipSb    -ArgumentList $cohortExcludePatterns, $cohortWhatIf }
-                    'Npm'         { Start-ThreadJob -ScriptBlock $npmSb    -ArgumentList $cohortWhatIf }
-                    'Scoop'       { Start-ThreadJob -ScriptBlock $scoopSb  -ArgumentList $cohortWhatIf }
-                    'DotnetTools' { Start-ThreadJob -ScriptBlock $dotnetSb -ArgumentList $cohortWhatIf }
-                    'Vscode'      { Start-ThreadJob -ScriptBlock $vscodeSb -ArgumentList $cohortWhatIf }
+                    'Pip'               { Start-ThreadJob -ScriptBlock $pipSb       -ArgumentList $cohortExcludePatterns, $cohortWhatIf }
+                    'Npm'               { Start-ThreadJob -ScriptBlock $npmSb       -ArgumentList $cohortWhatIf }
+                    'Scoop'             { Start-ThreadJob -ScriptBlock $scoopSb     -ArgumentList $cohortWhatIf }
+                    'DotnetTools'       { Start-ThreadJob -ScriptBlock $dotnetSb    -ArgumentList $cohortWhatIf }
+                    'Vscode'            { Start-ThreadJob -ScriptBlock $vscodeSb    -ArgumentList $cohortWhatIf }
+                    'Defender'          { Start-ThreadJob -ScriptBlock $defenderSb  -ArgumentList $cohortWhatIf }
+                    'Office365'         { Start-ThreadJob -ScriptBlock $office365Sb -ArgumentList $cohortWhatIf }
+                    'PowerShellModules' { Start-ThreadJob -ScriptBlock $psModulesSb -ArgumentList $cohortWhatIf, $script:PackageTimeoutMinutes }
                 }
                 if ($job) {
                     $job | Add-Member -NotePropertyName 'PhaseName' -NotePropertyValue $cp.Name -Force
@@ -3194,7 +3335,7 @@ function Invoke-BootUpdateCycle {
                 }
             }
 
-            <# Wait for all cohort jobs; timeout = sum of individual ceilings (5 * PackageTimeoutMinutes) #>
+            <# Wait for all cohort jobs; timeout = sum of individual ceilings (count * PackageTimeoutMinutes) #>
             $cohortTimeoutSec = [math]::Max($cohortTimeoutSec, $script:PackageTimeoutMinutes * 60 * $pendingCohort.Count)
             if ($cohortJobs.Count -gt 0) {
                 $null = Wait-Job -Job $cohortJobs -Timeout $cohortTimeoutSec
