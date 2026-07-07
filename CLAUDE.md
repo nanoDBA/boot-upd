@@ -235,7 +235,7 @@ bd close <id>         # Complete work
 4. **PUSH TO REMOTE** - This is MANDATORY:
    ```bash
    git pull --rebase
-   bd dolt push
+   bd export -o .beads/issues.jsonl   # bd writes land directly on the central Dolt server (boot_upd @ 100.88.59.72:3336); do NOT run `bd dolt push` (obsolete since the 2026-07-06 cutover — see bd memory beads-central-cutover)
    git push
    git status  # MUST show "up to date with origin"
    ```
