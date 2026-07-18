@@ -1,8 +1,20 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.16
-**Release Date:** 2026-07-06
+**Current Version:** v2.5.17
+**Release Date:** 2026-07-18
 **Status:** STABLE
+
+---
+
+## v2.5.17 (2026-07-18)
+
+**Self-update mutex handoff and persistent source healing.**
+
+- The running version now releases the named mutex before launching its downloaded replacement.
+- A replacement downloaded by v2.5.16 or older recognizes the legacy synchronous parent handoff, allowing existing broken installations to heal from GitHub without a manual file copy.
+- After GitHub confirms the live script is current, it repairs an older launcher-side `Invoke-BootUpdateCycle.ps1` so the next `upd` run cannot redeploy the stale version.
+- Deployment preserves a newer ProgramData copy if source update is unavailable, preventing a network failure from downgrading a healed installation.
+- No parameter or state-schema changes. Drop-in replacement for v2.5.16.
 
 ---
 

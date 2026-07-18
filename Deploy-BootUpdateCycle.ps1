@@ -205,8 +205,29 @@ if ([string]::IsNullOrEmpty($env:BOOT_UPDATE_NO_SELF_UPDATE)) {
 }
 
 $scriptPath = Join-Path $installDir 'Invoke-BootUpdateCycle.ps1'
-Copy-Item $sourceInvoke $scriptPath -Force
-Write-Host "Deployed: $scriptPath"
+$copySourceToLive = $true
+if (Test-Path -LiteralPath $scriptPath) {
+    try {
+        $sourceRaw = Get-Content -LiteralPath $sourceInvoke -Raw -ErrorAction Stop
+        $liveRaw = Get-Content -LiteralPath $scriptPath -Raw -ErrorAction Stop
+        if ($sourceRaw -match "BootUpdateCycleVersion'\s*-Value\s*'([\d.]+)'") {
+            $sourceVersion = [System.Version]::new($matches[1])
+        }
+        if ($liveRaw -match "BootUpdateCycleVersion'\s*-Value\s*'([\d.]+)'") {
+            $liveVersion = [System.Version]::new($matches[1])
+        }
+        if ($null -ne $sourceVersion -and $null -ne $liveVersion -and $liveVersion -gt $sourceVersion) {
+            $copySourceToLive = $false
+            Write-Host "Preserved newer deployed orchestrator: v$liveVersion (source is v$sourceVersion)." -ForegroundColor Yellow
+        }
+    } catch {
+        Write-Verbose "Could not compare source/deployed versions; deploying source copy: $_"
+    }
+}
+if ($copySourceToLive) {
+    Copy-Item $sourceInvoke $scriptPath -Force
+    Write-Host "Deployed: $scriptPath"
+}
 
 <# Also copy companion scripts if present #>
 foreach ($companion in @('Repair-AwsTooling.ps1')) {
@@ -313,6 +334,22 @@ $invokeArgs = @{
     MaintenanceWindowStart  = $Config.MaintenanceWindowStart
     MaintenanceWindowEnd    = $Config.MaintenanceWindowEnd
     ExcludePatterns         = $Config.ExcludePatterns
+}
+
+function Invoke-DeployedCycle {
+    <# Tell the live orchestrator which launcher/source directory to repair after
+       self-update. The environment value also crosses the re-exec boundary. #>
+    $previousSourceDir = $env:BOOT_UPDATE_SOURCE_DIR
+    $env:BOOT_UPDATE_SOURCE_DIR = $PSScriptRoot
+    try {
+        & $scriptPath @invokeArgs
+    } finally {
+        if ($null -eq $previousSourceDir) {
+            Remove-Item Env:BOOT_UPDATE_SOURCE_DIR -ErrorAction SilentlyContinue
+        } else {
+            $env:BOOT_UPDATE_SOURCE_DIR = $previousSourceDir
+        }
+    }
 }
 
 <# TUI: Modal overlay with deployment info #>
@@ -529,7 +566,7 @@ if ($Config.NonInteractive) {
         if ($Config.DirectFirstRun) {
             Write-Host "Starting update cycle directly (user context)..." -ForegroundColor Green
             Write-Host "Log: $installDir\BootUpdateCycle.log"
-            & $scriptPath @invokeArgs
+            Invoke-DeployedCycle
         } else {
             Write-Host "WARNING: DirectFirstRun=false - user-scope winget packages will NOT be updated" -ForegroundColor Yellow
             Register-ScheduledTaskNow
@@ -559,7 +596,7 @@ if ($Config.NonInteractive) {
             Write-Host ""
             Write-Host "Log: $installDir\BootUpdateCycle.log" -ForegroundColor Cyan
             Write-Host ""
-            & $scriptPath @invokeArgs
+            Invoke-DeployedCycle
         } else {
             Write-Host "Starting via scheduled task (SYSTEM context)..." -ForegroundColor Yellow
             Write-Host "WARNING: User-scope winget packages will NOT be updated!" -ForegroundColor Red

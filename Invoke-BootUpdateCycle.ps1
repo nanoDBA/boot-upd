@@ -147,7 +147,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 3 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.16' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.17' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 
 <# Force UTF-8 console I/O so box-drawing/block chars (BBS splash) render in cmd.exe regardless of system code page.
    chcp 65001 sets conhost interpretation; [Console]::OutputEncoding makes .NET write proper UTF-8 bytes. #>
@@ -2695,6 +2695,96 @@ function Invoke-PhaseHook {
    Downloads the latest Invoke-BootUpdateCycle.ps1 from the canonical GitHub release,
    validates it, and re-execs into the new version.  Only runs in user context (never
    SYSTEM).  Best-effort: all failure paths log and return — never throw. #>
+function Get-OrchestratorFileVersion {
+    param([Parameter(Mandatory)][string]$Path)
+
+    try {
+        $raw = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+        if ($raw -match "BootUpdateCycleVersion'\s*-Value\s*'([\d.]+)'") {
+            return [System.Version]::new($matches[1])
+        }
+    } catch { }
+    return $null
+}
+
+function Release-BootUpdateMutex {
+    <# A named Mutex is thread-affine. Release it synchronously on the owning
+       pipeline thread; the PowerShell.Exiting event is only a final fallback. #>
+    if (-not $script:BootUpdateMutex) { return }
+    try { $script:BootUpdateMutex.ReleaseMutex() } catch { }
+    $script:BootUpdateMutex.Dispose()
+    $script:BootUpdateMutex = $null
+}
+
+function Test-LegacySelfUpdateHandoff {
+    <# Versions through 2.5.16 started the replacement synchronously while still
+       owning the mutex. The child can safely inherit that handoff: its parent is
+       blocked waiting for it, so no two update cycles execute concurrently.
+       A freshly replaced live file plus an older .bak distinguishes that case
+       from an ordinary second launch. #>
+    $livePath = $PSCommandPath
+    $bakPath = "$livePath.bak"
+    if (-not (Test-Path -LiteralPath $bakPath)) { return $false }
+
+    try {
+        <# A genuine handoff child was spawned by the old pwsh process. A normal
+           second upd launch runs inside its own pwsh whose parent is cmd.exe. #>
+        $thisProcess = Get-CimInstance Win32_Process -Filter "ProcessId=$PID" -ErrorAction Stop
+        $parentProcess = Get-CimInstance Win32_Process -Filter "ProcessId=$($thisProcess.ParentProcessId)" -ErrorAction Stop
+        if ($parentProcess.Name -notin @('pwsh.exe', 'pwsh')) { return $false }
+        if ($parentProcess.CommandLine -notmatch '(?i)(Deploy|Invoke)-BootUpdateCycle\.ps1') { return $false }
+
+        $liveItem = Get-Item -LiteralPath $livePath -ErrorAction Stop
+        if ($liveItem.LastWriteTimeUtc -lt [datetime]::UtcNow.AddMinutes(-5)) { return $false }
+
+        $liveVersion = Get-OrchestratorFileVersion -Path $livePath
+        $bakVersion = Get-OrchestratorFileVersion -Path $bakPath
+        return ($null -ne $liveVersion -and $null -ne $bakVersion -and $liveVersion -gt $bakVersion)
+    } catch {
+        return $false
+    }
+}
+
+function Repair-OrchestratorSourceCopy {
+    <# An old Deploy script can repeatedly copy an old Invoke script over the
+       healed ProgramData copy. Repair launcher directories found on Machine
+       PATH so the self-update survives the next upd invocation. #>
+    param([Parameter(Mandatory)][System.Version]$VerifiedReleaseVersion)
+
+    try {
+        $liveVersion = Get-OrchestratorFileVersion -Path $PSCommandPath
+        if ($null -eq $liveVersion -or $liveVersion -lt $VerifiedReleaseVersion) { return }
+
+        $candidateDirs = [System.Collections.Generic.HashSet[string]]::new(
+            [System.StringComparer]::OrdinalIgnoreCase
+        )
+        if (-not [string]::IsNullOrWhiteSpace($env:BOOT_UPDATE_SOURCE_DIR)) {
+            $null = $candidateDirs.Add($env:BOOT_UPDATE_SOURCE_DIR)
+        }
+        $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+        foreach ($entry in ($machinePath -split ';')) {
+            $trimmed = $entry.Trim().Trim('"')
+            if (-not [string]::IsNullOrWhiteSpace($trimmed)) { $null = $candidateDirs.Add($trimmed) }
+        }
+
+        foreach ($dir in $candidateDirs) {
+            $sourceInvoke = Join-Path $dir 'Invoke-BootUpdateCycle.ps1'
+            $sourceLauncher = Join-Path $dir 'upd.cmd'
+            if (-not (Test-Path -LiteralPath $sourceInvoke) -or -not (Test-Path -LiteralPath $sourceLauncher)) { continue }
+            if ([System.IO.Path]::GetFullPath($sourceInvoke) -eq [System.IO.Path]::GetFullPath($PSCommandPath)) { continue }
+
+            $sourceVersion = Get-OrchestratorFileVersion -Path $sourceInvoke
+            if ($null -ne $sourceVersion -and $sourceVersion -ge $liveVersion) { continue }
+
+            Copy-Item -LiteralPath $sourceInvoke -Destination "$sourceInvoke.bak" -Force -ErrorAction Stop
+            Copy-Item -LiteralPath $PSCommandPath -Destination $sourceInvoke -Force -ErrorAction Stop
+            $oldVersion = if ($null -eq $sourceVersion) { 'unknown' } else { $sourceVersion.ToString() }
+            Write-Log "Self-update: repaired launcher source copy ($oldVersion -> $liveVersion): $sourceInvoke" -Level Info
+        }
+    } catch {
+        Write-Log "Self-update: source-copy repair skipped — $_" -Level Warn
+    }
+}
 function Update-OrchestratorSelf {
     param(
         <# Script-level $PSBoundParameters must be forwarded explicitly so the re-launch
@@ -2753,6 +2843,7 @@ function Update-OrchestratorSelf {
 
         if ($remoteVer -le $currentVer) {
             Write-Log "Self-update: already on latest ($current)." -Level Info
+            Repair-OrchestratorSourceCopy -VerifiedReleaseVersion $remoteVer
             return
         }
 
@@ -2853,6 +2944,9 @@ function Update-OrchestratorSelf {
             }
         }
 
+        <# The child must be able to acquire the single-instance mutex. Older
+           releases omitted this release, which caused the replacement to exit. #>
+        Release-BootUpdateMutex
         & pwsh -NoProfile -File $livePath @relaunchArgs
         exit $LASTEXITCODE
 
@@ -3794,10 +3888,16 @@ try {
         $acquired = $true
     }
     if (-not $acquired) {
-        Write-Log 'Another BootUpdateCycle instance is already running (mutex held). Exiting.' -Level Warn
-        $script:BootUpdateMutex.Dispose()
-        $script:BootUpdateMutex = $null
-        exit 0
+        if (Test-LegacySelfUpdateHandoff) {
+            Write-Log 'Self-update: inheriting mutex handoff from an older updater.' -Level Info
+            $script:BootUpdateMutex.Dispose()
+            $script:BootUpdateMutex = $null
+        } else {
+            Write-Log 'Another BootUpdateCycle instance is already running (mutex held). Exiting.' -Level Warn
+            $script:BootUpdateMutex.Dispose()
+            $script:BootUpdateMutex = $null
+            exit 0
+        }
     }
 } catch {
     Write-Log "Named mutex acquisition failed (non-fatal): $_" -Level Warn
