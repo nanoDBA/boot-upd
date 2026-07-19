@@ -147,7 +147,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 3 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.17' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.18' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 
 <# Force UTF-8 console I/O so box-drawing/block chars (BBS splash) render in cmd.exe regardless of system code page.
    chcp 65001 sets conhost interpretation; [Console]::OutputEncoding makes .NET write proper UTF-8 bytes. #>
@@ -3910,38 +3910,47 @@ if ($PreviewSplash) {
     exit 0
 }
 
-<# Named-mutex guard — prevents two instances racing on a fast boot (9ls).
-   AbandonedMutexException means the prior owner crashed without releasing; we inherit ownership. #>
-try {
-    $script:BootUpdateMutex = [System.Threading.Mutex]::new($false, 'Global\BootUpdateCycle')
-    $acquired = $false
+function Enter-BootUpdateMutex {
+    <# Acquire the cycle mutex or validate that this process is the replacement
+       child of its current owner. Returning false keeps the exit decision at
+       script scope and makes the complete arbitration path process-testable. #>
+    param([string]$MutexName = 'Global\BootUpdateCycle')
+
     try {
-        $acquired = $script:BootUpdateMutex.WaitOne(0)
-    } catch [System.Threading.AbandonedMutexException] {
-        Write-Log 'Named mutex was abandoned (previous instance exited uncleanly). Claiming ownership.' -Level Warn
-        $acquired = $true
-    }
-    if (-not $acquired) {
+        $script:BootUpdateMutex = [System.Threading.Mutex]::new($false, $MutexName)
+        $acquired = $false
+        try {
+            $acquired = $script:BootUpdateMutex.WaitOne(0)
+        } catch [System.Threading.AbandonedMutexException] {
+            Write-Log 'Named mutex was abandoned (previous instance exited uncleanly). Claiming ownership.' -Level Warn
+            $acquired = $true
+        }
+        if ($acquired) { return $true }
+
         if (Test-SelfUpdateHandoff) {
             Write-Log 'Self-update: accepted authenticated mutex handoff from parent updater.' -Level Info
-            $script:BootUpdateMutex.Dispose()
-            $script:BootUpdateMutex = $null
         } elseif (Test-LegacySelfUpdateHandoff) {
             Write-Log 'Self-update: inheriting mutex handoff from an older updater.' -Level Info
-            $script:BootUpdateMutex.Dispose()
-            $script:BootUpdateMutex = $null
         } else {
             Write-Log 'Another BootUpdateCycle instance is already running (mutex held). Exiting.' -Level Warn
             $script:BootUpdateMutex.Dispose()
             $script:BootUpdateMutex = $null
-            exit 0
+            return $false
         }
+
+        $script:BootUpdateMutex.Dispose()
+        $script:BootUpdateMutex = $null
+        return $true
+    } catch {
+        Write-Log "Named mutex acquisition failed (non-fatal): $_" -Level Warn
+        $script:BootUpdateMutex = $null
+        return $true
     }
-} catch {
-    Write-Log "Named mutex acquisition failed (non-fatal): $_" -Level Warn
-    $script:BootUpdateMutex = $null
 }
 
+<# Named-mutex guard — prevents two instances racing on a fast boot (9ls).
+   AbandonedMutexException means the prior owner crashed without releasing; we inherit ownership. #>
+if (-not (Enter-BootUpdateMutex)) { exit 0 }
 <# Release mutex on any exit path, including exit 0/1 inside the function #>
 Register-EngineEvent -SourceIdentifier 'PowerShell.Exiting' -Action {
     if ($script:BootUpdateMutex) {

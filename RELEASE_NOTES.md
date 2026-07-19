@@ -1,16 +1,33 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.17
-**Release Date:** 2026-07-18
+**Current Version:** v2.5.18
+**Release Date:** 2026-07-19
 **Status:** STABLE
 
 ---
 
 ## Unreleased
 
-- The current updater now retains continuous ownership of the single-instance mutex while its replacement runs, eliminating the release/reacquire race.
+No changes recorded yet.
+
+---
+
+## v2.5.18 (2026-07-19)
+
+**Race-free self-update handoff, process-level regression coverage, and automated quality gates.**
+
+- The updater retains continuous ownership of the single-instance mutex while its replacement runs, eliminating the release/reacquire race.
 - A consumed, process-only nonce capability identifies the replacement child while legacy updater handoffs remain supported.
-- Added focused regression coverage for accepted and rejected handoffs, capability consumption, fail-closed process checks, and continuous parent ownership.
+- Mutex arbitration now has an injectable mutex-name seam, preserving fail-closed production behavior while enabling isolated real-process tests.
+- Added focused unit and real-process regression coverage for accepted and rejected handoffs, capability consumption, continuous parent ownership, competing invocation rejection, and legacy compatibility.
+- Added Windows GitHub Actions quality gates for PowerShell parsing, Pester 5, PSScriptAnalyzer error-severity findings, and Git diff integrity.
+- Fixed invalid switch-return syntax in the update-history renderer that the new parser gate surfaced.
+- Hardened release creation by staging immutable script copies before hashing and upload, cleaning temporary assets on every exit path, and supporting `-WhatIf` validation without publication.
+- Added secure Windows Credential Manager onboarding for the centralized beads client and renamed its repository-local lookup key to `beads.credentialTarget`.
+
+### Compatibility
+
+- No user-facing updater parameter or state-schema changes. Drop-in replacement for v2.5.17.
 
 ---
 

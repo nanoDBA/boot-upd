@@ -210,6 +210,8 @@ This project uses **bd (beads)** for issue tracking. Run `./tools/Invoke-Beads.p
 
 On Windows, run tracker commands through `./tools/Invoke-Beads.ps1` so the central Dolt password is retrieved directly from Windows Credential Manager and cleared after each invocation. The command tables use `bd` as shorthand.
 
+On a new Windows checkout, run `./tools/Initialize-BeadsCredential.ps1` once. It reuses an existing named credential when available; otherwise it prompts twice without echo and stores the password in Windows Credential Manager. Use `-Replace` only when intentionally rotating the credential.
+
 ### Quick Reference
 
 ```bash

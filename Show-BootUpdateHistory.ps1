@@ -182,10 +182,10 @@ function Get-AnsiColor {
     param([int]$Value, [int]$Max)
     if (-not $useAnsi -or $Max -eq 0) { return '' }
     $ratio = $Value / $Max
-    return switch ($true) {
-        ($ratio -le 0.33) { "$ESC[32m" }   # green  - low
-        ($ratio -le 0.66) { "$ESC[33m" }   # yellow - medium
-        default           { "$ESC[31m" }   # red    - high
+    switch ($true) {
+        ($ratio -le 0.33) { return "$ESC[32m" }   # green  - low
+        ($ratio -le 0.66) { return "$ESC[33m" }   # yellow - medium
+        default           { return "$ESC[31m" }   # red    - high
     }
 }
 

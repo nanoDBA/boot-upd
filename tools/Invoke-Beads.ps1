@@ -6,7 +6,7 @@
 
 .DESCRIPTION
     Retrieves the generic credential identified by the repository-local
-    beads.credentialUser Git setting, makes its password available only for the
+    beads.credentialTarget Git setting, makes its password available only for the
     lifetime of the bd invocation, and clears it in a finally block.
 
     The password is never printed, passed on the command line, or persisted as
@@ -21,15 +21,33 @@
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path $PSScriptRoot -Parent
 
-$credentialUser = & git -C $repoRoot config --local --get beads.credentialUser
-if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($credentialUser)) {
-    throw 'Missing repository-local beads.credentialUser setting. Configure it with: git config --local beads.credentialUser BEADS_DOLT_PASSWORD'
+$credentialTarget = & git -C $repoRoot config --local --get beads.credentialTarget
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($credentialTarget)) {
+    throw 'Missing repository-local beads.credentialTarget setting. Run: ./tools/Initialize-BeadsCredential.ps1'
 }
 
 Import-Module BetterCredentials -ErrorAction Stop
-$credential = BetterCredentials\Get-Credential -UserName $credentialUser -GenericCredentials
+
+function Get-StoredGenericCredential {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Target
+    )
+
+    try {
+        return [CredentialManagement.Store]::Load($Target)
+    }
+    catch {
+        if ($_.Exception.InnerException.NativeErrorCode -eq 1168) {
+            return $null
+        }
+        throw
+    }
+}
+
+$credential = Get-StoredGenericCredential -Target $credentialTarget
 if (-not $credential) {
-    throw "Windows Credential Manager has no generic credential for '$credentialUser'."
+    throw "Windows Credential Manager has no generic credential for '$credentialTarget'. Run: ./tools/Initialize-BeadsCredential.ps1"
 }
 
 $exitCode = 1
@@ -40,6 +58,7 @@ try {
 }
 finally {
     Remove-Item Env:BEADS_DOLT_PASSWORD -ErrorAction SilentlyContinue
+    $credential = $null
 }
 
 exit $exitCode
