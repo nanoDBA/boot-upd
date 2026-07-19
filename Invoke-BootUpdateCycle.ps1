@@ -321,7 +321,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 3 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.21' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.22' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 
 <# Force UTF-8 console I/O so box-drawing/block chars (BBS splash) render in cmd.exe regardless of system code page.
    chcp 65001 sets conhost interpretation; [Console]::OutputEncoding makes .NET write proper UTF-8 bytes. #>
@@ -338,6 +338,7 @@ $script:TuiInteractive = $false
 $script:TuiProgressActive = $false
 $script:TuiSpinnerIndex = 0
 $script:TuiSpinnerFrames = @('⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏')
+$script:TuiRefreshMilliseconds = 100
 $script:SpectreModuleName = 'PwshSpectreConsole'
 $script:SpectreInstallVersion = [version]'2.6.3'
 $script:SpectreEnabled = $false
@@ -353,6 +354,7 @@ function Initialize-BootUpdateConsole {
             -not [Console]::IsInputRedirected -and -not [Console]::IsOutputRedirected -and
             $Host.Name -eq 'ConsoleHost'
         if ($script:TuiInteractive) {
+            $script:ProgressPreference = 'Continue'
             $PSStyle.Progress.View = 'Minimal'
             $PSStyle.Progress.MaxWidth = 88
         }
@@ -367,20 +369,24 @@ function Test-BootUpdateOutputAtLeast {
         [array]::IndexOf($script:OutputModes, $Minimum)
 }
 
+function Switch-BootUpdateOutputMode {
+    $current = [array]::IndexOf($script:OutputModes, $script:OutputMode)
+    $script:OutputMode = $script:OutputModes[($current + 1) % $script:OutputModes.Count]
+    $script:ScriptBoundParams['OutputMode'] = $script:OutputMode
+    if ($script:OutputMode -eq 'Quiet' -and $script:TuiProgressActive) {
+        Write-Progress -Id 740 -Activity 'Boot Update Cycle' -Completed
+        $script:TuiProgressActive = $false
+    }
+    Write-Host "  output mode: $($script:OutputMode)  (press v to cycle)" -ForegroundColor DarkCyan
+}
+
 function Read-BootUpdateUiKeys {
     if (-not $script:TuiInteractive) { return }
     try {
         while ([Console]::KeyAvailable) {
             $key = [Console]::ReadKey($true)
             if ($key.KeyChar -notin @('v', 'V')) { continue }
-            $current = [array]::IndexOf($script:OutputModes, $script:OutputMode)
-            $script:OutputMode = $script:OutputModes[($current + 1) % $script:OutputModes.Count]
-            $script:ScriptBoundParams['OutputMode'] = $script:OutputMode
-            if ($script:OutputMode -eq 'Quiet' -and $script:TuiProgressActive) {
-                Write-Progress -Id 740 -Activity 'Boot Update Cycle' -Completed
-                $script:TuiProgressActive = $false
-            }
-            Write-Host "  output mode: $($script:OutputMode)  (press v to cycle)" -ForegroundColor DarkCyan
+            Switch-BootUpdateOutputMode
         }
     } catch {
         # Key polling is an optional enhancement. Disable it if the host detaches.
@@ -419,21 +425,65 @@ function Write-BootUpdateProgress {
 
 function Wait-BootUpdateUiInterval {
     param(
-        [Parameter(Mandatory)][ValidateRange(0,86400)][int]$Seconds,
+        [Parameter(Mandatory)][ValidateRange(0,86400)][double]$Seconds,
         [string]$Activity = 'Boot Update Cycle',
         [string]$Status = 'Working',
         [ValidateRange(-1,100)][int]$PercentComplete = -1
     )
     if (-not $script:TuiInteractive) {
-        Start-Sleep -Seconds $Seconds
+        Start-Sleep -Milliseconds ([math]::Ceiling($Seconds * 1000))
         return
     }
     $deadline = [datetime]::UtcNow.AddSeconds($Seconds)
     do {
         Write-BootUpdateProgress -Activity $Activity -Status $Status -PercentComplete $PercentComplete
-        $remainingMs = [math]::Max(0, [math]::Min(250, ($deadline - [datetime]::UtcNow).TotalMilliseconds))
+        $remainingMs = [math]::Max(0, [math]::Min(
+            $script:TuiRefreshMilliseconds,
+            ($deadline - [datetime]::UtcNow).TotalMilliseconds
+        ))
         if ($remainingMs -gt 0) { Start-Sleep -Milliseconds $remainingMs }
     } while ([datetime]::UtcNow -lt $deadline)
+}
+
+function Wait-BootUpdateJobsWithProgress {
+    param(
+        [Parameter(Mandatory)][object[]]$Jobs,
+        [Parameter(Mandatory)][ValidateRange(0,86400)][double]$TimeoutSeconds,
+        [string]$Activity = 'Boot Update Cycle',
+        [string]$Status = 'Background work is running',
+        [ValidateRange(-1,100)][int]$PercentComplete = -1
+    )
+    if ($Jobs.Count -eq 0) { return $true }
+    $deadline = [datetime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        $pending = @($Jobs | Where-Object { $_.State -notin @('Completed','Failed','Stopped') })
+        if ($pending.Count -eq 0) { return $true }
+        $remainingSeconds = ($deadline - [datetime]::UtcNow).TotalSeconds
+        if ($remainingSeconds -le 0) { break }
+        Wait-BootUpdateUiInterval -Seconds ([math]::Min(0.2, $remainingSeconds)) `
+            -Activity $Activity -Status $Status -PercentComplete $PercentComplete
+    } while ([datetime]::UtcNow -lt $deadline)
+    return $false
+}
+
+function Invoke-BootUpdateBackgroundOperation {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][scriptblock]$ScriptBlock,
+        [object[]]$ArgumentList = @(),
+        [ValidateRange(0.01,1440)][double]$TimeoutMinutes = 60,
+        [string]$Status = 'Background operation is running'
+    )
+    $result = Invoke-PackageManagerWithTimeout -Name $Name -ScriptBlock $ScriptBlock `
+        -ArgumentList $ArgumentList -IdleTimeoutMinutes $TimeoutMinutes `
+        -HardTimeoutMinutes $TimeoutMinutes -Status $Status
+    return @{
+        Output = $result.Output
+        TimedOut = $result.TimedOut
+        Failed = $result.Failed
+        State = $result.Reason
+        ExitCode = $result.ExitCode
+    }
 }
 
 function Test-BootUpdateSpectreModulePath {
@@ -1205,12 +1255,25 @@ function Wait-ProcessWithIdleTimeout {
     param(
         [Parameter(Mandatory)][System.Diagnostics.Process]$Process,
         [string]$ActivityName = 'Package manager',
-        [int]$IdleTimeoutMinutes = 5, [int]$HardTimeoutMinutes = 60, [int]$PollIntervalSeconds = 30
+        [string]$Status = 'Operation is running',
+        [double]$IdleTimeoutMinutes = 5, [double]$HardTimeoutMinutes = 60,
+        [ValidateRange(0.2,30)][double]$PollIntervalSeconds = 1
     )
     $startTime = [datetime]::UtcNow; $lastCpuIncrease = $startTime; $lastCpuTime = [timespan]::Zero; $finalCpu = [timespan]::Zero
     $hardLimit = [timespan]::FromMinutes($HardTimeoutMinutes); $idleLimit = [timespan]::FromMinutes($IdleTimeoutMinutes)
 
     function Remove-ProcessTree { param([int]$RootPid)
+        $rootProcess = Get-Process -Id $RootPid -EA SilentlyContinue
+        if ($rootProcess -and -not $rootProcess.HasExited) {
+            try {
+                $rootProcess.Kill($true)
+                $null = $rootProcess.WaitForExit(5000)
+                Write-Log "Killed process tree rooted at PID $RootPid ($($rootProcess.ProcessName))" -Level Warn
+                return
+            } catch {
+                Write-Log "Process-tree kill API failed for PID $RootPid; using CIM fallback: $_" -Level Warn
+            }
+        }
         $all = Get-CimInstance Win32_Process -EA SilentlyContinue; if (-not $all) { return }
         $cm = @{}; foreach ($p in $all) { if (-not $cm.ContainsKey($p.ParentProcessId)) { $cm[$p.ParentProcessId] = [System.Collections.Generic.List[int]]::new() }; $cm[$p.ParentProcessId].Add($p.ProcessId) }
         $ordered = [System.Collections.Generic.List[int]]::new(); $q = [System.Collections.Generic.Queue[int]]::new(); $v = [System.Collections.Generic.HashSet[int]]::new()
@@ -1225,7 +1288,7 @@ function Wait-ProcessWithIdleTimeout {
         if ($Process.HasExited) {
             $elapsed = [datetime]::UtcNow - $startTime
             Write-Log "Process PID $($Process.Id) exited normally ($([math]::Round($elapsed.TotalMinutes,1))m)"
-            return @{ Reason = 'Completed'; Elapsed = $elapsed; FinalCpuTime = $finalCpu }
+            return @{ Reason = 'Completed'; Elapsed = $elapsed; FinalCpuTime = $finalCpu; ExitCode = $Process.ExitCode }
         }
         $elapsed = [datetime]::UtcNow - $startTime
         if ($elapsed -ge $hardLimit) {
@@ -1233,7 +1296,7 @@ function Wait-ProcessWithIdleTimeout {
             $tree = Get-ProcessTreeActivity -ParentPid $Process.Id
             Write-Log "  Tree at kill: $($tree.ProcessCount) processes, CPU=$([math]::Round($tree.TotalCpuTime.TotalSeconds,1))s, handles=$($tree.HandleCount)" -Level Warn
             Remove-ProcessTree -RootPid $Process.Id
-            return @{ Reason = 'HardTimeout'; Elapsed = $elapsed; FinalCpuTime = $tree.TotalCpuTime }
+            return @{ Reason = 'HardTimeout'; Elapsed = $elapsed; FinalCpuTime = $tree.TotalCpuTime; ExitCode = $null }
         }
         $activity = Get-ProcessTreeActivity -ParentPid $Process.Id; $finalCpu = $activity.TotalCpuTime
         if ($activity.TotalCpuTime -gt $lastCpuTime) { $lastCpuTime = $activity.TotalCpuTime; $lastCpuIncrease = [datetime]::UtcNow }
@@ -1242,12 +1305,12 @@ function Wait-ProcessWithIdleTimeout {
             Write-Log "IDLE TIMEOUT: PID $($Process.Id) idle $([math]::Round($idleFor.TotalMinutes,1))m (threshold: ${IdleTimeoutMinutes}m), final CPU=$([math]::Round($activity.TotalCpuTime.TotalSeconds,1))s. Killing." -Level Error
             Write-Log "  Tree at kill: $($activity.ProcessCount) processes, handles=$($activity.HandleCount)" -Level Warn
             Remove-ProcessTree -RootPid $Process.Id
-            return @{ Reason = 'IdleTimeout'; Elapsed = $elapsed; FinalCpuTime = $finalCpu }
+            return @{ Reason = 'IdleTimeout'; Elapsed = $elapsed; FinalCpuTime = $finalCpu; ExitCode = $null }
         }
-        $status = "CPU $([math]::Round($activity.TotalCpuTime.TotalSeconds,1))s | $($activity.ProcessCount) proc | idle $([math]::Round($idleFor.TotalMinutes,1))m | elapsed $([math]::Round($elapsed.TotalMinutes,1))m"
+        $progressStatus = "$Status | CPU $([math]::Round($activity.TotalCpuTime.TotalSeconds,1))s | $($activity.ProcessCount) proc | idle $([math]::Round($idleFor.TotalMinutes,1))m | elapsed $([math]::Round($elapsed.TotalMinutes,1))m"
         $percent = [math]::Min(99, [math]::Floor(($elapsed.TotalSeconds / $hardLimit.TotalSeconds) * 100))
         Write-Log "  heartbeat: CPU=$([math]::Round($activity.TotalCpuTime.TotalSeconds,1))s procs=$($activity.ProcessCount) idle=$([math]::Round($idleFor.TotalMinutes,1))m elapsed=$([math]::Round($elapsed.TotalMinutes,1))m" -Visibility Debug
-        Wait-BootUpdateUiInterval -Seconds $PollIntervalSeconds -Activity "Updating $ActivityName" -Status $status -PercentComplete $percent
+        Wait-BootUpdateUiInterval -Seconds $PollIntervalSeconds -Activity $ActivityName -Status $progressStatus -PercentComplete $percent
     }
 }
 
@@ -1256,7 +1319,8 @@ function Invoke-PackageManagerWithTimeout {
         [Parameter(Mandatory)][string]$Name,
         [Parameter(Mandatory)][scriptblock]$ScriptBlock,
         [object[]]$ArgumentList = @(),
-        [int]$IdleTimeoutMinutes = 5, [int]$HardTimeoutMinutes = 60
+        [double]$IdleTimeoutMinutes = 5, [double]$HardTimeoutMinutes = 60,
+        [string]$Status = 'Operation is running'
     )
     $pwshPath = (Get-Command pwsh -EA SilentlyContinue)?.Source
     if (-not $pwshPath) { $pwshPath = Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe' }
@@ -1271,7 +1335,12 @@ $sbText
 '@)
 `$argList = (`'$argsJson`' | ConvertFrom-Json -NoEnumerate)
 if (`$argList -isnot [array]) { `$argList = @(`$argList) }
-& `$sb @argList 2>&1 | ForEach-Object { `$_.ToString() } | Out-File -FilePath '$($outputFile -replace "'","''")' -Encoding UTF8 -Append
+try {
+    & `$sb @argList 2>&1 | ForEach-Object { `$_.ToString() } | Out-File -FilePath '$($outputFile -replace "'","''")' -Encoding UTF8 -Append
+} catch {
+    "BOOTUPDATE_ERROR|`$(`$_.Exception.Message)" | Out-File -FilePath '$($outputFile -replace "'","''")' -Encoding UTF8 -Append
+    exit 1
+}
 "@
     $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($childScript))
     Write-Log "${Name}: Starting (idle: ${IdleTimeoutMinutes}m, hard: ${HardTimeoutMinutes}m)"
@@ -1283,17 +1352,20 @@ if (`$argList -isnot [array]) { `$argList = @(`$argList) }
     $proc = [System.Diagnostics.Process]::Start($si)
     if (-not $proc) {
         Write-Log "${Name}: Failed to start." -Level Error
-        return @{ Output = @(); TimedOut = $false; Reason = 'StartFailed'; Elapsed = [timespan]::Zero }
+        return @{ Output = @(); TimedOut = $false; Failed = $true; Reason = 'StartFailed'; Elapsed = [timespan]::Zero; ExitCode = $null }
     }
     Write-Log "${Name}: PID $($proc.Id)" -Visibility Debug
-    $result = Wait-ProcessWithIdleTimeout -Process $proc -ActivityName $Name -IdleTimeoutMinutes $IdleTimeoutMinutes -HardTimeoutMinutes $HardTimeoutMinutes -PollIntervalSeconds 30
+    $result = Wait-ProcessWithIdleTimeout -Process $proc -ActivityName $Name -Status $Status `
+        -IdleTimeoutMinutes $IdleTimeoutMinutes -HardTimeoutMinutes $HardTimeoutMinutes -PollIntervalSeconds 1
 
     $output = @()
     if (Test-Path $outputFile) { $output = Get-Content $outputFile -Encoding UTF8 -EA SilentlyContinue; Remove-Item $outputFile -Force -EA SilentlyContinue }
     $timedOut = $result.Reason -in @('IdleTimeout','HardTimeout')
+    $failed = $timedOut -or $result.Reason -ne 'Completed' -or $result.ExitCode -ne 0
     if ($timedOut) { Write-Log "${Name}: Killed ($($result.Reason)) after $([math]::Round($result.Elapsed.TotalMinutes,1))m. Will retry next boot." -Level Warn }
+    elseif ($failed) { Write-Log "${Name}: child process exited with code $($result.ExitCode)." -Level Warn }
     else { Write-Log "${Name}: Done in $([math]::Round($result.Elapsed.TotalMinutes,1))m" }
-    return @{ Output = $output; TimedOut = $timedOut; Reason = $result.Reason; Elapsed = $result.Elapsed }
+    return @{ Output = $output; TimedOut = $timedOut; Failed = $failed; Reason = $result.Reason; Elapsed = $result.Elapsed; ExitCode = $result.ExitCode }
 }
 #endregion
 
@@ -1370,7 +1442,8 @@ function Update-WingetPackages {
 
             <# Wait for both jobs; combined ceiling = hard timeout + 60s grace #>
             $combinedTimeoutSec = $hardTimeoutSec + 60
-            $null = Wait-Job -Job $scopeJobs -Timeout $combinedTimeoutSec
+            $null = Wait-BootUpdateJobsWithProgress -Jobs $scopeJobs -TimeoutSeconds $combinedTimeoutSec `
+                -Activity 'Updating Winget scopes' -Status 'User and machine upgrades are running'
 
             foreach ($job in $scopeJobs) {
                 $jr = $null
@@ -1398,7 +1471,8 @@ function Update-WingetPackages {
                 <# Retry if blocked — sequential, after parallel phase completes #>
                 if ($installBlocked -and -not $jr.TimedOut) {
                     Write-Log "Winget ($sc) blocked by another install. Waiting 30s, retrying once..." -Level Warn
-                    Start-Sleep -Seconds 30
+                    Wait-BootUpdateUiInterval -Seconds 30 -Activity "Updating Winget $sc" `
+                        -Status 'Another installer is active; waiting to retry'
                     $retryResult = Invoke-PackageManagerWithTimeout -Name "Winget-$sc-retry" -ScriptBlock {
                         param($wp, $sc2)
                         & $wp upgrade --all --scope $sc2 --accept-source-agreements --accept-package-agreements --disable-interactivity --no-vt 2>&1
@@ -1441,7 +1515,8 @@ function Update-WingetPackages {
                 <# One retry if blocked by another installer #>
                 if ($installBlocked -and -not $result.TimedOut) {
                     Write-Log "Winget ($scope) blocked by another install. Waiting 30s, retrying once..." -Level Warn
-                    Start-Sleep -Seconds 30
+                    Wait-BootUpdateUiInterval -Seconds 30 -Activity "Updating Winget $scope" `
+                        -Status 'Another installer is active; waiting to retry'
                     $retry = Invoke-PackageManagerWithTimeout -Name "Winget-$scope-retry" -ScriptBlock {
                         param($wp, $sc)
                         & $wp upgrade --all --scope $sc --accept-source-agreements --accept-package-agreements --disable-interactivity --no-vt 2>&1
@@ -1553,21 +1628,35 @@ function Update-ChocolateyPackages {
     param()
     $choco = Get-Command choco -EA SilentlyContinue
     if (-not $choco) { Write-Log 'Chocolatey not found, skipping.' -Level Warn; return @{ Success = $true; Count = 0 } }
+    $chocoPath = $choco.Source
     Write-Log 'Updating Chocolatey packages...'
     $count = 0
     if ($PSCmdlet.ShouldProcess('Chocolatey', 'Run choco upgrade all')) {
         if ($script:ExcludePatterns.Count -eq 0 -and $script:IncludePatterns.Count -eq 0) {
             <# Fast path: no package filters #>
-            & choco upgrade all -y --no-progress 2>&1 | ForEach-Object {
+            $result = Invoke-BootUpdateBackgroundOperation -Name 'Updating Chocolatey packages' `
+                -Status 'choco upgrade all is running' -TimeoutMinutes $script:PackageTimeoutMinutes `
+                -ScriptBlock { param($Path) & $Path upgrade all -y --no-progress 2>&1 } `
+                -ArgumentList @($chocoPath)
+            $result.Output | ForEach-Object {
                 if ($_ -match 'upgraded (\d+)/\d+ package') { $count = [int]$Matches[1] }
                 Write-Log $_
             }
+            if ($result.Failed -or $result.TimedOut) { Write-Log 'Chocolatey upgrade failed or timed out; continuing.' -Level Warn }
         } else {
             <# Filtered path: enumerate outdated packages, exclude by pattern, upgrade individually #>
             Write-Log "Chocolatey: ExcludePatterns active ($($script:ExcludePatterns -join ', ')) — enumerating outdated packages"
             $outdatedLines = @()
             try {
-                $outdatedLines = @(& choco outdated --limit-output 2>&1 | ForEach-Object { $_.ToString() })
+                $listResult = Invoke-BootUpdateBackgroundOperation -Name 'Checking Chocolatey packages' `
+                    -Status 'choco outdated is running' -TimeoutMinutes $script:PackageTimeoutMinutes `
+                    -ScriptBlock { param($Path) & $Path outdated --limit-output 2>&1 } `
+                    -ArgumentList @($chocoPath)
+                $outdatedLines = @($listResult.Output | ForEach-Object { $_.ToString() })
+                if ($listResult.Failed -or $listResult.TimedOut) {
+                    Write-Log 'Chocolatey package enumeration failed or timed out.' -Level Error
+                    return @{ Success = $true; Count = 0 }
+                }
             } catch {
                 Write-Log "Chocolatey: Failed to enumerate outdated packages: $_" -Level Error
                 return @{ Success = $true; Count = 0 }
@@ -1593,10 +1682,15 @@ function Update-ChocolateyPackages {
 
             foreach ($pkgName in $toUpgrade) {
                 Write-Log "Chocolatey: Upgrading $pkgName"
-                & choco upgrade $pkgName -y --no-progress 2>&1 | ForEach-Object {
+                $result = Invoke-BootUpdateBackgroundOperation -Name "Updating Chocolatey $pkgName" `
+                    -Status "$pkgName upgrade is running" -TimeoutMinutes $script:PackageTimeoutMinutes `
+                    -ScriptBlock { param($Path, $Package) & $Path upgrade $Package -y --no-progress 2>&1 } `
+                    -ArgumentList @($chocoPath, $pkgName)
+                $result.Output | ForEach-Object {
                     if ($_ -match 'upgraded (\d+)/\d+ package|Software installed') { $count++ }
                     Write-Log $_
                 }
+                if ($result.Failed -or $result.TimedOut) { Write-Log "Chocolatey $pkgName failed or timed out; continuing." -Level Warn }
             }
         }
     } else {
@@ -1637,14 +1731,31 @@ function Repair-WindowsUpdateComponents {
     Write-Log 'WU remediation: component reset complete. If failures persist, run DISM /Online /Cleanup-Image /RestoreHealth manually.'
 }
 
+function Initialize-BootUpdateWindowsUpdateModule {
+    if (Get-Module -ListAvailable PSWindowsUpdate) { return $true }
+    if ($WhatIfPreference) {
+        Write-Log '  [WHATIF] Would install PSWindowsUpdate for all users.'
+        return $true
+    }
+    Write-Log 'Installing PSWindowsUpdate module...'
+    $result = Invoke-BootUpdateBackgroundOperation -Name 'Installing PSWindowsUpdate' `
+        -Status 'Downloading and installing the Windows Update module' `
+        -TimeoutMinutes $script:PackageTimeoutMinutes -ScriptBlock {
+            Install-Module PSWindowsUpdate -Force -Scope AllUsers -AllowClobber -ErrorAction Stop
+        }
+    if ($result.Failed -or $result.TimedOut) {
+        Write-Log 'PSWindowsUpdate installation failed or timed out.' -Level Error
+        return $false
+    }
+    return [bool](Get-Module -ListAvailable PSWindowsUpdate)
+}
+
 function Install-WindowsUpdates {
     [CmdletBinding(SupportsShouldProcess)]
     param()
-    if (-not (Get-Module -ListAvailable PSWindowsUpdate)) {
-        Write-Log 'Installing PSWindowsUpdate module...'
-        Install-Module PSWindowsUpdate -Force -Scope AllUsers -AllowClobber
+    if (-not (Initialize-BootUpdateWindowsUpdateModule)) {
+        return @{ Success = $true; Count = 0 }
     }
-    Import-Module PSWindowsUpdate -Force
 
     <# Consecutive-failure streak persists across reboots in a sidecar file (no state
        schema change). At 2+ consecutive failures, run the component reset once per
@@ -1662,7 +1773,9 @@ function Install-WindowsUpdates {
     <# Collect the background prefetch job (2uj) before installing, if one is running #>
     if ($script:WuPrefetchJob) {
         Write-Log 'Waiting for background Windows Update download to finish...'
-        $done = Wait-Job $script:WuPrefetchJob -Timeout ($script:PackageTimeoutMinutes * 60)
+        $done = Wait-BootUpdateJobsWithProgress -Jobs @($script:WuPrefetchJob) `
+            -TimeoutSeconds ($script:PackageTimeoutMinutes * 60) `
+            -Activity 'Windows Update prefetch' -Status 'Finishing background downloads'
         if ($done) {
             $dlLines = @(Receive-Job $script:WuPrefetchJob -ErrorAction SilentlyContinue)
             $dlCount = @($dlLines | Where-Object { $_ -match 'Downloaded' }).Count
@@ -1685,11 +1798,35 @@ function Install-WindowsUpdates {
     $failed = $false
     if ($PSCmdlet.ShouldProcess('Windows Update', 'Install available updates')) {
         try {
-            Get-WindowsUpdate @params -Verbose 4>&1 | ForEach-Object {
-                $line = $_.ToString()
-                if ($line -eq 'System.__ComObject') { return }
-                if ($_ -match 'Installed|Downloaded') { $count++ }
+            $result = Invoke-BootUpdateBackgroundOperation -Name 'Installing Windows Updates' `
+                -Status 'Windows Update scan and installation are running' `
+                -TimeoutMinutes $script:PackageTimeoutMinutes -ScriptBlock {
+                    param($UpdateParams)
+                    try {
+                        Import-Module PSWindowsUpdate -Force
+                        $updateHashtable = @{}
+                        foreach ($property in $UpdateParams.PSObject.Properties) {
+                            $updateHashtable[$property.Name] = $property.Value
+                        }
+                        Get-WindowsUpdate @updateHashtable -Verbose 4>&1 | ForEach-Object { $_.ToString() }
+                    } catch {
+                        "BOOTUPDATE_ERROR|$($_.Exception.Message)"
+                    }
+                } -ArgumentList (,$params)
+            foreach ($item in $result.Output) {
+                $line = $item.ToString()
+                if ($line -eq 'System.__ComObject') { continue }
+                if ($line -match '^BOOTUPDATE_ERROR\|(.+)$') {
+                    $failed = $true
+                    Write-Log "Windows Update error: $($Matches[1])" -Level Error
+                    continue
+                }
+                if ($line -match 'Installed|Downloaded') { $count++ }
                 Write-Log $line
+            }
+            if ($result.Failed -or $result.TimedOut) {
+                $failed = $true
+                Write-Log 'Windows Update operation failed or timed out.' -Level Error
             }
         } catch { $failed = $true; Write-Log "Windows Update error: $_" -Level Error }
 
@@ -1723,11 +1860,9 @@ function Install-DriverFirmwareUpdates {
         Write-Log 'Driver/Firmware updates: skipped (neither -IncludeDriverUpdates nor -IncludeFirmwareUpdates specified).'
         return @{ Success = $true; Count = 0 }
     }
-    if (-not (Get-Module -ListAvailable PSWindowsUpdate)) {
-        Write-Log 'Installing PSWindowsUpdate module...'
-        Install-Module PSWindowsUpdate -Force -Scope AllUsers -AllowClobber
+    if (-not (Initialize-BootUpdateWindowsUpdateModule)) {
+        return @{ Success = $true; Count = 0 }
     }
-    Import-Module PSWindowsUpdate -Force
     $count = 0
     $excludeTitle = ((@('SQL') + ($script:ExcludePatterns | ForEach-Object { [regex]::Escape($_) })) -join '|')
 
@@ -1735,13 +1870,22 @@ function Install-DriverFirmwareUpdates {
         Write-Log 'Checking for Driver updates via PSWindowsUpdate...'
         if ($PSCmdlet.ShouldProcess('Windows Update - Drivers', 'Install driver updates')) {
             try {
-                Get-WindowsUpdate -Category 'Drivers' -AcceptAll -Install -IgnoreReboot `
-                    -NotTitle $excludeTitle -AutoReboot:$false -Confirm:$false -Verbose 4>&1 | ForEach-Object {
+                $result = Invoke-BootUpdateBackgroundOperation -Name 'Installing driver updates' `
+                    -Status 'Windows driver updates are running' -TimeoutMinutes $script:PackageTimeoutMinutes `
+                    -ScriptBlock {
+                        param($NotTitle)
+                        Import-Module PSWindowsUpdate -Force
+                        Get-WindowsUpdate -Category 'Drivers' -AcceptAll -Install -IgnoreReboot `
+                            -NotTitle $NotTitle -AutoReboot:$false -Confirm:$false -Verbose 4>&1 |
+                            ForEach-Object { $_.ToString() }
+                    } -ArgumentList @($excludeTitle)
+                $result.Output | ForEach-Object {
                     $line = $_.ToString()
                     if ($line -eq 'System.__ComObject') { return }
-                    if ($_ -match 'Installed|Downloaded') { $count++ }
+                    if ($line -match 'Installed|Downloaded') { $count++ }
                     Write-Log $line
                 }
+                if ($result.Failed -or $result.TimedOut) { Write-Log 'Driver updates failed or timed out.' -Level Warn }
             } catch { Write-Log "Driver updates error: $_" -Level Warn }
         } else {
             Write-Log '  [WHATIF] Would run: Get-WindowsUpdate -Category Drivers -AcceptAll -Install -IgnoreReboot'
@@ -1752,13 +1896,22 @@ function Install-DriverFirmwareUpdates {
         Write-Log 'Checking for Firmware updates via PSWindowsUpdate...'
         if ($PSCmdlet.ShouldProcess('Windows Update - Firmware', 'Install firmware updates')) {
             try {
-                Get-WindowsUpdate -Category 'Firmware' -AcceptAll -Install -IgnoreReboot `
-                    -NotTitle $excludeTitle -AutoReboot:$false -Confirm:$false -Verbose 4>&1 | ForEach-Object {
+                $result = Invoke-BootUpdateBackgroundOperation -Name 'Installing firmware updates' `
+                    -Status 'Windows firmware updates are running' -TimeoutMinutes $script:PackageTimeoutMinutes `
+                    -ScriptBlock {
+                        param($NotTitle)
+                        Import-Module PSWindowsUpdate -Force
+                        Get-WindowsUpdate -Category 'Firmware' -AcceptAll -Install -IgnoreReboot `
+                            -NotTitle $NotTitle -AutoReboot:$false -Confirm:$false -Verbose 4>&1 |
+                            ForEach-Object { $_.ToString() }
+                    } -ArgumentList @($excludeTitle)
+                $result.Output | ForEach-Object {
                     $line = $_.ToString()
                     if ($line -eq 'System.__ComObject') { return }
-                    if ($_ -match 'Installed|Downloaded') { $count++ }
+                    if ($line -match 'Installed|Downloaded') { $count++ }
                     Write-Log $line
                 }
+                if ($result.Failed -or $result.TimedOut) { Write-Log 'Firmware updates failed or timed out.' -Level Warn }
             } catch { Write-Log "Firmware updates error: $_" -Level Warn }
         } else {
             Write-Log '  [WHATIF] Would run: Get-WindowsUpdate -Category Firmware -AcceptAll -Install -IgnoreReboot'
@@ -1788,28 +1941,37 @@ function Update-DefenderSignatures {
         Write-Log 'Defender signature update: skipped (not Windows).'
         return @{ Success = $true; Count = 0 }
     }
-    if (-not (Get-Command Get-MpComputerStatus -EA SilentlyContinue)) {
-        Write-Log 'Defender signature update: skipped (Get-MpComputerStatus not available — Defender may be disabled or absent).' -Level Warn
+    $mpCmdRun = Join-Path $env:ProgramFiles 'Windows Defender\MpCmdRun.exe'
+    if (-not (Test-Path $mpCmdRun)) {
+        Write-Log 'Defender signature update: skipped (MpCmdRun.exe not found — Defender may be disabled or absent).' -Level Warn
         return @{ Success = $true; Count = 0 }
     }
     Write-Log 'Updating Windows Defender signatures...'
-    if ($PSCmdlet.ShouldProcess('Windows Defender', 'Update-MpSignature -UpdateSource MicrosoftUpdateServer')) {
+    if ($PSCmdlet.ShouldProcess('Windows Defender', 'MpCmdRun.exe -SignatureUpdate -MMPC')) {
         try {
-            Update-MpSignature -UpdateSource MicrosoftUpdateServer -ErrorAction Stop
-            $mpStatus = Get-MpComputerStatus -ErrorAction SilentlyContinue
-            if ($mpStatus) {
-                $lastUpdated = $mpStatus.AntivirusSignatureLastUpdated
-                Write-Log "Defender signatures updated. Last updated: $lastUpdated"
-            } else {
-                Write-Log 'Defender signatures update-MpSignature completed.'
+            $result = Invoke-BootUpdateBackgroundOperation -Name 'Updating Defender signatures' `
+                -Status 'Microsoft Defender signature update is running' `
+                -TimeoutMinutes $script:PackageTimeoutMinutes -ScriptBlock {
+                    param($Path)
+                    & $Path -SignatureUpdate -MMPC 2>&1
+                    "BOOTUPDATE_EXIT|$LASTEXITCODE"
+                } -ArgumentList @($mpCmdRun)
+            $exitCode = -1
+            foreach ($line in $result.Output) {
+                if ($line -match '^BOOTUPDATE_EXIT\|(-?\d+)$') { $exitCode = [int]$Matches[1]; continue }
+                Write-Log $line.ToString()
             }
+            if ($result.Failed -or $result.TimedOut -or $exitCode -ne 0) {
+                throw "Defender signature process failed, timed out, or exited with code $exitCode."
+            }
+            Write-Log 'Defender signatures updated.'
             return @{ Success = $true; Count = 1 }
         } catch {
             Write-Log "Defender signature update failed (non-fatal): $_" -Level Warn
             return @{ Success = $true; Count = 0 }
         }
     } else {
-        Write-Log '  [WHATIF] Would run: Update-MpSignature -UpdateSource MicrosoftUpdateServer'
+        Write-Log '  [WHATIF] Would run: MpCmdRun.exe -SignatureUpdate -MMPC'
         return @{ Success = $true; Count = 0 }
     }
 }
@@ -1834,7 +1996,8 @@ function Update-WslKernelAndDistros {
         Write-Log 'WSL update: skipped (use -UpdateWsl to enable).'
         return @{ Success = $true; Count = 0 }
     }
-    if (-not (Get-Command wsl -EA SilentlyContinue)) {
+    $wslCommand = Get-Command wsl -EA SilentlyContinue
+    if (-not $wslCommand) {
         Write-Log 'WSL update: wsl.exe not found — WSL not installed, skipping.'
         return @{ Success = $true; Count = 0 }
     }
@@ -1842,10 +2005,20 @@ function Update-WslKernelAndDistros {
     Write-Log 'Updating WSL kernel...'
     if ($PSCmdlet.ShouldProcess('WSL', 'wsl --update --no-distribution')) {
         try {
-            $kernelOut = & wsl --update --no-distribution 2>&1
-            $kernelOut | ForEach-Object { Write-Log $_.ToString() }
-            if ($LASTEXITCODE -ne 0) {
-                Write-Log "WSL kernel update exited with code $LASTEXITCODE (advisory — continuing)." -Level Warn
+            $kernelResult = Invoke-BootUpdateBackgroundOperation -Name 'Updating WSL kernel' `
+                -Status 'wsl --update is running' -TimeoutMinutes $script:PackageTimeoutMinutes `
+                -ScriptBlock {
+                    param($Path)
+                    & $Path --update --no-distribution 2>&1
+                    "BOOTUPDATE_EXIT|$LASTEXITCODE"
+                } -ArgumentList @($wslCommand.Source)
+            $kernelExit = -1
+            foreach ($line in $kernelResult.Output) {
+                if ($line -match '^BOOTUPDATE_EXIT\|(-?\d+)$') { $kernelExit = [int]$Matches[1]; continue }
+                Write-Log $line.ToString()
+            }
+            if ($kernelResult.Failed -or $kernelResult.TimedOut -or $kernelExit -ne 0) {
+                Write-Log "WSL kernel update failed, timed out, or exited with code $kernelExit (advisory — continuing)." -Level Warn
             } else {
                 Write-Log 'WSL kernel update completed.'
             }
@@ -1859,8 +2032,11 @@ function Update-WslKernelAndDistros {
     <# Enumerate distros #>
     $distros = @()
     try {
-        $listOut = & wsl --list --quiet 2>&1
-        $distros = @($listOut | ForEach-Object { $_.ToString().Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        $listResult = Invoke-BootUpdateBackgroundOperation -Name 'Enumerating WSL distributions' `
+            -Status 'wsl --list is running' -TimeoutMinutes 5 `
+            -ScriptBlock { param($Path) & $Path --list --quiet 2>&1 } `
+            -ArgumentList @($wslCommand.Source)
+        $distros = @($listResult.Output | ForEach-Object { $_.ToString().Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     } catch {
         Write-Log "WSL distro enumeration failed: $_" -Level Warn
         return @{ Success = $true; Count = 0 }
@@ -1880,41 +2056,47 @@ function Update-WslKernelAndDistros {
             continue
         }
         try {
-            <# Detect package manager — try apt-get first, then dnf, then pacman #>
-            $hasApt = $null
-            try { $hasApt = & wsl -d $distro -u root -- which apt-get 2>&1; $hasApt = ($LASTEXITCODE -eq 0) } catch { $hasApt = $false }
-
-            if ($hasApt) {
-                Write-Log "  [$distro] Using apt-get"
-                $upgradeOut = & wsl -d $distro -u root -- sh -c 'DEBIAN_FRONTEND=noninteractive apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y' 2>&1
-                $upgradeOut | ForEach-Object { Write-Log "  [$distro] $($_.ToString())" }
-                $updatedCount++
-                continue
+            $distroResult = Invoke-BootUpdateBackgroundOperation -Name "Updating WSL $distro" `
+                -Status "Linux package updates are running in $distro" `
+                -TimeoutMinutes $script:PackageTimeoutMinutes -ScriptBlock {
+                    param($Path, $Distro)
+                    & $Path -d $Distro -u root -- which apt-get *> $null
+                    if ($LASTEXITCODE -eq 0) {
+                        'BOOTUPDATE_PM|apt-get'
+                        & $Path -d $Distro -u root -- sh -c 'DEBIAN_FRONTEND=noninteractive apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y' 2>&1
+                        "BOOTUPDATE_EXIT|$LASTEXITCODE"
+                        return
+                    }
+                    & $Path -d $Distro -u root -- which dnf *> $null
+                    if ($LASTEXITCODE -eq 0) {
+                        'BOOTUPDATE_PM|dnf'
+                        & $Path -d $Distro -u root -- dnf upgrade -y 2>&1
+                        "BOOTUPDATE_EXIT|$LASTEXITCODE"
+                        return
+                    }
+                    & $Path -d $Distro -u root -- which pacman *> $null
+                    if ($LASTEXITCODE -eq 0) {
+                        'BOOTUPDATE_PM|pacman'
+                        & $Path -d $Distro -u root -- pacman -Syu --noconfirm 2>&1
+                        "BOOTUPDATE_EXIT|$LASTEXITCODE"
+                        return
+                    }
+                    'BOOTUPDATE_PM|none'
+                } -ArgumentList @($wslCommand.Source, $distro)
+            $manager = 'none'; $exitCode = -1
+            foreach ($line in $distroResult.Output) {
+                if ($line -match '^BOOTUPDATE_PM\|(.+)$') { $manager = $Matches[1]; continue }
+                if ($line -match '^BOOTUPDATE_EXIT\|(-?\d+)$') { $exitCode = [int]$Matches[1]; continue }
+                Write-Log "  [$distro] $($line.ToString())"
             }
-
-            $hasDnf = $null
-            try { $hasDnf = & wsl -d $distro -u root -- which dnf 2>&1; $hasDnf = ($LASTEXITCODE -eq 0) } catch { $hasDnf = $false }
-
-            if ($hasDnf) {
-                Write-Log "  [$distro] Using dnf"
-                $upgradeOut = & wsl -d $distro -u root -- dnf upgrade -y 2>&1
-                $upgradeOut | ForEach-Object { Write-Log "  [$distro] $($_.ToString())" }
+            if ($manager -eq 'none') {
+                Write-Log "  [$distro] No recognized package manager (apt-get/dnf/pacman) found — skipping." -Level Warn
+            } elseif (-not $distroResult.Failed -and -not $distroResult.TimedOut -and $exitCode -eq 0) {
+                Write-Log "  [$distro] $manager update completed."
                 $updatedCount++
-                continue
+            } else {
+                Write-Log "  [$distro] $manager update failed or timed out." -Level Warn
             }
-
-            $hasPacman = $null
-            try { $hasPacman = & wsl -d $distro -u root -- which pacman 2>&1; $hasPacman = ($LASTEXITCODE -eq 0) } catch { $hasPacman = $false }
-
-            if ($hasPacman) {
-                Write-Log "  [$distro] Using pacman"
-                $upgradeOut = & wsl -d $distro -u root -- pacman -Syu --noconfirm 2>&1
-                $upgradeOut | ForEach-Object { Write-Log "  [$distro] $($_.ToString())" }
-                $updatedCount++
-                continue
-            }
-
-            Write-Log "  [$distro] No recognized package manager (apt-get/dnf/pacman) found — skipping." -Level Warn
         } catch {
             Write-Log "  [$distro] Update error (advisory): $_" -Level Warn
         }
@@ -1949,10 +2131,10 @@ function Update-ContainerImages {
     <# Detect runtime: docker first, then podman #>
     $runtime = $null
     $dockerCmd = Get-Command docker -EA SilentlyContinue
-    if ($dockerCmd) { $runtime = 'docker' }
+    if ($dockerCmd) { $runtime = 'docker'; $runtimePath = $dockerCmd.Source }
     else {
         $podmanCmd = Get-Command podman -EA SilentlyContinue
-        if ($podmanCmd) { $runtime = 'podman' }
+        if ($podmanCmd) { $runtime = 'podman'; $runtimePath = $podmanCmd.Source }
     }
     if (-not $runtime) {
         Write-Log 'Container image update: neither docker nor podman found — skipping.'
@@ -1965,8 +2147,11 @@ function Update-ContainerImages {
         <# Enumerate unique non-<none> images #>
         $imageList = @()
         try {
-            $rawImages = & $runtime images --format '{{.Repository}}:{{.Tag}}' 2>&1
-            $imageList = @($rawImages |
+            $listResult = Invoke-BootUpdateBackgroundOperation -Name "Enumerating $runtime images" `
+                -Status "$runtime image inventory is running" -TimeoutMinutes 5 `
+                -ScriptBlock { param($Path) & $Path images --format '{{.Repository}}:{{.Tag}}' 2>&1 } `
+                -ArgumentList @($runtimePath)
+            $imageList = @($listResult.Output |
                 ForEach-Object { $_.ToString().Trim() } |
                 Where-Object { $_ -notmatch '<none>' -and -not [string]::IsNullOrWhiteSpace($_) } |
                 Select-Object -Unique)
@@ -1988,12 +2173,22 @@ function Update-ContainerImages {
             }
             Write-Log "  Pulling: $image"
             try {
-                $pullOut = & $runtime pull $image 2>&1
-                $pullOut | ForEach-Object { Write-Log "    $($_.ToString())" }
-                if ($LASTEXITCODE -eq 0) {
+                $pullResult = Invoke-BootUpdateBackgroundOperation -Name "Pulling $image" `
+                    -Status "$runtime pull is running" -TimeoutMinutes $script:PackageTimeoutMinutes `
+                    -ScriptBlock {
+                        param($Path, $Image)
+                        & $Path pull $Image 2>&1
+                        "BOOTUPDATE_EXIT|$LASTEXITCODE"
+                    } -ArgumentList @($runtimePath, $image)
+                $pullExit = -1
+                foreach ($line in $pullResult.Output) {
+                    if ($line -match '^BOOTUPDATE_EXIT\|(-?\d+)$') { $pullExit = [int]$Matches[1]; continue }
+                    Write-Log "    $($line.ToString())"
+                }
+                if (-not $pullResult.Failed -and -not $pullResult.TimedOut -and $pullExit -eq 0) {
                     $successfulPulls++
                 } else {
-                    Write-Log "  Pull failed for $image (exit $LASTEXITCODE) — continuing." -Level Warn
+                    Write-Log "  Pull failed or timed out for $image (exit $pullExit) — continuing." -Level Warn
                 }
             } catch {
                 Write-Log "  Pull error for ${image}: $_ — continuing." -Level Warn
@@ -2003,7 +2198,13 @@ function Update-ContainerImages {
         <# Prune dangling layers — best-effort, ignore exit code #>
         if ($PSCmdlet.ShouldProcess('container system', "$runtime system prune -f")) {
             Write-Log "Container prune: $runtime system prune -f"
-            try { & $runtime system prune -f 2>&1 | ForEach-Object { Write-Log "  $($_.ToString())" } } catch { }
+            try {
+                $pruneResult = Invoke-BootUpdateBackgroundOperation -Name "Pruning $runtime images" `
+                    -Status "$runtime system prune is running" -TimeoutMinutes 15 `
+                    -ScriptBlock { param($Path) & $Path system prune -f 2>&1 } `
+                    -ArgumentList @($runtimePath)
+                $pruneResult.Output | ForEach-Object { Write-Log "  $($_.ToString())" }
+            } catch { }
         } else {
             Write-Log "  [WHATIF] Would run: $runtime system prune -f"
         }
@@ -2020,11 +2221,26 @@ function Update-PipPackages {
     param()
     $pip = Get-Command pip -EA SilentlyContinue
     if (-not $pip) { Write-Log 'pip not found, skipping.' -Level Warn; return @{ Success = $true; Count = 0 } }
+    $python = Get-Command python -EA SilentlyContinue
+    if (-not $python) { Write-Log 'python not found, skipping pip updates.' -Level Warn; return @{ Success = $true; Count = 0 } }
     Write-Log 'Updating pip packages...'
     $count = 0
     if ($PSCmdlet.ShouldProcess('pip', 'Upgrade pip and outdated packages')) {
-        & python -m pip install --upgrade pip 2>&1 | ForEach-Object { Write-Log $_ }
-        $outdated = @(& pip list --outdated --format=json 2>$null | ConvertFrom-Json -EA SilentlyContinue)
+        $pipSelf = Invoke-BootUpdateBackgroundOperation -Name 'Updating pip' -Status 'pip self-update is running' `
+            -TimeoutMinutes $script:PackageTimeoutMinutes `
+            -ScriptBlock { param($Python) & $Python -m pip install --upgrade pip 2>&1 } `
+            -ArgumentList @($python.Source)
+        $pipSelf.Output | ForEach-Object { Write-Log $_ }
+        if ($pipSelf.Failed -or $pipSelf.TimedOut) { Write-Log 'pip self-update failed or timed out; continuing.' -Level Warn }
+        $listResult = Invoke-BootUpdateBackgroundOperation -Name 'Checking pip packages' `
+            -Status 'pip package inventory is running' -TimeoutMinutes 5 `
+            -ScriptBlock { param($Pip) & $Pip list --outdated --format=json 2>$null } `
+            -ArgumentList @($pip.Source)
+        if ($listResult.Failed -or $listResult.TimedOut) {
+            Write-Log 'pip package inventory failed or timed out.' -Level Warn
+            return @{ Success = $true; Count = 0 }
+        }
+        $outdated = @(($listResult.Output -join "`n") | ConvertFrom-Json -EA SilentlyContinue)
         foreach ($pkg in $outdated) {
             $skipReason = Test-PackageExcluded -Name $pkg.name
             if ($skipReason) {
@@ -2032,8 +2248,14 @@ function Update-PipPackages {
                 continue
             }
             Write-Log "Upgrading: $($pkg.name)"
-            & pip install --upgrade "$($pkg.name)" 2>&1 | ForEach-Object { Write-Log $_ }
-            $count++
+            $result = Invoke-BootUpdateBackgroundOperation -Name "Updating pip $($pkg.name)" `
+                -Status "$($pkg.name) upgrade is running" -TimeoutMinutes $script:PackageTimeoutMinutes `
+                -ScriptBlock { param($Pip, $Package) & $Pip install --upgrade $Package 2>&1 } `
+                -ArgumentList @($pip.Source, $pkg.name)
+            $result.Output | ForEach-Object { Write-Log $_ }
+            if ($result.Failed -or $result.TimedOut) {
+                Write-Log "pip update failed or timed out for $($pkg.name)." -Level Warn
+            } else { $count++ }
         }
     } else {
         Write-Log '  [WHATIF] Would run: pip install --upgrade <outdated packages>'
@@ -2049,7 +2271,11 @@ function Update-NpmPackages {
     Write-Log 'Updating npm global packages...'
     $count = 0
     if ($PSCmdlet.ShouldProcess('npm', 'Run npm update -g')) {
-        & npm update -g 2>&1 | ForEach-Object { if ($_ -match 'added|updated') { $count++ }; Write-Log $_ }
+        $result = Invoke-BootUpdateBackgroundOperation -Name 'Updating npm packages' `
+            -Status 'npm update -g is running' -TimeoutMinutes $script:PackageTimeoutMinutes `
+            -ScriptBlock { param($Path) & $Path update -g 2>&1 } -ArgumentList @($npm.Source)
+        $result.Output | ForEach-Object { if ($_ -match 'added|updated') { $count++ }; Write-Log $_ }
+        if ($result.Failed -or $result.TimedOut) { Write-Log 'npm update failed or timed out.' -Level Warn }
     } else {
         Write-Log '  [WHATIF] Would run: npm update -g'
     }
@@ -2064,7 +2290,17 @@ function Update-Office365 {
     Write-Log 'Updating Office 365 (Click-to-Run)...'
     if ($PSCmdlet.ShouldProcess('Office 365', 'Trigger OfficeC2RClient update')) {
         try {
-            & $c2rClient /update user updatepromptuser=false forceappshutdown=true displaylevel=false 2>&1 | ForEach-Object { Write-Log $_ }
+            $result = Invoke-BootUpdateBackgroundOperation -Name 'Updating Office 365' `
+                -Status 'Office Click-to-Run update is starting' -TimeoutMinutes $script:PackageTimeoutMinutes `
+                -ScriptBlock {
+                    param($Path)
+                    & $Path /update user updatepromptuser=false forceappshutdown=true displaylevel=false 2>&1
+                } -ArgumentList @($c2rClient)
+            $result.Output | ForEach-Object { Write-Log $_ }
+            if ($result.Failed -or $result.TimedOut) {
+                Write-Log 'Office 365 update failed or timed out.' -Level Warn
+                return @{ Success = $true; Count = 0 }
+            }
             Write-Log 'Office 365 update triggered (may complete in background)'
             return @{ Success = $true; Count = 1 }
         } catch { Write-Log "Office 365 error: $_" -Level Error; return @{ Success = $true; Count = 0 } }
@@ -2113,7 +2349,9 @@ function Update-PowerShellModules {
                     }
                 }
             } -ArgumentList (,$moduleNames), $throttle
-            $done = $job | Wait-Job -Timeout ($script:PackageTimeoutMinutes * 60)
+            $done = Wait-BootUpdateJobsWithProgress -Jobs @($job) `
+                -TimeoutSeconds ($script:PackageTimeoutMinutes * 60) `
+                -Activity 'Updating PowerShell modules' -Status 'PSResourceGet updates are running'
             if (-not $done) {
                 Write-Log "TIMEOUT: PSResource bulk update exceeded ${script:PackageTimeoutMinutes}m" -Level Warn
                 try { Get-Process -Id $job.ChildJobs[0].ProcessId -EA SilentlyContinue | Stop-Process -Force -EA SilentlyContinue } catch { }
@@ -2167,7 +2405,9 @@ function Update-PowerShellModules {
                     }
                 }
             } -ArgumentList (,$modulePairs), $throttle
-            $done = $job | Wait-Job -Timeout ($script:PackageTimeoutMinutes * 60)
+            $done = Wait-BootUpdateJobsWithProgress -Jobs @($job) `
+                -TimeoutSeconds ($script:PackageTimeoutMinutes * 60) `
+                -Activity 'Updating PowerShell modules' -Status 'Update-Module jobs are running'
             if (-not $done) {
                 Write-Log "TIMEOUT: parallel module update exceeded ${script:PackageTimeoutMinutes}m" -Level Warn
                 try { Get-Process -Id $job.ChildJobs[0].ProcessId -EA SilentlyContinue | Stop-Process -Force -EA SilentlyContinue } catch { }
@@ -2202,7 +2442,9 @@ function Update-PowerShellModules {
         if ($PSCmdlet.ShouldProcess('AWS.Tools.*', 'Update-AWSToolsModule -CleanUp')) {
             try {
                 $job = Start-Job -ScriptBlock { Update-AWSToolsModule -CleanUp -Force -Confirm:$false 2>&1 }
-                $done = $job | Wait-Job -Timeout ($script:PackageTimeoutMinutes * 60)
+                $done = Wait-BootUpdateJobsWithProgress -Jobs @($job) `
+                    -TimeoutSeconds ($script:PackageTimeoutMinutes * 60) `
+                    -Activity 'Updating AWS.Tools modules' -Status 'AWS.Tools update is running'
                 if (-not $done) {
                     Write-Log 'TIMEOUT: AWS.Tools update exceeded timeout' -Level Warn
                     try { Get-Process -Id $job.ChildJobs[0].ProcessId -EA SilentlyContinue | Stop-Process -Force -EA SilentlyContinue } catch { }
@@ -2237,13 +2479,24 @@ function Update-ScoopPackages {
     Write-Log 'Updating Scoop...'
     if ($PSCmdlet.ShouldProcess('Scoop', 'Run scoop update and scoop update *')) {
         try {
-            & scoop update 2>&1 | ForEach-Object { Write-Log $_ }
+            $scoopSelf = Invoke-BootUpdateBackgroundOperation -Name 'Updating Scoop' `
+                -Status 'Scoop metadata update is running' -TimeoutMinutes $script:PackageTimeoutMinutes `
+                -ScriptBlock { param($Path) & $Path update 2>&1 } -ArgumentList @($scoop.Source)
+            $scoopSelf.Output | ForEach-Object { Write-Log $_ }
+            if ($scoopSelf.Failed -or $scoopSelf.TimedOut) {
+                Write-Log 'Scoop metadata update failed or timed out.' -Level Warn
+                return @{ Success = $true; Count = 0 }
+            }
             Write-Log 'Updating all Scoop packages...'
             $count = 0
-            & scoop update * 2>&1 | ForEach-Object {
+            $result = Invoke-BootUpdateBackgroundOperation -Name 'Updating Scoop packages' `
+                -Status 'Scoop package updates are running' -TimeoutMinutes $script:PackageTimeoutMinutes `
+                -ScriptBlock { param($Path) & $Path update '*' 2>&1 } -ArgumentList @($scoop.Source)
+            $result.Output | ForEach-Object {
                 if ($_ -match '^\s*\S+:\s+\S+\s+->\s+\S+') { $count++ }
                 Write-Log $_
             }
+            if ($result.Failed -or $result.TimedOut) { Write-Log 'Scoop package updates failed or timed out.' -Level Warn }
             Write-Log "Scoop: $count package(s) updated."
             return @{ Success = $true; Count = $count }
         } catch { Write-Log "Scoop error: $_" -Level Error; return @{ Success = $true; Count = 0 } }
@@ -2261,7 +2514,14 @@ function Update-DotnetTools {
     Write-Log '*** DOTNET TOOLS UPDATE - HIGH RISK ***' -Level Warn
     Write-Log '    May break SDK-dependent builds. To disable: -SkipDotnetTools' -Level Warn
     try {
-        $listOutput = & dotnet tool list --global 2>&1
+        $listResult = Invoke-BootUpdateBackgroundOperation -Name 'Checking .NET global tools' `
+            -Status '.NET tool inventory is running' -TimeoutMinutes 5 `
+            -ScriptBlock { param($Path) & $Path tool list --global 2>&1 } -ArgumentList @($dotnet.Source)
+        $listOutput = $listResult.Output
+        if ($listResult.Failed -or $listResult.TimedOut) {
+            Write-Log '.NET global tool inventory failed or timed out.' -Level Warn
+            return @{ Success = $true; Count = 0 }
+        }
         $tools = @($listOutput | Select-Object -Skip 2 | Where-Object { $_ -match '^\S' } | ForEach-Object { ($_ -split '\s+')[0] } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
         if ($tools.Count -eq 0) { Write-Log 'No .NET global tools found.'; return @{ Success = $true; Count = 0 } }
         Write-Log "Found $($tools.Count) tool(s): $($tools -join ', ')"
@@ -2270,9 +2530,15 @@ function Update-DotnetTools {
             Write-Log "Updating: $tool"
             if ($PSCmdlet.ShouldProcess($tool, 'dotnet tool update --global')) {
                 try {
-                    $output = & dotnet tool update --global $tool 2>&1
+                    $result = Invoke-BootUpdateBackgroundOperation -Name "Updating .NET tool $tool" `
+                        -Status "$tool update is running" -TimeoutMinutes $script:PackageTimeoutMinutes `
+                        -ScriptBlock { param($Path, $Tool) & $Path tool update --global $Tool 2>&1 } `
+                        -ArgumentList @($dotnet.Source, $tool)
+                    $output = $result.Output
                     $output | ForEach-Object { Write-Log $_ }
-                    if ($output -match 'was successfully updated') { $count++ }
+                    if ($result.Failed -or $result.TimedOut) {
+                        Write-Log "  $tool update failed or timed out." -Level Warn
+                    } elseif ($output -match 'was successfully updated') { $count++ }
                 } catch { Write-Log "  $tool error: $_" -Level Warn }
             } else {
                 Write-Log "  [WHATIF] Would run: dotnet tool update --global $tool"
@@ -2294,8 +2560,16 @@ function Update-VscodeExtensions {
     Write-Log "Updating VS Code extensions via: $($codeCmd.Name)"
     if ($PSCmdlet.ShouldProcess('VS Code', 'Run code --update-extensions')) {
         try {
-            $output = & $codeCmd.Name --update-extensions 2>&1
+            $result = Invoke-BootUpdateBackgroundOperation -Name 'Updating VS Code extensions' `
+                -Status 'VS Code extension updates are running' -TimeoutMinutes $script:PackageTimeoutMinutes `
+                -ScriptBlock { param($Path) & $Path --update-extensions 2>&1 } `
+                -ArgumentList @($codeCmd.Source)
+            $output = $result.Output
             $output | ForEach-Object { Write-Log $_ }
+            if ($result.Failed -or $result.TimedOut) {
+                Write-Log 'VS Code extension update failed or timed out.' -Level Warn
+                return @{ Success = $true; Count = 0 }
+            }
             $count = @($output | Where-Object { $_ -match '(?i)updating extension|updated to version' }).Count
             if ($count -eq 0) {
                 $upToDate = $output | Where-Object { $_ -match '(?i)already installed|up.to.date' }
@@ -2317,7 +2591,15 @@ function Repair-AwsTooling {
     if (-not (Test-Path $awsScript)) { Write-Log 'Repair-AwsTooling.ps1 not found, skipping.' -Level Warn; return $true }
     Write-Log 'Repairing AWS tooling...'
     if ($PSCmdlet.ShouldProcess('AWS tooling', 'Run Repair-AwsTooling.ps1 -Mode Remediate')) {
-        try { & $awsScript -Mode Remediate } catch { Write-Log "AWS error: $_" -Level Error }
+        try {
+            $result = Invoke-BootUpdateBackgroundOperation -Name 'Repairing AWS tooling' `
+                -Status 'AWS CLI and module remediation is running' `
+                -TimeoutMinutes $script:PackageTimeoutMinutes `
+                -ScriptBlock { param($Path) & $Path -Mode Remediate 2>&1 } `
+                -ArgumentList @($awsScript)
+            $result.Output | ForEach-Object { Write-Log $_.ToString() }
+            if ($result.Failed -or $result.TimedOut) { Write-Log 'AWS tooling repair failed or timed out.' -Level Error }
+        } catch { Write-Log "AWS error: $_" -Level Error }
     } else {
         Write-Log '  [WHATIF] Would run: Repair-AwsTooling.ps1 -Mode Remediate'
     }
@@ -2365,7 +2647,8 @@ function Test-PostUpdateHealth {
                     param($n) Start-Service -Name $n -ErrorAction SilentlyContinue
                 } -ArgumentList $svc
 
-                Wait-Job -Job $startJob -Timeout 5 | Out-Null
+                $null = Wait-BootUpdateJobsWithProgress -Jobs @($startJob) -TimeoutSeconds 5 `
+                    -Activity 'Post-update health check' -Status "Starting service $svc"
                 if ($startJob.State -eq 'Running') {
                     Stop-Job  -Job $startJob
                     Write-Log "  Health check: $svc start timed out (>5 s) — service may still be starting" -Level Warn
@@ -2688,6 +2971,8 @@ function Send-WebhookNotification {
         $maxRetries = 3
         for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
             try {
+                <# Keep the bearer URL out of child-process arguments. The request itself is
+                   capped at 10 seconds; animated retry delays resume immediately on failure. #>
                 Invoke-RestMethod -Uri $url -Method Post -Body $jsonBody `
                     -ContentType 'application/json' -TimeoutSec 10 -ErrorAction Stop | Out-Null
                 Write-Log "Notification: webhook delivered"
@@ -2695,7 +2980,8 @@ function Send-WebhookNotification {
             } catch {
                 if ($attempt -lt $maxRetries) {
                     Write-Log "Notification: webhook attempt $attempt failed, retrying in $($attempt * 2)s..." -Level Warn
-                    Start-Sleep -Seconds ($attempt * 2)
+                    Wait-BootUpdateUiInterval -Seconds ($attempt * 2) `
+                        -Activity 'Sending completion notification' -Status 'Waiting to retry webhook delivery'
                 } else {
                     Write-Log "Notification: webhook failed after $maxRetries attempts: $_" -Level Warn
                 }
@@ -2763,7 +3049,8 @@ function Send-EmailNotification {
         }
         $mailJob = Send-MailMessage @mailParams -AsJob
         Write-Log "Notification: email job queued to $($script:NotifyEmail)"
-        $null = Wait-Job -Job $mailJob -Timeout 30
+        $null = Wait-BootUpdateJobsWithProgress -Jobs @($mailJob) -TimeoutSeconds 30 `
+            -Activity 'Sending completion notification' -Status 'Waiting for email delivery'
         $jobErrors = @(Receive-Job -Job $mailJob -ErrorAction SilentlyContinue -ErrorVariable receiveErrs 2>$null)
         if ($receiveErrs) { Write-Log "Notification: email job errors: $($receiveErrs -join '; ')" -Level Warn }
         Remove-Job -Job $mailJob -Force
@@ -4153,7 +4440,8 @@ function Invoke-BootUpdateCycle {
                     Write-BootUpdateProgress -Activity 'Parallel update cohort' `
                         -Status "$finished/$($cohortJobs.Count) phases complete" -PercentComplete $overallPercent
                     if ($finished -eq $cohortJobs.Count) { break }
-                    $null = Wait-Job -Job $cohortJobs -Timeout 1
+                    Wait-BootUpdateUiInterval -Seconds 1 -Activity 'Parallel update cohort' `
+                        -Status "$finished/$($cohortJobs.Count) phases complete" -PercentComplete $overallPercent
                 } while ([datetime]::UtcNow -lt $cohortDeadline)
             }
 
@@ -4303,6 +4591,7 @@ function Invoke-BootUpdateCycle {
                 Write-Log "Staged rollout: $($remainingPhases.Count) phase(s) remaining. Next boot will run [$($nextPhase.Name)]. Task stays registered." -Level Info
                 Write-Log "  Remaining: $(($remainingPhases | ForEach-Object { $_.Name }) -join ', ')"
                 if (-not $WhatIfPreference) { Register-BootUpdateTaskForReboot }
+                Write-BootUpdateProgress -Completed
                 return  <# Cycle not complete — exit without cleanup #>
             }
             Write-Log 'Staged rollout: all phases complete, no pending reboots — cycle done.' -Level Info
@@ -4452,4 +4741,9 @@ Update-OrchestratorSelf -ScriptBoundParams $script:ScriptBoundParams
 $script:_remoteConfig = Get-RemoteConfig
 Apply-RemoteConfig -RemoteConfig $script:_remoteConfig -UserBoundParams $script:ScriptBoundParams
 
-Invoke-BootUpdateCycle
+try {
+    Invoke-BootUpdateCycle
+} finally {
+    <# Idempotent safety net for normal return, terminating errors, and exit paths. #>
+    Write-BootUpdateProgress -Completed
+}

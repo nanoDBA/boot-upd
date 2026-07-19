@@ -70,6 +70,20 @@ updater. Existing protected installations are left unchanged. Offline runs, olde
 versions, `-WhatIf`, SYSTEM, redirected output, and any install/import failure automatically keep
 the native renderer. The themed splash is independent of Spectre and remains unchanged.
 
+To visually smoke-test animation without running any package updates:
+
+```powershell
+.\tools\Show-BootUpdateProgressDemo.ps1
+```
+
+The demo renders the same ten-frame spinner at the production 100 ms cadence and clears its
+progress record when complete.
+
+Built-in operations that can block for more than a moment run behind a process-tree-aware,
+progress-pumped adapter, keeping both animation and `v` key handling responsive. Administrator-supplied
+hooks intentionally retain same-scope execution semantics; a long hook must provide its own
+console feedback because isolating it would change how hook variables and side effects work.
+
 ### What happens
 
 1. Pre-flight checks validate disk space, network, battery, and conflicting installers

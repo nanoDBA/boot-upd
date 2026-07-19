@@ -1,8 +1,26 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.21
+**Current Version:** v2.5.22
 **Release Date:** 2026-07-19
 **Status:** STABLE
+
+---
+
+## v2.5.22 (2026-07-19)
+
+**Continuously animated progress with extensive UI regression coverage.**
+
+- Spinner rendering now refreshes every 100 ms and polls `v` on every frame.
+- Long built-in commands and background jobs run behind progress-pumped, process-tree-aware adapters instead of freezing the parent UI thread.
+- Sequential and staged paths now animate across Chocolatey, Windows Update and drivers, WSL, containers, package ecosystems, Defender, Office, AWS tooling, service checks, notification waits, and installer retry waits.
+- Progress cleanup is idempotent and protected by a top-level `finally`, including staged-rollout early returns.
+- Added behavioral tests for exact frame rotation, cadence bounds, live jobs, silent native processes, partial timeout output, descendant cleanup, failures, Quiet/noninteractive behavior, verbosity cycling, blocking-path coverage, and completion cleanup.
+- Added `tools/Show-BootUpdateProgressDemo.ps1` for a harmless human-visible animation smoke test.
+- The BBS splash implementation and all three themes remain unchanged.
+
+### Compatibility
+
+- Trusted hooks retain their existing same-scope behavior and are not moved to background runspaces. Long-running hooks remain responsible for their own feedback.
 
 ---
 

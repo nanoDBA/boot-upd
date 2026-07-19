@@ -52,6 +52,14 @@ Describe 'Concise output modes' {
         $invokeSource | Should -Match 'Test-BootUpdateOutputAtLeast -Minimum Normal\) \{\s*Show-StartupArt'
         $invokeSource | Should -Match '\$PreviewSplash'
     }
+
+    It 'keeps the complete splash implementation byte-stable after newline normalization' {
+        $splash = (Get-FunctionText -Ast $invokeAst -Name 'Show-StartupArt') -replace "`r`n", "`n"
+        $hash = [Convert]::ToHexString(
+            [Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($splash))
+        ).ToLowerInvariant()
+        $hash | Should -Be '2d5cd129d268aa97144d5da1fb84cec3035fa8541aae3eff0a53ed313290811c'
+    }
 }
 
 Describe 'Interactive verbosity cycling' {
@@ -60,7 +68,9 @@ Describe 'Interactive verbosity cycling' {
         $text | Should -Match '\[Console\]::KeyAvailable'
         $text | Should -Match '\[Console\]::ReadKey\(\$true\)'
         $text | Should -Match "KeyChar -notin @\('v', 'V'\)"
-        $text | Should -Match '% \$script:OutputModes.Count'
+        $text | Should -Match 'Switch-BootUpdateOutputMode'
+        (Get-FunctionText -Ast $invokeAst -Name 'Switch-BootUpdateOutputMode') |
+            Should -Match '% \$script:OutputModes.Count'
     }
 
     It 'disables key polling for SYSTEM and redirected consoles' {
@@ -77,6 +87,7 @@ Describe 'Resilient rich progress rendering' {
         $initialize = Get-FunctionText -Ast $invokeAst -Name 'Initialize-BootUpdateConsole'
         $progress = Get-FunctionText -Ast $invokeAst -Name 'Write-BootUpdateProgress'
         $initialize | Should -Match "Progress.View = 'Minimal'"
+        $initialize | Should -Match "ProgressPreference = 'Continue'"
         $progress | Should -Match 'Write-Progress @progressArgs'
         $progress | Should -Match 'TuiSpinnerFrames'
         (Get-FunctionText -Ast $invokeAst -Name 'Write-BootUpdateSpectreText') |
@@ -173,5 +184,249 @@ Describe 'Spectre bootstrap behavior' {
         $manifest = Join-Path $TestDrive 'PwshSpectreConsole.psd1'
         Set-Content -LiteralPath $manifest -Value '@{}'
         Test-BootUpdateSpectreModulePath -Path $manifest | Should -BeFalse
+    }
+}
+
+Describe 'Animated progress behavior' {
+    BeforeAll {
+        . ([scriptblock]::Create((Get-FunctionText -Ast $invokeAst -Name 'Write-BootUpdateProgress')))
+        . ([scriptblock]::Create((Get-FunctionText -Ast $invokeAst -Name 'Wait-BootUpdateUiInterval')))
+        . ([scriptblock]::Create((Get-FunctionText -Ast $invokeAst -Name 'Wait-BootUpdateJobsWithProgress')))
+        . ([scriptblock]::Create((Get-FunctionText -Ast $invokeAst -Name 'Get-ProcessTreeActivity')))
+        . ([scriptblock]::Create((Get-FunctionText -Ast $invokeAst -Name 'Wait-ProcessWithIdleTimeout')))
+        . ([scriptblock]::Create((Get-FunctionText -Ast $invokeAst -Name 'Invoke-PackageManagerWithTimeout')))
+        . ([scriptblock]::Create((Get-FunctionText -Ast $invokeAst -Name 'Invoke-BootUpdateBackgroundOperation')))
+        function Read-BootUpdateUiKeys { $script:UiKeyPollCount++ }
+        function Write-Log { param($Message, $Level, $Visibility) }
+    }
+
+    BeforeEach {
+        $script:TuiInteractive = $true
+        $script:OutputMode = 'Normal'
+        $script:TuiProgressActive = $false
+        $script:TuiSpinnerIndex = 0
+        $script:TuiSpinnerFrames = @('⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏')
+        $script:TuiRefreshMilliseconds = 50
+        $script:UiKeyPollCount = 0
+        $script:ProgressCaptures = [System.Collections.Generic.List[object]]::new()
+        Mock Write-Progress {
+            $script:ProgressCaptures.Add([pscustomobject]@{
+                At = [datetime]::UtcNow
+                Activity = $Activity
+                Status = $Status
+                PercentComplete = $PercentComplete
+                Completed = [bool]$Completed
+            })
+        }
+    }
+
+    It 'rotates through every spinner frame instead of repainting one static glyph' {
+        1..12 | ForEach-Object {
+            Write-BootUpdateProgress -Activity 'Demo' -Status 'Animating' -PercentComplete 25
+        }
+        $capturedFrames = @($script:ProgressCaptures | ForEach-Object { $_.Status.Substring(0, 1) })
+        $capturedFrames | Should -Be @($script:TuiSpinnerFrames + $script:TuiSpinnerFrames[0..1])
+        $script:TuiSpinnerIndex | Should -Be 12
+    }
+
+    It 'pumps multiple distinct frames at a bounded cadence during a wait' {
+        $script:TuiRefreshMilliseconds = 100
+        $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+        Wait-BootUpdateUiInterval -Seconds 1.05 -Activity 'Cadence test' -Status 'Working' -PercentComplete 40
+        $stopwatch.Stop()
+
+        $script:ProgressCaptures.Count | Should -BeGreaterOrEqual 8
+        @($script:ProgressCaptures.Status | Select-Object -Unique).Count | Should -BeGreaterOrEqual 8
+        $stopwatch.Elapsed.TotalMilliseconds | Should -BeGreaterOrEqual 900
+        $stopwatch.Elapsed.TotalMilliseconds | Should -BeLessThan 2000
+        $gaps = for ($i = 1; $i -lt $script:ProgressCaptures.Count; $i++) {
+            ($script:ProgressCaptures[$i].At - $script:ProgressCaptures[$i - 1].At).TotalMilliseconds
+        }
+        ($gaps | Measure-Object -Maximum).Maximum | Should -BeLessThan 300
+        $script:UiKeyPollCount | Should -Be $script:ProgressCaptures.Count
+    }
+
+    It 'animates while a real background job is running and returns on completion' {
+        $job = Start-ThreadJob -ScriptBlock { Start-Sleep -Milliseconds 450 }
+        try {
+            $completed = Wait-BootUpdateJobsWithProgress -Jobs @($job) -TimeoutSeconds 3 `
+                -Activity 'Job test' -Status 'Background job running'
+            $completed | Should -BeTrue
+            $script:ProgressCaptures.Count | Should -BeGreaterOrEqual 5
+            @($script:ProgressCaptures.Status | Select-Object -Unique).Count | Should -BeGreaterOrEqual 5
+        } finally {
+            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'returns false at the job deadline while continuing to animate until timeout' {
+        $fakeJob = [pscustomobject]@{ State = 'Running' }
+        $completed = Wait-BootUpdateJobsWithProgress -Jobs @($fakeJob) -TimeoutSeconds 0.3 `
+            -Activity 'Timeout test' -Status 'Still running'
+        $completed | Should -BeFalse
+        $script:ProgressCaptures.Count | Should -BeGreaterOrEqual 4
+    }
+
+    It 'keeps animating through the production background-operation adapter' {
+        $result = Invoke-BootUpdateBackgroundOperation -Name 'Adapter test' `
+            -Status 'Silent operation running' -TimeoutMinutes 1 `
+            -ScriptBlock { Start-Sleep -Milliseconds 450; 'adapter-complete' }
+        $result.Failed | Should -BeFalse
+        $result.TimedOut | Should -BeFalse
+        $result.Output | Should -Contain 'adapter-complete'
+        $script:ProgressCaptures.Count | Should -BeGreaterOrEqual 5
+        @($script:ProgressCaptures.Status | Select-Object -Unique).Count | Should -BeGreaterOrEqual 5
+    }
+
+    It 'keeps animating while a silent external process produces no output' {
+        $pwshPath = (Get-Process -Id $PID).Path
+        $result = Invoke-BootUpdateBackgroundOperation -Name 'External process test' `
+            -Status 'Silent executable running' -TimeoutMinutes 1 `
+            -ScriptBlock {
+                param($Path)
+                & $Path -NoProfile -NonInteractive -Command 'Start-Sleep -Milliseconds 450; "external-complete"'
+            } -ArgumentList @($pwshPath)
+        $result.Failed | Should -BeFalse
+        $result.Output | Should -Contain 'external-complete'
+        $script:ProgressCaptures.Count | Should -BeGreaterOrEqual 5
+        @($script:ProgressCaptures.Status | Select-Object -Unique).Count | Should -BeGreaterOrEqual 5
+    }
+
+    It 'reports a failed background operation without freezing the renderer' {
+        $result = Invoke-BootUpdateBackgroundOperation -Name 'Failure test' `
+            -Status 'Failing operation running' -TimeoutMinutes 1 `
+            -ScriptBlock { Start-Sleep -Milliseconds 250; throw 'synthetic failure' }
+        $result.Failed | Should -BeTrue
+        $result.TimedOut | Should -BeFalse
+        ($result.Output -join "`n") | Should -Match 'BOOTUPDATE_ERROR\|synthetic failure'
+        $script:ProgressCaptures.Count | Should -BeGreaterOrEqual 2
+    }
+
+    It 'captures partial output and kills a silent native process tree at timeout' {
+        $pwshPath = (Get-Process -Id $PID).Path
+        $result = Invoke-BootUpdateBackgroundOperation -Name 'Process-tree timeout test' `
+            -Status 'Waiting for forced cleanup' -TimeoutMinutes 0.02 `
+            -ScriptBlock {
+                param($Path)
+                & $Path -NoProfile -NonInteractive -Command '"CHILD_PID|$PID"; Start-Sleep -Seconds 30'
+            } -ArgumentList @($pwshPath)
+        $result.TimedOut | Should -BeTrue
+        $result.Failed | Should -BeTrue
+        $pidLine = $result.Output | Where-Object { $_ -match '^CHILD_PID\|(\d+)$' } | Select-Object -First 1
+        $pidLine | Should -Not -BeNullOrEmpty
+        $childPid = [int]([regex]::Match($pidLine, '\d+').Value)
+        Get-Process -Id $childPid -ErrorAction SilentlyContinue | Should -BeNullOrEmpty
+        $script:ProgressCaptures.Count | Should -BeGreaterOrEqual 5
+    }
+
+    It 'clears the active progress record on completion' {
+        Write-BootUpdateProgress -Activity 'Cleanup test' -Status 'Working'
+        Write-BootUpdateProgress -Activity 'Cleanup test' -Completed
+        Write-BootUpdateProgress -Activity 'Cleanup test' -Completed
+        $script:TuiProgressActive | Should -BeFalse
+        $script:ProgressCaptures[-1].Completed | Should -BeTrue
+        $script:ProgressCaptures.Count | Should -Be 2
+    }
+
+    It 'polls keys but does not render progress in Quiet mode' {
+        $script:OutputMode = 'Quiet'
+        Write-BootUpdateProgress -Activity 'Quiet test' -Status 'Hidden'
+        $script:UiKeyPollCount | Should -Be 1
+        $script:ProgressCaptures.Count | Should -Be 0
+    }
+
+    It 'does not render or poll keys when the host is non-interactive' {
+        $script:TuiInteractive = $false
+        Wait-BootUpdateUiInterval -Seconds 0.05 -Activity 'Redirected test'
+        $script:UiKeyPollCount | Should -Be 0
+        $script:ProgressCaptures.Count | Should -Be 0
+    }
+
+    It 'cycles Normal through every mode, clears Quiet, and resumes animation' {
+        . ([scriptblock]::Create((Get-FunctionText -Ast $invokeAst -Name 'Switch-BootUpdateOutputMode')))
+        $script:OutputModes = @('Quiet', 'Normal', 'Verbose', 'Debug')
+        $script:OutputMode = 'Normal'
+        $script:ScriptBoundParams = @{}
+        $script:TuiProgressActive = $true
+        Mock Write-Host { }
+
+        $observed = foreach ($null in 1..4) {
+            Switch-BootUpdateOutputMode
+            $script:OutputMode
+        }
+        $observed | Should -Be @('Verbose','Debug','Quiet','Normal')
+        $script:ScriptBoundParams.OutputMode | Should -Be 'Normal'
+        Should -Invoke Write-Progress -ParameterFilter { $Completed } -Times 1
+    }
+}
+
+Describe 'Progress coverage across blocking paths' {
+    It 'pumps the UI during every parent-thread background-job wait' {
+        foreach ($functionName in @(
+            'Update-WingetPackages',
+            'Install-WindowsUpdates',
+            'Update-PowerShellModules',
+            'Test-PostUpdateHealth',
+            'Send-EmailNotification'
+        )) {
+            (Get-FunctionText -Ast $invokeAst -Name $functionName) |
+                Should -Match 'Wait-BootUpdateJobsWithProgress' -Because "$functionName can block for seconds or minutes"
+        }
+    }
+
+    It 'pumps at 100 ms inside long monitor intervals and the parallel cohort loop' {
+        $invokeSource | Should -Match 'TuiRefreshMilliseconds = 100'
+        (Get-FunctionText -Ast $invokeAst -Name 'Wait-ProcessWithIdleTimeout') |
+            Should -Match 'Wait-BootUpdateUiInterval'
+        $cohortWait = '(?s)Parallel update cohort.*?Wait-BootUpdateUiInterval -Seconds 1'
+        $invokeSource | Should -Match $cohortWait
+    }
+
+    It 'uses animated waits for installer retry delays' {
+        $winget = Get-FunctionText -Ast $invokeAst -Name 'Update-WingetPackages'
+        $winget | Should -Not -Match 'Start-Sleep -Seconds 30'
+        $winget | Should -Match 'Another installer is active; waiting to retry'
+    }
+
+    It 'isolates every potentially long built-in phase operation behind a progress pump' {
+        foreach ($functionName in @(
+            'Update-ChocolateyPackages',
+            'Initialize-BootUpdateWindowsUpdateModule',
+            'Install-WindowsUpdates',
+            'Install-DriverFirmwareUpdates',
+            'Update-DefenderSignatures',
+            'Update-WslKernelAndDistros',
+            'Update-ContainerImages',
+            'Update-PipPackages',
+            'Update-NpmPackages',
+            'Update-Office365',
+            'Update-ScoopPackages',
+            'Update-DotnetTools',
+            'Update-VscodeExtensions',
+            'Repair-AwsTooling'
+        )) {
+            (Get-FunctionText -Ast $invokeAst -Name $functionName) |
+                Should -Match 'Invoke-BootUpdateBackgroundOperation' -Because "$functionName must not freeze the UI thread"
+        }
+    }
+
+    It 'uses process-tree isolation while keeping bearer webhook URLs out of child arguments' {
+        $adapter = Get-FunctionText -Ast $invokeAst -Name 'Invoke-BootUpdateBackgroundOperation'
+        $adapter | Should -Match 'Invoke-PackageManagerWithTimeout'
+        $adapter | Should -Not -Match 'Start-ThreadJob'
+        (Get-FunctionText -Ast $invokeAst -Name 'Wait-ProcessWithIdleTimeout') |
+            Should -Match 'Kill\(\$true\)'
+        (Get-FunctionText -Ast $invokeAst -Name 'Send-WebhookNotification') |
+            Should -Not -Match 'Invoke-BootUpdateBackgroundOperation'
+    }
+
+    It 'does not install PSWindowsUpdate under WhatIf' {
+        $initializer = Get-FunctionText -Ast $invokeAst -Name 'Initialize-BootUpdateWindowsUpdateModule'
+        $initializer.IndexOf('$WhatIfPreference') | Should -BeLessThan $initializer.IndexOf('Invoke-BootUpdateBackgroundOperation')
+    }
+
+    It 'clears progress in staged-return and top-level finally paths' {
+        $invokeSource | Should -Match '(?s)Staged rollout:.*?Write-BootUpdateProgress -Completed\s+return'
+        $invokeSource | Should -Match '(?s)try \{\s*Invoke-BootUpdateCycle\s*\} finally \{.*?Write-BootUpdateProgress -Completed'
     }
 }
