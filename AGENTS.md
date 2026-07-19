@@ -9,7 +9,7 @@ bd ready              # Find available work
 bd show <id>          # View issue details
 bd update <id> --claim  # Claim work atomically
 bd close <id>         # Complete work
-bd dolt push          # Push beads data to remote
+bd export -o .beads/issues.jsonl  # Export a Git backup; writes already land on central Dolt
 ```
 
 ## Non-Interactive Shell Commands
@@ -68,7 +68,7 @@ bd close <id>         # Complete work
 4. **PUSH TO REMOTE** - This is MANDATORY:
    ```bash
    git pull --rebase
-   bd dolt push
+   bd export -o .beads/issues.jsonl   # Direct-SQL writes are already durable on boot_upd @ 100.88.59.72:3336
    git push
    git status  # MUST show "up to date with origin"
    ```

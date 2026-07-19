@@ -1,7 +1,9 @@
 {
   "database": "dolt",
   "backend": "dolt",
-  "dolt_mode": "embedded",
-  "dolt_database": "on_boot_update_reboot_loop_while_pending_restarts_exist",
-  "project_id": "501b1c40-930b-4a08-967f-fe30ff90ad93"
+  "dolt_mode": "server",
+  "dolt_database": "boot_upd",
+  "project_id": "501b1c40-930b-4a08-967f-fe30ff90ad93",
+  "dolt_server_host": "100.88.59.72",
+  "dolt_server_user": "root"
 }
