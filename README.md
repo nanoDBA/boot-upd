@@ -77,6 +77,7 @@ Package managers are auto-detected. Missing ones are skipped with a warning.
 | `Register-BootUpdateTask.ps1` | Standalone task registration (alternative to Deploy) |
 | `Unregister-BootUpdateTask.ps1` | Emergency stop — removes the scheduled task |
 | `Repair-AwsTooling.ps1` | Optional AWS CLI v2 + module maintenance |
+| `tools/Initialize-BootUpdateWebhook.ps1` | Securely configures a notification webhook outside Git and task arguments |
 
 ## Monitoring
 
@@ -123,6 +124,32 @@ $Config = @{
     SkipVscode            = $false
 }
 ```
+
+### Notification webhook
+
+Never commit a Teams, Slack, or Discord webhook URL or place it in a scheduled-task
+command line. Configure it once from an elevated PowerShell prompt; the tool prompts
+without echo and stores the URL under ProgramData with access limited to SYSTEM and
+local Administrators:
+
+```powershell
+./tools/Initialize-BootUpdateWebhook.ps1
+
+# Remove it later
+./tools/Initialize-BootUpdateWebhook.ps1 -Remove
+```
+
+The legacy `WebhookUrl` deployment setting remains as a one-time migration path. If
+set, deployment immediately moves its value into the protected local file and clears
+the in-memory configuration before registering a task. Do not save a real URL in a
+tracked copy of `Deploy-BootUpdateCycle.ps1`.
+
+### Extension-hook trust boundary
+
+Pre-cycle, post-cycle, and `hooks.psd1` extensions must be located inside the deployed
+BootUpdateCycle directory. The orchestrator rejects hooks outside that directory,
+hooks reached through reparse points, and hooks whose file or parent directory grants
+write access to Everyone, Authenticated Users, or the built-in Users group.
 
 ## Smart timeouts
 

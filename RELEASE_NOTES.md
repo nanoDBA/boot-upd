@@ -8,7 +8,10 @@
 
 ## Unreleased
 
-No changes recorded yet.
+- Self-update now fails closed unless every downloaded PowerShell asset has a valid, matching SHA-256 value.
+- Notification webhook URLs persist only in an ACL-protected ProgramData file and are no longer forwarded through Task Scheduler or self-update process arguments.
+- Elevated extension hooks must remain under the orchestrator directory and pass path, reparse-point, and broad-write ACL checks before execution.
+- Deployment now hardens the ProgramData installation directory, and a no-echo webhook initializer supports secure setup and removal.
 
 ---
 

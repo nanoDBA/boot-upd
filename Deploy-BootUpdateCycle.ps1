@@ -71,7 +71,7 @@ $Config = @{
     NonInteractive        = $false  # Set $true for fire-and-forget: no prompts, no TUI
 
     <# NOTIFICATIONS - leave empty to disable #>
-    WebhookUrl            = ''     # Teams/Slack/Discord webhook URL (leave empty to disable)
+    WebhookUrl            = ''     # One-time HTTPS bootstrap only; persisted to protected ProgramData, never task arguments
     NotifyEmail           = ''     # Recipient email (leave empty to disable)
     SmtpServer            = ''     # SMTP relay hostname (e.g., smtp.office365.com)
 
@@ -98,6 +98,67 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
 #endregion
 
+function Set-BootUpdateInstallDirectoryAcl {
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        $null = New-Item -ItemType Directory -Path $Path -Force
+    }
+    $acl = [Security.AccessControl.DirectorySecurity]::new()
+    $acl.SetAccessRuleProtection($true, $false)
+    $inheritance = [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+    $propagation = [Security.AccessControl.PropagationFlags]::None
+    $allow = [Security.AccessControl.AccessControlType]::Allow
+    $administrators = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+    $system = [Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+    $users = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-545')
+    foreach ($sid in @($administrators, $system)) {
+        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+            $sid, [Security.AccessControl.FileSystemRights]::FullControl,
+            $inheritance, $propagation, $allow
+        ))
+    }
+    $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+        $users, [Security.AccessControl.FileSystemRights]::ReadAndExecute,
+        $inheritance, $propagation, $allow
+    ))
+    $acl.SetOwner($administrators)
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
+function Set-BootUpdateWebhookSecret {
+    param(
+        [Parameter(Mandatory)][ValidatePattern('^https://')][string]$Url,
+        [Parameter(Mandatory)][string]$InstallDirectory
+    )
+
+    Set-BootUpdateInstallDirectoryAcl -Path $InstallDirectory
+    $secretPath = Join-Path $InstallDirectory 'webhook-url.secret'
+    $tempPath = Join-Path $InstallDirectory ('.webhook-url.{0}.tmp' -f [guid]::NewGuid().ToString('N'))
+    try {
+        $null = New-Item -ItemType File -Path $tempPath -Force
+        $acl = [Security.AccessControl.FileSecurity]::new()
+        $acl.SetAccessRuleProtection($true, $false)
+        $allow = [Security.AccessControl.AccessControlType]::Allow
+        $administrators = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+        $system = [Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+        foreach ($sid in @($administrators, $system)) {
+            $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+                $sid, [Security.AccessControl.FileSystemRights]::FullControl, $allow
+            ))
+        }
+        $acl.SetOwner($administrators)
+        Set-Acl -LiteralPath $tempPath -AclObject $acl
+        [IO.File]::WriteAllText($tempPath, $Url, [Text.UTF8Encoding]::new($false))
+        Move-Item -LiteralPath $tempPath -Destination $secretPath -Force
+        Set-Acl -LiteralPath $secretPath -AclObject $acl
+    } finally {
+        if (Test-Path -LiteralPath $tempPath) {
+            Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 #region Deploy
 Write-Host "`n=== Boot Update Cycle Deployment ===" -ForegroundColor Cyan
 
@@ -116,9 +177,14 @@ foreach ($mod in $requiredModules) {
 }
 
 $installDir = $Config.InstallDir
-if (-not (Test-Path $installDir)) {
-    New-Item -Path $installDir -ItemType Directory -Force | Out-Null
+if (-not (Test-Path -LiteralPath $installDir)) {
     Write-Host "Created: $installDir"
+}
+Set-BootUpdateInstallDirectoryAcl -Path $installDir
+if (-not [string]::IsNullOrWhiteSpace($Config.WebhookUrl)) {
+    Set-BootUpdateWebhookSecret -Url $Config.WebhookUrl -InstallDirectory $installDir
+    $Config.WebhookUrl = ''
+    Write-Host 'Webhook URL stored in protected ProgramData configuration.' -ForegroundColor Green
 }
 
 <# Deploy Invoke script from source directory (no more embedded here-string duplication) #>
@@ -180,13 +246,12 @@ if ([string]::IsNullOrEmpty($env:BOOT_UPDATE_NO_SELF_UPDATE)) {
                 } elseif ($releaseInfo.body -match "(?i)$([regex]::Escape($assetName))[^\n]*?([0-9a-fA-F]{64})") {
                     $expectedSha = $matches[1].ToUpperInvariant()
                 }
-                if ($expectedSha) {
-                    $actualSha = (Get-FileHash -Path $tempPath -Algorithm SHA256).Hash.ToUpperInvariant()
-                    if ($actualSha -ne $expectedSha) { throw "SHA256 mismatch for $assetName (expected=$expectedSha actual=$actualSha)" }
-                    Write-Host "Source self-update: $assetName SHA256 verified."
-                } else {
-                    Write-Host "Source self-update: release provides no SHA256 for $assetName - skipping integrity check." -ForegroundColor Yellow
+                if ($expectedSha -notmatch '^[0-9A-F]{64}$') {
+                    throw "release $($releaseInfo.tag_name) provides no valid SHA256 for $assetName"
                 }
+                $actualSha = (Get-FileHash -Path $tempPath -Algorithm SHA256).Hash.ToUpperInvariant()
+                if ($actualSha -ne $expectedSha) { throw "SHA256 mismatch for $assetName (expected=$expectedSha actual=$actualSha)" }
+                Write-Host "Source self-update: $assetName SHA256 verified."
 
                 <# Atomic replace with backup #>
                 $target = Join-Path $PSScriptRoot $assetName
@@ -328,7 +393,6 @@ $invokeArgs = @{
     SkipRestorePoint     = $Config.SkipRestorePoint
     SkipHealthCheck      = $Config.SkipHealthCheck
     StagedRollout        = $Config.StagedRollout
-    WebhookUrl              = $Config.WebhookUrl
     NotifyEmail             = $Config.NotifyEmail
     SmtpServer              = $Config.SmtpServer
     MaintenanceWindowStart  = $Config.MaintenanceWindowStart
@@ -529,7 +593,6 @@ function Register-ScheduledTaskNow {
     if ($Config.StagedRollout)        { $taskArgs += '-StagedRollout' }
     if ($Config.MaintenanceWindowStart -ge 0) { $taskArgs += "-MaintenanceWindowStart $($Config.MaintenanceWindowStart)" }
     if ($Config.MaintenanceWindowEnd   -ge 0) { $taskArgs += "-MaintenanceWindowEnd $($Config.MaintenanceWindowEnd)" }
-    if ($Config.WebhookUrl)           { $taskArgs += "-WebhookUrl `"$($Config.WebhookUrl)`"" }
     if ($Config.NotifyEmail)          { $taskArgs += "-NotifyEmail `"$($Config.NotifyEmail)`"" }
     if ($Config.SmtpServer)           { $taskArgs += "-SmtpServer `"$($Config.SmtpServer)`"" }
     if ($Config.ExcludePatterns.Count -gt 0) {

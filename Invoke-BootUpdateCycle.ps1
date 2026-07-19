@@ -63,7 +63,7 @@ param(
     [switch]$SkipBitLocker,
     [switch]$StagedRollout,           # Run one package manager per boot instead of all at once
     [switch]$Force,
-    [ValidateScript({ $_ -eq '' -or $_ -match '^https?://' })]
+    [ValidateScript({ $_ -eq '' -or $_ -match '^https://' })]
     [string]$WebhookUrl       = '',   # Teams/Slack/Discord incoming webhook URL
     [string]$NotifyEmail      = '',   # SMTP recipient email address
     [string]$SmtpServer       = '',   # SMTP relay hostname (e.g., smtp.office365.com)
@@ -87,6 +87,150 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$script:WebhookSecretPath     = Join-Path $env:ProgramData 'BootUpdateCycle\webhook-url.secret'
+
+function Set-BootUpdateInstallDirectoryAcl {
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not $IsWindows) { throw 'BootUpdateCycle ACL protection requires Windows.' }
+    if (-not (Test-Path -LiteralPath $Path)) {
+        $null = New-Item -ItemType Directory -Path $Path -Force
+    }
+
+    $acl = [Security.AccessControl.DirectorySecurity]::new()
+    $acl.SetAccessRuleProtection($true, $false)
+    $inheritance = [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+    $propagation = [Security.AccessControl.PropagationFlags]::None
+    $allow = [Security.AccessControl.AccessControlType]::Allow
+    $administrators = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+    $system = [Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+    $users = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-545')
+
+    foreach ($sid in @($administrators, $system)) {
+        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+            $sid, [Security.AccessControl.FileSystemRights]::FullControl,
+            $inheritance, $propagation, $allow
+        ))
+    }
+    $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+        $users, [Security.AccessControl.FileSystemRights]::ReadAndExecute,
+        $inheritance, $propagation, $allow
+    ))
+    $acl.SetOwner($administrators)
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
+function Set-BootUpdateRestrictedFileAcl {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $acl = [Security.AccessControl.FileSecurity]::new()
+    $acl.SetAccessRuleProtection($true, $false)
+    $allow = [Security.AccessControl.AccessControlType]::Allow
+    $administrators = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+    $system = [Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+    foreach ($sid in @($administrators, $system)) {
+        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+            $sid, [Security.AccessControl.FileSystemRights]::FullControl, $allow
+        ))
+    }
+    $acl.SetOwner($administrators)
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
+function Resolve-BootUpdateTrustedFile {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$TrustRoot,
+        [Parameter(Mandatory)][string[]]$AllowedExtension
+    )
+
+    try {
+        $resolvedPath = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path
+        $resolvedRoot = (Resolve-Path -LiteralPath $TrustRoot -ErrorAction Stop).Path.TrimEnd('\')
+        $pathWithSeparator = "$resolvedPath\"
+        $rootWithSeparator = "$resolvedRoot\"
+        if (-not $pathWithSeparator.StartsWith($rootWithSeparator, [StringComparison]::OrdinalIgnoreCase)) {
+            return $null
+        }
+        if ([IO.Path]::GetExtension($resolvedPath) -notin $AllowedExtension) { return $null }
+
+        $trustedOwnerSids = @('S-1-5-18', 'S-1-5-32-544')
+        $broadWriteSids = @('S-1-1-0', 'S-1-5-11', 'S-1-5-32-545')
+        $writeMask = [Security.AccessControl.FileSystemRights]::Write -bor
+            [Security.AccessControl.FileSystemRights]::Modify -bor
+            [Security.AccessControl.FileSystemRights]::FullControl -bor
+            [Security.AccessControl.FileSystemRights]::Delete -bor
+            [Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+            [Security.AccessControl.FileSystemRights]::TakeOwnership
+
+        $current = $resolvedPath
+        while ($true) {
+            $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $null }
+
+            $acl = Get-Acl -LiteralPath $current -ErrorAction Stop
+            $ownerSid = if ($acl.Owner -is [Security.Principal.SecurityIdentifier]) {
+                $acl.Owner.Value
+            } else {
+                ([Security.Principal.NTAccount]$acl.Owner).Translate(
+                    [Security.Principal.SecurityIdentifier]
+                ).Value
+            }
+            if ($ownerSid -notin $trustedOwnerSids) { return $null }
+
+            foreach ($rule in $acl.Access) {
+                if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
+                $sid = if ($rule.IdentityReference -is [Security.Principal.SecurityIdentifier]) {
+                    $rule.IdentityReference.Value
+                } else {
+                    $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
+                }
+                if ($sid -in $broadWriteSids -and (($rule.FileSystemRights -band $writeMask) -ne 0)) {
+                    return $null
+                }
+            }
+
+            if ($current.Equals($resolvedRoot, [StringComparison]::OrdinalIgnoreCase)) { break }
+            $current = Split-Path -Parent $current
+            if ([string]::IsNullOrWhiteSpace($current)) { return $null }
+        }
+        return $resolvedPath
+    } catch {
+        return $null
+    }
+}
+
+function Set-BootUpdateWebhookSecret {
+    param([Parameter(Mandatory)][ValidatePattern('^https://')][string]$Url)
+
+    $secretDir = Split-Path -Parent $script:WebhookSecretPath
+    Set-BootUpdateInstallDirectoryAcl -Path $secretDir
+    $tempPath = Join-Path $secretDir ('.webhook-url.{0}.tmp' -f [guid]::NewGuid().ToString('N'))
+    try {
+        $null = New-Item -ItemType File -Path $tempPath -Force
+        Set-BootUpdateRestrictedFileAcl -Path $tempPath
+        [IO.File]::WriteAllText($tempPath, $Url, [Text.UTF8Encoding]::new($false))
+        Move-Item -LiteralPath $tempPath -Destination $script:WebhookSecretPath -Force
+        Set-BootUpdateRestrictedFileAcl -Path $script:WebhookSecretPath
+    } finally {
+        if (Test-Path -LiteralPath $tempPath) {
+            Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Get-BootUpdateWebhookSecret {
+    if (-not (Test-Path -LiteralPath $script:WebhookSecretPath)) { return '' }
+    $trustedPath = Resolve-BootUpdateTrustedFile `
+        -Path $script:WebhookSecretPath `
+        -TrustRoot (Split-Path -Parent $script:WebhookSecretPath) `
+        -AllowedExtension @('.secret')
+    if (-not $trustedPath) { throw 'Webhook secret file failed its path or ACL trust check.' }
+    $url = (Get-Content -LiteralPath $trustedPath -Raw -Encoding UTF8).Trim()
+    if ($url -notmatch '^https://') { throw 'Webhook secret must contain an HTTPS URL.' }
+    return $url
+}
+
 $script:LogPath               = Join-Path $PSScriptRoot 'BootUpdateCycle.log'
 $script:StatePath             = Join-Path $PSScriptRoot 'BootUpdateCycle.state.json'
 $script:HistoryPath           = Join-Path $PSScriptRoot 'BootUpdateCycle.history.json'
@@ -130,12 +274,34 @@ $script:PhaseHooks             = @{}
 $script:DisableSelfUpdate      = $DisableSelfUpdate
 $script:ConfigUrl              = $ConfigUrl
 
+if ($PSBoundParameters.ContainsKey('WebhookUrl')) {
+    if ([string]::IsNullOrWhiteSpace($WebhookUrl)) {
+        if (Test-Path -LiteralPath $script:WebhookSecretPath) {
+            Remove-Item -LiteralPath $script:WebhookSecretPath -Force
+        }
+        $script:WebhookUrl = ''
+    } else {
+        Set-BootUpdateWebhookSecret -Url $WebhookUrl
+        $script:WebhookUrl = Get-BootUpdateWebhookSecret
+    }
+} elseif (Test-Path -LiteralPath $script:WebhookSecretPath) {
+    try {
+        $script:WebhookUrl = Get-BootUpdateWebhookSecret
+    } catch {
+        Write-Host "[WARN] Webhook secret unavailable: $_"
+        $script:WebhookUrl = ''
+    }
+}
+
 <# Load per-phase hooks sidecar (hooks.psd1) at script start.
-   Evaluated as a scriptblock so values remain actual scriptblocks (Import-PowerShellDataFile
-   strips them to strings in safe-mode).  SECURITY: file is local user-controlled code. #>
+   Evaluated as a scriptblock so values remain actual scriptblocks. The file must
+   remain inside the orchestrator directory and pass the full path/ACL trust check. #>
 if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $script:HooksConfig)) {
     try {
-        $script:PhaseHooks = & ([scriptblock]::Create((Get-Content $script:HooksConfig -Raw)))
+        $trustedHooksConfig = Resolve-BootUpdateTrustedFile `
+            -Path $script:HooksConfig -TrustRoot $PSScriptRoot -AllowedExtension @('.psd1')
+        if (-not $trustedHooksConfig) { throw 'hooks.psd1 failed its path or ACL trust check.' }
+        $script:PhaseHooks = & ([scriptblock]::Create((Get-Content $trustedHooksConfig -Raw)))
         if ($script:PhaseHooks -isnot [hashtable]) {
             Write-Host "[WARN] hooks.psd1 did not return a hashtable — hooks disabled."
             $script:PhaseHooks = @{}
@@ -2067,7 +2233,6 @@ function Register-BootUpdateTaskForReboot {
     if ($script:SkipRestorePoint)     { $taskArgs += '-SkipRestorePoint' }
     if ($script:SkipHealthCheck)      { $taskArgs += '-SkipHealthCheck' }
     if ($script:StagedRollout)        { $taskArgs += '-StagedRollout' }
-    if ($script:WebhookUrl)           { $taskArgs += "-WebhookUrl `"$($script:WebhookUrl)`"" }
     if ($script:NotifyEmail)          { $taskArgs += "-NotifyEmail `"$($script:NotifyEmail)`"" }
     if ($script:SmtpServer)           { $taskArgs += "-SmtpServer `"$($script:SmtpServer)`"" }
     if ($script:MaintenanceWindowStart -ge 0) { $taskArgs += "-MaintenanceWindowStart $($script:MaintenanceWindowStart)" }
@@ -2651,15 +2816,19 @@ function Invoke-Hook {
 
     if ([string]::IsNullOrWhiteSpace($Path)) { return }
 
-    if (-not (Test-Path $Path)) {
+    if (-not (Test-Path -LiteralPath $Path)) {
         Write-Log "Hook [$HookName]: file not found at '$Path' — skipping." -Level Warn
         return
     }
 
     try {
-        $resolvedPath = (Resolve-Path $Path).Path
-        Write-Log "Hook [$HookName]: executing '$resolvedPath'"
-        . $resolvedPath
+        $trustedPath = Resolve-BootUpdateTrustedFile `
+            -Path $Path -TrustRoot $PSScriptRoot -AllowedExtension @('.ps1')
+        if (-not $trustedPath) {
+            throw 'hook failed its path or ACL trust check'
+        }
+        Write-Log "Hook [$HookName]: executing '$trustedPath'"
+        . $trustedPath
         Write-Log "Hook [$HookName]: completed."
     } catch {
         Write-Log "Hook [$HookName]: error during execution — $_" -Level Warn
@@ -2893,6 +3062,8 @@ function Update-OrchestratorSelf {
             }
         }
 
+        if ($expectedSha -notmatch '^[0-9A-F]{64}$') { $expectedSha = $null }
+
         if (-not $expectedSha -and -not [string]::IsNullOrWhiteSpace($releaseInfo.body)) {
             <# Try to find a SHA256 hex near the asset filename in the release body #>
             if ($releaseInfo.body -match '(?i)Invoke-BootUpdateCycle\.ps1[^\n]*?([0-9a-fA-F]{64})') {
@@ -2900,6 +3071,11 @@ function Update-OrchestratorSelf {
             } elseif ($releaseInfo.body -match '([0-9a-fA-F]{64})') {
                 $expectedSha = $matches[1].ToUpperInvariant()
             }
+        }
+
+        if ($expectedSha -notmatch '^[0-9A-F]{64}$') {
+            Write-Log 'Self-update: release provides no valid SHA256; refusing unverified update.' -Level Error
+            return
         }
 
         <# Download to temp file #>
@@ -2926,18 +3102,14 @@ function Update-OrchestratorSelf {
             return
         }
 
-        <# SHA256 integrity check #>
-        if ($expectedSha) {
-            $actualSha = (Get-FileHash -Path $tempPath -Algorithm SHA256).Hash.ToUpperInvariant()
-            if ($actualSha -ne $expectedSha) {
-                Write-Log "Self-update: SHA256 mismatch! Expected=$expectedSha Actual=$actualSha. Aborting update." -Level Error
-                Remove-Item $tempPath -Force -ErrorAction SilentlyContinue
-                return
-            }
-            Write-Log "Self-update: SHA256 verified ($actualSha)." -Level Info
-        } else {
-            Write-Log 'Self-update: release provides no SHA256 — skipping integrity check.' -Level Warn
+        <# SHA256 verification is mandatory before replacing elevated code. #>
+        $actualSha = (Get-FileHash -Path $tempPath -Algorithm SHA256).Hash.ToUpperInvariant()
+        if ($actualSha -ne $expectedSha) {
+            Write-Log "Self-update: SHA256 mismatch! Expected=$expectedSha Actual=$actualSha. Aborting update." -Level Error
+            Remove-Item $tempPath -Force -ErrorAction SilentlyContinue
+            return
         }
+        Write-Log "Self-update: SHA256 verified ($actualSha)." -Level Info
 
         <# Atomic replace: backup then move #>
         $livePath = $PSCommandPath   # The running script file
@@ -2963,6 +3135,9 @@ function Update-OrchestratorSelf {
             } elseif ($p.Value -is [pscredential]) {
                 <# Cannot pass credential over process boundary — skip; caller must re-supply if needed #>
                 Write-Log 'Self-update: -SmtpCredential cannot be forwarded to re-launched process.' -Level Warn
+            } elseif ($p.Key -eq 'WebhookUrl') {
+                <# Persisted in the ACL-protected ProgramData secret; never expose it in child argv. #>
+                continue
             } else {
                 $relaunchArgs.Add("-$($p.Key)")
                 $relaunchArgs.Add("$($p.Value)")
