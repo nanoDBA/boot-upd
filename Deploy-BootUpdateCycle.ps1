@@ -69,6 +69,7 @@ $Config = @{
 
     RunAsUser             = $false  # Only matters if DirectFirstRun = $false
     NonInteractive        = $false  # Set $true for fire-and-forget: no prompts, no TUI
+    OutputMode            = 'Normal' # Quiet | Normal | Verbose | Debug; interactive runs can cycle with v
 
     <# NOTIFICATIONS - leave empty to disable #>
     WebhookUrl            = ''     # One-time HTTPS bootstrap only; persisted to protected ProgramData, never task arguments
@@ -91,6 +92,9 @@ if ($NonInteractive) { $Config.NonInteractive = $true }
 #region Validation
 if ($PSVersionTable.PSVersion.Major -lt 7) {
     throw "PowerShell 7+ required. Current: $($PSVersionTable.PSVersion)"
+}
+if ($Config.OutputMode -notin @('Quiet','Normal','Verbose','Debug')) {
+    throw "OutputMode must be Quiet, Normal, Verbose, or Debug. Current: $($Config.OutputMode)"
 }
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw "Run as Administrator."
@@ -382,6 +386,7 @@ $invokeArgs = @{
     MaxIterations        = $Config.MaxIterations
     PackageTimeoutMinutes = $Config.PackageTimeoutMin
     RebootDelaySec       = $Config.RebootDelaySec
+    OutputMode           = $Config.OutputMode
     SkipPip              = $Config.SkipPip
     SkipNpm              = $Config.SkipNpm
     SkipOffice365        = $Config.SkipOffice365
@@ -579,6 +584,7 @@ function Register-ScheduledTaskNow {
         "-MaxIterations $($Config.MaxIterations)"
         "-PackageTimeoutMinutes $($Config.PackageTimeoutMin)"
         "-RebootDelaySec $($Config.RebootDelaySec)"
+        "-OutputMode $($Config.OutputMode)"
     )
     if ($Config.SkipPip)              { $taskArgs += '-SkipPip' }
     if ($Config.SkipNpm)              { $taskArgs += '-SkipNpm' }

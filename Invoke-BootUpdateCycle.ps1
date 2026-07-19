@@ -39,6 +39,10 @@
 .PARAMETER WhatIf
     Show what would happen without making any changes.  No packages are updated,
     no reboots are triggered, no scheduled tasks are registered.
+
+.PARAMETER OutputMode
+    Initial console detail: Quiet, Normal, Verbose, or Debug. Normal is the
+    default. During interactive runs, press v to cycle modes without restarting.
 #>
 [CmdletBinding(SupportsShouldProcess)]
 param(
@@ -83,10 +87,13 @@ param(
     [switch]$DisableSelfUpdate,          # Suppress self-update from GitHub releases (lz1). Default: self-update runs.
     [ValidateScript({ $_ -eq '' -or $_ -match '^https?://' })]
     [string]$ConfigUrl       = '',       # URL for remote JSON config overrides (jzw). Empty = disabled.
+    [ValidateSet('Quiet','Normal','Verbose','Debug')]
+    [string]$OutputMode      = 'Normal', # Console detail; press v during an interactive run to cycle modes.
     [switch]$PreviewSplash               # Render all splash themes and exit (no updates). Also via `upd splash`.
 )
 
 $ErrorActionPreference = 'Stop'
+$script:ScriptBoundParams = @{} + $PSBoundParameters
 $script:WebhookSecretPath     = Join-Path $env:ProgramData 'BootUpdateCycle\webhook-url.secret'
 
 function Set-BootUpdateInstallDirectoryAcl {
@@ -273,6 +280,7 @@ $script:HooksConfig            = $HooksConfig
 $script:PhaseHooks             = @{}
 $script:DisableSelfUpdate      = $DisableSelfUpdate
 $script:ConfigUrl              = $ConfigUrl
+$script:OutputMode             = $OutputMode
 
 if ($PSBoundParameters.ContainsKey('WebhookUrl')) {
     if ([string]::IsNullOrWhiteSpace($WebhookUrl)) {
@@ -313,7 +321,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 3 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.19' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.20' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 
 <# Force UTF-8 console I/O so box-drawing/block chars (BBS splash) render in cmd.exe regardless of system code page.
    chcp 65001 sets conhost interpretation; [Console]::OutputEncoding makes .NET write proper UTF-8 bytes. #>
@@ -323,6 +331,106 @@ try {
     $OutputEncoding           = [System.Text.UTF8Encoding]::new($false)
     & chcp.com 65001 > $null 2>&1
 } catch { <# no console attached (SYSTEM scheduled task) — ignore #> }
+
+#region Console UX
+$script:OutputModes = @('Quiet', 'Normal', 'Verbose', 'Debug')
+$script:TuiInteractive = $false
+$script:TuiProgressActive = $false
+$script:TuiSpinnerIndex = 0
+$script:TuiSpinnerFrames = @('⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏')
+
+function Initialize-BootUpdateConsole {
+    try {
+        $isSystem = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value -eq 'S-1-5-18'
+        $script:TuiInteractive = [Environment]::UserInteractive -and -not $isSystem -and
+            -not [Console]::IsInputRedirected -and -not [Console]::IsOutputRedirected -and
+            $Host.Name -eq 'ConsoleHost'
+        if ($script:TuiInteractive) {
+            $PSStyle.Progress.View = 'Minimal'
+            $PSStyle.Progress.MaxWidth = 88
+        }
+    } catch {
+        $script:TuiInteractive = $false
+    }
+}
+
+function Test-BootUpdateOutputAtLeast {
+    param([Parameter(Mandatory)][ValidateSet('Quiet','Normal','Verbose','Debug')][string]$Minimum)
+    return [array]::IndexOf($script:OutputModes, $script:OutputMode) -ge
+        [array]::IndexOf($script:OutputModes, $Minimum)
+}
+
+function Read-BootUpdateUiKeys {
+    if (-not $script:TuiInteractive) { return }
+    try {
+        while ([Console]::KeyAvailable) {
+            $key = [Console]::ReadKey($true)
+            if ($key.KeyChar -notin @('v', 'V')) { continue }
+            $current = [array]::IndexOf($script:OutputModes, $script:OutputMode)
+            $script:OutputMode = $script:OutputModes[($current + 1) % $script:OutputModes.Count]
+            $script:ScriptBoundParams['OutputMode'] = $script:OutputMode
+            if ($script:OutputMode -eq 'Quiet' -and $script:TuiProgressActive) {
+                Write-Progress -Id 740 -Activity 'Boot Update Cycle' -Completed
+                $script:TuiProgressActive = $false
+            }
+            Write-Host "  output mode: $($script:OutputMode)  (press v to cycle)" -ForegroundColor DarkCyan
+        }
+    } catch {
+        # Key polling is an optional enhancement. Disable it if the host detaches.
+        $script:TuiInteractive = $false
+    }
+}
+
+function Write-BootUpdateProgress {
+    param(
+        [string]$Activity = 'Boot Update Cycle',
+        [string]$Status = '',
+        [ValidateRange(-1,100)][int]$PercentComplete = -1,
+        [switch]$Completed
+    )
+    Read-BootUpdateUiKeys
+    if ($Completed) {
+        if ($script:TuiProgressActive) {
+            Write-Progress -Id 740 -Activity $Activity -Completed
+            $script:TuiProgressActive = $false
+        }
+        return
+    }
+    if (-not $script:TuiInteractive -or $script:OutputMode -eq 'Quiet') { return }
+
+    $frame = $script:TuiSpinnerFrames[$script:TuiSpinnerIndex % $script:TuiSpinnerFrames.Count]
+    $script:TuiSpinnerIndex++
+    $progressArgs = @{
+        Id = 740
+        Activity = $Activity
+        Status = "$frame $Status  [v: $($script:OutputMode)]"
+        PercentComplete = $PercentComplete
+    }
+    Write-Progress @progressArgs
+    $script:TuiProgressActive = $true
+}
+
+function Wait-BootUpdateUiInterval {
+    param(
+        [Parameter(Mandatory)][ValidateRange(0,86400)][int]$Seconds,
+        [string]$Activity = 'Boot Update Cycle',
+        [string]$Status = 'Working',
+        [ValidateRange(-1,100)][int]$PercentComplete = -1
+    )
+    if (-not $script:TuiInteractive) {
+        Start-Sleep -Seconds $Seconds
+        return
+    }
+    $deadline = [datetime]::UtcNow.AddSeconds($Seconds)
+    do {
+        Write-BootUpdateProgress -Activity $Activity -Status $Status -PercentComplete $PercentComplete
+        $remainingMs = [math]::Max(0, [math]::Min(250, ($deadline - [datetime]::UtcNow).TotalMilliseconds))
+        if ($remainingMs -gt 0) { Start-Sleep -Milliseconds $remainingMs }
+    } while ([datetime]::UtcNow -lt $deadline)
+}
+
+Initialize-BootUpdateConsole
+#endregion
 
 #region Logging
 $script:LastLogMessage = $null
@@ -340,7 +448,11 @@ function Invoke-LogRotation {
 }
 
 function Write-Log {
-    param([string]$Message, [ValidateSet('Info','Warn','Error')]$Level = 'Info')
+    param(
+        [string]$Message,
+        [ValidateSet('Info','Warn','Error')][string]$Level = 'Info',
+        [ValidateSet('Verbose','Debug')][string]$Visibility = 'Verbose'
+    )
     if ([string]::IsNullOrWhiteSpace($Message)) { return }
     $trimmed = $Message.Trim()
     if ($trimmed -match '^[\|/\-\\]$') { return }
@@ -366,7 +478,7 @@ function Write-Log {
     if ($script:LastLogRepeatCount -gt 0) {
         $repeatEntry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [Info] (previous line repeated $($script:LastLogRepeatCount) more time$(if ($script:LastLogRepeatCount -ne 1) { 's' }))"
         Add-Content -Path $script:LogPath -Value $repeatEntry -Force
-        Write-Host $repeatEntry
+        if (Test-BootUpdateOutputAtLeast -Minimum Verbose) { Write-Host $repeatEntry }
     }
     $script:LastLogMessage = $trimmedMsg
     $script:LastLogRepeatCount = 0
@@ -374,9 +486,14 @@ function Write-Log {
     $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $entry = "[$ts] [$Level] $Message"
     Add-Content -Path $script:LogPath -Value $entry -Force
+    Read-BootUpdateUiKeys
     switch ($Level) {
-        'Info'  { Write-Host $entry }
-        'Warn'  { Write-Host $entry -ForegroundColor Yellow }
+        'Info'  {
+            if (Test-BootUpdateOutputAtLeast -Minimum $Visibility) { Write-Host $entry }
+        }
+        'Warn'  {
+            if (Test-BootUpdateOutputAtLeast -Minimum Normal) { Write-Host $entry -ForegroundColor Yellow }
+        }
         'Error' { Write-Host $entry -ForegroundColor Red }
     }
 }
@@ -949,6 +1066,7 @@ function Get-ProcessTreeActivity {
 function Wait-ProcessWithIdleTimeout {
     param(
         [Parameter(Mandatory)][System.Diagnostics.Process]$Process,
+        [string]$ActivityName = 'Package manager',
         [int]$IdleTimeoutMinutes = 5, [int]$HardTimeoutMinutes = 60, [int]$PollIntervalSeconds = 30
     )
     $startTime = [datetime]::UtcNow; $lastCpuIncrease = $startTime; $lastCpuTime = [timespan]::Zero; $finalCpu = [timespan]::Zero
@@ -988,8 +1106,10 @@ function Wait-ProcessWithIdleTimeout {
             Remove-ProcessTree -RootPid $Process.Id
             return @{ Reason = 'IdleTimeout'; Elapsed = $elapsed; FinalCpuTime = $finalCpu }
         }
-        Write-Log "  heartbeat: CPU=$([math]::Round($activity.TotalCpuTime.TotalSeconds,1))s procs=$($activity.ProcessCount) idle=$([math]::Round($idleFor.TotalMinutes,1))m elapsed=$([math]::Round($elapsed.TotalMinutes,1))m"
-        Start-Sleep -Seconds $PollIntervalSeconds
+        $status = "CPU $([math]::Round($activity.TotalCpuTime.TotalSeconds,1))s | $($activity.ProcessCount) proc | idle $([math]::Round($idleFor.TotalMinutes,1))m | elapsed $([math]::Round($elapsed.TotalMinutes,1))m"
+        $percent = [math]::Min(99, [math]::Floor(($elapsed.TotalSeconds / $hardLimit.TotalSeconds) * 100))
+        Write-Log "  heartbeat: CPU=$([math]::Round($activity.TotalCpuTime.TotalSeconds,1))s procs=$($activity.ProcessCount) idle=$([math]::Round($idleFor.TotalMinutes,1))m elapsed=$([math]::Round($elapsed.TotalMinutes,1))m" -Visibility Debug
+        Wait-BootUpdateUiInterval -Seconds $PollIntervalSeconds -Activity "Updating $ActivityName" -Status $status -PercentComplete $percent
     }
 }
 
@@ -1027,8 +1147,8 @@ if (`$argList -isnot [array]) { `$argList = @(`$argList) }
         Write-Log "${Name}: Failed to start." -Level Error
         return @{ Output = @(); TimedOut = $false; Reason = 'StartFailed'; Elapsed = [timespan]::Zero }
     }
-    Write-Log "${Name}: PID $($proc.Id)"
-    $result = Wait-ProcessWithIdleTimeout -Process $proc -IdleTimeoutMinutes $IdleTimeoutMinutes -HardTimeoutMinutes $HardTimeoutMinutes -PollIntervalSeconds 30
+    Write-Log "${Name}: PID $($proc.Id)" -Visibility Debug
+    $result = Wait-ProcessWithIdleTimeout -Process $proc -ActivityName $Name -IdleTimeoutMinutes $IdleTimeoutMinutes -HardTimeoutMinutes $HardTimeoutMinutes -PollIntervalSeconds 30
 
     $output = @()
     if (Test-Path $outputFile) { $output = Get-Content $outputFile -Encoding UTF8 -EA SilentlyContinue; Remove-Item $outputFile -Force -EA SilentlyContinue }
@@ -2216,6 +2336,7 @@ function Register-BootUpdateTaskForReboot {
         "-MaxIterations $($script:MaxIterations)"
         "-PackageTimeoutMinutes $($script:PackageTimeoutMinutes)"
         "-RebootDelaySec $($script:RebootDelaySec)"
+        "-OutputMode $($script:OutputMode)"
     )
     if ($script:SkipPip)              { $taskArgs += '-SkipPip' }
     if ($script:SkipNpm)              { $taskArgs += '-SkipNpm' }
@@ -2732,6 +2853,7 @@ function Show-StartupArt {
 
 function Show-CycleStartStatus {
     param([string]$Verb, [string]$SessionId, [int]$Iteration, [int]$MaxIterations, [string]$Context, [string]$Window = '')
+    if (-not (Test-BootUpdateOutputAtLeast -Minimum Normal)) { return }
     Write-Host '  [' -NoNewline -ForegroundColor DarkGray
     Write-Host $Verb -NoNewline -ForegroundColor Green
     Write-Host '] ' -NoNewline -ForegroundColor DarkGray
@@ -2767,6 +2889,9 @@ function Show-CycleBanner {
 
 function Write-PhaseHeader {
     param([int]$Num, [int]$Total, [string]$Name)
+    $percent = if ($Total -gt 0) { [math]::Floor((($Num - 1) / $Total) * 100) } else { 0 }
+    Write-BootUpdateProgress -Activity "Boot Update Cycle [$Num/$Total]" -Status "Running $Name" -PercentComplete $percent
+    if (-not (Test-BootUpdateOutputAtLeast -Minimum Normal)) { return }
     $e = [char]27; $c = "$e[36m"; $b = "$e[1m"; $w = "$e[97m"; $r = "$e[0m"
     $label = "[$Num/$Total] $Name"
     $pad = 66 - $label.Length; if ($pad -lt 3) { $pad = 3 }
@@ -2776,6 +2901,9 @@ function Write-PhaseHeader {
 
 function Write-PhaseResult {
     param([int]$Num, [int]$Total, [string]$Name, [bool]$Success, [double]$Minutes, [int]$Count = 0)
+    $percent = if ($Total -gt 0) { [math]::Min(100, [math]::Floor(($Num / $Total) * 100)) } else { 100 }
+    Write-BootUpdateProgress -Activity "Boot Update Cycle [$Num/$Total]" -Status "$Name complete" -PercentComplete $percent
+    if ($Success -and -not (Test-BootUpdateOutputAtLeast -Minimum Normal)) { return }
     $e = [char]27; $g = "$e[32m"; $red = "$e[31m"; $r = "$e[0m"
     $countMsg = if ($Count -gt 0) { ", $Count pkg" } else { '' }
     $t = "$([math]::Round($Minutes, 1)) min"
@@ -2785,6 +2913,8 @@ function Write-PhaseResult {
 
 function Write-PhaseSkip {
     param([string]$Name)
+    Read-BootUpdateUiKeys
+    if (-not (Test-BootUpdateOutputAtLeast -Minimum Verbose)) { return }
     $e = [char]27; $d = "$e[2m"; $r = "$e[0m"
     Write-Host "$d    ~ $Name skipped$r"
 }
@@ -3240,7 +3370,7 @@ function Apply-RemoteConfig {
         'SkipDefender', 'SkipBitLocker', 'SkipRestorePoint', 'SkipHealthCheck',
         'IncludeDriverUpdates', 'IncludeFirmwareUpdates',
         'UpdateWsl', 'UpdateContainers', 'AllowMetered', 'DisableSelfUpdate',
-        'StagedRollout'
+        'StagedRollout', 'OutputMode'
     )
 
     $overridden = [System.Collections.Generic.List[string]]::new()
@@ -3254,6 +3384,10 @@ function Apply-RemoteConfig {
 
         $remoteVal = $RemoteConfig.$key
         if ($null -eq $remoteVal) { continue }
+        if ($key -eq 'OutputMode' -and $remoteVal -notin $script:OutputModes) {
+            Write-Log "Remote config: invalid OutputMode '$remoteVal' ignored." -Level Warn
+            continue
+        }
 
         try {
             Set-Variable -Name $key -Value $remoteVal -Scope Script -Force -ErrorAction Stop
@@ -3286,7 +3420,7 @@ function Invoke-BootUpdateCycle {
 
     <# Console: BBS splash on every run.  Entry-point may have already shown it before
        self-update chatter; honor that flag and clear it so post-reboot resumes still splash. #>
-    if (-not $script:_splashShown) { Show-StartupArt }
+    if (-not $script:_splashShown -and (Test-BootUpdateOutputAtLeast -Minimum Normal)) { Show-StartupArt }
     $script:_splashShown = $false
     $statusVerb = if ($WhatIfPreference) { "$cycleVerb [WHATIF]" } else { $cycleVerb }
     $windowText = ''
@@ -3294,6 +3428,9 @@ function Invoke-BootUpdateCycle {
         $windowText = "$($script:MaintenanceWindowStart):00 - $($script:MaintenanceWindowEnd):00"
     }
     Show-CycleStartStatus -Verb $statusVerb -SessionId $sessionId -Iteration $pendingIteration -MaxIterations $MaxIterations -Context $context -Window $windowText
+    if ($script:TuiInteractive -and (Test-BootUpdateOutputAtLeast -Minimum Normal)) {
+        Write-Host "  [view] $($script:OutputMode) | press v to cycle Quiet > Normal > Verbose > Debug" -ForegroundColor DarkCyan
+    }
     <# Log file: clean greppable entry #>
     $whatIfTag = if ($WhatIfPreference) { ' [WHATIF]' } else { '' }
     Write-Log "BOOT UPDATE CYCLE$whatIfTag $cycleVerb | Session: $sessionId | Iteration: $pendingIteration/$MaxIterations | Context: $context"
@@ -3862,7 +3999,18 @@ function Invoke-BootUpdateCycle {
             <# Wait for all cohort jobs; timeout = sum of individual ceilings (count * PackageTimeoutMinutes) #>
             $cohortTimeoutSec = [math]::Max($cohortTimeoutSec, $script:PackageTimeoutMinutes * 60 * $pendingCohort.Count)
             if ($cohortJobs.Count -gt 0) {
-                $null = Wait-Job -Job $cohortJobs -Timeout $cohortTimeoutSec
+                $cohortDeadline = [datetime]::UtcNow.AddSeconds($cohortTimeoutSec)
+                do {
+                    $finished = @($cohortJobs | Where-Object { $_.State -in @('Completed','Failed','Stopped') }).Count
+                    $overallDone = $phaseNum + $finished
+                    $overallPercent = if ($enabledPhases.Count -gt 0) {
+                        [math]::Min(99, [math]::Floor(($overallDone / $enabledPhases.Count) * 100))
+                    } else { 99 }
+                    Write-BootUpdateProgress -Activity 'Parallel update cohort' `
+                        -Status "$finished/$($cohortJobs.Count) phases complete" -PercentComplete $overallPercent
+                    if ($finished -eq $cohortJobs.Count) { break }
+                    $null = Wait-Job -Job $cohortJobs -Timeout 1
+                } while ([datetime]::UtcNow -lt $cohortDeadline)
             }
 
             <# Collect results, replay logs, update state — one atomic write at the end #>
@@ -3974,12 +4122,12 @@ function Invoke-BootUpdateCycle {
             }
 
             <# Console: styled reboot banner #>
+            Write-BootUpdateProgress -Completed
             Show-CycleBanner -Title 'R E B O O T I N G . . .' -AnsiColor "$([char]27)[33m" -Info @(
                 "Shutdown in $($script:RebootDelaySec) seconds"
                 "Cancel:  shutdown /a"
                 "Next run as SYSTEM (scheduled task)"
             )
-
             Suspend-BitLockerForReboot
             $shutdownComment = 'Boot Update Cycle: Applying updates (forced reboot).'
             <# /g instead of /r: leverages Windows ARSO (Automatic Restart Sign-On) —
@@ -4026,6 +4174,7 @@ function Invoke-BootUpdateCycle {
 
         <# Console: styled completion banner #>
         $completionTitle = if ($WhatIfPreference) { 'W H A T I F   C H E C K   C O M P L E T E' } else { 'M I S S I O N   C O M P L E T E' }
+        Write-BootUpdateProgress -Completed
         Show-CycleBanner -Title $completionTitle -AnsiColor "$([char]27)[32m" -Info @(
             "$durMin min | $($state.Iteration) iteration(s) | $reboots reboot(s)"
             "$total packages updated"
@@ -4138,17 +4287,21 @@ Register-EngineEvent -SourceIdentifier 'PowerShell.Exiting' -Action {
 <# Render splash BEFORE self-update / remote-config chatter so the BBS art is the
    first thing on screen and never gets pushed off the visible viewport on small
    consoles.  Invoke-BootUpdateCycle skips its own splash call when this flag is set. #>
-Show-StartupArt
-$script:_splashShown = $true
+if (Test-BootUpdateOutputAtLeast -Minimum Normal) {
+    Show-StartupArt
+    $script:_splashShown = $true
+} else {
+    $script:_splashShown = $false
+}
 
 <# lz1: Self-update — runs after mutex, before pre-flight. Skips under SYSTEM.
    If a newer version is downloaded and validated, re-execs and never returns.
    $PSBoundParameters is captured at script scope (before the function call). #>
-Update-OrchestratorSelf -ScriptBoundParams $PSBoundParameters
+Update-OrchestratorSelf -ScriptBoundParams $script:ScriptBoundParams
 
 <# jzw: Remote config — fetch fleet-wide overrides from $ConfigUrl and apply any
    key NOT explicitly passed by the user.  No-op when ConfigUrl is empty. #>
 $script:_remoteConfig = Get-RemoteConfig
-Apply-RemoteConfig -RemoteConfig $script:_remoteConfig -UserBoundParams $PSBoundParameters
+Apply-RemoteConfig -RemoteConfig $script:_remoteConfig -UserBoundParams $script:ScriptBoundParams
 
 Invoke-BootUpdateCycle

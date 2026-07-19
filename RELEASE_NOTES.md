@@ -1,8 +1,24 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.19
+**Current Version:** v2.5.20
 **Release Date:** 2026-07-19
 **Status:** STABLE
+
+---
+
+## v2.5.20 (2026-07-19)
+
+**Compact live progress, runtime verbosity controls, and preserved themed splash.**
+
+- Interactive runs now default to a compact phase/progress view while retaining the complete timestamped log file.
+- The existing themed startup splash and preview/theme controls remain enabled in the default view; only explicit Quiet mode suppresses the splash.
+- Pressing `v` cycles live through Quiet, Normal, Verbose, and Debug console modes without restarting the updater.
+- Native minimal `Write-Progress` rendering adds phase progress and spinner feedback during monitored processes and parallel cohorts, with safe automatic disablement under SYSTEM or redirected hosts.
+- `-OutputMode` and the deployment `OutputMode` setting select the initial view and persist across scheduled reboot resumes.
+
+### Compatibility
+
+- No state-schema changes and no mandatory UI dependency. Normal remains the default, while full diagnostic output remains available in the log and through Verbose/Debug modes.
 
 ---
 

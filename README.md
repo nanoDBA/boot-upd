@@ -43,6 +43,25 @@ That's it. Runs from an elevated command prompt, PowerShell, or the Run dialog (
 
 `upd.cmd` auto-adds itself to your system PATH on first run, so it works from anywhere after that.
 
+### Console views
+
+Interactive runs use a compact progress view by default: current phase, overall progress,
+phase results, warnings, and errors. The complete timestamped detail stream still goes to
+`BootUpdateCycle.log`.
+
+Press `v` at any time during an interactive run to cycle through:
+
+| Mode | Console output |
+|---|---|
+| `Quiet` | Errors and final/reboot status only |
+| `Normal` | The themed splash, progress, phase results, warnings, and errors (default) |
+| `Verbose` | Normal plus detailed package-manager output |
+| `Debug` | Verbose plus process IDs and heartbeat diagnostics |
+
+Choose the initial view explicitly with `-OutputMode Quiet|Normal|Verbose|Debug`, or set
+`OutputMode` in `Deploy-BootUpdateCycle.ps1`. Key polling and animated progress disable
+themselves under SYSTEM, redirected output, and non-console hosts; file logging is unchanged.
+
 ### What happens
 
 1. Pre-flight checks validate disk space, network, battery, and conflicting installers
