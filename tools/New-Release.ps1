@@ -31,6 +31,44 @@ if ($NotesPath -and $Notes) { throw 'Provide only one of -Notes or -NotesPath.' 
 $root = Split-Path $PSScriptRoot -Parent
 $assetNames = @('Deploy-BootUpdateCycle.ps1', 'Invoke-BootUpdateCycle.ps1')
 
+function Export-GitBlob {
+    param(
+        [Parameter(Mandatory)][string]$RepositoryRoot,
+        [Parameter(Mandatory)][string]$ObjectSpec,
+        [Parameter(Mandatory)][string]$Destination
+    )
+
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = 'git'
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    foreach ($argument in @('-C', $RepositoryRoot, 'cat-file', 'blob', $ObjectSpec)) {
+        $null = $startInfo.ArgumentList.Add($argument)
+    }
+
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    $fileStream = $null
+    try {
+        if (-not $process.Start()) { throw 'Could not start git cat-file.' }
+        $fileStream = [IO.File]::Open(
+            $Destination, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None
+        )
+        $process.StandardOutput.BaseStream.CopyTo($fileStream)
+        $fileStream.Dispose()
+        $fileStream = $null
+        $standardError = $process.StandardError.ReadToEnd()
+        $process.WaitForExit()
+        if ($process.ExitCode -ne 0) {
+            throw "git cat-file failed for '$ObjectSpec': $standardError"
+        }
+    } finally {
+        if ($fileStream) { $fileStream.Dispose() }
+        $process.Dispose()
+    }
+}
+
 $worktreeChanges = @(& git -C $root status --porcelain --untracked-files=all)
 if ($LASTEXITCODE -ne 0) { throw 'Could not inspect the Git worktree.' }
 if ($worktreeChanges) {
@@ -70,15 +108,9 @@ try {
     $uploads = @()
 
     foreach ($name in $assetNames) {
-        $source = Join-Path $root $name
         $stagedAsset = Join-Path $stage $name
         $expectedBlob = "$( & git -C $root rev-parse "$headSha`:$name" )".Trim()
-        $sourceBlob = "$( & git -C $root hash-object --no-filters -- $source )".Trim()
-        if ($LASTEXITCODE -ne 0 -or $sourceBlob -ne $expectedBlob) {
-            throw "Working-tree asset '$name' does not match committed HEAD."
-        }
-
-        Copy-Item -LiteralPath $source -Destination $stagedAsset -ErrorAction Stop -WhatIf:$false
+        Export-GitBlob -RepositoryRoot $root -ObjectSpec "$headSha`:$name" -Destination $stagedAsset
         $stagedBlob = "$( & git -C $root hash-object --no-filters -- $stagedAsset )".Trim()
         if ($LASTEXITCODE -ne 0 -or $stagedBlob -ne $expectedBlob) {
             throw "Staged asset '$name' does not match committed HEAD."
