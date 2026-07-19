@@ -206,7 +206,9 @@ The `hooks.psd1` file is evaluated as a scriptblock, not parsed in safe mode, so
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
 ## Beads Issue Tracker
 
-This project uses **bd (beads)** for issue tracking. Run `bd prime` to see full workflow context and commands.
+This project uses **bd (beads)** for issue tracking. Run `./tools/Invoke-Beads.ps1 prime` to see full workflow context and commands.
+
+On Windows, run tracker commands through `./tools/Invoke-Beads.ps1` so the central Dolt password is retrieved directly from Windows Credential Manager and cleared after each invocation. The command tables use `bd` as shorthand.
 
 ### Quick Reference
 
@@ -220,7 +222,7 @@ bd close <id>         # Complete work
 ### Rules
 
 - Use `bd` for ALL task tracking — do NOT use TodoWrite, TaskCreate, or markdown TODO lists
-- Run `bd prime` for detailed command reference and session close protocol
+- Run `./tools/Invoke-Beads.ps1 prime` for detailed command reference and session close protocol
 - Use `bd remember` for persistent knowledge — do NOT use MEMORY.md files
 
 ## Session Completion
@@ -235,7 +237,7 @@ bd close <id>         # Complete work
 4. **PUSH TO REMOTE** - This is MANDATORY:
    ```bash
    git pull --rebase
-   bd export -o .beads/issues.jsonl   # bd writes land directly on the central Dolt server (boot_upd @ 100.88.59.72:3336); do NOT run `bd dolt push` (obsolete since the 2026-07-06 cutover — see bd memory beads-central-cutover)
+   ./tools/Invoke-Beads.ps1 export -o .beads/issues.jsonl   # bd writes land directly on the central Dolt server (boot_upd @ 100.88.59.72:3336); do NOT run `bd dolt push` (obsolete since the 2026-07-06 cutover — see bd memory beads-central-cutover)
    git push
    git status  # MUST show "up to date with origin"
    ```

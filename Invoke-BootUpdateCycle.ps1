@@ -2707,13 +2707,38 @@ function Get-OrchestratorFileVersion {
     return $null
 }
 
-function Release-BootUpdateMutex {
-    <# A named Mutex is thread-affine. Release it synchronously on the owning
-       pipeline thread; the PowerShell.Exiting event is only a final fallback. #>
-    if (-not $script:BootUpdateMutex) { return }
-    try { $script:BootUpdateMutex.ReleaseMutex() } catch { }
-    $script:BootUpdateMutex.Dispose()
-    $script:BootUpdateMutex = $null
+function Test-SelfUpdateHandoff {
+    <# The current updater keeps the mutex while it synchronously waits for its
+       replacement. Only that replacement inherits this short-lived, nonced
+       marker. Confirming the recorded PID is the replacement's actual pwsh
+       parent prevents an unrelated invocation from bypassing the mutex. #>
+    $markerName = 'BOOT_UPDATE_SELF_UPDATE_HANDOFF'
+    $marker = [Environment]::GetEnvironmentVariable($markerName, 'Process')
+    if ([string]::IsNullOrWhiteSpace($marker)) { return $false }
+
+    <# Consume the capability before the update cycle starts so tools launched
+       by the replacement cannot inherit and replay it. #>
+    [Environment]::SetEnvironmentVariable($markerName, $null, 'Process')
+
+    try {
+        $parts = $marker.Split(':')
+        if ($parts.Count -ne 3 -or $parts[0] -ne 'v1') { return $false }
+
+        $expectedParentPid = 0
+        if (-not [int]::TryParse($parts[1], [ref]$expectedParentPid) -or $expectedParentPid -le 0) {
+            return $false
+        }
+        if ($parts[2] -notmatch '^[0-9a-f]{32}$') { return $false }
+
+        $thisProcess = Get-CimInstance Win32_Process -Filter "ProcessId=$PID" -ErrorAction Stop
+        if ([int]$thisProcess.ParentProcessId -ne $expectedParentPid) { return $false }
+
+        $parentProcess = Get-CimInstance Win32_Process -Filter "ProcessId=$expectedParentPid" -ErrorAction Stop
+        if ($parentProcess.Name -notin @('pwsh.exe', 'pwsh')) { return $false }
+        return ($parentProcess.CommandLine -match '(?i)(Deploy|Invoke)-BootUpdateCycle\.ps1')
+    } catch {
+        return $false
+    }
 }
 
 function Test-LegacySelfUpdateHandoff {
@@ -2944,11 +2969,20 @@ function Update-OrchestratorSelf {
             }
         }
 
-        <# The child must be able to acquire the single-instance mutex. Older
-           releases omitted this release, which caused the replacement to exit. #>
-        Release-BootUpdateMutex
-        & pwsh -NoProfile -File $livePath @relaunchArgs
-        exit $LASTEXITCODE
+        <# Keep the mutex continuously held while the replacement runs. The
+           process-only capability is inherited by this child but not by a
+           concurrently scheduled/manual invocation. #>
+        $handoffName = 'BOOT_UPDATE_SELF_UPDATE_HANDOFF'
+        $previousHandoff = [Environment]::GetEnvironmentVariable($handoffName, 'Process')
+        $handoffMarker = "v1:${PID}:$([guid]::NewGuid().ToString('N'))"
+        try {
+            [Environment]::SetEnvironmentVariable($handoffName, $handoffMarker, 'Process')
+            & pwsh -NoProfile -File $livePath @relaunchArgs
+            $replacementExitCode = $LASTEXITCODE
+        } finally {
+            [Environment]::SetEnvironmentVariable($handoffName, $previousHandoff, 'Process')
+        }
+        exit $replacementExitCode
 
     } catch {
         Write-Log "Self-update: unexpected error — $_" -Level Warn
@@ -3888,7 +3922,11 @@ try {
         $acquired = $true
     }
     if (-not $acquired) {
-        if (Test-LegacySelfUpdateHandoff) {
+        if (Test-SelfUpdateHandoff) {
+            Write-Log 'Self-update: accepted authenticated mutex handoff from parent updater.' -Level Info
+            $script:BootUpdateMutex.Dispose()
+            $script:BootUpdateMutex = $null
+        } elseif (Test-LegacySelfUpdateHandoff) {
             Write-Log 'Self-update: inheriting mutex handoff from an older updater.' -Level Info
             $script:BootUpdateMutex.Dispose()
             $script:BootUpdateMutex = $null

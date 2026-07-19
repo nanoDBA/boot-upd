@@ -6,6 +6,14 @@
 
 ---
 
+## Unreleased
+
+- The current updater now retains continuous ownership of the single-instance mutex while its replacement runs, eliminating the release/reacquire race.
+- A consumed, process-only nonce capability identifies the replacement child while legacy updater handoffs remain supported.
+- Added focused regression coverage for accepted and rejected handoffs, capability consumption, fail-closed process checks, and continuous parent ownership.
+
+---
+
 ## v2.5.17 (2026-07-18)
 
 **Self-update mutex handoff and persistent source healing.**
