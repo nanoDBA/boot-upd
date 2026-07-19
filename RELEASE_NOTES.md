@@ -1,8 +1,23 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.20
+**Current Version:** v2.5.21
 **Release Date:** 2026-07-19
 **Status:** STABLE
+
+---
+
+## v2.5.21 (2026-07-19)
+
+**Optional Spectre-enhanced phase rendering with automatic, safe bootstrap.**
+
+- Interactive PowerShell 7.4+ runs now use `PwshSpectreConsole` for richer phase and result lines.
+- When no protected all-users copy exists, stable version 2.6.3 is installed from PSGallery under Program Files; user-writable module copies are never imported by the elevated updater.
+- SYSTEM, redirected, older-PowerShell, offline, `-WhatIf`, and failed install/import paths retain the native renderer.
+- The key-responsive native `Write-Progress` spinner and all themed splash functionality remain unchanged.
+
+### Compatibility
+
+- PowerShell 7 remains the baseline. Spectre enhancement requires 7.4+, but it is optional and never blocks an update cycle.
 
 ---
 

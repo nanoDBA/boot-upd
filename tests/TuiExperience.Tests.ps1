@@ -72,14 +72,44 @@ Describe 'Interactive verbosity cycling' {
     }
 }
 
-Describe 'Native progress rendering' {
-    It 'uses minimal Write-Progress with spinner frames and no Spectre dependency' {
+Describe 'Resilient rich progress rendering' {
+    It 'keeps native key-responsive progress while enabling optional Spectre phase rendering' {
         $initialize = Get-FunctionText -Ast $invokeAst -Name 'Initialize-BootUpdateConsole'
         $progress = Get-FunctionText -Ast $invokeAst -Name 'Write-BootUpdateProgress'
         $initialize | Should -Match "Progress.View = 'Minimal'"
         $progress | Should -Match 'Write-Progress @progressArgs'
         $progress | Should -Match 'TuiSpinnerFrames'
-        $invokeSource | Should -Not -Match 'Spectre\.Console'
+        (Get-FunctionText -Ast $invokeAst -Name 'Write-BootUpdateSpectreText') |
+            Should -Match 'PwshSpectreConsole\\Write-SpectreHost'
+    }
+
+    It 'installs a pinned stable module only for eligible interactive runs' {
+        $text = Get-FunctionText -Ast $invokeAst -Name 'Initialize-BootUpdateSpectreConsole'
+        $invokeSource | Should -Match "SpectreInstallVersion = \[version\]'2\.6\.3'"
+        $text | Should -Match '-not \$script:TuiInteractive'
+        $text | Should -Match '\$WhatIfPreference'
+        $text | Should -Match "PSVersion -lt \[version\]'7\.4'"
+        $text | Should -Match 'Install-PSResource'
+        $text | Should -Match 'Install-Module'
+        $text | Should -Match 'Scope AllUsers'
+        $text | Should -Match 'Repository PSGallery'
+        $invokeSource | Should -Match 'Join-Path \$env:ProgramFiles ''PowerShell\\Modules'''
+        $pathCheck = Get-FunctionText -Ast $invokeAst -Name 'Test-BootUpdateSpectreModulePath'
+        $pathCheck | Should -Match 'SpectreTrustedRoots'
+        $pathCheck | Should -Match 'OrdinalIgnoreCase'
+        $pathCheck | Should -Match 'ReparsePoint'
+        $pathCheck | Should -Match 'broadWriteSids'
+        $text | Should -Match 'using native console rendering'
+    }
+
+    It 'initializes Spectre only after preview exit, mutex acquisition, and the splash' {
+        $bootstrapCall = $invokeSource.LastIndexOf('Initialize-BootUpdateSpectreConsole')
+        $previewExit = $invokeSource.LastIndexOf('if ($PreviewSplash)')
+        $mutexCall = $invokeSource.LastIndexOf('if (-not (Enter-BootUpdateMutex))')
+        $splashCall = $invokeSource.LastIndexOf('Show-StartupArt')
+        $bootstrapCall | Should -BeGreaterThan $previewExit
+        $bootstrapCall | Should -BeGreaterThan $mutexCall
+        $bootstrapCall | Should -BeGreaterThan $splashCall
     }
 
     It 'connects phase, monitored-process, and parallel-cohort progress' {
@@ -97,5 +127,51 @@ Describe 'Native progress rendering' {
             Should -Match '-OutputMode \$\(\$Config\.OutputMode\)'
         (Get-FunctionText -Ast $invokeAst -Name 'Register-BootUpdateTaskForReboot') |
             Should -Match '-OutputMode \$\(\$script:OutputMode\)'
+    }
+}
+
+Describe 'Spectre bootstrap behavior' {
+    BeforeAll {
+        . ([scriptblock]::Create((Get-FunctionText -Ast $invokeAst -Name 'Test-BootUpdateSpectreModulePath')))
+        . ([scriptblock]::Create((Get-FunctionText -Ast $invokeAst -Name 'Initialize-BootUpdateSpectreConsole')))
+        function Write-Log { param($Message, $Level, $Visibility) }
+    }
+
+    BeforeEach {
+        $script:TuiInteractive = $false
+        $script:SpectreEnabled = $false
+        $script:SpectreModuleName = 'PwshSpectreConsole'
+        $script:SpectreInstallVersion = [version]'2.6.3'
+        $script:SpectreTrustedRoots = @((Join-Path $env:ProgramFiles 'PowerShell\Modules'))
+        Mock Get-Module { return $null }
+        Mock Install-PSResource { }
+        Mock Import-Module { }
+    }
+
+    It 'does not discover, install, or import from a non-interactive session' {
+        Initialize-BootUpdateSpectreConsole
+        Should -Invoke Get-Module -Times 0
+        Should -Invoke Install-PSResource -Times 0
+        Should -Invoke Import-Module -Times 0
+    }
+
+    It 'does not install a missing module under WhatIf' {
+        $script:TuiInteractive = $true
+        $savedWhatIf = $WhatIfPreference
+        try {
+            $WhatIfPreference = $true
+            Initialize-BootUpdateSpectreConsole
+        } finally {
+            $WhatIfPreference = $savedWhatIf
+        }
+        Should -Invoke Get-Module -Times 1
+        Should -Invoke Install-PSResource -Times 0
+        Should -Invoke Import-Module -Times 0
+    }
+
+    It 'rejects a module manifest outside protected Program Files roots' {
+        $manifest = Join-Path $TestDrive 'PwshSpectreConsole.psd1'
+        Set-Content -LiteralPath $manifest -Value '@{}'
+        Test-BootUpdateSpectreModulePath -Path $manifest | Should -BeFalse
     }
 }

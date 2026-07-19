@@ -62,6 +62,14 @@ Choose the initial view explicitly with `-OutputMode Quiet|Normal|Verbose|Debug`
 `OutputMode` in `Deploy-BootUpdateCycle.ps1`. Key polling and animated progress disable
 themselves under SYSTEM, redirected output, and non-console hosts; file logging is unchanged.
 
+On an interactive PowerShell 7.4+ console, the updater uses
+[`PwshSpectreConsole`](https://github.com/ShaunLawrie/PwshSpectreConsole) for richer phase and
+result lines. If no protected all-users copy is available, the pinned stable release is installed
+from PSGallery under Program Files; user-writable module copies are never imported by the elevated
+updater. Existing protected installations are left unchanged. Offline runs, older PowerShell
+versions, `-WhatIf`, SYSTEM, redirected output, and any install/import failure automatically keep
+the native renderer. The themed splash is independent of Spectre and remains unchanged.
+
 ### What happens
 
 1. Pre-flight checks validate disk space, network, battery, and conflicting installers
