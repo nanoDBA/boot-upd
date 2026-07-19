@@ -1,17 +1,23 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.18
+**Current Version:** v2.5.19
 **Release Date:** 2026-07-19
 **Status:** STABLE
 
 ---
 
-## Unreleased
+## v2.5.19 (2026-07-19)
+
+**Fail-closed self-update integrity, protected webhook storage, and trusted elevated hooks.**
 
 - Self-update now fails closed unless every downloaded PowerShell asset has a valid, matching SHA-256 value.
 - Notification webhook URLs persist only in an ACL-protected ProgramData file and are no longer forwarded through Task Scheduler or self-update process arguments.
-- Elevated extension hooks must remain under the orchestrator directory and pass path, reparse-point, and broad-write ACL checks before execution.
+- Elevated extension hooks must remain under the orchestrator directory, be owned by Administrators or SYSTEM, and pass path, reparse-point, and broad-write ACL checks before execution.
 - Deployment now hardens the ProgramData installation directory, and a no-echo webhook initializer supports secure setup and removal.
+
+### Compatibility
+
+- No state-schema changes. Existing webhook configuration can migrate through the one-time deployment setting; non-HTTPS webhook endpoints are now rejected.
 
 ---
 
