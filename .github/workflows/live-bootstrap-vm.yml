@@ -1,0 +1,117 @@
+name: Live bootstrap VM
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  exact-readme-bootstrap:
+    name: Exact README bootstrap (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+
+    steps:
+      - name: Check out test harness
+        uses: actions/checkout@v6
+
+      - name: Prove fresh Windows PowerShell VM baseline
+        shell: powershell
+        run: |
+          if ($PSVersionTable.PSVersion.Major -ne 5) {
+              throw "Expected Windows PowerShell 5.1, got $($PSVersionTable.PSVersion)."
+          }
+          if (Test-Path -LiteralPath "$env:ProgramFiles\BootUpdateCycle") {
+              throw 'Hosted VM was not fresh: BootUpdateCycle is already installed.'
+          }
+          if (@(& where.exe upd 2>$null)) {
+              throw 'Hosted VM was not fresh: upd already resolves on PATH.'
+          }
+          Get-ComputerInfo | Select-Object WindowsProductName,WindowsVersion,OsBuildNumber |
+              ConvertTo-Json | Set-Content -LiteralPath "$env:RUNNER_TEMP\vm-baseline.json"
+
+      - name: Execute exact README command and answer post-install prompt
+        shell: pwsh
+        run: |
+          $commands = @(Get-Content -LiteralPath README.md | Where-Object {
+              $_ -match '^powershell\.exe -NoProfile -ExecutionPolicy Bypass' -and
+              $_ -match '\[ScriptBlock\]::Create' -and
+              $_ -match '-PromptForArguments$'
+          })
+          if ($commands.Count -ne 1) {
+              throw "Expected exactly one interactive README bootstrap; found $($commands.Count)."
+          }
+
+          $transcript = Join-Path $env:RUNNER_TEMP 'live-bootstrap-transcript.txt'
+          $result = ./tools/Invoke-ConsolePromptHarness.ps1 `
+              -CommandLine $commands[0] `
+              -InputLine 'help' `
+              -TranscriptPath $transcript `
+              -TimeoutSeconds 900 `
+              -InputDelayMilliseconds 2000
+          Get-Content -LiteralPath $transcript
+          if ($result.ExitCode -ne 0) { throw "Exact README bootstrap exited $($result.ExitCode)." }
+
+          $text = Get-Content -LiteralPath $transcript -Raw
+          foreach ($required in @(
+              'Verified v\d+\.\d+\.\d+ installed at',
+              'The verified updater is ready',
+              'UPD // Boot Update Cycle'
+          )) {
+              if ($text -notmatch $required) { throw "Bootstrap transcript is missing: $required" }
+          }
+
+      - name: Verify installed release and help-only dispatch
+        shell: pwsh
+        run: |
+          $installRoot = Join-Path $env:ProgramFiles 'BootUpdateCycle'
+          $expected = @(
+              'Invoke-BootUpdateCycle.ps1',
+              'Deploy-BootUpdateCycle.ps1',
+              'Repair-AwsTooling.ps1',
+              'upd.cmd',
+              'tools\Invoke-UpdLauncher.ps1',
+              'tools\Invoke-UpdBootstrap.ps1',
+              'tools\Show-BootUpdateProgressDemo.ps1',
+              'tools\Install-PowerShell7.ps1'
+          )
+          foreach ($relative in $expected) {
+              if (-not (Test-Path -LiteralPath (Join-Path $installRoot $relative) -PathType Leaf)) {
+                  throw "Installed bundle is missing $relative."
+              }
+          }
+
+          $release = Invoke-RestMethod `
+              -Uri 'https://api.github.com/repos/nanoDBA/boot-upd/releases/latest' `
+              -Headers @{ 'User-Agent'='BootUpdateCycle-VM-E2E' }
+          $core = Get-Content -LiteralPath (Join-Path $installRoot 'Invoke-BootUpdateCycle.ps1') -Raw
+          if ($core -notmatch "BootUpdateCycleVersion'\s*-Value\s*'([\d.]+)'") {
+              throw 'Installed core version marker is missing.'
+          }
+          if ("v$($Matches[1])" -ne $release.tag_name) {
+              throw "Installed v$($Matches[1]); latest is $($release.tag_name)."
+          }
+
+          if (Get-ScheduledTask -TaskName 'BootUpdateCycle*' -ErrorAction SilentlyContinue) {
+              throw 'Selecting help unexpectedly registered a resume task.'
+          }
+          if (Test-Path -LiteralPath (Join-Path $installRoot 'BootUpdateCycle.state.json')) {
+              throw 'Selecting help unexpectedly created a cycle checkpoint.'
+          }
+
+      - name: Upload VM evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: live-bootstrap-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/live-bootstrap-transcript.txt
+            ${{ runner.temp }}/vm-baseline.json
+          if-no-files-found: warn

@@ -17,6 +17,34 @@ BeforeAll {
         return $ast
     }
 
+    function Get-GitBlobSha256 {
+        param([Parameter(Mandatory)][string]$ObjectSpec)
+
+        $startInfo = [Diagnostics.ProcessStartInfo]::new()
+        $startInfo.FileName = 'git'
+        $startInfo.WorkingDirectory = $repoRoot
+        $startInfo.UseShellExecute = $false
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        foreach ($argument in @('cat-file','blob',$ObjectSpec)) { $null = $startInfo.ArgumentList.Add($argument) }
+        $process = [Diagnostics.Process]::new()
+        $process.StartInfo = $startInfo
+        $memory = [IO.MemoryStream]::new()
+        try {
+            if (-not $process.Start()) { throw 'Could not start git cat-file.' }
+            $process.StandardOutput.BaseStream.CopyTo($memory)
+            $standardError = $process.StandardError.ReadToEnd()
+            $process.WaitForExit()
+            if ($process.ExitCode -ne 0) { throw "git cat-file failed: $standardError" }
+            $sha = [Security.Cryptography.SHA256]::Create()
+            try { return ([BitConverter]::ToString($sha.ComputeHash($memory.ToArray())) -replace '-','') }
+            finally { $sha.Dispose() }
+        } finally {
+            $memory.Dispose()
+            $process.Dispose()
+        }
+    }
+
     $launcherAst = Get-ParsedScript $launcherPath
     $null = Get-ParsedScript $deployPath
     $null = Get-ParsedScript $invokePath
@@ -29,6 +57,7 @@ BeforeAll {
     $ps7BootstrapSource = Get-Content -LiteralPath $ps7BootstrapPath -Raw
     $argumentBootstrapSource = Get-Content -LiteralPath $argumentBootstrapPath -Raw
     $compatInstallerSource = Get-Content -LiteralPath $compatInstallerPath -Raw
+    $compatInstallerReleaseHash = Get-GitBlobSha256 'HEAD:tools/Install-UpdCompat.ps1'
     $cmdSource = Get-Content -LiteralPath $cmdPath -Raw
 
     function Invoke-UpdCommand {
@@ -213,7 +242,7 @@ exit 29
         $releaseSource | Should -Match 'README compatibility command must pin'
         $readme = Get-Content -LiteralPath (Join-Path $repoRoot 'README.md') -Raw
         $readme | Should -Not -Match 'COMPAT_INSTALLER_SHA256'
-        $readme | Should -Match (Get-FileHash -LiteralPath $compatInstallerPath -Algorithm SHA256).Hash
+        $readme | Should -Match $compatInstallerReleaseHash
         $readme |
             Should -Match 'powershell\.exe -NoProfile -ExecutionPolicy Bypass.*releases/latest/download/Install-UpdCompat\.ps1'
         $readme | Should -Match '\[ScriptBlock\]::Create\(\(Invoke-RestMethod -UseBasicParsing.*Install-UpdCompat\.ps1'
