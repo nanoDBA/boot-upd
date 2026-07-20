@@ -295,7 +295,7 @@ exit 29
         Copy-Item $launcherPath (Join-Path $tools 'Invoke-UpdLauncher.ps1')
         Copy-Item $invokePath (Join-Path $root 'Invoke-BootUpdateCycle.ps1')
         Copy-Item $cmdPath (Join-Path $root 'upd.cmd')
-        $stale = (Get-Content $cmdPath -Raw) -replace 'BootUpdateCycleVersion=2\.5\.31','BootUpdateCycleVersion=1.0.0'
+        $stale = (Get-Content $cmdPath -Raw) -replace 'BootUpdateCycleVersion=\d+(?:\.\d+){2}','BootUpdateCycleVersion=1.0.0'
         Set-Content (Join-Path $root 'upd.cmd.next') $stale -NoNewline
         $hash = (Get-FileHash (Join-Path $root 'upd.cmd.next') -Algorithm SHA256).Hash
         Set-Content (Join-Path $root 'upd.cmd.next.sha256') $hash -NoNewline
@@ -349,7 +349,7 @@ Describe 'Windows PowerShell 5.1 bootstrap with PowerShell 7 parallel runtime' {
 
         $version = & cmd.exe /d /c "`"$simulatedPath`" v" 2>&1
         $LASTEXITCODE | Should -Be 0
-        ($version -join "`n") | Should -Match 'v2\.5\.31.*runtime not installed'
+        ($version -join "`n") | Should -Match 'v2\.5\.32.*runtime not installed'
 
         $demo = & cmd.exe /d /c "`"$simulatedPath`" demo" 2>&1
         $LASTEXITCODE | Should -Be 2

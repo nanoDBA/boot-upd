@@ -143,6 +143,113 @@ Describe 'README console gallery' {
             ($signature -join ',') | Should -Be '137,80,78,71,13,10,26,10'
         }
     }
+
+}
+
+Describe 'Duplicate log compression visibility' {
+    BeforeAll {
+        function Clear-BootUpdateProgressLine { }
+        function Read-BootUpdateUiKeys { }
+        . ([scriptblock]::Create((Get-FunctionText -Ast $invokeAst -Name 'Test-BootUpdateOutputAtLeast')))
+        . ([scriptblock]::Create((Get-FunctionText -Ast $invokeAst -Name 'Write-Log')))
+    }
+
+    BeforeEach {
+        $script:LogPath = Join-Path $TestDrive "repeat-$([guid]::NewGuid()).log"
+        $script:LastLogMessage = $null
+        $script:LastLogRepeatCount = 0
+        $script:LastLogLevel = 'Info'
+        $script:LastLogVisibility = 'Verbose'
+        $script:OutputModes = @('Quiet', 'Normal', 'Verbose', 'Debug')
+        $script:OutputMode = 'Verbose'
+        Mock Clear-BootUpdateProgressLine { }
+        Mock Read-BootUpdateUiKeys { }
+        Mock Write-Host { }
+    }
+
+    It 'retains repeat summaries in the file without printing them in Verbose' {
+        Write-Log 'installer heartbeat'
+        Write-Log 'installer heartbeat'
+        Write-Log 'installer heartbeat'
+        Write-Log 'installer completed'
+
+        (Get-Content -LiteralPath $script:LogPath -Raw) |
+            Should -Match 'previous line repeated 2 more times'
+        Should -Invoke Write-Host -Times 0 -ParameterFilter {
+            [string]$Object -match 'previous line repeated'
+        }
+    }
+
+    It 'exposes one repeat summary in Debug for troubleshooting' {
+        $script:OutputMode = 'Debug'
+        Write-Log 'installer heartbeat'
+        Write-Log 'installer heartbeat'
+        Write-Log 'installer completed'
+
+        Should -Invoke Write-Host -Times 1 -ParameterFilter {
+            [string]$Object -match 'previous line repeated 1 more time'
+        }
+    }
+
+    It 'keeps repeated warnings and errors visible in Normal' {
+        $script:OutputMode = 'Normal'
+        Write-Log 'installer contention' -Level Warn
+        Write-Log 'installer contention' -Level Warn
+        Write-Log 'fatal installer result' -Level Error
+        Write-Log 'fatal installer result' -Level Error
+        Write-Log 'next event'
+
+        Should -Invoke Write-Host -Times 1 -ParameterFilter {
+            [string]$Object -match '\[Warn\] \(previous line repeated 1 more time\)'
+        }
+        Should -Invoke Write-Host -Times 1 -ParameterFilter {
+            [string]$Object -match '\[Error\] \(previous line repeated 1 more time\)'
+        }
+    }
+
+    It 'keeps logging mechanics and duplicated lifecycle narration out of Verbose' {
+        $writeLog = Get-FunctionText -Ast $invokeAst -Name 'Write-Log'
+        $writeLog | Should -Match '(?s)LastLogRepeatCount.*?Test-BootUpdateOutputAtLeast -Minimum Debug'
+        $invokeSource | Should -Match 'Write-Log ">>> \[\$phaseNum/.*? - STARTING" -Visibility Debug'
+        $invokeSource | Should -Match 'Write-Log "<<< \[\$phaseNum/.*? - \$phaseLabel .*? -Visibility Debug'
+        $invokeSource | Should -Match 'Write-Log "<<< \[parallel\].*? -Visibility Debug'
+        (Get-FunctionText -Ast $invokeAst -Name 'Wait-ProcessWithIdleTimeout') |
+            Should -Match 'exited normally .* -Visibility Debug'
+        (Get-FunctionText -Ast $invokeAst -Name 'Invoke-PackageManagerWithTimeout') |
+            Should -Match 'Starting \(idle: .* -Visibility Debug'
+    }
+}
+
+Describe 'Deferred phase result rendering' {
+    BeforeAll {
+        function Clear-BootUpdateProgressLine { }
+        function Write-BootUpdateProgress { param($Activity, $Status, $PercentComplete) }
+        . ([scriptblock]::Create((Get-FunctionText -Ast $invokeAst -Name 'Test-BootUpdateOutputAtLeast')))
+        . ([scriptblock]::Create((Get-FunctionText -Ast $invokeAst -Name 'Write-PhaseResult')))
+    }
+
+    BeforeEach {
+        $script:OutputModes = @('Quiet', 'Normal', 'Verbose', 'Debug')
+        $script:OutputMode = 'Normal'
+        Mock Clear-BootUpdateProgressLine { }
+        Mock Write-BootUpdateProgress { }
+        Mock Write-Host { }
+    }
+
+    It 'renders a planned user-context continuation as deferred, not failed' {
+        Write-PhaseResult -Num 1 -Total 2 -Name Winget -Success $false -Deferred -Minutes 0.2 -Count 3
+
+        Should -Invoke Write-Host -Times 1 -ParameterFilter {
+            [string]$Object -match 'machine done; user pass deferred' -and
+            [string]$Object -notmatch 'FAILED'
+        }
+    }
+
+    It 'keeps a deferred result quiet in Quiet mode' {
+        $script:OutputMode = 'Quiet'
+        Write-PhaseResult -Num 1 -Total 2 -Name Winget -Success $false -Deferred -Minutes 0.2
+        Should -Invoke Write-Host -Times 0
+    }
 }
 
 Describe 'Animated progress behavior' {

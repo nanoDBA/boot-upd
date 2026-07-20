@@ -1,8 +1,19 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.31
+**Current Version:** v2.5.32
 **Release Date:** 2026-07-20
 **Status:** STABLE
+
+---
+
+## v2.5.32 (2026-07-20)
+
+### Verbose without the heartbeat chatter
+
+- Keeps informational duplicate-line compression summaries in the durable log while showing them on-screen only in Debug mode; repeated warnings and errors remain visible.
+- Removes redundant timestamped phase start/finish narration from Verbose because the styled phase header and result already communicate the same state.
+- Renders a planned machine-to-user-context continuation as an amber deferred result instead of a red failure.
+- Preserves warnings, failures, useful preflight decisions, the animated live status row, and the splash screen unchanged.
 
 ---
 

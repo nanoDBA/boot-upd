@@ -332,7 +332,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 3 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.31' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.32' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 Set-Variable -Name 'RebootSignalSettleSeconds' -Value 20 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 $script:ExplicitRebootRequests = [System.Collections.Generic.List[object]]::new()
 
@@ -629,6 +629,8 @@ Initialize-BootUpdateConsole
 #region Logging
 $script:LastLogMessage = $null
 $script:LastLogRepeatCount = 0
+$script:LastLogLevel = 'Info'
+$script:LastLogVisibility = 'Verbose'
 
 function Invoke-LogRotation {
     if (-not (Test-Path $script:LogPath)) { return }
@@ -665,20 +667,40 @@ function Write-Log {
        pattern filters above). First occurrence logs normally; repeats are counted and
        summarized as one line when the message finally changes. #>
     $trimmedMsg = $Message.TrimEnd()
-    if ($trimmedMsg -eq $script:LastLogMessage) {
+    if (($trimmedMsg -eq $script:LastLogMessage) -and
+        ($Level -eq $script:LastLogLevel) -and
+        ($Visibility -eq $script:LastLogVisibility)) {
         $script:LastLogRepeatCount++
         return
     }
     if ($script:LastLogRepeatCount -gt 0) {
-        $repeatEntry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [Info] (previous line repeated $($script:LastLogRepeatCount) more time$(if ($script:LastLogRepeatCount -ne 1) { 's' }))"
+        $repeatEntry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [$($script:LastLogLevel)] (previous line repeated $($script:LastLogRepeatCount) more time$(if ($script:LastLogRepeatCount -ne 1) { 's' }))"
         Add-Content -Path $script:LogPath -Value $repeatEntry -Force
-        if (Test-BootUpdateOutputAtLeast -Minimum Verbose) {
-            Clear-BootUpdateProgressLine
-            Write-Host $repeatEntry
+        # Informational repeat counts are logging mechanics; the live row already
+        # proves progress. Repeated warnings and errors remain operator-visible.
+        switch ($script:LastLogLevel) {
+            'Info' {
+                if (Test-BootUpdateOutputAtLeast -Minimum Debug) {
+                    Clear-BootUpdateProgressLine
+                    Write-Host $repeatEntry
+                }
+            }
+            'Warn' {
+                if (Test-BootUpdateOutputAtLeast -Minimum Normal) {
+                    Clear-BootUpdateProgressLine
+                    Write-Host $repeatEntry -ForegroundColor Yellow
+                }
+            }
+            'Error' {
+                Clear-BootUpdateProgressLine
+                Write-Host $repeatEntry -ForegroundColor Red
+            }
         }
     }
     $script:LastLogMessage = $trimmedMsg
     $script:LastLogRepeatCount = 0
+    $script:LastLogLevel = $Level
+    $script:LastLogVisibility = $Visibility
 
     $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $entry = "[$ts] [$Level] $Message"
@@ -1365,7 +1387,7 @@ function Wait-ProcessWithIdleTimeout {
         $Process.Refresh()
         if ($Process.HasExited) {
             $elapsed = [datetime]::UtcNow - $startTime
-            Write-Log "Process PID $($Process.Id) exited normally ($([math]::Round($elapsed.TotalMinutes,1))m)"
+            Write-Log "Process PID $($Process.Id) exited normally ($([math]::Round($elapsed.TotalMinutes,1))m)" -Visibility Debug
             return @{ Reason = 'Completed'; Elapsed = $elapsed; FinalCpuTime = $finalCpu; ExitCode = $Process.ExitCode }
         }
         $elapsed = [datetime]::UtcNow - $startTime
@@ -1425,7 +1447,7 @@ try {
 }
 "@
     $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($childScript))
-    Write-Log "${Name}: Starting (idle: ${IdleTimeoutMinutes}m, hard: ${HardTimeoutMinutes}m)"
+    Write-Log "${Name}: Starting (idle: ${IdleTimeoutMinutes}m, hard: ${HardTimeoutMinutes}m)" -Visibility Debug
 
     $si = [System.Diagnostics.ProcessStartInfo]@{
         FileName = $pwshPath; Arguments = "-NoProfile -NonInteractive -EncodedCommand $encoded"
@@ -3628,15 +3650,19 @@ function Write-PhaseHeader {
 }
 
 function Write-PhaseResult {
-    param([int]$Num, [int]$Total, [string]$Name, [bool]$Success, [double]$Minutes, [int]$Count = 0)
+    param([int]$Num, [int]$Total, [string]$Name, [bool]$Success, [switch]$Deferred, [double]$Minutes, [int]$Count = 0)
     $percent = if ($Total -gt 0) { [math]::Min(100, [math]::Floor(($Num / $Total) * 100)) } else { 100 }
-    Write-BootUpdateProgress -Activity "Boot Update Cycle [$Num/$Total]" -Status "$Name complete" -PercentComplete $percent
-    if ($Success -and -not (Test-BootUpdateOutputAtLeast -Minimum Normal)) { return }
-    $e = [char]27; $g = "$e[32m"; $red = "$e[31m"; $r = "$e[0m"
+    $progressStatus = if ($Deferred) { "$Name machine pass complete; user pass deferred" } else { "$Name complete" }
+    Write-BootUpdateProgress -Activity "Boot Update Cycle [$Num/$Total]" -Status $progressStatus -PercentComplete $percent
+    if (($Success -or $Deferred) -and -not (Test-BootUpdateOutputAtLeast -Minimum Normal)) { return }
+    $e = [char]27; $g = "$e[32m"; $amber = "$e[33m"; $red = "$e[31m"; $r = "$e[0m"
     $countMsg = if ($Count -gt 0) { ", $Count pkg" } else { '' }
     $t = "$([math]::Round($Minutes, 1)) min"
     Clear-BootUpdateProgressLine
-    if ($Success) {
+    if ($Deferred) {
+        $message = ">>> [$Num/$Total] $Name machine done; user pass deferred ($t$countMsg)"
+        Write-Host "$amber  $message$r"
+    } elseif ($Success) {
         $message = ">>> [$Num/$Total] $Name done ($t$countMsg)"
         Write-Host "$g  $message$r"
     } else {
@@ -4365,7 +4391,7 @@ function Invoke-BootUpdateCycle {
             if ($phaseNum -lt 1) { $phaseNum = 1 }
 
             Write-PhaseHeader -Num $phaseNum -Total $enabledPhases.Count -Name $targetPhase.Name
-            Write-Log ">>> [$phaseNum/$($enabledPhases.Count)] $($targetPhase.Name) - STARTING"
+            Write-Log ">>> [$phaseNum/$($enabledPhases.Count)] $($targetPhase.Name) - STARTING" -Visibility Debug
             $phaseStart = Get-Date
 
             $state.LastPhaseStarted = $targetPhase.Name; $state.LastPhaseTimestamp = Get-Date -Format 'o'; $state.Phase = $targetPhase.Name
@@ -4383,9 +4409,9 @@ function Invoke-BootUpdateCycle {
                 $phaseCount = if ($targetPhase.Key -and $r.Count) { $state.Summary.($targetPhase.Key) += $r.Count; $r.Count } else { 0 }
                 $elapsed = (Get-Date) - $phaseStart
 
-                Write-PhaseResult -Num $phaseNum -Total $enabledPhases.Count -Name $targetPhase.Name -Success $phaseSucceeded -Minutes $elapsed.TotalMinutes -Count $phaseCount
+                Write-PhaseResult -Num $phaseNum -Total $enabledPhases.Count -Name $targetPhase.Name -Success $phaseSucceeded -Deferred:$targetPhase.UserCompletionDeferred -Minutes $elapsed.TotalMinutes -Count $phaseCount
                 $phaseLabel = if ($targetPhase.UserCompletionDeferred) { 'MACHINE PORTION DONE; USER PASS DEFERRED' } elseif ($phaseSucceeded) { 'DONE' } else { 'FAILED' }
-                Write-Log "<<< [$phaseNum/$($enabledPhases.Count)] $($targetPhase.Name) - $phaseLabel ($([math]::Round($elapsed.TotalMinutes, 1)) min, $phaseCount pkg)" -Level $(if ($phaseSucceeded -or $targetPhase.UserCompletionDeferred) { 'Info' } else { 'Error' })
+                Write-Log "<<< [$phaseNum/$($enabledPhases.Count)] $($targetPhase.Name) - $phaseLabel ($([math]::Round($elapsed.TotalMinutes, 1)) min, $phaseCount pkg)" -Level $(if ($phaseSucceeded -or $targetPhase.UserCompletionDeferred) { 'Info' } else { 'Error' }) -Visibility Debug
                 if ($phaseSucceeded) { Write-EventLogEntry -EventId 1004 -Message "$($targetPhase.Name) complete: $phaseCount packages in $([math]::Round($elapsed.TotalMinutes,1)) min" }
             } catch {
                 $elapsed = (Get-Date) - $phaseStart
@@ -4427,7 +4453,7 @@ function Invoke-BootUpdateCycle {
 
             <# Console: styled phase header #>
             Write-PhaseHeader -Num $phaseNum -Total $enabledPhases.Count -Name $phase.Name
-            Write-Log ">>> [$phaseNum/$($enabledPhases.Count)] $($phase.Name) - STARTING"
+            Write-Log ">>> [$phaseNum/$($enabledPhases.Count)] $($phase.Name) - STARTING" -Visibility Debug
             $phaseStart = Get-Date
 
             <# Crash-recovery markers: write intent before execution (skipped in WhatIf) #>
@@ -4451,9 +4477,9 @@ function Invoke-BootUpdateCycle {
                 $elapsed = (Get-Date) - $phaseStart
 
                 <# Console: styled result #>
-                Write-PhaseResult -Num $phaseNum -Total $enabledPhases.Count -Name $phase.Name -Success $phaseSucceeded -Minutes $elapsed.TotalMinutes -Count $phaseCount
+                Write-PhaseResult -Num $phaseNum -Total $enabledPhases.Count -Name $phase.Name -Success $phaseSucceeded -Deferred:$phase.UserCompletionDeferred -Minutes $elapsed.TotalMinutes -Count $phaseCount
                 $phaseLabel = if ($phase.UserCompletionDeferred) { 'MACHINE PORTION DONE; USER PASS DEFERRED' } elseif ($phaseSucceeded) { 'DONE' } else { 'FAILED' }
-                Write-Log "<<< [$phaseNum/$($enabledPhases.Count)] $($phase.Name) - $phaseLabel ($([math]::Round($elapsed.TotalMinutes, 1)) min, $phaseCount pkg)" -Level $(if ($phaseSucceeded -or $phase.UserCompletionDeferred) { 'Info' } else { 'Error' })
+                Write-Log "<<< [$phaseNum/$($enabledPhases.Count)] $($phase.Name) - $phaseLabel ($([math]::Round($elapsed.TotalMinutes, 1)) min, $phaseCount pkg)" -Level $(if ($phaseSucceeded -or $phase.UserCompletionDeferred) { 'Info' } else { 'Error' }) -Visibility Debug
                 if ($phaseSucceeded) { Write-EventLogEntry -EventId 1004 -Message "$($phase.Name) complete: $phaseCount packages in $([math]::Round($elapsed.TotalMinutes,1)) min" }
             } catch {
                 $elapsed = (Get-Date) - $phaseStart
@@ -4863,7 +4889,7 @@ function Invoke-BootUpdateCycle {
                 $phaseNum++
                 $elapsed = (Get-Date) - $cohortStart
                 Write-PhaseResult -Num $phaseNum -Total $enabledPhases.Count -Name $phaseName -Success $phaseSucceeded -Minutes $elapsed.TotalMinutes -Count $jr.Count
-                Write-Log "<<< [parallel] $phaseName - $(if ($phaseSucceeded) { 'DONE' } else { 'FAILED; RETRY PENDING' }) ($($jr.Count) pkg)" -Level $(if ($phaseSucceeded) { 'Info' } else { 'Error' })
+                Write-Log "<<< [parallel] $phaseName - $(if ($phaseSucceeded) { 'DONE' } else { 'FAILED; RETRY PENDING' }) ($($jr.Count) pkg)" -Level $(if ($phaseSucceeded) { 'Info' } else { 'Error' }) -Visibility Debug
                 if ($phaseSucceeded) { Write-EventLogEntry -EventId 1004 -Message "$phaseName complete: $($jr.Count) packages (parallel cohort)" }
                 <# After<Phase> hook — fired on the parent thread as each result is collected (approximate order). #>
                 Invoke-PhaseHook -EventName "After$phaseName"

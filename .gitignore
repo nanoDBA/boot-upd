@@ -1,5 +1,6 @@
 # Dev scratch files
 scratch.ps1
+testResults.xml
 
 # Temp cleanup utilities (not part of the tool)
 DEL_ALL*.CMD
