@@ -105,7 +105,7 @@ has exited**. It verifies the installer against the hash embedded below, then th
 verifies and transactionally replaces the complete release bundle before forwarding `aws`:
 
 ```powershell
-$u='https://github.com/nanoDBA/boot-upd/releases/download/v2.5.32/Install-UpdCompat.ps1'; $f=Join-Path $env:TEMP 'Install-UpdCompat-v2.5.32.ps1'; Invoke-WebRequest $u -OutFile $f; if((Get-FileHash $f -Algorithm SHA256).Hash -ne '54CC93E136F060B0CB287109007EDA7FA8D96E9B80B6B38D2FD0255A07149F6F'){throw 'Compatibility installer hash mismatch'}; & $f -CommandArguments aws
+$u='https://github.com/nanoDBA/boot-upd/releases/download/v2.5.33/Install-UpdCompat.ps1'; $f=Join-Path $env:TEMP 'Install-UpdCompat-v2.5.33.ps1'; Invoke-WebRequest $u -OutFile $f; if((Get-FileHash $f -Algorithm SHA256).Hash -ne '54CC93E136F060B0CB287109007EDA7FA8D96E9B80B6B38D2FD0255A07149F6F'){throw 'Compatibility installer hash mismatch'}; & $f -CommandArguments aws
 ```
 
 This is the one-time chicken-and-egg escape hatch. It resolves the first `upd.cmd` on PATH,

@@ -349,7 +349,7 @@ Describe 'Windows PowerShell 5.1 bootstrap with PowerShell 7 parallel runtime' {
 
         $version = & cmd.exe /d /c "`"$simulatedPath`" v" 2>&1
         $LASTEXITCODE | Should -Be 0
-        ($version -join "`n") | Should -Match 'v2\.5\.32.*runtime not installed'
+        ($version -join "`n") | Should -Match 'v2\.5\.33.*runtime not installed'
 
         $demo = & cmd.exe /d /c "`"$simulatedPath`" demo" 2>&1
         $LASTEXITCODE | Should -Be 2

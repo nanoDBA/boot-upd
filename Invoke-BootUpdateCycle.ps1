@@ -332,7 +332,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 3 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.32' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.33' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 Set-Variable -Name 'RebootSignalSettleSeconds' -Value 20 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 $script:ExplicitRebootRequests = [System.Collections.Generic.List[object]]::new()
 
@@ -388,6 +388,43 @@ $script:TuiCursorWasVisible = $true
 $script:TuiCursorHidden = $false
 $script:TuiInProgressTick = $false
 
+function Test-BootUpdateVirtualTerminal {
+    param(
+        [switch]$UseSuppliedCapabilities,
+        [bool]$HostReportsSupport = $false,
+        [bool]$OutputRedirected = $false,
+        [string]$HostName = '',
+        [int]$OsBuild = 0,
+        [bool]$WindowsPlatform = $false
+    )
+
+    if (-not $UseSuppliedCapabilities) {
+        try { $HostReportsSupport = [bool]$Host.UI.SupportsVirtualTerminal } catch { }
+        try { $OutputRedirected = [Console]::IsOutputRedirected } catch { $OutputRedirected = $true }
+        try { $HostName = $Host.Name } catch { }
+        try { $OsBuild = [Environment]::OSVersion.Version.Build } catch { }
+        $WindowsPlatform = $PSVersionTable.Platform -eq 'Win32NT'
+    }
+
+    if ($OutputRedirected) { return $false }
+    if ($HostReportsSupport) { return $true }
+
+    <# PowerShell's host flag can under-report after a UAC/relauncher handoff even
+       though modern conhost supports VT. PowerShell 7 enables VT processing for
+       ConsoleHost; keep the genuine pre-Windows-10 fallback below build 15063. #>
+    return $WindowsPlatform -and $HostName -eq 'ConsoleHost' -and $OsBuild -ge 15063
+}
+
+function Resolve-BootUpdateSplashTheme {
+    param(
+        [Parameter(Mandatory)][bool]$VirtualTerminalSupported,
+        [AllowEmptyString()][string]$RequestedTheme = ''
+    )
+    if (-not $VirtualTerminalSupported) { return 2 }
+    if ($RequestedTheme -match '^[0-2]$') { return [int]$RequestedTheme }
+    return 0
+}
+
 function Initialize-BootUpdateConsole {
     try {
         $isSystem = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value -eq 'S-1-5-18'
@@ -395,7 +432,7 @@ function Initialize-BootUpdateConsole {
             -not [Console]::IsInputRedirected -and -not [Console]::IsOutputRedirected -and
             $Host.Name -eq 'ConsoleHost'
         if ($script:TuiInteractive) {
-            $script:TuiSupportsVirtualTerminal = [bool]$Host.UI.SupportsVirtualTerminal
+            $script:TuiSupportsVirtualTerminal = Test-BootUpdateVirtualTerminal
         }
     } catch {
         $script:TuiInteractive = $false
@@ -3473,19 +3510,12 @@ function Show-StartupArt {
        Windows Terminal). Still spaces + background color only — no Unicode glyphs —
        so the cmd.exe glyph-drop failure mode from pre-2.5.6 cannot recur. Legacy
        consoles (Server 2016, no VT) fall back to the 16-color block wordmark. #>
-    $vtOk = $false
-    try {
-        $vtOk = $Host.UI.SupportsVirtualTerminal -and ([System.Environment]::OSVersion.Version.Build -ge 15063)
-    } catch { }
+    $vtOk = Test-BootUpdateVirtualTerminal
 
     <# Splash theme (0 = neon gradient [default], 1 = bright-rim outline with
        dithered fill, 2 = classic 16-color blocks). Override with
        BOOT_UPDATE_SPLASH_THEME=0|1|2. Non-VT consoles always get 2. #>
-    $theme = 2
-    if ($vtOk) {
-        $theme = 0
-        if ($env:BOOT_UPDATE_SPLASH_THEME -match '^[0-2]$') { $theme = [int]$env:BOOT_UPDATE_SPLASH_THEME }
-    }
+    $theme = Resolve-BootUpdateSplashTheme -VirtualTerminalSupported $vtOk -RequestedTheme $env:BOOT_UPDATE_SPLASH_THEME
 
     if ($theme -le 1) {
         $e = [char]27

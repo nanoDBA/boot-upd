@@ -1,8 +1,19 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.32
+**Current Version:** v2.5.33
 **Release Date:** 2026-07-20
 **Status:** STABLE
+
+---
+
+## v2.5.33 (2026-07-20)
+
+### Neon splash default restored across modern relaunches
+
+- Centralizes terminal capability detection so a modern Windows ConsoleHost remains VT-capable when the host property under-reports support after a relaunch or UAC handoff.
+- Restores neon gradient theme 0 as the no-override default on modern interactive consoles.
+- Preserves explicit theme selection and the classic theme 2 fallback for redirected output and genuine legacy consoles.
+- Leaves the splash artwork, animation palette, and layout unchanged.
 
 ---
 

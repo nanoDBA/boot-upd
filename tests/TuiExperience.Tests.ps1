@@ -61,7 +61,40 @@ Describe 'Concise output modes' {
         $hash = [Convert]::ToHexString(
             [Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($splash))
         ).ToLowerInvariant()
-        $hash | Should -Be '2d5cd129d268aa97144d5da1fb84cec3035fa8541aae3eff0a53ed313290811c'
+        $hash | Should -Be 'ec928edc16039db28faf66b577e725a1223c67316e70311c69952a940e5289cf'
+    }
+}
+
+Describe 'Splash theme selection' {
+    BeforeAll {
+        . ([scriptblock]::Create((Get-FunctionText -Ast $invokeAst -Name 'Test-BootUpdateVirtualTerminal')))
+        . ([scriptblock]::Create((Get-FunctionText -Ast $invokeAst -Name 'Resolve-BootUpdateSplashTheme')))
+    }
+
+    It 'recognizes a modern ConsoleHost when the host flag under-reports VT support' {
+        Test-BootUpdateVirtualTerminal -UseSuppliedCapabilities `
+            -HostReportsSupport:$false -OutputRedirected:$false -HostName ConsoleHost `
+            -OsBuild 26200 -WindowsPlatform:$true | Should -BeTrue
+    }
+
+    It 'defaults a VT-capable console to neon theme 0' {
+        Resolve-BootUpdateSplashTheme -VirtualTerminalSupported $true | Should -Be 0
+        Resolve-BootUpdateSplashTheme -VirtualTerminalSupported $true -RequestedTheme 'invalid' | Should -Be 0
+    }
+
+    It 'honors explicit themes but preserves the genuine non-VT fallback' {
+        Resolve-BootUpdateSplashTheme -VirtualTerminalSupported $true -RequestedTheme '1' | Should -Be 1
+        Resolve-BootUpdateSplashTheme -VirtualTerminalSupported $true -RequestedTheme '2' | Should -Be 2
+        Resolve-BootUpdateSplashTheme -VirtualTerminalSupported $false -RequestedTheme '0' | Should -Be 2
+    }
+
+    It 'does not emit VT styling into redirected output or legacy Windows consoles' {
+        Test-BootUpdateVirtualTerminal -UseSuppliedCapabilities `
+            -HostReportsSupport:$true -OutputRedirected:$true -HostName ConsoleHost `
+            -OsBuild 26200 -WindowsPlatform:$true | Should -BeFalse
+        Test-BootUpdateVirtualTerminal -UseSuppliedCapabilities `
+            -HostReportsSupport:$false -OutputRedirected:$false -HostName ConsoleHost `
+            -OsBuild 14393 -WindowsPlatform:$true | Should -BeFalse
     }
 }
 
