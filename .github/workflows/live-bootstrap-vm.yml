@@ -10,13 +10,13 @@ permissions:
 
 jobs:
   exact-readme-bootstrap:
-    name: Exact README bootstrap (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    name: Exact README bootstrap (${{ matrix.scenario }})
+    runs-on: windows-2022
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-2022, windows-2025]
+        scenario: [fresh-install, legacy-repair]
 
     steps:
       - name: Check out test harness
@@ -33,6 +33,22 @@ jobs:
           }
           Get-ComputerInfo | Select-Object WindowsProductName,WindowsVersion,OsBuildNumber |
               ConvertTo-Json | Set-Content -LiteralPath "$env:RUNNER_TEMP\vm-baseline.json"
+
+      - name: Seed a legacy launcher for repair scenario
+        if: matrix.scenario == 'legacy-repair'
+        shell: powershell
+        run: |
+          $installRoot = Join-Path $env:ProgramFiles 'BootUpdateCycle'
+          $null = New-Item -ItemType Directory -Path $installRoot -Force
+          @(
+              '@echo off',
+              ':: BootUpdateCycleVersion=1.0.0',
+              'echo legacy launcher must be replaced',
+              'exit /b 99'
+          ) | Set-Content -LiteralPath (Join-Path $installRoot 'upd.cmd') -Encoding ascii
+          $machinePath = [Environment]::GetEnvironmentVariable('Path','Machine')
+          [Environment]::SetEnvironmentVariable('Path',"$installRoot;$machinePath",'Machine')
+          $env:Path = "$installRoot;$env:Path"
 
       - name: Execute exact README command and answer post-install prompt
         shell: pwsh
@@ -51,6 +67,7 @@ jobs:
               -CommandLine $commands[0] `
               -InputLine 'help' `
               -TranscriptPath $transcript `
+              -WorkingDirectory $env:RUNNER_TEMP `
               -TimeoutSeconds 900 `
               -InputDelayMilliseconds 2000
           Get-Content -LiteralPath $transcript
@@ -107,7 +124,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: live-bootstrap-${{ matrix.os }}
+          name: live-bootstrap-${{ matrix.scenario }}
           path: |
             ${{ runner.temp }}/live-bootstrap-transcript.txt
             ${{ runner.temp }}/vm-baseline.json

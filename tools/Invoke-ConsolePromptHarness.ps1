@@ -4,6 +4,7 @@ param(
     [Parameter(Mandatory)][string]$CommandLine,
     [Parameter(Mandatory)][string]$InputLine,
     [Parameter(Mandatory)][string]$TranscriptPath,
+    [string]$WorkingDirectory = (Get-Location).Path,
     [ValidateRange(5,1800)][int]$TimeoutSeconds = 900,
     [ValidateRange(100,10000)][int]$InputDelayMilliseconds = 1500
 )
@@ -199,7 +200,8 @@ $runnerLines = @(
 )
 [IO.File]::WriteAllLines($runnerPath,$runnerLines,[Text.Encoding]::ASCII)
 $childCommand = 'cmd.exe /d /s /c ""{0}""' -f $runnerPath
-$child = [BootUpdateCycle.ConsolePromptDriver]::Start($childCommand,(Get-Location).Path)
+$workingDirectoryFullPath = [IO.Path]::GetFullPath($WorkingDirectory)
+$child = [BootUpdateCycle.ConsolePromptDriver]::Start($childCommand,$workingDirectoryFullPath)
 try {
     Start-Sleep -Milliseconds $InputDelayMilliseconds
     [BootUpdateCycle.ConsolePromptDriver]::SendLine($child.ProcessId,$InputLine)
