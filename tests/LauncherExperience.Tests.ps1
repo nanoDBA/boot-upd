@@ -39,6 +39,15 @@ BeforeAll {
     }
 }
 
+Describe 'Batch launcher file format' {
+    It 'stores only CRLF line endings because cmd.exe misparses LF-only files' {
+        $bytes = [IO.File]::ReadAllBytes($cmdPath)
+        $text = [Text.Encoding]::UTF8.GetString($bytes)
+        $text | Should -Match "`r`n"
+        $text.Replace("`r`n", '') | Should -Not -Match "`n"
+    }
+}
+
 Describe 'Friendly launcher help' {
     It 'accepts <alias> without elevation or side effects' -ForEach @(
         @{ Alias='/?' }, @{ Alias='?' }, @{ Alias='/help' }, @{ Alias='help' },

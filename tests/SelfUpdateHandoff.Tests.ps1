@@ -23,6 +23,10 @@ BeforeAll {
     }
 
     . ([scriptblock]::Create((Get-ProductionFunctionText -Name 'Test-SelfUpdateHandoff')))
+    . ([scriptblock]::Create((Get-ProductionFunctionText -Name 'Repair-OrchestratorSourceCopy')))
+
+    function Get-OrchestratorFileVersion { }
+    function Write-Log { }
 
     $markerName = 'BOOT_UPDATE_SELF_UPDATE_HANDOFF'
     $originalMarker = [Environment]::GetEnvironmentVariable($markerName, 'Process')
@@ -30,6 +34,26 @@ BeforeAll {
 
 AfterAll {
     [Environment]::SetEnvironmentVariable($markerName, $originalMarker, 'Process')
+}
+
+Describe 'Repair-OrchestratorSourceCopy' {
+    BeforeEach {
+        $script:OriginalSourceDir = $env:BOOT_UPDATE_SOURCE_DIR
+        $env:BOOT_UPDATE_SOURCE_DIR = 'Z:\Cloud checkout unavailable after reboot'
+        Mock Get-OrchestratorFileVersion { [version]'2.5.42' }
+        Mock Test-Path { $false }
+        Mock Write-Log { }
+    }
+
+    AfterEach {
+        $env:BOOT_UPDATE_SOURCE_DIR = $script:OriginalSourceDir
+    }
+
+    It 'silently ignores launcher directories on unavailable mapped drives' {
+        { Repair-OrchestratorSourceCopy -VerifiedReleaseVersion ([version]'2.5.42') } |
+            Should -Not -Throw
+        Should -Invoke Write-Log -ParameterFilter { $Level -eq 'Warn' } -Times 0
+    }
 }
 
 Describe 'Test-SelfUpdateHandoff' {

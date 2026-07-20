@@ -4024,18 +4024,30 @@ function Repair-OrchestratorSourceCopy {
         }
 
         foreach ($dir in $candidateDirs) {
-            $sourceInvoke = Join-Path $dir 'Invoke-BootUpdateCycle.ps1'
-            $sourceLauncher = Join-Path $dir 'upd.cmd'
-            if (-not (Test-Path -LiteralPath $sourceInvoke) -or -not (Test-Path -LiteralPath $sourceLauncher)) { continue }
-            if ([System.IO.Path]::GetFullPath($sourceInvoke) -eq [System.IO.Path]::GetFullPath($PSCommandPath)) { continue }
+            <# Mapped and cloud-provider drives are commonly absent after reboot or
+               before interactive sign-in. An unavailable launcher directory is an
+               expected candidate miss, not a self-update failure. Test the directory
+               before Join-Path because Join-Path throws when the drive does not exist. #>
+            if (-not (Test-Path -LiteralPath $dir -PathType Container -ErrorAction SilentlyContinue)) {
+                continue
+            }
 
-            $sourceVersion = Get-OrchestratorFileVersion -Path $sourceInvoke
-            if ($null -ne $sourceVersion -and $sourceVersion -ge $liveVersion) { continue }
+            try {
+                $sourceInvoke = Join-Path $dir 'Invoke-BootUpdateCycle.ps1' -ErrorAction Stop
+                $sourceLauncher = Join-Path $dir 'upd.cmd' -ErrorAction Stop
+                if (-not (Test-Path -LiteralPath $sourceInvoke) -or -not (Test-Path -LiteralPath $sourceLauncher)) { continue }
+                if ([System.IO.Path]::GetFullPath($sourceInvoke) -eq [System.IO.Path]::GetFullPath($PSCommandPath)) { continue }
 
-            Copy-Item -LiteralPath $sourceInvoke -Destination "$sourceInvoke.bak" -Force -ErrorAction Stop
-            Copy-Item -LiteralPath $PSCommandPath -Destination $sourceInvoke -Force -ErrorAction Stop
-            $oldVersion = if ($null -eq $sourceVersion) { 'unknown' } else { $sourceVersion.ToString() }
-            Write-Log "Self-update: repaired launcher source copy ($oldVersion -> $liveVersion): $sourceInvoke" -Level Info
+                $sourceVersion = Get-OrchestratorFileVersion -Path $sourceInvoke
+                if ($null -ne $sourceVersion -and $sourceVersion -ge $liveVersion) { continue }
+
+                Copy-Item -LiteralPath $sourceInvoke -Destination "$sourceInvoke.bak" -Force -ErrorAction Stop
+                Copy-Item -LiteralPath $PSCommandPath -Destination $sourceInvoke -Force -ErrorAction Stop
+                $oldVersion = if ($null -eq $sourceVersion) { 'unknown' } else { $sourceVersion.ToString() }
+                Write-Log "Self-update: repaired launcher source copy ($oldVersion -> $liveVersion): $sourceInvoke" -Level Info
+            } catch {
+                Write-Log "Self-update: launcher source repair failed ($dir) — $_" -Level Warn
+            }
         }
     } catch {
         Write-Log "Self-update: source-copy repair skipped — $_" -Level Warn

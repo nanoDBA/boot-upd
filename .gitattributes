@@ -1,2 +1,4 @@
-*.cmd text eol=crlf
+# cmd.exe is not reliable with LF-only batch files. Preserve CRLF bytes in Git
+# so release assets and cloud-synced working copies cannot bypass checkout conversion.
+*.cmd -text whitespace=cr-at-eol
 *.ps1 text eol=lf
