@@ -74,6 +74,34 @@ function Test-CompatPowerShellAsset {
     if ($errors.Count) { throw "PowerShell parse error in ${Name}: $($errors[0].Message)" }
 }
 
+function Set-CompatStagedFile {
+    param(
+        [Parameter(Mandatory)][string]$Incoming,
+        [Parameter(Mandatory)][string]$Target,
+        [Parameter(Mandatory)][string]$Snapshot,
+        [Parameter(Mandatory)][bool]$Existed
+    )
+
+    if (-not $Existed) {
+        Move-Item -LiteralPath $Incoming -Destination $Target -Force
+        return
+    }
+    if (-not (Test-Path -LiteralPath $Snapshot -PathType Leaf)) {
+        throw "Rollback snapshot is missing for $Target."
+    }
+
+    # Windows PowerShell 5.1 runs on .NET Framework, whose four-argument
+    # File.Replace overload rejects a null destinationBackupFileName. The
+    # durable rollback snapshot already exists; this concrete target-adjacent
+    # backup keeps the atomic API on one volume and is removed after the swap.
+    $replaceBackup = "$Target.file-replace-$PID"
+    try {
+        [IO.File]::Replace($Incoming,$Target,$replaceBackup,$true)
+    } finally {
+        Remove-Item -LiteralPath $replaceBackup -Force -ErrorAction SilentlyContinue
+    }
+}
+
 if (-not (Test-CompatAdministrator)) {
     $payload = [ordered]@{ InstallRoot=$InstallRoot; CommandArguments=@($CommandArguments); Repository=$Repository }
     $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject $payload -Compress)))
@@ -188,8 +216,7 @@ try {
         $committed.Add([pscustomobject]@{ Target=$item.Target; Snapshot=$snapshot; Existed=$existed })
         Copy-Item -LiteralPath $item.Staged -Destination $incoming -Force
         try {
-            if ($existed) { [IO.File]::Replace($incoming,$item.Target,$null,$true) }
-            else { Move-Item -LiteralPath $incoming -Destination $item.Target -Force }
+            Set-CompatStagedFile -Incoming $incoming -Target $item.Target -Snapshot $snapshot -Existed $existed
             if ((Get-FileHash -LiteralPath $item.Target -Algorithm SHA256).Hash.ToUpperInvariant() -ne $item.Hash) {
                 throw "Post-copy SHA256 mismatch for $($item.Spec.Name)."
             }

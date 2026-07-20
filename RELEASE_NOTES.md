@@ -1,8 +1,18 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.35
+**Current Version:** v2.5.36
 **Release Date:** 2026-07-20
 **Status:** STABLE
+
+---
+
+## v2.5.36 (2026-07-20)
+
+### PS5-compatible transactional file replacement
+
+- Supplies the concrete backup path required by Windows PowerShell 5.1's .NET Framework `File.Replace` implementation instead of passing a null backup path.
+- Keeps the verified rollback snapshot and same-volume atomic replacement semantics, including safe cleanup of the redundant target-adjacent swap backup.
+- Adds an actual Windows PowerShell 5.1 replacement test using an existing target in a path containing spaces.
 
 ---
 

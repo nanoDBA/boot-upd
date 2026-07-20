@@ -316,6 +316,39 @@ exit 29
 }
 
 Describe 'Windows PowerShell 5.1 bootstrap with PowerShell 7 parallel runtime' {
+    It 'atomically replaces an existing file under Windows PowerShell 5.1 with a concrete backup path' {
+        $replacer = $compatInstallerAst.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq 'Set-CompatStagedFile'
+        },$true) | Select-Object -First 1
+        $replacer | Should -Not -BeNullOrEmpty
+
+        $root = Join-Path $TestDrive 'replace path with spaces'
+        $null = New-Item -ItemType Directory -Path $root
+        $helperPath = Join-Path $root 'compat-replacer.ps1'
+        $incoming = Join-Path $root 'target.ps1.incoming'
+        $target = Join-Path $root 'target.ps1'
+        $snapshot = Join-Path $root 'target.ps1.snapshot'
+        Set-Content -LiteralPath $helperPath -Value $replacer.Extent.Text -Encoding utf8
+        Set-Content -LiteralPath $incoming -Value 'new bytes' -NoNewline -Encoding ascii
+        Set-Content -LiteralPath $target -Value 'old bytes' -NoNewline -Encoding ascii
+        Set-Content -LiteralPath $snapshot -Value 'old bytes' -NoNewline -Encoding ascii
+
+        $probe = @"
+. '$($helperPath.Replace("'","''"))'
+Set-CompatStagedFile -Incoming '$($incoming.Replace("'","''"))' -Target '$($target.Replace("'","''"))' -Snapshot '$($snapshot.Replace("'","''"))' -Existed `$true
+if ((Get-Content -LiteralPath '$($target.Replace("'","''"))' -Raw) -ne 'new bytes') { exit 7 }
+if (Test-Path -LiteralPath '$($incoming.Replace("'","''"))') { exit 8 }
+if (Get-ChildItem -LiteralPath '$($root.Replace("'","''"))' -Filter '*.file-replace-*') { exit 9 }
+exit 0
+"@
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($probe))
+        $output = @(& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -EncodedCommand $encoded 2>&1)
+        if ($LASTEXITCODE -ne 0) { throw "Windows PowerShell replacement probe failed: $($output -join "`n")" }
+        $LASTEXITCODE | Should -Be 0
+    }
+
     It 'does not feed checksum-verified PowerShell 7 assets to the PowerShell 5 parser' {
         $validator = $compatInstallerAst.FindAll({
             param($node)
