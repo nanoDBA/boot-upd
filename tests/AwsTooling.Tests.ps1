@@ -68,6 +68,8 @@ Authenticode issuer 'CN="Amazon Web Services, Inc.", OU=SDKs and Tools, O="Amazo
         $candidate | Should -Match 'Save-Module -Name \$moduleName'
         $candidate | Should -Match 'distinctVersions.Count -ne 1'
         $candidate | Should -Match 'Get-AwsToolsDirectoryManifest'
+        (Get-ChildFunctionText -Name 'Get-AwsToolsDirectoryManifest') |
+            Should -Match "Name -ne 'PSGetModuleInfo\.xml'"
     }
 
     It 'retains old versions until the installed target passes post-install verification' {

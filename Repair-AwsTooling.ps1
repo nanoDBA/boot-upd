@@ -274,7 +274,12 @@ function Test-AwsToolsSignedModuleDirectory {
 function Get-AwsToolsDirectoryManifest {
     param([Parameter(Mandatory)][string]$ModuleRoot)
     $root = [IO.Path]::GetFullPath($ModuleRoot).TrimEnd([IO.Path]::DirectorySeparatorChar)
-    return @(Get-ChildItem -LiteralPath $root -Recurse -File -Force | ForEach-Object {
+    <# PowerShellGet creates PSGetModuleInfo.xml locally after package extraction;
+       it is repository metadata, not package payload. Every package-supplied byte
+       remains in the comparison. #>
+    return @(Get-ChildItem -LiteralPath $root -Recurse -File -Force |
+        Where-Object { $_.Name -ne 'PSGetModuleInfo.xml' } |
+        ForEach-Object {
         [pscustomobject]@{
             RelativePath = $_.FullName.Substring($root.Length).TrimStart([IO.Path]::DirectorySeparatorChar).Replace('\','/')
             Length = [int64]$_.Length
