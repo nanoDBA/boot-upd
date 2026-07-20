@@ -1,8 +1,20 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.24
+**Current Version:** v2.5.25
 **Release Date:** 2026-07-20
 **Status:** STABLE
+
+---
+
+## v2.5.25 (2026-07-20)
+
+**Turbo-era propeller status bar.**
+
+- Replaced the bidirectional chevron comet with the classic fixed-width ASCII `| / - \` propeller sequence.
+- Preserved the existing smooth cyan, blue, magenta, and acid-green glow exactly; only the motion glyph changed.
+- Retained the independent 48-step color cycle, 100 ms cadence, immutable status text, live `v` mode switching, and safe non-VT fallback.
+- Updated the visual demo and regression suite to enforce the propeller order, fixed width, smooth loop seam, and production/demo parity.
+- Kept every splash theme byte-identical.
 
 ---
 

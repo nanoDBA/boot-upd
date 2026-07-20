@@ -60,8 +60,8 @@ Press `v` at any time during an interactive run to cycle through:
 
 Choose the initial view explicitly with `-OutputMode Quiet|Normal|Verbose|Debug`, or set
 `OutputMode` in `Deploy-BootUpdateCycle.ps1`. The interactive `BOOT//PULSE` row uses a
-fixed-width ASCII comet with a smooth 48-step fade through the splash palette's cyan, blue,
-magenta, and acid-green anchors. Motion and color advance independently, avoiding abrupt flashes.
+classic `| / - \` ASCII propeller with the existing 48-step cyan, blue, magenta, and acid-green
+glow. Motion and color advance independently, preserving the gradual fade without abrupt flashes.
 ASCII status text is kept immutable; non-ASCII glyphs are represented safely in the live row while
 remaining untouched in the log. Key polling and animation disable themselves under SYSTEM,
 redirected output, and non-console hosts; file logging is unchanged.
@@ -75,7 +75,7 @@ To visually smoke-test animation without running any package updates:
 .\tools\Show-BootUpdateProgressDemo.ps1
 ```
 
-The demo renders the same ten-frame `BOOT//PULSE` comet and interpolated neon gradient at the production
+The demo renders the same four-frame `BOOT//PULSE` propeller and interpolated neon gradient at the production
 100 ms cadence, includes the photographed Windows Update status text, accepts live `v` mode
 cycling, and restores its console row and cursor when complete.
 

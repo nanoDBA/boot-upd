@@ -9,10 +9,7 @@ if ([Console]::IsOutputRedirected -or $Host.Name -ne 'ConsoleHost') {
     throw 'Run this demo directly in a PowerShell console so in-place rendering is visible.'
 }
 
-$frames = @(
-    '>>>.....', '.>>>....', '..>>>...', '...>>>..', '....>>>.', '.....>>>',
-    '....<<<.', '...<<<..', '..<<<...', '.<<<....'
-)
+$frames = @('|', '/', '-', '\')
 function New-NeonGradient {
     param([ValidateRange(4,64)][int]$StepsPerSegment = 12)
     $anchors = @(
@@ -50,7 +47,7 @@ $vt = [bool]$Host.UI.SupportsVirtualTerminal
 $escape = [char]27
 try {
     [Console]::CursorVisible = $false
-    Write-Host 'BOOT//PULSE demo — neon comet, immutable status text; press v to cycle modes.' -ForegroundColor Cyan
+    Write-Host 'BOOT//PULSE demo — Turbo-era propeller status bar; press v to cycle modes.' -ForegroundColor Cyan
     while ([datetime]::UtcNow -lt $deadline) {
         while ([Console]::KeyAvailable) {
             $key = [Console]::ReadKey($true)

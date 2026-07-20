@@ -321,7 +321,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 3 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.24' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.25' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 
 <# Force UTF-8 console I/O so box-drawing/block chars (BBS splash) render in cmd.exe regardless of system code page.
    chcp 65001 sets conhost interpretation; [Console]::OutputEncoding makes .NET write proper UTF-8 bytes. #>
@@ -337,10 +337,7 @@ $script:OutputModes = @('Quiet', 'Normal', 'Verbose', 'Debug')
 $script:TuiInteractive = $false
 $script:TuiProgressActive = $false
 $script:TuiSpinnerIndex = 0
-$script:TuiSpinnerFrames = @(
-    '>>>.....', '.>>>....', '..>>>...', '...>>>..', '....>>>.', '.....>>>',
-    '....<<<.', '...<<<..', '..<<<...', '.<<<....'
-)
+$script:TuiSpinnerFrames = @('|', '/', '-', '\')
 
 function New-BootUpdateNeonGradient {
     param([ValidateRange(4,64)][int]$StepsPerSegment = 12)

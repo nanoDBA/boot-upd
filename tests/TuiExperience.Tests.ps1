@@ -155,10 +155,7 @@ Describe 'Animated progress behavior' {
         $script:OutputMode = 'Normal'
         $script:TuiProgressActive = $false
         $script:TuiSpinnerIndex = 0
-        $script:TuiSpinnerFrames = @(
-            '>>>.....', '.>>>....', '..>>>...', '...>>>..', '....>>>.', '.....>>>',
-            '....<<<.', '...<<<..', '..<<<...', '.<<<....'
-        )
+        $script:TuiSpinnerFrames = @('|', '/', '-', '\')
         $script:TuiNeonPalette = New-BootUpdateNeonGradient
         $script:TuiColorIndex = 0
         $script:TuiRefreshMilliseconds = 50
@@ -184,20 +181,22 @@ Describe 'Animated progress behavior' {
         }
     }
 
-    It 'rotates the full fixed-width comet sequence without repainting one frame' {
+    It 'rotates the classic fixed-width ASCII propeller at the established line-spinner cadence' {
         1..12 | ForEach-Object {
             Write-BootUpdateProgress -Activity 'Demo' -Status 'Animating' -PercentComplete 25
         }
         $capturedFrames = @($script:ProgressCaptures | ForEach-Object {
             [regex]::Match($_.Text, 'BOOT//PULSE \[([^\]]+)\]').Groups[1].Value
         })
-        $capturedFrames | Should -Be @($script:TuiSpinnerFrames + $script:TuiSpinnerFrames[0..1])
-        @($script:TuiSpinnerFrames | ForEach-Object Length | Select-Object -Unique) | Should -Be @(8)
+        $script:TuiSpinnerFrames | Should -Be @('|', '/', '-', '\')
+        $capturedFrames | Should -Be @($script:TuiSpinnerFrames * 3)
+        @($script:TuiSpinnerFrames | ForEach-Object Length | Select-Object -Unique) | Should -Be @(1)
         ($script:TuiSpinnerFrames -join '').ToCharArray() | ForEach-Object { [int]$_ | Should -BeLessOrEqual 127 }
-        $script:TuiSpinnerIndex | Should -Be 2
+        $script:TuiSpinnerIndex | Should -Be 0
+        $invokeSource | Should -Match 'TuiRefreshMilliseconds\s*=\s*100'
     }
 
-    It 'crossfades gradually around a closed splash-palette loop independent of comet motion' {
+    It 'crossfades gradually around a closed splash-palette loop independent of propeller motion' {
         $script:TuiNeonPalette.Count | Should -Be 48
         $colors = @($script:TuiNeonPalette | ForEach-Object {
             ,([int[]]($_ -split ';'))
@@ -215,7 +214,7 @@ Describe 'Animated progress behavior' {
             Write-BootUpdateProgress -Activity 'Fade test' -Status 'Glowing'
         }
         @($script:ProgressCaptures.PaletteIndex) | Should -Be @(0..11)
-        $script:TuiSpinnerIndex | Should -Be 2
+        $script:TuiSpinnerIndex | Should -Be 0
         $script:TuiColorIndex | Should -Be 12
     }
 
@@ -225,13 +224,15 @@ Describe 'Animated progress behavior' {
             New-NeonGradient
         }
         @($demoGradient) | Should -Be @($script:TuiNeonPalette)
+        $demoFrames = '$frames = @(''|'', ''/'', ''-'', ''\'')'
+        $demoSource | Should -Match ([regex]::Escape($demoFrames))
         $demoSource | Should -Match '\$colorIndex\s*=\s*\(\$colorIndex \+ 1\) % \$palette\.Count'
         $demoSource | Should -Not -Match '\$palette\[\$index'
     }
 
     It 'preserves the photographed status text code point for code point' {
         $status = 'Finishing background downloads'
-        $text = Get-BootUpdateProgressText -Frame '>>>.....' -Activity 'Windows Update prefetch' `
+        $text = Get-BootUpdateProgressText -Frame '/' -Activity 'Windows Update prefetch' `
             -Status $status -PercentComplete 20 -MaxWidth 160
         $text | Should -Match ([regex]::Escape($status))
         $text | Should -Not -Match 'Ehmhrghmf'
@@ -241,10 +242,13 @@ Describe 'Animated progress behavior' {
     }
 
     It 'sanitizes controls and non-ASCII glyphs before cell-safe truncation' {
-        $text = Get-BootUpdateProgressText -Frame '>>>.....' -Activity "Phase`r`nThree" `
+        $text = Get-BootUpdateProgressText -Frame '/' -Activity "Phase`r`nThree" `
             -Status "Updating e$([char]0x301)$([char]0x9b)$([char]0x202e) package`tquietly" -MaxWidth 42
         $text.Length | Should -BeLessOrEqual 42
-        $text | Should -Not -Match '[\r\n\t\x80-\uffff]'
+        @($text.ToCharArray() | Where-Object {
+            $code = [int]$_
+            $code -lt 32 -or $code -gt 126
+        }) | Should -BeNullOrEmpty
         $text | Should -Match '\.\.\.$'
     }
 
@@ -255,7 +259,8 @@ Describe 'Animated progress behavior' {
         $stopwatch.Stop()
 
         $script:ProgressCaptures.Count | Should -BeGreaterOrEqual 8
-        @($script:ProgressCaptures.Status | Select-Object -Unique).Count | Should -BeGreaterOrEqual 8
+        @($script:ProgressCaptures.Status | Select-Object -Unique).Count | Should -Be 4
+        @($script:ProgressCaptures.PaletteIndex | Select-Object -Unique).Count | Should -BeGreaterOrEqual 8
         $stopwatch.Elapsed.TotalMilliseconds | Should -BeGreaterOrEqual 900
         $stopwatch.Elapsed.TotalMilliseconds | Should -BeLessThan 2000
         $gaps = for ($i = 1; $i -lt $script:ProgressCaptures.Count; $i++) {
@@ -272,7 +277,9 @@ Describe 'Animated progress behavior' {
                 -Activity 'Job test' -Status 'Background job running'
             $completed | Should -BeTrue
             $script:ProgressCaptures.Count | Should -BeGreaterOrEqual 5
-            @($script:ProgressCaptures.Status | Select-Object -Unique).Count | Should -BeGreaterOrEqual 5
+            @($script:ProgressCaptures.Status | Select-Object -Unique).Count | Should -Be 4
+            @($script:ProgressCaptures.PaletteIndex | Select-Object -Unique).Count |
+                Should -Be $script:ProgressCaptures.Count
         } finally {
             Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
         }
@@ -294,7 +301,9 @@ Describe 'Animated progress behavior' {
         $result.TimedOut | Should -BeFalse
         $result.Output | Should -Contain 'adapter-complete'
         $script:ProgressCaptures.Count | Should -BeGreaterOrEqual 5
-        @($script:ProgressCaptures.Status | Select-Object -Unique).Count | Should -BeGreaterOrEqual 5
+        @($script:ProgressCaptures.Status | Select-Object -Unique).Count | Should -Be 4
+        @($script:ProgressCaptures.PaletteIndex | Select-Object -Unique).Count |
+            Should -Be $script:ProgressCaptures.Count
     }
 
     It 'keeps animating while a silent external process produces no output' {
@@ -308,7 +317,9 @@ Describe 'Animated progress behavior' {
         $result.Failed | Should -BeFalse
         $result.Output | Should -Contain 'external-complete'
         $script:ProgressCaptures.Count | Should -BeGreaterOrEqual 5
-        @($script:ProgressCaptures.Status | Select-Object -Unique).Count | Should -BeGreaterOrEqual 5
+        @($script:ProgressCaptures.Status | Select-Object -Unique).Count | Should -Be 4
+        @($script:ProgressCaptures.PaletteIndex | Select-Object -Unique).Count |
+            Should -Be $script:ProgressCaptures.Count
     }
 
     It 'reports a failed background operation without freezing the renderer' {
