@@ -1,8 +1,20 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.40
+**Current Version:** v2.5.41
 **Release Date:** 2026-07-20
 **Status:** STABLE
+
+---
+
+## v2.5.41 (2026-07-20)
+
+### Guarded AWS.Tools publisher-certificate rollover
+
+- Handles AWS.Tools v4-to-v5 Authenticode publisher continuity failures without weakening the normal update path.
+- Uses AWS's supported `-SkipPublisherCheck` only for the exact AWS.Tools issuer-mismatch error and only after staging every installed AWS.Tools module's current PSGallery candidate.
+- Requires the canonical PSGallery endpoint, synchronized candidate versions, valid Amazon Web Services Authenticode identities, code-signing EKUs, and trusted online certificate chains.
+- Installs the verified target without cleanup, revalidates every installed module, and only then removes legacy versions; any unrelated, unsigned, untrusted, or non-Amazon result fails closed and retains the old modules.
+- Adds focused rollover security tests and a disposable Windows Server 2022 v4-to-v5 VM workflow with transcript artifacts.
 
 ---
 

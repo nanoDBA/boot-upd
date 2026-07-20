@@ -226,9 +226,151 @@ function Repair-AwsToolsModules {
         
         $scriptBlock = @'
 $ErrorActionPreference = 'Stop'
+
+function Test-AwsToolsSignedModuleDirectory {
+    param(
+        [Parameter(Mandatory)][string]$ModuleRoot,
+        [Parameter(Mandatory)][string]$ModuleName
+    )
+    $requiredSignedFiles = @("$ModuleName.psd1", "$ModuleName.dll")
+    if ($ModuleName -eq 'AWS.Tools.Common') { $requiredSignedFiles += 'AWSSDK.Core.dll' }
+    else { $requiredSignedFiles += (($ModuleName -replace '^AWS\.Tools\.','AWSSDK.') + '.dll') }
+    foreach ($relativePath in $requiredSignedFiles) {
+        $path = Join-Path $ModuleRoot $relativePath
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw "The AWS module $ModuleName is missing signed file $relativePath."
+        }
+        $signature = Get-AuthenticodeSignature -LiteralPath $path
+        if ($signature.Status -ne [Management.Automation.SignatureStatus]::Valid -or -not $signature.SignerCertificate) {
+            throw "The AWS module file $relativePath has Authenticode status $($signature.Status)."
+        }
+
+        $certificate = $signature.SignerCertificate
+        $commonName = $certificate.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+        $isAmazonOrganization = $certificate.Subject -match '(?:^|,\s*)O="?Amazon Web Services, Inc\."?(?:,|$)'
+        if ($commonName -ne 'Amazon Web Services, Inc.' -or -not $isAmazonOrganization) {
+            throw "The AWS module file $relativePath is signed by an unexpected publisher: $($certificate.Subject)"
+        }
+        $codeSigningOid = '1.3.6.1.5.5.7.3.3'
+        $hasCodeSigningEku = @($certificate.Extensions | Where-Object { $_ -is [Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension] } |
+            ForEach-Object { $_.EnhancedKeyUsages } | Where-Object { $_.Value -eq $codeSigningOid }).Count -gt 0
+        if (-not $hasCodeSigningEku) { throw "The AWS module signer for $relativePath is not authorized for code signing." }
+
+        $chain = [Security.Cryptography.X509Certificates.X509Chain]::new()
+        try {
+            $chain.ChainPolicy.RevocationMode = [Security.Cryptography.X509Certificates.X509RevocationMode]::Online
+            $chain.ChainPolicy.RevocationFlag = [Security.Cryptography.X509Certificates.X509RevocationFlag]::EntireChain
+            $chain.ChainPolicy.VerificationFlags = [Security.Cryptography.X509Certificates.X509VerificationFlags]::NoFlag
+            $chain.ChainPolicy.UrlRetrievalTimeout = [timespan]::FromSeconds(30)
+            if (-not $chain.Build($certificate)) {
+                $why = ($chain.ChainStatus | ForEach-Object { $_.Status.ToString() } | Sort-Object -Unique) -join ', '
+                throw "The AWS module signer chain failed validation for ${relativePath}: $why"
+            }
+        } finally { $chain.Dispose() }
+    }
+    return $true
+}
+
+function Get-AwsToolsDirectoryManifest {
+    param([Parameter(Mandatory)][string]$ModuleRoot)
+    $root = [IO.Path]::GetFullPath($ModuleRoot).TrimEnd([IO.Path]::DirectorySeparatorChar)
+    return @(Get-ChildItem -LiteralPath $root -Recurse -File -Force | ForEach-Object {
+        [pscustomobject]@{
+            RelativePath = $_.FullName.Substring($root.Length).TrimStart([IO.Path]::DirectorySeparatorChar).Replace('\','/')
+            Length = [int64]$_.Length
+            SHA256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
+        }
+    } | Sort-Object RelativePath)
+}
+
+function Test-AwsToolsDirectoryManifest {
+    param(
+        [Parameter(Mandatory)][string]$ModuleRoot,
+        [Parameter(Mandatory)][object[]]$Expected
+    )
+    $actualJson = Get-AwsToolsDirectoryManifest -ModuleRoot $ModuleRoot | ConvertTo-Json -Depth 3 -Compress
+    $expectedJson = @($Expected) | ConvertTo-Json -Depth 3 -Compress
+    return $actualJson -ceq $expectedJson
+}
+
+function Get-VerifiedAwsToolsRolloverCandidate {
+    $stageRoot = Join-Path ([IO.Path]::GetTempPath()) ('aws-tools-publisher-check-{0}' -f [guid]::NewGuid().ToString('N'))
+    try {
+        $repository = Get-PSRepository -Name PSGallery -ErrorAction Stop
+        $source = ([string]$repository.SourceLocation).TrimEnd('/')
+        if ($source -ine 'https://www.powershellgallery.com/api/v2') {
+            throw "PSGallery resolves to an unexpected source: $source"
+        }
+        if (-not (Get-Command Update-AWSToolsModule -ErrorAction Stop).Parameters.ContainsKey('SkipPublisherCheck')) {
+            throw 'The installed AWS.Tools.Installer does not expose the supported SkipPublisherCheck parameter.'
+        }
+
+        $moduleNames = @(Get-Module -ListAvailable 'AWS.Tools.*' |
+            Where-Object { $_.Name -ne 'AWS.Tools.Installer' } |
+            Select-Object -ExpandProperty Name -Unique)
+        if ($moduleNames -notcontains 'AWS.Tools.Common') { $moduleNames += 'AWS.Tools.Common' }
+        foreach ($moduleName in $moduleNames) {
+            Save-Module -Name $moduleName -Path $stageRoot -Repository PSGallery -Force -ErrorAction Stop
+        }
+
+        $versions = [Collections.Generic.List[version]]::new()
+        $manifests = @{}
+        foreach ($moduleName in $moduleNames) {
+            $moduleRoot = Get-ChildItem -LiteralPath (Join-Path $stageRoot $moduleName) -Directory -ErrorAction Stop |
+                Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1
+            if (-not $moduleRoot) { throw "The staged $moduleName package has no version directory." }
+            if (-not (Test-AwsToolsSignedModuleDirectory -ModuleRoot $moduleRoot.FullName -ModuleName $moduleName)) {
+                throw "Signature verification did not succeed for staged $moduleName."
+            }
+            $manifests[$moduleName] = @(Get-AwsToolsDirectoryManifest -ModuleRoot $moduleRoot.FullName)
+            $versions.Add([version]$moduleRoot.Name)
+        }
+        $distinctVersions = @($versions | Sort-Object -Unique)
+        if ($distinctVersions.Count -ne 1) {
+            throw "The staged AWS.Tools modules do not have one synchronized version: $($distinctVersions -join ', ')."
+        }
+        return [pscustomobject]@{ Version=$distinctVersions[0]; ModuleNames=[string[]]$moduleNames; Manifests=$manifests }
+    } finally {
+        if (Test-Path -LiteralPath $stageRoot) { Remove-Item -LiteralPath $stageRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Test-AwsToolsPublisherMismatchMessage {
+    param([Parameter(Mandatory)][string]$Message)
+    $pattern = "(?s)Authenticode issuer '(?<NewIssuer>[^']+)' of the new module '(?<NewModule>AWS\.Tools\.[^']+)'.+?is not matching with the authenticode issuer '(?<OldIssuer>[^']+)' of the previously-installed module '(?<OldModule>AWS\.Tools\.[^']+)'"
+    $match = [regex]::Match($Message, $pattern)
+    if (-not $match.Success -or $match.Groups['NewModule'].Value -ne $match.Groups['OldModule'].Value) { return $false }
+    foreach ($issuer in @($match.Groups['NewIssuer'].Value, $match.Groups['OldIssuer'].Value)) {
+        $amazonCn = $issuer -match '(?:^|,\s*)CN="?Amazon Web Services, Inc\."?(?:,|$)'
+        $amazonOrg = $issuer -match '(?:^|,\s*)O="?Amazon Web Services, Inc\."?(?:,|$)'
+        if (-not $amazonCn -or -not $amazonOrg) { return $false }
+    }
+    return $true
+}
+
 try {
     Import-Module AWS.Tools.Installer -Force -ErrorAction Stop
-    Update-AWSToolsModule -CleanUp -Force -Confirm:$false -ErrorAction Stop
+    try {
+        Update-AWSToolsModule -CleanUp -Force -Confirm:$false -ErrorAction Stop
+    } catch {
+        $publisherMismatch = Test-AwsToolsPublisherMismatchMessage -Message $_.Exception.Message
+        if (-not $publisherMismatch) { throw }
+        Write-Warning 'AWS.Tools publisher certificate rollover detected; validating the current AWS.Tools.Common package before the supported bypass.'
+        $candidate = Get-VerifiedAwsToolsRolloverCandidate
+        Update-AWSToolsModule -RequiredVersion $candidate.Version -Force -SkipPublisherCheck -Confirm:$false -ErrorAction Stop
+        foreach ($moduleName in $candidate.ModuleNames) {
+            $installedCopies = @(Get-Module -ListAvailable $moduleName | Where-Object Version -eq $candidate.Version)
+            if (-not $installedCopies.Count) { throw "The target AWS module $moduleName $($candidate.Version) was not installed. Old versions were retained." }
+            foreach ($installed in $installedCopies) {
+                $signed = Test-AwsToolsSignedModuleDirectory -ModuleRoot $installed.ModuleBase -ModuleName $moduleName
+                $byteIdentical = Test-AwsToolsDirectoryManifest -ModuleRoot $installed.ModuleBase -Expected $candidate.Manifests[$moduleName]
+                if (-not $signed -or -not $byteIdentical) {
+                    throw "Installed AWS module verification failed for $moduleName $($candidate.Version) at $($installed.ModuleBase). Old versions were retained."
+                }
+            }
+        }
+        Uninstall-AWSToolsModule -ExceptVersion $candidate.Version -Force -Confirm:$false -ErrorAction Stop
+    }
     exit 0
 }
 catch {

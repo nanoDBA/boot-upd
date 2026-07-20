@@ -1,0 +1,78 @@
+name: Live AWS publisher rollover VM
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  aws-tools-v4-to-v5:
+    name: AWS.Tools v4 signer to v5 signer
+    runs-on: windows-2022
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out updater
+        uses: actions/checkout@v6
+
+      - name: Seed AWS.Tools v4 signed modules
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Install-Module AWS.Tools.Installer -Repository PSGallery -Scope CurrentUser -Force
+          Install-Module AWS.Tools.Common,AWS.Tools.S3 -Repository PSGallery -RequiredVersion 4.1.14.0 -Scope CurrentUser -Force
+          $seed = Get-Module -ListAvailable AWS.Tools.Common,AWS.Tools.S3 |
+              Where-Object Version -eq ([version]'4.1.14.0')
+          if (@($seed).Count -ne 2) { throw 'Could not seed both AWS.Tools v4 modules.' }
+          $seed | Select-Object Name,Version,ModuleBase | ConvertTo-Json |
+              Set-Content -LiteralPath "$env:RUNNER_TEMP\aws-before.json"
+
+      - name: Exercise guarded publisher rollover
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & ./Repair-AwsTooling.ps1 -Mode Remediate -SkipCli *>&1 |
+              Tee-Object -FilePath "$env:RUNNER_TEMP\aws-rollover-transcript.txt"
+          $transcript = Get-Content -LiteralPath "$env:RUNNER_TEMP\aws-rollover-transcript.txt" -Raw
+          if ($transcript -notmatch 'publisher certificate rollover detected') {
+              throw 'The VM did not exercise the guarded publisher-rollover branch.'
+          }
+
+      - name: Verify synchronized v5 modules and cleanup
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $modules = @(Get-Module -ListAvailable AWS.Tools.Common,AWS.Tools.S3)
+          $current = @($modules | Where-Object Version -ge ([version]'5.0.0'))
+          if ($current.Count -ne 2) { throw 'Expected one v5 Common and S3 module after repair.' }
+          if (@($modules | Where-Object Version -lt ([version]'5.0.0')).Count -ne 0) {
+              throw 'Legacy AWS.Tools versions remained after verified cleanup.'
+          }
+          if (@($current.Version | Sort-Object -Unique).Count -ne 1) {
+              throw 'AWS.Tools modules did not converge to one version.'
+          }
+          foreach ($module in $current) {
+              foreach ($path in @(
+                  (Join-Path $module.ModuleBase "$($module.Name).psd1"),
+                  (Join-Path $module.ModuleBase "$($module.Name).dll")
+              )) {
+                  $signature = Get-AuthenticodeSignature -LiteralPath $path
+                  if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Amazon Web Services, Inc.') {
+                      throw "Unexpected installed signature for $path: $($signature.Status)"
+                  }
+              }
+          }
+          $current | Select-Object Name,Version,ModuleBase | ConvertTo-Json |
+              Set-Content -LiteralPath "$env:RUNNER_TEMP\aws-after.json"
+
+      - name: Upload rollover evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: aws-tools-publisher-rollover
+          path: |
+            ${{ runner.temp }}\aws-before.json
+            ${{ runner.temp }}\aws-rollover-transcript.txt
+            ${{ runner.temp }}\aws-after.json
+          if-no-files-found: warn
