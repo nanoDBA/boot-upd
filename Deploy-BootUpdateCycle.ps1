@@ -1,3 +1,4 @@
+#requires -Version 7.0
 # ------------------------------------------------------------------------------
 # File:        Deploy-BootUpdateCycle.ps1
 # Description: Single-file paste-to-deploy boot update cycle installer

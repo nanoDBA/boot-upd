@@ -34,6 +34,46 @@ function Test-CompatAdministrator {
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+function Test-CompatPowerShellAsset {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][int]$RequiredMajor
+    )
+
+    if ($RequiredMajor -gt $PSVersionTable.PSVersion.Major) {
+        $source = Get-Content -LiteralPath $Path -Raw
+        if ($source -notmatch "(?im)^\s*#requires\s+-Version\s+$RequiredMajor(?:\.0)?\s*$") {
+            throw "PowerShell $RequiredMajor runtime declaration is missing from $Name."
+        }
+
+        $pwsh = Get-Command pwsh.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $pwsh) {
+            # The release checksum authenticates these exact bytes. The stable PS5
+            # bootstrap is parsed below and installs PS7 before this asset executes.
+            return
+        }
+
+        $parsePathVariable = 'BOOT_UPD_COMPAT_PARSE_PATH'
+        $previousParsePath = [Environment]::GetEnvironmentVariable($parsePathVariable,'Process')
+        try {
+            [Environment]::SetEnvironmentVariable($parsePathVariable,$Path,'Process')
+            $parseProbe = '& { $p=$env:BOOT_UPD_COMPAT_PARSE_PATH;$t=$null;$e=$null;[void][Management.Automation.Language.Parser]::ParseFile($p,[ref]$t,[ref]$e);if($e.Count){[Console]::Error.WriteLine($e[0].Message);exit 1} }'
+            $probeOutput = @(& $pwsh.Source -NoLogo -NoProfile -Command $parseProbe 2>&1)
+            if ($LASTEXITCODE -ne 0) {
+                throw "PowerShell parse error in ${Name}: $($probeOutput -join ' ')"
+            }
+        } finally {
+            [Environment]::SetEnvironmentVariable($parsePathVariable,$previousParsePath,'Process')
+        }
+        return
+    }
+
+    $tokens=$null; $errors=$null
+    [void][Management.Automation.Language.Parser]::ParseFile($Path,[ref]$tokens,[ref]$errors)
+    if ($errors.Count) { throw "PowerShell parse error in ${Name}: $($errors[0].Message)" }
+}
+
 if (-not (Test-CompatAdministrator)) {
     $payload = [ordered]@{ InstallRoot=$InstallRoot; CommandArguments=@($CommandArguments); Repository=$Repository }
     $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject $payload -Compress)))
@@ -63,14 +103,14 @@ $InstallRoot = [IO.Path]::GetFullPath($InstallRoot)
 $targetBatch = Join-Path $InstallRoot 'upd.cmd'
 
 $specs = @(
-    [pscustomobject]@{ Name='Invoke-BootUpdateCycle.ps1'; Relative='Invoke-BootUpdateCycle.ps1'; PowerShell=$true; Batch=$false }
-    [pscustomobject]@{ Name='Deploy-BootUpdateCycle.ps1'; Relative='Deploy-BootUpdateCycle.ps1'; PowerShell=$true; Batch=$false }
-    [pscustomobject]@{ Name='Invoke-UpdLauncher.ps1'; Relative='tools\Invoke-UpdLauncher.ps1'; PowerShell=$true; Batch=$false }
-    [pscustomobject]@{ Name='Invoke-UpdBootstrap.ps1'; Relative='tools\Invoke-UpdBootstrap.ps1'; PowerShell=$true; Batch=$false }
-    [pscustomobject]@{ Name='Show-BootUpdateProgressDemo.ps1'; Relative='tools\Show-BootUpdateProgressDemo.ps1'; PowerShell=$true; Batch=$false }
-    [pscustomobject]@{ Name='Install-PowerShell7.ps1'; Relative='tools\Install-PowerShell7.ps1'; PowerShell=$true; Batch=$false }
-    [pscustomobject]@{ Name='Repair-AwsTooling.ps1'; Relative='Repair-AwsTooling.ps1'; PowerShell=$true; Batch=$false }
-    [pscustomobject]@{ Name='upd.cmd'; Relative='upd.cmd'; PowerShell=$false; Batch=$true }
+    [pscustomobject]@{ Name='Invoke-BootUpdateCycle.ps1'; Relative='Invoke-BootUpdateCycle.ps1'; PowerShell=$true; RequiredMajor=7; Batch=$false }
+    [pscustomobject]@{ Name='Deploy-BootUpdateCycle.ps1'; Relative='Deploy-BootUpdateCycle.ps1'; PowerShell=$true; RequiredMajor=7; Batch=$false }
+    [pscustomobject]@{ Name='Invoke-UpdLauncher.ps1'; Relative='tools\Invoke-UpdLauncher.ps1'; PowerShell=$true; RequiredMajor=7; Batch=$false }
+    [pscustomobject]@{ Name='Invoke-UpdBootstrap.ps1'; Relative='tools\Invoke-UpdBootstrap.ps1'; PowerShell=$true; RequiredMajor=5; Batch=$false }
+    [pscustomobject]@{ Name='Show-BootUpdateProgressDemo.ps1'; Relative='tools\Show-BootUpdateProgressDemo.ps1'; PowerShell=$true; RequiredMajor=7; Batch=$false }
+    [pscustomobject]@{ Name='Install-PowerShell7.ps1'; Relative='tools\Install-PowerShell7.ps1'; PowerShell=$true; RequiredMajor=5; Batch=$false }
+    [pscustomobject]@{ Name='Repair-AwsTooling.ps1'; Relative='Repair-AwsTooling.ps1'; PowerShell=$true; RequiredMajor=7; Batch=$false }
+    [pscustomobject]@{ Name='upd.cmd'; Relative='upd.cmd'; PowerShell=$false; RequiredMajor=0; Batch=$true }
 )
 
 $headers = @{ 'User-Agent'='BootUpdateCycle-Compatibility-Installer' }
@@ -109,9 +149,7 @@ try {
         $actual = (Get-FileHash -LiteralPath $staged -Algorithm SHA256).Hash.ToUpperInvariant()
         if ($actual -ne $expected) { throw "SHA256 mismatch for $($spec.Name)." }
         if ($spec.PowerShell) {
-            $tokens=$null; $errors=$null
-            [void][Management.Automation.Language.Parser]::ParseFile($staged,[ref]$tokens,[ref]$errors)
-            if ($errors.Count) { throw "PowerShell parse error in $($spec.Name): $($errors[0].Message)" }
+            Test-CompatPowerShellAsset -Path $staged -Name $spec.Name -RequiredMajor $spec.RequiredMajor
         }
         $target = Join-Path $InstallRoot $spec.Relative
         $baseline = if (Test-Path -LiteralPath $target) { (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash } else { $null }

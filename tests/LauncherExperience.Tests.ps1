@@ -21,7 +21,7 @@ BeforeAll {
     $null = Get-ParsedScript $deployPath
     $null = Get-ParsedScript $invokePath
     $argumentBootstrapAst = Get-ParsedScript $argumentBootstrapPath
-    $null = Get-ParsedScript $compatInstallerPath
+    $compatInstallerAst = Get-ParsedScript $compatInstallerPath
     $launcherSource = Get-Content -LiteralPath $launcherPath -Raw
     $deploySource = Get-Content -LiteralPath $deployPath -Raw
     $invokeSource = Get-Content -LiteralPath $invokePath -Raw
@@ -316,6 +316,50 @@ exit 29
 }
 
 Describe 'Windows PowerShell 5.1 bootstrap with PowerShell 7 parallel runtime' {
+    It 'does not feed checksum-verified PowerShell 7 assets to the PowerShell 5 parser' {
+        $validator = $compatInstallerAst.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq 'Test-CompatPowerShellAsset'
+        },$true) | Select-Object -First 1
+        $validator | Should -Not -BeNullOrEmpty
+
+        $helperPath = Join-Path $TestDrive 'compat-validator.ps1'
+        $ps7Path = Join-Path $TestDrive 'valid-ps7.ps1'
+        $unmarkedPs7Path = Join-Path $TestDrive 'unmarked-ps7.ps1'
+        $brokenPs5Path = Join-Path $TestDrive 'broken-ps5.ps1'
+        Set-Content -LiteralPath $helperPath -Value $validator.Extent.Text -Encoding utf8
+        Set-Content -LiteralPath $ps7Path -Value "#requires -Version 7.0`n`$value = `$null ?? 'valid'" -Encoding utf8
+        Set-Content -LiteralPath $unmarkedPs7Path -Value "`$value = `$null ?? 'unmarked'" -Encoding utf8
+        Set-Content -LiteralPath $brokenPs5Path -Value "#requires -Version 5.1`ntry { 'broken' }" -Encoding utf8
+
+        $probe = @"
+. '$($helperPath.Replace("'","''"))'
+Test-CompatPowerShellAsset -Path '$($invokePath.Replace("'","''"))' -Name 'Invoke-BootUpdateCycle.ps1' -RequiredMajor 7
+`$env:PATH = ''
+Test-CompatPowerShellAsset -Path '$($ps7Path.Replace("'","''"))' -Name 'valid-ps7.ps1' -RequiredMajor 7
+`$unmarkedRejected = `$false
+try {
+    Test-CompatPowerShellAsset -Path '$($unmarkedPs7Path.Replace("'","''"))' -Name 'unmarked-ps7.ps1' -RequiredMajor 7
+} catch {
+    `$unmarkedRejected = `$_.Exception.Message -match 'runtime declaration is missing'
+}
+if (-not `$unmarkedRejected) { exit 8 }
+`$brokenRejected = `$false
+try {
+    Test-CompatPowerShellAsset -Path '$($brokenPs5Path.Replace("'","''"))' -Name 'broken-ps5.ps1' -RequiredMajor 5
+} catch {
+    `$brokenRejected = `$_.Exception.Message -match 'PowerShell parse error'
+}
+if (-not `$brokenRejected) { exit 9 }
+exit 0
+"@
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($probe))
+        $output = @(& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -EncodedCommand $encoded 2>&1)
+        if ($LASTEXITCODE -ne 0) { throw "Windows PowerShell validator probe failed: $($output -join "`n")" }
+        $LASTEXITCODE | Should -Be 0
+    }
+
     It 'runs its no-op installed-runtime path under Windows PowerShell' {
         $output = & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $ps7BootstrapPath 2>&1
         $LASTEXITCODE | Should -Be 0
@@ -355,7 +399,9 @@ Describe 'Windows PowerShell 5.1 bootstrap with PowerShell 7 parallel runtime' {
 
         $version = & cmd.exe /d /c "`"$simulatedPath`" v" 2>&1
         $LASTEXITCODE | Should -Be 0
-        ($version -join "`n") | Should -Match 'v2\.5\.34.*runtime not installed'
+        $bundledVersion = [regex]::Match($cmdSource,'(?m)^:: BootUpdateCycleVersion=([\d.]+)\s*$').Groups[1].Value
+        $bundledVersion | Should -Not -BeNullOrEmpty
+        ($version -join "`n") | Should -Match "v$([regex]::Escape($bundledVersion)).*runtime not installed"
 
         $demo = & cmd.exe /d /c "`"$simulatedPath`" demo" 2>&1
         $LASTEXITCODE | Should -Be 2

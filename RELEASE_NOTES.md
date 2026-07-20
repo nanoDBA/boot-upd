@@ -1,8 +1,18 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.34
+**Current Version:** v2.5.35
 **Release Date:** 2026-07-20
 **Status:** STABLE
+
+---
+
+## v2.5.35 (2026-07-20)
+
+### Windows PowerShell 5.1 compatibility bridge restored
+
+- Stops validating PowerShell 7-only release assets with the Windows PowerShell 5.1 parser, which incorrectly rejected valid modern syntax before a fresh install could bootstrap PowerShell 7.
+- Keeps validation fail-closed: every asset still requires its release SHA-256; PS5-native bootstrap files are parsed by PS5; PS7 assets require an explicit runtime declaration and are parsed by `pwsh` whenever it is already available.
+- Adds an actual Windows PowerShell 5.1 regression probe covering both PS7-present and fresh PS5-only paths, including install paths containing spaces.
 
 ---
 
