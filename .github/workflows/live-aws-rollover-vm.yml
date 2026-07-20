@@ -34,9 +34,19 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          & ./Repair-AwsTooling.ps1 -Mode Remediate -SkipCli *>&1 |
-              Tee-Object -FilePath "$env:RUNNER_TEMP\aws-rollover-transcript.txt"
-          $transcript = Get-Content -LiteralPath "$env:RUNNER_TEMP\aws-rollover-transcript.txt" -Raw
+          $stdout = "$env:RUNNER_TEMP\aws-rollover-stdout.txt"
+          $stderr = "$env:RUNNER_TEMP\aws-rollover-stderr.txt"
+          $process = Start-Process pwsh.exe -ArgumentList @(
+              '-NoProfile','-File',(Resolve-Path './Repair-AwsTooling.ps1'),
+              '-Mode','Remediate','-SkipCli'
+          ) -RedirectStandardOutput $stdout -RedirectStandardError $stderr -Wait -PassThru
+          $transcript = (@(
+              Get-Content -LiteralPath $stdout -Raw -ErrorAction SilentlyContinue
+              Get-Content -LiteralPath $stderr -Raw -ErrorAction SilentlyContinue
+          ) -join [Environment]::NewLine)
+          $transcript | Set-Content -LiteralPath "$env:RUNNER_TEMP\aws-rollover-transcript.txt"
+          Write-Host $transcript
+          if ($process.ExitCode -ne 0) { throw "AWS repair exited $($process.ExitCode)." }
           if ($transcript -notmatch 'publisher certificate rollover detected') {
               throw 'The VM did not exercise the guarded publisher-rollover branch.'
           }
