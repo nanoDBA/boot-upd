@@ -1,8 +1,23 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.22
-**Release Date:** 2026-07-19
+**Current Version:** v2.5.23
+**Release Date:** 2026-07-20
 **Status:** STABLE
+
+---
+
+## v2.5.23 (2026-07-20)
+
+**Splash-themed BOOT//PULSE animation with corruption-proof status text.**
+
+- Replaced PowerShell's host-owned yellow Minimal progress pane after ConsoleHost was observed shifting every status character down one code point.
+- The updater now owns one live carriage-return row with a fixed-width ASCII comet and the splash palette's cyan, magenta, blue, and acid-green pulse.
+- Activity and status text remain separate from the animated frame; unsafe controls are removed and the live row is normalized to single-cell ASCII before resize-safe truncation. Full Unicode remains unchanged in the log.
+- Ordinary logs and Spectre phase/result lines clear the live row before printing; completion restores the cursor and removes residual text.
+- Quiet mode hides the row while continuing to poll `v`, and SYSTEM, redirected, detached, or non-VT consoles retain safe fallbacks.
+- The visual demo now exercises `BOOT//PULSE`, the exact photographed Windows Update text, palette cycling, and live verbosity changes without running updates.
+- Added regression coverage for exact status preservation, ASCII-safe fixed-width frames, cadence, console cleanup, and width handling.
+- The BBS splash implementation and all three themes remain byte-stable.
 
 ---
 

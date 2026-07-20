@@ -59,8 +59,11 @@ Press `v` at any time during an interactive run to cycle through:
 | `Debug` | Verbose plus process IDs and heartbeat diagnostics |
 
 Choose the initial view explicitly with `-OutputMode Quiet|Normal|Verbose|Debug`, or set
-`OutputMode` in `Deploy-BootUpdateCycle.ps1`. Key polling and animated progress disable
-themselves under SYSTEM, redirected output, and non-console hosts; file logging is unchanged.
+`OutputMode` in `Deploy-BootUpdateCycle.ps1`. The interactive `BOOT//PULSE` row uses a
+fixed-width ASCII comet with the splash palette's cyan, magenta, blue, and acid-green pulse.
+ASCII status text is kept immutable; non-ASCII glyphs are represented safely in the live row while
+remaining untouched in the log. Key polling and animation disable themselves under SYSTEM,
+redirected output, and non-console hosts; file logging is unchanged.
 
 On an interactive PowerShell 7.4+ console, the updater uses
 [`PwshSpectreConsole`](https://github.com/ShaunLawrie/PwshSpectreConsole) for richer phase and
@@ -76,8 +79,9 @@ To visually smoke-test animation without running any package updates:
 .\tools\Show-BootUpdateProgressDemo.ps1
 ```
 
-The demo renders the same ten-frame spinner at the production 100 ms cadence and clears its
-progress record when complete.
+The demo renders the same ten-frame `BOOT//PULSE` comet and neon palette at the production
+100 ms cadence, includes the photographed Windows Update status text, accepts live `v` mode
+cycling, and restores its console row and cursor when complete.
 
 Built-in operations that can block for more than a moment run behind a process-tree-aware,
 progress-pumped adapter, keeping both animation and `v` key handling responsive. Administrator-supplied

@@ -79,17 +79,27 @@ Describe 'Interactive verbosity cycling' {
         $text | Should -Match 'IsInputRedirected'
         $text | Should -Match 'IsOutputRedirected'
         $text | Should -Match "ConsoleHost"
+        $keys = Get-FunctionText -Ast $invokeAst -Name 'Read-BootUpdateUiKeys'
+        $keys | Should -Match '(?s)catch\s*\{.*?Clear-BootUpdateProgressLine.*?TuiInteractive\s*=\s*\$false'
     }
 }
 
 Describe 'Resilient rich progress rendering' {
-    It 'keeps native key-responsive progress while enabling optional Spectre phase rendering' {
+    It 'uses one custom live-row owner while retaining optional Spectre phase rendering' {
         $initialize = Get-FunctionText -Ast $invokeAst -Name 'Initialize-BootUpdateConsole'
         $progress = Get-FunctionText -Ast $invokeAst -Name 'Write-BootUpdateProgress'
-        $initialize | Should -Match "Progress.View = 'Minimal'"
-        $initialize | Should -Match "ProgressPreference = 'Continue'"
-        $progress | Should -Match 'Write-Progress @progressArgs'
+        $writer = Get-FunctionText -Ast $invokeAst -Name 'Write-BootUpdateLiveText'
+        $clear = Get-FunctionText -Ast $invokeAst -Name 'Clear-BootUpdateProgressLine'
+        $initialize | Should -Match 'SupportsVirtualTerminal'
+        $progress | Should -Match 'Write-BootUpdateLiveText'
         $progress | Should -Match 'TuiSpinnerFrames'
+        $writer | Should -Match '\[Console\]::Write'
+        $writer | Should -Match '\[2K'
+        $writer | Should -Not -Match 'ValidateRange\(0,1000000\)'
+        $clear | Should -Match '\[2K'
+        $clear | Should -Match '(?s)finally.*CursorVisible'
+        $progress | Should -Not -Match 'Write-Progress'
+        $invokeSource | Should -Not -Match '\$PSStyle\.Progress\.View'
         (Get-FunctionText -Ast $invokeAst -Name 'Write-BootUpdateSpectreText') |
             Should -Match 'PwshSpectreConsole\\Write-SpectreHost'
     }
@@ -123,9 +133,11 @@ Describe 'Resilient rich progress rendering' {
         $bootstrapCall | Should -BeGreaterThan $splashCall
     }
 
-    It 'connects phase, monitored-process, and parallel-cohort progress' {
-        (Get-FunctionText -Ast $invokeAst -Name 'Write-PhaseHeader') |
-            Should -Match 'Write-BootUpdateProgress'
+    It 'connects phase, monitored-process, and parallel-cohort progress without committing the live row' {
+        $phaseHeader = Get-FunctionText -Ast $invokeAst -Name 'Write-PhaseHeader'
+        $phaseHeader | Should -Match 'Write-BootUpdateProgress'
+        $phaseHeader.IndexOf('Clear-BootUpdateProgressLine') |
+            Should -BeLessThan $phaseHeader.IndexOf('Write-Host ""')
         (Get-FunctionText -Ast $invokeAst -Name 'Wait-ProcessWithIdleTimeout') |
             Should -Match 'Wait-BootUpdateUiInterval'
         $invokeSource | Should -Match "-Activity 'Parallel update cohort'"
@@ -189,13 +201,21 @@ Describe 'Spectre bootstrap behavior' {
 
 Describe 'Animated progress behavior' {
     BeforeAll {
-        . ([scriptblock]::Create((Get-FunctionText -Ast $invokeAst -Name 'Write-BootUpdateProgress')))
-        . ([scriptblock]::Create((Get-FunctionText -Ast $invokeAst -Name 'Wait-BootUpdateUiInterval')))
-        . ([scriptblock]::Create((Get-FunctionText -Ast $invokeAst -Name 'Wait-BootUpdateJobsWithProgress')))
-        . ([scriptblock]::Create((Get-FunctionText -Ast $invokeAst -Name 'Get-ProcessTreeActivity')))
-        . ([scriptblock]::Create((Get-FunctionText -Ast $invokeAst -Name 'Wait-ProcessWithIdleTimeout')))
-        . ([scriptblock]::Create((Get-FunctionText -Ast $invokeAst -Name 'Invoke-PackageManagerWithTimeout')))
-        . ([scriptblock]::Create((Get-FunctionText -Ast $invokeAst -Name 'Invoke-BootUpdateBackgroundOperation')))
+        foreach ($functionName in @(
+            'Limit-BootUpdateConsoleText',
+            'Get-BootUpdateProgressText',
+            'Clear-BootUpdateProgressLine',
+            'Write-BootUpdateLiveText',
+            'Write-BootUpdateProgress',
+            'Wait-BootUpdateUiInterval',
+            'Wait-BootUpdateJobsWithProgress',
+            'Get-ProcessTreeActivity',
+            'Wait-ProcessWithIdleTimeout',
+            'Invoke-PackageManagerWithTimeout',
+            'Invoke-BootUpdateBackgroundOperation'
+        )) {
+            . ([scriptblock]::Create((Get-FunctionText -Ast $invokeAst -Name $functionName)))
+        }
         function Read-BootUpdateUiKeys { $script:UiKeyPollCount++ }
         function Write-Log { param($Message, $Level, $Visibility) }
     }
@@ -205,28 +225,64 @@ Describe 'Animated progress behavior' {
         $script:OutputMode = 'Normal'
         $script:TuiProgressActive = $false
         $script:TuiSpinnerIndex = 0
-        $script:TuiSpinnerFrames = @('⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏')
+        $script:TuiSpinnerFrames = @(
+            '>>>.....', '.>>>....', '..>>>...', '...>>>..', '....>>>.', '.....>>>',
+            '....<<<.', '...<<<..', '..<<<...', '.<<<....'
+        )
+        $script:TuiNeonPalette = @('80;255;230','95;115;255','255;90;205','75;255;145')
         $script:TuiRefreshMilliseconds = 50
+        $script:TuiInProgressTick = $false
         $script:UiKeyPollCount = 0
+        $script:ClearCount = 0
         $script:ProgressCaptures = [System.Collections.Generic.List[object]]::new()
-        Mock Write-Progress {
+        Mock Write-BootUpdateLiveText {
             $script:ProgressCaptures.Add([pscustomobject]@{
                 At = [datetime]::UtcNow
-                Activity = $Activity
-                Status = $Status
-                PercentComplete = $PercentComplete
-                Completed = [bool]$Completed
+                Text = $Text
+                Status = $Text
+                PaletteIndex = $PaletteIndex
             })
+            $script:TuiProgressActive = $true
+            $script:TuiRenderedWidth = $Text.Length
+        }
+        Mock Clear-BootUpdateProgressLine {
+            if ($script:TuiProgressActive) { $script:ClearCount++ }
+            $script:TuiProgressActive = $false
+            $script:TuiRenderedWidth = 0
+            $script:TuiCursorHidden = $false
         }
     }
 
-    It 'rotates through every spinner frame instead of repainting one static glyph' {
+    It 'rotates the full fixed-width comet sequence without repainting one frame' {
         1..12 | ForEach-Object {
             Write-BootUpdateProgress -Activity 'Demo' -Status 'Animating' -PercentComplete 25
         }
-        $capturedFrames = @($script:ProgressCaptures | ForEach-Object { $_.Status.Substring(0, 1) })
+        $capturedFrames = @($script:ProgressCaptures | ForEach-Object {
+            [regex]::Match($_.Text, 'BOOT//PULSE \[([^\]]+)\]').Groups[1].Value
+        })
         $capturedFrames | Should -Be @($script:TuiSpinnerFrames + $script:TuiSpinnerFrames[0..1])
-        $script:TuiSpinnerIndex | Should -Be 12
+        @($script:TuiSpinnerFrames | ForEach-Object Length | Select-Object -Unique) | Should -Be @(8)
+        ($script:TuiSpinnerFrames -join '').ToCharArray() | ForEach-Object { [int]$_ | Should -BeLessOrEqual 127 }
+        $script:TuiSpinnerIndex | Should -Be 2
+    }
+
+    It 'preserves the photographed status text code point for code point' {
+        $status = 'Finishing background downloads'
+        $text = Get-BootUpdateProgressText -Frame '>>>.....' -Activity 'Windows Update prefetch' `
+            -Status $status -PercentComplete 20 -MaxWidth 160
+        $text | Should -Match ([regex]::Escape($status))
+        $text | Should -Not -Match 'Ehmhrghmf'
+        $text | Should -Match 'BOOT//PULSE'
+        $text | Should -Match '\[##--------\] 20%'
+        $text | Should -Match 'v:NORMAL'
+    }
+
+    It 'sanitizes controls and non-ASCII glyphs before cell-safe truncation' {
+        $text = Get-BootUpdateProgressText -Frame '>>>.....' -Activity "Phase`r`nThree" `
+            -Status "Updating e$([char]0x301)$([char]0x9b)$([char]0x202e) package`tquietly" -MaxWidth 42
+        $text.Length | Should -BeLessOrEqual 42
+        $text | Should -Not -Match '[\r\n\t\x80-\uffff]'
+        $text | Should -Match '\.\.\.$'
     }
 
     It 'pumps multiple distinct frames at a bounded cadence during a wait' {
@@ -319,13 +375,13 @@ Describe 'Animated progress behavior' {
         $script:ProgressCaptures.Count | Should -BeGreaterOrEqual 5
     }
 
-    It 'clears the active progress record on completion' {
+    It 'clears the owned live row idempotently on completion' {
         Write-BootUpdateProgress -Activity 'Cleanup test' -Status 'Working'
         Write-BootUpdateProgress -Activity 'Cleanup test' -Completed
         Write-BootUpdateProgress -Activity 'Cleanup test' -Completed
         $script:TuiProgressActive | Should -BeFalse
-        $script:ProgressCaptures[-1].Completed | Should -BeTrue
-        $script:ProgressCaptures.Count | Should -Be 2
+        $script:ClearCount | Should -Be 1
+        $script:ProgressCaptures.Count | Should -Be 1
     }
 
     It 'polls keys but does not render progress in Quiet mode' {
@@ -356,7 +412,8 @@ Describe 'Animated progress behavior' {
         }
         $observed | Should -Be @('Verbose','Debug','Quiet','Normal')
         $script:ScriptBoundParams.OutputMode | Should -Be 'Normal'
-        Should -Invoke Write-Progress -ParameterFilter { $Completed } -Times 1
+        $script:ClearCount | Should -Be 1
+        $invokeSource | Should -Not -Match 'Write-Progress'
     }
 }
 

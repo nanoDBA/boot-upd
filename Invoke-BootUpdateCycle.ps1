@@ -321,7 +321,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 3 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.22' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.23' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 
 <# Force UTF-8 console I/O so box-drawing/block chars (BBS splash) render in cmd.exe regardless of system code page.
    chcp 65001 sets conhost interpretation; [Console]::OutputEncoding makes .NET write proper UTF-8 bytes. #>
@@ -337,8 +337,20 @@ $script:OutputModes = @('Quiet', 'Normal', 'Verbose', 'Debug')
 $script:TuiInteractive = $false
 $script:TuiProgressActive = $false
 $script:TuiSpinnerIndex = 0
-$script:TuiSpinnerFrames = @('⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏')
+$script:TuiSpinnerFrames = @(
+    '>>>.....', '.>>>....', '..>>>...', '...>>>..', '....>>>.', '.....>>>',
+    '....<<<.', '...<<<..', '..<<<...', '.<<<....'
+)
+$script:TuiNeonPalette = @(
+    '80;255;230', '45;225;238', '20;185;240', '95;115;255', '155;60;255',
+    '220;70;230', '255;90;205', '190;105;235', '110;210;205', '75;255;145'
+)
 $script:TuiRefreshMilliseconds = 100
+$script:TuiSupportsVirtualTerminal = $false
+$script:TuiRenderedWidth = 0
+$script:TuiCursorWasVisible = $true
+$script:TuiCursorHidden = $false
+$script:TuiInProgressTick = $false
 $script:SpectreModuleName = 'PwshSpectreConsole'
 $script:SpectreInstallVersion = [version]'2.6.3'
 $script:SpectreEnabled = $false
@@ -354,9 +366,7 @@ function Initialize-BootUpdateConsole {
             -not [Console]::IsInputRedirected -and -not [Console]::IsOutputRedirected -and
             $Host.Name -eq 'ConsoleHost'
         if ($script:TuiInteractive) {
-            $script:ProgressPreference = 'Continue'
-            $PSStyle.Progress.View = 'Minimal'
-            $PSStyle.Progress.MaxWidth = 88
+            $script:TuiSupportsVirtualTerminal = [bool]$Host.UI.SupportsVirtualTerminal
         }
     } catch {
         $script:TuiInteractive = $false
@@ -373,11 +383,11 @@ function Switch-BootUpdateOutputMode {
     $current = [array]::IndexOf($script:OutputModes, $script:OutputMode)
     $script:OutputMode = $script:OutputModes[($current + 1) % $script:OutputModes.Count]
     $script:ScriptBoundParams['OutputMode'] = $script:OutputMode
-    if ($script:OutputMode -eq 'Quiet' -and $script:TuiProgressActive) {
-        Write-Progress -Id 740 -Activity 'Boot Update Cycle' -Completed
-        $script:TuiProgressActive = $false
+    if ($script:OutputMode -eq 'Quiet') { Clear-BootUpdateProgressLine }
+    if (-not $script:TuiInProgressTick) {
+        Clear-BootUpdateProgressLine
+        Write-Host "  output mode: $($script:OutputMode)  (press v to cycle)" -ForegroundColor DarkCyan
     }
-    Write-Host "  output mode: $($script:OutputMode)  (press v to cycle)" -ForegroundColor DarkCyan
 }
 
 function Read-BootUpdateUiKeys {
@@ -390,6 +400,101 @@ function Read-BootUpdateUiKeys {
         }
     } catch {
         # Key polling is an optional enhancement. Disable it if the host detaches.
+        Clear-BootUpdateProgressLine
+        $script:TuiInteractive = $false
+    }
+}
+
+function Limit-BootUpdateConsoleText {
+    param(
+        [AllowEmptyString()][string]$Text,
+        [ValidateRange(4,4096)][int]$MaxLength
+    )
+    if ($Text.Length -le $MaxLength) { return $Text }
+    $builder = [Text.StringBuilder]::new()
+    $elements = [Globalization.StringInfo]::GetTextElementEnumerator($Text)
+    while ($elements.MoveNext()) {
+        $element = $elements.GetTextElement()
+        if (($builder.Length + $element.Length) -gt ($MaxLength - 3)) { break }
+        $null = $builder.Append($element)
+    }
+    return "$builder..."
+}
+
+function Get-BootUpdateProgressText {
+    param(
+        [Parameter(Mandatory)][string]$Frame,
+        [Parameter(Mandatory)][string]$Activity,
+        [AllowEmptyString()][string]$Status = '',
+        [ValidateRange(-1,100)][int]$PercentComplete = -1,
+        [ValidateRange(20,4096)][int]$MaxWidth = 88
+    )
+    $unsafeControls = '[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]+'
+    $safeActivity = (($Activity -replace $unsafeControls, ' ') -replace '\s+', ' ').Trim()
+    $safeActivity = (($safeActivity -replace '^Boot Update Cycle\s*', '') -replace '[^\x20-\x7e]', '?').Trim()
+    if (-not $safeActivity) { $safeActivity = 'cycle' }
+    $safeStatus = (($Status -replace $unsafeControls, ' ') -replace '\s+', ' ').Trim()
+    $safeStatus = ($safeStatus -replace '[^\x20-\x7e]', '?').Trim()
+    if (-not $safeStatus) { $safeStatus = 'working' }
+    $filled = if ($PercentComplete -ge 0) { [math]::Min(10, [math]::Floor($PercentComplete / 10)) } else { 0 }
+    $meter = ('#' * $filled) + ('-' * (10 - $filled))
+    $percent = if ($PercentComplete -ge 0) { " $PercentComplete%" } else { '' }
+    $line = " BOOT//PULSE [$Frame] $safeActivity :: $safeStatus :: [$meter]$percent :: v:$($script:OutputMode.ToUpperInvariant())"
+    return Limit-BootUpdateConsoleText -Text $line -MaxLength $MaxWidth
+}
+
+function Clear-BootUpdateProgressLine {
+    if (-not $script:TuiProgressActive -and -not $script:TuiCursorHidden) { return }
+    try {
+        if ($script:TuiSupportsVirtualTerminal) {
+            $escape = [char]27
+            [Console]::Write("$escape[0m`r$escape[2K")
+        } else {
+            $width = [math]::Max(1, $script:TuiRenderedWidth)
+            try { $width = [math]::Min($width, [math]::Max(1, [Console]::WindowWidth - 1)) } catch { }
+            [Console]::Write("`r$(' ' * $width)`r")
+        }
+    } catch {
+        $script:TuiInteractive = $false
+    } finally {
+        if ($script:TuiCursorHidden) {
+            try { [Console]::CursorVisible = $script:TuiCursorWasVisible } catch { }
+        }
+        $script:TuiProgressActive = $false
+        $script:TuiRenderedWidth = 0
+        $script:TuiCursorHidden = $false
+    }
+}
+
+function Write-BootUpdateLiveText {
+    param(
+        [Parameter(Mandatory)][string]$Text,
+        [int]$PaletteIndex = 0
+    )
+    try {
+        if (-not $script:TuiProgressActive) {
+            try {
+                $script:TuiCursorWasVisible = [Console]::CursorVisible
+                [Console]::CursorVisible = $false
+                $script:TuiCursorHidden = $true
+            } catch { $script:TuiCursorHidden = $false }
+        }
+        $availableWidth = 88
+        try { $availableWidth = [math]::Max(20, [math]::Min(120, [Console]::WindowWidth - 1)) } catch { }
+        $Text = Limit-BootUpdateConsoleText -Text $Text -MaxLength $availableWidth
+        if ($script:TuiSupportsVirtualTerminal) {
+            $escape = [char]27
+            $rgb = $script:TuiNeonPalette[[math]::Abs($PaletteIndex % $script:TuiNeonPalette.Count)]
+            [Console]::Write("`r$escape[2K$escape[1;38;2;${rgb}m$Text$escape[0m")
+        } else {
+            $paddingCount = [math]::Max(0, $script:TuiRenderedWidth - $Text.Length)
+            $paddingCount = [math]::Min($paddingCount, [math]::Max(0, $availableWidth - $Text.Length))
+            [Console]::Write("`r$Text$(' ' * $paddingCount)")
+        }
+        $script:TuiRenderedWidth = $Text.Length
+        $script:TuiProgressActive = $true
+    } catch {
+        Clear-BootUpdateProgressLine
         $script:TuiInteractive = $false
     }
 }
@@ -401,26 +506,22 @@ function Write-BootUpdateProgress {
         [ValidateRange(-1,100)][int]$PercentComplete = -1,
         [switch]$Completed
     )
-    Read-BootUpdateUiKeys
+    $script:TuiInProgressTick = $true
+    try { Read-BootUpdateUiKeys } finally { $script:TuiInProgressTick = $false }
     if ($Completed) {
-        if ($script:TuiProgressActive) {
-            Write-Progress -Id 740 -Activity $Activity -Completed
-            $script:TuiProgressActive = $false
-        }
+        Clear-BootUpdateProgressLine
         return
     }
     if (-not $script:TuiInteractive -or $script:OutputMode -eq 'Quiet') { return }
 
-    $frame = $script:TuiSpinnerFrames[$script:TuiSpinnerIndex % $script:TuiSpinnerFrames.Count]
-    $script:TuiSpinnerIndex++
-    $progressArgs = @{
-        Id = 740
-        Activity = $Activity
-        Status = "$frame $Status  [v: $($script:OutputMode)]"
-        PercentComplete = $PercentComplete
-    }
-    Write-Progress @progressArgs
-    $script:TuiProgressActive = $true
+    $frame = $script:TuiSpinnerFrames[$script:TuiSpinnerIndex]
+    $paletteIndex = $script:TuiSpinnerIndex
+    $script:TuiSpinnerIndex = ($script:TuiSpinnerIndex + 1) % $script:TuiSpinnerFrames.Count
+    $maxWidth = 88
+    try { $maxWidth = [math]::Max(20, [math]::Min(120, [Console]::WindowWidth - 1)) } catch { }
+    $text = Get-BootUpdateProgressText -Frame $frame -Activity $Activity -Status $Status `
+        -PercentComplete $PercentComplete -MaxWidth $maxWidth
+    Write-BootUpdateLiveText -Text $text -PaletteIndex $paletteIndex
 }
 
 function Wait-BootUpdateUiInterval {
@@ -605,6 +706,7 @@ function Write-BootUpdateSpectreText {
         [Parameter(Mandatory)][string]$Message,
         [Parameter(Mandatory)][ValidateSet('cyan bold','green','red')][string]$Style
     )
+    Clear-BootUpdateProgressLine
     if (-not $script:SpectreEnabled) { return $false }
     try {
         $escaped = [Spectre.Console.Markup]::Escape($Message)
@@ -666,7 +768,10 @@ function Write-Log {
     if ($script:LastLogRepeatCount -gt 0) {
         $repeatEntry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [Info] (previous line repeated $($script:LastLogRepeatCount) more time$(if ($script:LastLogRepeatCount -ne 1) { 's' }))"
         Add-Content -Path $script:LogPath -Value $repeatEntry -Force
-        if (Test-BootUpdateOutputAtLeast -Minimum Verbose) { Write-Host $repeatEntry }
+        if (Test-BootUpdateOutputAtLeast -Minimum Verbose) {
+            Clear-BootUpdateProgressLine
+            Write-Host $repeatEntry
+        }
     }
     $script:LastLogMessage = $trimmedMsg
     $script:LastLogRepeatCount = 0
@@ -677,12 +782,21 @@ function Write-Log {
     Read-BootUpdateUiKeys
     switch ($Level) {
         'Info'  {
-            if (Test-BootUpdateOutputAtLeast -Minimum $Visibility) { Write-Host $entry }
+            if (Test-BootUpdateOutputAtLeast -Minimum $Visibility) {
+                Clear-BootUpdateProgressLine
+                Write-Host $entry
+            }
         }
         'Warn'  {
-            if (Test-BootUpdateOutputAtLeast -Minimum Normal) { Write-Host $entry -ForegroundColor Yellow }
+            if (Test-BootUpdateOutputAtLeast -Minimum Normal) {
+                Clear-BootUpdateProgressLine
+                Write-Host $entry -ForegroundColor Yellow
+            }
         }
-        'Error' { Write-Host $entry -ForegroundColor Red }
+        'Error' {
+            Clear-BootUpdateProgressLine
+            Write-Host $entry -ForegroundColor Red
+        }
     }
 }
 #endregion
@@ -3317,6 +3431,7 @@ function Write-PhaseHeader {
     $percent = if ($Total -gt 0) { [math]::Floor((($Num - 1) / $Total) * 100) } else { 0 }
     Write-BootUpdateProgress -Activity "Boot Update Cycle [$Num/$Total]" -Status "Running $Name" -PercentComplete $percent
     if (-not (Test-BootUpdateOutputAtLeast -Minimum Normal)) { return }
+    Clear-BootUpdateProgressLine
     $e = [char]27; $c = "$e[36m"; $b = "$e[1m"; $w = "$e[97m"; $r = "$e[0m"
     $label = "[$Num/$Total] $Name"
     $pad = 66 - $label.Length; if ($pad -lt 3) { $pad = 3 }
@@ -3346,6 +3461,7 @@ function Write-PhaseSkip {
     param([string]$Name)
     Read-BootUpdateUiKeys
     if (-not (Test-BootUpdateOutputAtLeast -Minimum Verbose)) { return }
+    Clear-BootUpdateProgressLine
     $e = [char]27; $d = "$e[2m"; $r = "$e[0m"
     Write-Host "$d    ~ $Name skipped$r"
 }
