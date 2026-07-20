@@ -36,6 +36,24 @@ function Test-CompatAdministrator {
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+function Get-CompatSha256 {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $stream = [IO.File]::Open(
+        $Path,
+        [IO.FileMode]::Open,
+        [IO.FileAccess]::Read,
+        [IO.FileShare]::Read
+    )
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        return ([BitConverter]::ToString($sha.ComputeHash($stream)) -replace '-','')
+    } finally {
+        $sha.Dispose()
+        $stream.Dispose()
+    }
+}
+
 function Test-CompatPowerShellAsset {
     param(
         [Parameter(Mandatory)][string]$Path,
@@ -206,13 +224,13 @@ try {
         if ($expected -notmatch '^[0-9A-F]{64}$') { throw "Malformed checksum for $($spec.Name)." }
         $staged = Join-Path $stageRoot $spec.Name
         Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $staged -Headers $headers -UseBasicParsing -TimeoutSec 120
-        $actual = (Get-FileHash -LiteralPath $staged -Algorithm SHA256).Hash.ToUpperInvariant()
+        $actual = (Get-CompatSha256 -Path $staged).ToUpperInvariant()
         if ($actual -ne $expected) { throw "SHA256 mismatch for $($spec.Name)." }
         if ($spec.PowerShell) {
             Test-CompatPowerShellAsset -Path $staged -Name $spec.Name -RequiredMajor $spec.RequiredMajor
         }
         $target = Join-Path $InstallRoot $spec.Relative
-        $baseline = if (Test-Path -LiteralPath $target) { (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash } else { $null }
+        $baseline = if (Test-Path -LiteralPath $target) { Get-CompatSha256 -Path $target } else { $null }
         $verified.Add([pscustomobject]@{ Spec=$spec; Staged=$staged; Target=$target; Baseline=$baseline; Hash=$actual })
     }
 
@@ -237,7 +255,7 @@ try {
     }
 
     foreach ($item in @($verified | Sort-Object { $_.Spec.Batch })) {
-        $liveHash = if (Test-Path -LiteralPath $item.Target) { (Get-FileHash -LiteralPath $item.Target -Algorithm SHA256).Hash } else { $null }
+        $liveHash = if (Test-Path -LiteralPath $item.Target) { Get-CompatSha256 -Path $item.Target } else { $null }
         if ($liveHash -ne $item.Baseline) { throw "Cloud/local sync changed $($item.Target) during staging; no files were replaced." }
         $relativeBackup = $item.Spec.Relative -replace '[\\/:*?"<>|]','_'
         $snapshot = Join-Path $backupRoot $relativeBackup
@@ -249,7 +267,7 @@ try {
         Copy-Item -LiteralPath $item.Staged -Destination $incoming -Force
         try {
             Set-CompatStagedFile -Incoming $incoming -Target $item.Target -Snapshot $snapshot -Existed $existed
-            if ((Get-FileHash -LiteralPath $item.Target -Algorithm SHA256).Hash.ToUpperInvariant() -ne $item.Hash) {
+            if ((Get-CompatSha256 -Path $item.Target).ToUpperInvariant() -ne $item.Hash) {
                 throw "Post-copy SHA256 mismatch for $($item.Spec.Name)."
             }
         } finally {
@@ -258,7 +276,7 @@ try {
     }
 
     foreach ($item in $verified) {
-        if (-not (Test-Path -LiteralPath $item.Target) -or (Get-FileHash -LiteralPath $item.Target -Algorithm SHA256).Hash.ToUpperInvariant() -ne $item.Hash) {
+        if (-not (Test-Path -LiteralPath $item.Target) -or (Get-CompatSha256 -Path $item.Target).ToUpperInvariant() -ne $item.Hash) {
             throw "Committed bundle verification failed for $($item.Spec.Name)."
         }
     }

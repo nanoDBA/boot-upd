@@ -1,8 +1,18 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.37
+**Current Version:** v2.5.38
 **Release Date:** 2026-07-20
 **Status:** STABLE
+
+---
+
+## v2.5.38 (2026-07-20)
+
+### Self-contained SHA-256 on minimal PowerShell 5.1 hosts
+
+- Replaces the compatibility bridge's `Get-FileHash` dependency with a built-in .NET SHA-256 implementation after the exact README command exposed a missing-cmdlet failure on a fresh Windows Server 2022 VM.
+- Keeps exclusive read sharing while hashing so cloud/local races cannot rewrite a file during verification.
+- Adds a Windows PowerShell 5.1 test with module autoloading disabled and a two-image hosted-VM workflow for the exact live interactive bootstrap.
 
 ---
 
