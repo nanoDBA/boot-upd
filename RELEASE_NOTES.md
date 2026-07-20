@@ -1,8 +1,22 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.30
+**Current Version:** v2.5.31
 **Release Date:** 2026-07-20
 **Status:** STABLE
+
+---
+
+## v2.5.31 (2026-07-20)
+
+### Verified launcher handoff before operational dispatch
+
+- Added a deliberately untyped stage-zero launcher that receives raw arguments, refreshes the complete checksummed release bundle, and only then invokes the current typed command implementation.
+- With PowerShell 7 already present, operational and not-yet-known commands cross a single elevation boundary and are interpreted by the newly installed launcher; a current invocation no longer continues under stale in-memory dispatch code. A PS5.1-only machine may show a separate first-use consent while installing PowerShell 7.
+- Help, version, plan, status, splash, demo, fun, and bootstrap remain local and non-mutating. `-nu` remains the explicit offline/no-refresh escape hatch.
+- Added a PS5.1-compatible compatibility installer for pre-trampoline batches. It resolves the actual PATH winner, stages outside cloud storage, verifies every runtime asset, checks for sync races, snapshots exact targets, commits batch-last, rolls back on failure, and then forwards the requested arguments.
+- Added checksummed recovery for a missing stage-zero asset and expanded release/deployer coverage and regression tests.
+
+Historical batches still require the one-time external compatibility installer; newer code cannot intercept arguments that an already-running legacy batch rejected before handoff.
 
 ---
 

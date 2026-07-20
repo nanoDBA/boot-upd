@@ -87,15 +87,30 @@ Short forms keep everyday commands light: `upd d 12`, `upd f`, `upd p -drv -r 12
 leading dash; ambiguous dashed forms fail before they can reach the update path. Long
 names remain available for scripts and discoverability.
 
-A real `upd` run checks the latest GitHub release before deployment. Every executable
+A stable raw-argument bootstrap now checks the latest GitHub release before an operational
+command reaches the typed parser. Every executable
 asset must have a valid SHA256 sidecar or the refresh is rejected. These checksums detect
 corruption but are not code-signing signatures. PowerShell files are
 verified and installed first; `upd.cmd` is staged as `upd.cmd.next` and adopted only after
-the current PowerShell launcher exits, after a second checksum and version check. Older two-script installs cross the chicken-and-egg
-boundary through the deployer's compatibility bridge, then use this staged handoff on
-subsequent runs. Use `upd u` to request the refresh explicitly or `-nu` to skip the
+the current PowerShell launcher exits, after a second checksum and version check. The
+requested arguments are dispatched through the newly installed typed launcher rather than
+the stale in-memory copy. Use `upd u` to request the refresh explicitly or `-nu` to skip the
 automatic check for one run. `upd repair` can bootstrap a missing launcher and repair a
 missing or corrupt core bundle.
+
+An already-running historical batch cannot benefit from code it has not downloaded: some
+pre-v2.5.29 launchers parse the first token as a reboot delay before self-update is reachable.
+For those installations, run this version-pinned compatibility bridge **after the old batch
+has exited**. It verifies the installer against the hash embedded below, then the installer
+verifies and transactionally replaces the complete release bundle before forwarding `aws`:
+
+```powershell
+$u='https://github.com/nanoDBA/boot-upd/releases/download/v2.5.31/Install-UpdCompat.ps1'; $f=Join-Path $env:TEMP 'Install-UpdCompat-v2.5.31.ps1'; Invoke-WebRequest $u -OutFile $f; if((Get-FileHash $f -Algorithm SHA256).Hash -ne '54CC93E136F060B0CB287109007EDA7FA8D96E9B80B6B38D2FD0255A07149F6F'){throw 'Compatibility installer hash mismatch'}; & $f -CommandArguments aws
+```
+
+This is the one-time chicken-and-egg escape hatch. It resolves the first `upd.cmd` on PATH,
+stages outside cloud storage, preserves a rollback snapshot, detects sync races, and replaces
+only runtime files. It deliberately does not use a mutable gist or `iex`.
 
 Windows PowerShell 5.1 is supported as a bootstrap host. On an operational command,
 `upd.cmd` installs PowerShell 7 side-by-side using WinGet when available, or a
@@ -185,7 +200,9 @@ Package managers are auto-detected. Missing ones are skipped with a warning.
 | File | Purpose |
 |------|---------|
 | `upd.cmd` | Entry point — run this |
+| `tools/Invoke-UpdBootstrap.ps1` | Stable raw-argument preflight and verified current-launcher handoff |
 | `tools/Invoke-UpdLauncher.ps1` | Typed commands, compact aliases, UAC boundary, and runtime-bundle updates |
+| `tools/Install-UpdCompat.ps1` | One-time repair bridge for historical batch parsers |
 | `tools/Install-PowerShell7.ps1` | Windows PowerShell 5.1-compatible PS7 bootstrap |
 | `Deploy-BootUpdateCycle.ps1` | Deploys scripts to ProgramData + runs first iteration |
 | `Invoke-BootUpdateCycle.ps1` | The orchestrator — runs all updates, manages reboots |

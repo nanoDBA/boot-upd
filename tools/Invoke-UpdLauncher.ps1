@@ -33,6 +33,7 @@ param(
     [Parameter(DontShow)][switch]$D,
     [Parameter(DontShow)][switch]$F,
     [Parameter(DontShow)][switch]$St,
+    [Parameter(DontShow)][switch]$BundlePreflighted,
     [Parameter(DontShow)][string]$EncodedArguments = '',
     [Parameter(ValueFromRemainingArguments)][string[]]$RemainingArguments = @()
 )
@@ -43,6 +44,7 @@ $deployPath = Join-Path $repoRoot 'Deploy-BootUpdateCycle.ps1'
 $invokePath = Join-Path $repoRoot 'Invoke-BootUpdateCycle.ps1'
 $demoPath = Join-Path $PSScriptRoot 'Show-BootUpdateProgressDemo.ps1'
 $ps7BootstrapPath = Join-Path $PSScriptRoot 'Install-PowerShell7.ps1'
+$argumentBootstrapPath = Join-Path $PSScriptRoot 'Invoke-UpdBootstrap.ps1'
 $awsPath = Join-Path $repoRoot 'Repair-AwsTooling.ps1'
 
 function Show-UpdHelp {
@@ -126,9 +128,13 @@ function Install-UpdStagedBatch {
     $target = Join-Path $repoRoot 'upd.cmd'
     $staged = "$target.next"
     $sidecar = "$staged.sha256"
+    $baselineSidecar = "$staged.baseline"
+    $backup = "$target.bak"
+    $replaced = $false
     if (-not (Test-Path -LiteralPath $staged)) { return $false }
     try {
         if (-not (Test-Path -LiteralPath $sidecar)) { throw 'staged checksum is missing' }
+        if (-not (Test-Path -LiteralPath $baselineSidecar)) { throw 'staged baseline is missing' }
         $expected = ((Get-Content -LiteralPath $sidecar -Raw) -split '\s+')[0].ToUpperInvariant()
         if ($expected -notmatch '^[0-9A-F]{64}$') { throw 'staged checksum is malformed' }
         $actual = (Get-FileHash -LiteralPath $staged -Algorithm SHA256).Hash.ToUpperInvariant()
@@ -139,12 +145,26 @@ function Install-UpdStagedBatch {
         $coreVersion = Get-UpdVersion
         if ($stagedVersion -ne $coreVersion) { throw "staged v$stagedVersion does not match core v$coreVersion" }
         if ($batch -notmatch '(?im)^@echo off\s*$' -or $batch -notmatch 'Invoke-UpdLauncher\.ps1') { throw 'staged launcher structure is invalid' }
-        [IO.File]::Replace($staged, $target, "$target.bak", $true)
-        Remove-Item -LiteralPath $sidecar -Force -ErrorAction SilentlyContinue
+        $expectedBaseline = (Get-Content -LiteralPath $baselineSidecar -Raw).Trim().ToUpperInvariant()
+        if ($expectedBaseline -eq 'MISSING') {
+            if (Test-Path -LiteralPath $target) { throw 'live upd.cmd appeared after staging' }
+        } else {
+            if ($expectedBaseline -notmatch '^[0-9A-F]{64}$') { throw 'staged baseline is malformed' }
+            if (-not (Test-Path -LiteralPath $target)) { throw 'live upd.cmd disappeared after staging' }
+            $liveHash = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash.ToUpperInvariant()
+            if ($liveHash -ne $expectedBaseline) { throw 'live upd.cmd changed after staging' }
+        }
+        [IO.File]::Replace($staged, $target, $backup, $true)
+        $replaced = $true
+        if ((Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash.ToUpperInvariant() -ne $actual) { throw 'adopted upd.cmd failed post-copy verification' }
+        Remove-Item -LiteralPath $sidecar,$baselineSidecar -Force -ErrorAction SilentlyContinue
         return $true
     } catch {
+        if ($replaced -and (Test-Path -LiteralPath $backup)) {
+            [IO.File]::Replace($backup, $target, $null, $true)
+        }
         Write-Warning "Rejected upd.cmd.next: $_"
-        Remove-Item -LiteralPath $staged,$sidecar -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $staged,$sidecar,$baselineSidecar -Force -ErrorAction SilentlyContinue
         throw
     }
 }
@@ -211,11 +231,20 @@ function Update-UpdSourceBundle {
             [pscustomobject]@{ Name='Invoke-BootUpdateCycle.ps1'; Target=(Join-Path $repoRoot 'Invoke-BootUpdateCycle.ps1'); PowerShell=$true; StageBatch=$false }
             [pscustomobject]@{ Name='Deploy-BootUpdateCycle.ps1'; Target=(Join-Path $repoRoot 'Deploy-BootUpdateCycle.ps1'); PowerShell=$true; StageBatch=$false }
             [pscustomobject]@{ Name='Invoke-UpdLauncher.ps1'; Target=$PSCommandPath; PowerShell=$true; StageBatch=$false }
+            [pscustomobject]@{ Name='Invoke-UpdBootstrap.ps1'; Target=$argumentBootstrapPath; PowerShell=$true; StageBatch=$false }
             [pscustomobject]@{ Name='Show-BootUpdateProgressDemo.ps1'; Target=$demoPath; PowerShell=$true; StageBatch=$false }
             [pscustomobject]@{ Name='Install-PowerShell7.ps1'; Target=$ps7BootstrapPath; PowerShell=$true; StageBatch=$false }
             [pscustomobject]@{ Name='Repair-AwsTooling.ps1'; Target=$awsPath; PowerShell=$true; StageBatch=$false }
             [pscustomobject]@{ Name='upd.cmd'; Target=(Join-Path $repoRoot 'upd.cmd'); PowerShell=$false; StageBatch=$true }
         )
+        $baselines = @{}
+        foreach ($spec in $specs) {
+            $exists = Test-Path -LiteralPath $spec.Target
+            $baselines[$spec.Name] = [pscustomobject]@{
+                Exists = $exists
+                Hash = if ($exists) { (Get-FileHash -LiteralPath $spec.Target -Algorithm SHA256).Hash.ToUpperInvariant() } else { $null }
+            }
+        }
         $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ('boot-upd-bundle-{0}' -f [guid]::NewGuid().ToString('N'))
         $null = New-Item -ItemType Directory -Path $tempRoot -ErrorAction Stop
         $verified = [Collections.Generic.List[object]]::new()
@@ -242,6 +271,23 @@ function Update-UpdSourceBundle {
             $verified.Add([pscustomobject]@{ Spec=$spec; Temp=$temp; Hash=$actual })
         }
 
+        $downloadedCore = Get-Content -LiteralPath (($verified | Where-Object { $_.Spec.Name -eq 'Invoke-BootUpdateCycle.ps1' }).Temp) -Raw
+        $downloadedBatch = Get-Content -LiteralPath (($verified | Where-Object { $_.Spec.Name -eq 'upd.cmd' }).Temp) -Raw
+        if ($downloadedCore -notmatch "BootUpdateCycleVersion'\s*-Value\s*'([\d.]+)'") {
+            throw "Release $($release.tag_name) core version marker is missing."
+        }
+        $downloadedCoreVersion = [version]$Matches[1]
+        if ($downloadedCoreVersion -ne $remoteVersion) {
+            throw "Release $($release.tag_name) core version does not match its tag."
+        }
+        if ($downloadedBatch -notmatch '(?m)^:: BootUpdateCycleVersion=([\d.]+)\s*$') {
+            throw "Release $($release.tag_name) batch version marker is missing."
+        }
+        $downloadedBatchVersion = [version]$Matches[1]
+        if ($downloadedBatchVersion -ne $remoteVersion) {
+            throw "Release $($release.tag_name) batch version does not match its tag."
+        }
+
         $changed = [Collections.Generic.List[string]]::new()
         $committed = [Collections.Generic.List[object]]::new()
         $commitStarted = $false
@@ -249,8 +295,14 @@ function Update-UpdSourceBundle {
             foreach ($item in $verified) {
                 $spec = $item.Spec
                 $destination = if ($spec.StageBatch) { "$($spec.Target).next" } else { $spec.Target }
+                $baseline = $baselines[$spec.Name]
+                $liveExists = Test-Path -LiteralPath $spec.Target
+                $liveHash = if ($liveExists) { (Get-FileHash -LiteralPath $spec.Target -Algorithm SHA256).Hash.ToUpperInvariant() } else { $null }
+                if ($liveExists -ne $baseline.Exists -or $liveHash -ne $baseline.Hash) {
+                    throw "Local/cloud sync changed $($spec.Target) during bundle staging."
+                }
                 if ((Test-Path -LiteralPath $spec.Target) -and (Get-FileHash -LiteralPath $spec.Target -Algorithm SHA256).Hash -eq $item.Hash) {
-                    if ($spec.StageBatch) { Remove-Item -LiteralPath $destination,"$destination.sha256" -Force -ErrorAction SilentlyContinue }
+                    if ($spec.StageBatch) { Remove-Item -LiteralPath $destination,"$destination.sha256","$destination.baseline" -Force -ErrorAction SilentlyContinue }
                     continue
                 }
                 $snapshot = Join-Path $tempRoot ("rollback-{0}" -f $committed.Count)
@@ -258,15 +310,25 @@ function Update-UpdSourceBundle {
                 if ($existed) { Copy-Item -LiteralPath $destination -Destination $snapshot -Force }
                 $sidecarPath = "$destination.sha256"
                 $sidecarSnapshot = "$snapshot.sha256"
+                $baselinePath = "$destination.baseline"
+                $baselineSnapshot = "$snapshot.baseline"
                 $sidecarExisted = $spec.StageBatch -and (Test-Path -LiteralPath $sidecarPath)
+                $baselineExisted = $spec.StageBatch -and (Test-Path -LiteralPath $baselinePath)
                 if ($sidecarExisted) { Copy-Item -LiteralPath $sidecarPath -Destination $sidecarSnapshot -Force }
-                $committed.Add([pscustomobject]@{ Destination=$destination; Snapshot=$snapshot; Existed=$existed; SidecarPath=$sidecarPath; SidecarSnapshot=$sidecarSnapshot; SidecarExisted=$sidecarExisted; Staged=$spec.StageBatch })
+                if ($baselineExisted) { Copy-Item -LiteralPath $baselinePath -Destination $baselineSnapshot -Force }
+                $committed.Add([pscustomobject]@{ Destination=$destination; Snapshot=$snapshot; Existed=$existed; SidecarPath=$sidecarPath; SidecarSnapshot=$sidecarSnapshot; SidecarExisted=$sidecarExisted; BaselinePath=$baselinePath; BaselineSnapshot=$baselineSnapshot; BaselineExisted=$baselineExisted; Staged=$spec.StageBatch })
                 $commitStarted = $true
                 $incoming = "$destination.incoming-$PID"
                 try {
                     Copy-Item -LiteralPath $item.Temp -Destination $incoming -Force
                     Move-Item -LiteralPath $incoming -Destination $destination -Force
-                    if ($spec.StageBatch) { Set-Content -LiteralPath $sidecarPath -Value $item.Hash -Encoding ascii -NoNewline }
+                    if ($spec.StageBatch) {
+                        Set-Content -LiteralPath $sidecarPath -Value $item.Hash -Encoding ascii -NoNewline
+                        $baselineValue = if ($baseline.Exists) { $baseline.Hash } else { 'MISSING' }
+                        Set-Content -LiteralPath $baselinePath -Value $baselineValue -Encoding ascii -NoNewline
+                    } elseif ((Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToUpperInvariant() -ne $item.Hash) {
+                        throw "Post-copy SHA256 mismatch for $($spec.Name)."
+                    }
                     $changed.Add($spec.Name)
                 } finally {
                     if (Test-Path -LiteralPath $incoming) { Remove-Item -LiteralPath $incoming -Force -ErrorAction SilentlyContinue }
@@ -280,6 +342,8 @@ function Update-UpdSourceBundle {
                 if ($entry.Staged) {
                     if ($entry.SidecarExisted) { Copy-Item -LiteralPath $entry.SidecarSnapshot -Destination $entry.SidecarPath -Force }
                     else { Remove-Item -LiteralPath $entry.SidecarPath -Force -ErrorAction SilentlyContinue }
+                    if ($entry.BaselineExisted) { Copy-Item -LiteralPath $entry.BaselineSnapshot -Destination $entry.BaselinePath -Force }
+                    else { Remove-Item -LiteralPath $entry.BaselinePath -Force -ErrorAction SilentlyContinue }
                 }
             }
             throw "Bundle commit failed and was rolled back: $_"
@@ -328,6 +392,15 @@ function Get-UpdCanonicalRunArguments {
             $arguments.Add($launcherName); $arguments.Add([string]$entry.Value)
         }
     }
+    return $arguments.ToArray()
+}
+
+function Get-UpdCanonicalAwsArguments {
+    param([switch]$DisableUpdate,[switch]$Preflighted)
+    $arguments = [Collections.Generic.List[string]]::new()
+    $arguments.Add('aws')
+    if ($DisableUpdate) { $arguments.Add('-DisableSelfUpdate') }
+    if ($Preflighted) { $arguments.Add('-BundlePreflighted') }
     return $arguments.ToArray()
 }
 
@@ -420,9 +493,9 @@ switch ($Command.ToLowerInvariant()) {
     'aws' {
         if (-not (Test-UpdAdministrator)) {
             Write-Host 'Requesting administrator access to update AWS tooling...' -ForegroundColor Yellow
-            exit (Invoke-UpdElevated -CanonicalArguments @('aws'))
+            exit (Invoke-UpdElevated -CanonicalArguments (Get-UpdCanonicalAwsArguments -DisableUpdate:$DisableSelfUpdate -Preflighted:$BundlePreflighted))
         }
-        $null = Update-UpdSourceBundle
+        if (-not $DisableSelfUpdate -and -not $BundlePreflighted) { $null = Update-UpdSourceBundle }
         if (-not (Test-Path -LiteralPath $awsPath)) { throw 'Repair-AwsTooling.ps1 is unavailable. Run upd repair.' }
         & $awsPath -Mode Remediate
         exit $LASTEXITCODE
@@ -434,7 +507,7 @@ switch ($Command.ToLowerInvariant()) {
             exit (Invoke-UpdElevated -CanonicalArguments (Get-UpdCanonicalRunArguments -DeployParameters $deployParameters))
         }
         Add-UpdToMachinePath
-        if (-not $DisableSelfUpdate) { $null = Update-UpdSourceBundle }
+        if (-not $DisableSelfUpdate -and -not $BundlePreflighted) { $null = Update-UpdSourceBundle }
         & $deployPath @deployParameters
         exit $LASTEXITCODE
     }
