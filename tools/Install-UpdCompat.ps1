@@ -54,6 +54,28 @@ function Get-CompatSha256 {
     }
 }
 
+function Find-CompatUpdBatch {
+    $extensions = @([Environment]::GetEnvironmentVariable('PATHEXT','Process') -split ';' |
+        ForEach-Object { ([string]$_).Trim().ToUpperInvariant() } |
+        Where-Object { $_ })
+    if (-not $extensions.Count) { $extensions = @('.COM','.EXE','.BAT','.CMD') }
+    foreach ($entry in @([Environment]::GetEnvironmentVariable('Path','Process') -split ';')) {
+        $directory = [Environment]::ExpandEnvironmentVariables(([string]$entry).Trim().Trim('"'))
+        if ([string]::IsNullOrWhiteSpace($directory)) { continue }
+        foreach ($extension in $extensions) {
+            try { $candidate = Join-Path $directory "upd$extension" -ErrorAction Stop }
+            catch { continue }
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+                if ($extension -ne '.CMD') {
+                    throw "The first PATH winner is not upd.cmd ($candidate). Refusing to repair a shadowed launcher; supply -InstallRoot explicitly."
+                }
+                return [IO.Path]::GetFullPath($candidate)
+            }
+        }
+    }
+    return $null
+}
+
 function Test-CompatPowerShellAsset {
     param(
         [Parameter(Mandatory)][string]$Path,
@@ -167,12 +189,9 @@ if ($PSVersionTable.PSVersion.Major -lt 6) {
 }
 
 if (-not $InstallRoot) {
-    $resolved = @(& where.exe upd 2>$null | Select-Object -First 1)
+    $resolved = Find-CompatUpdBatch
     if ($resolved) {
-        if ($resolved[0] -notmatch '(?i)\.cmd$') {
-            throw "The first PATH winner is not upd.cmd ($($resolved[0])). Refusing to repair a shadowed launcher; supply -InstallRoot explicitly."
-        }
-        $InstallRoot = Split-Path -Parent $resolved[0]
+        $InstallRoot = Split-Path -Parent $resolved
     } else {
         $InstallRoot = Join-Path $env:ProgramFiles 'BootUpdateCycle'
     }

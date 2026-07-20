@@ -1,8 +1,18 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.38
+**Current Version:** v2.5.39
 **Release Date:** 2026-07-20
 **Status:** STABLE
+
+---
+
+## v2.5.39 (2026-07-20)
+
+### Fresh-install PATH discovery under strict PowerShell 5.1
+
+- Replaces `where.exe upd` with a PowerShell-native, PATH-only `upd.cmd` resolver after fresh disposable VMs showed that the expected native “not found” stderr becomes terminating under strict error handling.
+- Treats no existing launcher as the normal Program Files fresh-install path while preserving the first PATH entry for transactional repairs.
+- Covers absent PATH winners and paths containing spaces under actual Windows PowerShell 5.1.
 
 ---
 

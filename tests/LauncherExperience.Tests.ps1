@@ -198,7 +198,8 @@ exit 29
 
     It 'publishes a one-time compatibility installer for historical batch parsers' {
         $releaseSource | Should -Match "Source='tools/Install-UpdCompat\.ps1'"
-        $compatInstallerSource | Should -Match 'where\.exe upd'
+        $compatInstallerSource | Should -Match 'Find-CompatUpdBatch'
+        $compatInstallerSource | Should -Not -Match 'where\.exe upd'
         $compatInstallerSource | Should -Match 'Join-Path \$env:ProgramFiles ''BootUpdateCycle'''
         $compatInstallerSource | Should -Match 'SetEnvironmentVariable\(''Path'',\$newMachinePath,''Machine''\)'
         $compatInstallerSource | Should -Match 'boot-upd-compat-stage-'
@@ -321,6 +322,38 @@ exit 29
 }
 
 Describe 'Windows PowerShell 5.1 bootstrap with PowerShell 7 parallel runtime' {
+    It 'treats a missing upd PATH entry as a fresh install under Windows PowerShell 5.1' {
+        $resolver = $compatInstallerAst.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq 'Find-CompatUpdBatch'
+        },$true) | Select-Object -First 1
+        $resolver | Should -Not -BeNullOrEmpty
+
+        $helperPath = Join-Path $TestDrive 'compat-path-resolver.ps1'
+        $winnerRoot = Join-Path $TestDrive 'winner path with spaces'
+        $emptyRoot = Join-Path $TestDrive 'empty path'
+        $null = New-Item -ItemType Directory -Path $winnerRoot,$emptyRoot
+        Set-Content -LiteralPath $helperPath -Value $resolver.Extent.Text -Encoding utf8
+        Set-Content -LiteralPath (Join-Path $winnerRoot 'upd.cmd') -Value '@echo off' -Encoding ascii
+        $probe = @"
+. '$($helperPath.Replace("'","''"))'
+`$env:Path = '$($emptyRoot.Replace("'","''"))'
+if (`$null -ne (Find-CompatUpdBatch)) { exit 7 }
+`$env:Path = '$($winnerRoot.Replace("'","''"))'
+`$expected = [IO.Path]::GetFullPath((Join-Path `$env:Path 'upd.cmd'))
+if ((Find-CompatUpdBatch) -ine `$expected) { exit 8 }
+Set-Content -LiteralPath (Join-Path `$env:Path 'upd.exe') -Value 'shadow' -Encoding ascii
+try { Find-CompatUpdBatch; exit 9 } catch {
+    if (`$_.Exception.Message -notmatch 'first PATH winner is not upd.cmd') { exit 10 }
+}
+exit 0
+"@
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($probe))
+        & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -EncodedCommand $encoded
+        $LASTEXITCODE | Should -Be 0
+    }
+
     It 'hashes assets without module autoloading under Windows PowerShell 5.1' {
         $hasher = $compatInstallerAst.FindAll({
             param($node)
