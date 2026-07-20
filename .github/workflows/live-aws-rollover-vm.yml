@@ -71,7 +71,7 @@ jobs:
               )) {
                   $signature = Get-AuthenticodeSignature -LiteralPath $path
                   if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Amazon Web Services, Inc.') {
-                      throw "Unexpected installed signature for $path: $($signature.Status)"
+                  throw "Unexpected installed signature for ${path}: $($signature.Status)"
                   }
               }
           }
