@@ -40,7 +40,7 @@ jobs:
           $commands = @(Get-Content -LiteralPath README.md | Where-Object {
               $_ -match '^powershell\.exe -NoProfile -ExecutionPolicy Bypass' -and
               $_ -match '\[ScriptBlock\]::Create' -and
-              $_ -match '-PromptForArguments$'
+              $_ -match '-PromptForArguments"$'
           })
           if ($commands.Count -ne 1) {
               throw "Expected exactly one interactive README bootstrap; found $($commands.Count)."
