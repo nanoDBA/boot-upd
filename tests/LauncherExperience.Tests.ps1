@@ -199,6 +199,8 @@ exit 29
     It 'publishes a one-time compatibility installer for historical batch parsers' {
         $releaseSource | Should -Match "Source='tools/Install-UpdCompat\.ps1'"
         $compatInstallerSource | Should -Match 'where\.exe upd'
+        $compatInstallerSource | Should -Match 'Join-Path \$env:ProgramFiles ''BootUpdateCycle'''
+        $compatInstallerSource | Should -Match 'SetEnvironmentVariable\(''Path'',\$newMachinePath,''Machine''\)'
         $compatInstallerSource | Should -Match 'boot-upd-compat-stage-'
         $compatInstallerSource | Should -Match 'boot-upd-compat-backup-'
         $compatInstallerSource | Should -Match 'Cloud/local sync changed'
@@ -209,7 +211,11 @@ exit 29
         $compatInstallerSource | Should -Match 'TimeoutSec 120'
         $compatInstallerSource | Should -Match 'Committed bundle verification failed'
         $releaseSource | Should -Match 'README compatibility command must pin'
-        (Get-Content -LiteralPath (Join-Path $repoRoot 'README.md') -Raw) | Should -Not -Match 'COMPAT_INSTALLER_SHA256'
+        $readme = Get-Content -LiteralPath (Join-Path $repoRoot 'README.md') -Raw
+        $readme | Should -Not -Match 'COMPAT_INSTALLER_SHA256'
+        $readme | Should -Match (Get-FileHash -LiteralPath $compatInstallerPath -Algorithm SHA256).Hash
+        $readme |
+            Should -Match 'powershell\.exe -NoProfile -ExecutionPolicy Bypass.*releases/latest/download/Install-UpdCompat\.ps1'
     }
 
     It 'coheres release versions and detects cloud races around every bundle commit' {
@@ -349,7 +355,7 @@ Describe 'Windows PowerShell 5.1 bootstrap with PowerShell 7 parallel runtime' {
 
         $version = & cmd.exe /d /c "`"$simulatedPath`" v" 2>&1
         $LASTEXITCODE | Should -Be 0
-        ($version -join "`n") | Should -Match 'v2\.5\.33.*runtime not installed'
+        ($version -join "`n") | Should -Match 'v2\.5\.34.*runtime not installed'
 
         $demo = & cmd.exe /d /c "`"$simulatedPath`" demo" 2>&1
         $LASTEXITCODE | Should -Be 2

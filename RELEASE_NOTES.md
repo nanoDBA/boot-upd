@@ -1,8 +1,19 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.33
+**Current Version:** v2.5.34
 **Release Date:** 2026-07-20
 **Status:** STABLE
+
+---
+
+## v2.5.34 (2026-07-20)
+
+### Recovery queued without a false fatal exit
+
+- Treats a successfully persisted and scheduled recovery pass as a clean process handoff while continuing to withhold the fully-patched claim.
+- Prevents outer launch environments from turning the amber recovery banner into a red failure/pause prompt.
+- Keeps actual terminal failures nonzero and continues treating Defender native exit code 2 as a retryable phase failure.
+- Adds a Chocolatey-style README one-liner that can bootstrap a fresh Program Files installation or transactionally repair the existing `upd.cmd` PATH winner before running.
 
 ---
 

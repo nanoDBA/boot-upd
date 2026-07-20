@@ -220,6 +220,27 @@ Describe 'Evidence-backed completion' {
         $text.IndexOf('$incompletePhases') | Should -BeLessThan $text.IndexOf('C O N F I G U R E D   P A T C H   P A S S   V E R I F I E D')
     }
 
+    It 'returns success after the retry checkpoint transaction is durably armed' {
+        $text = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
+        $retryStart = $text.IndexOf("if (-not `$WhatIfPreference -and `$disposition.Kind -eq 'Retry')")
+        $nextDisposition = $text.IndexOf("if (-not `$WhatIfPreference -and `$disposition.Kind -eq 'UserContext')", $retryStart)
+        $retryBranch = $text.Substring($retryStart, $nextDisposition - $retryStart)
+
+        $retryBranch | Should -Match 'Set-BootUpdateState'
+        $retryBranch | Should -Match 'Register-BootUpdateTaskForReboot -RetrySoon'
+        $retryBranch | Should -Match 'R E C O V E R Y   P A S S   Q U E U E D'
+        $retryBranch | Should -Match 'No action needed.*window may close'
+        $retryBranch | Should -Match 'exit\s+0'
+        $retryBranch | Should -Not -Match 'exit\s+[1-9]'
+    }
+
+    It 'continues treating Defender native exit code 2 as a retryable phase failure' {
+        $text = Get-FunctionText $invokeAst 'Update-DefenderSignatures'
+        $text | Should -Match '\$exitCode -ne 0'
+        $text | Should -Match 'exited with code \$exitCode'
+        $text | Should -Match 'Success = \$false'
+    }
+
     It 'congratulates only the verified green path and reports its evidence' {
         $text = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
         $text | Should -Match 'YOU DID IT.*CONFIGURED PATCH PASS IS VERIFIED.*NICE WORK'

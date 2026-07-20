@@ -50,17 +50,17 @@ if ($PSVersionTable.PSVersion.Major -lt 6) {
 
 if (-not $InstallRoot) {
     $resolved = @(& where.exe upd 2>$null | Select-Object -First 1)
-    if (-not $resolved) { throw 'No upd.cmd was found on PATH. Supply -InstallRoot explicitly.' }
-    if ($resolved[0] -notmatch '(?i)\.cmd$') {
-        throw "The first PATH winner is not upd.cmd ($($resolved[0])). Refusing to repair a shadowed launcher; supply -InstallRoot explicitly."
+    if ($resolved) {
+        if ($resolved[0] -notmatch '(?i)\.cmd$') {
+            throw "The first PATH winner is not upd.cmd ($($resolved[0])). Refusing to repair a shadowed launcher; supply -InstallRoot explicitly."
+        }
+        $InstallRoot = Split-Path -Parent $resolved[0]
+    } else {
+        $InstallRoot = Join-Path $env:ProgramFiles 'BootUpdateCycle'
     }
-    $InstallRoot = Split-Path -Parent $resolved[0]
 }
 $InstallRoot = [IO.Path]::GetFullPath($InstallRoot)
 $targetBatch = Join-Path $InstallRoot 'upd.cmd'
-if (-not (Test-Path -LiteralPath $targetBatch)) {
-    throw "The selected install root has no upd.cmd: $InstallRoot"
-}
 
 $specs = @(
     [pscustomobject]@{ Name='Invoke-BootUpdateCycle.ps1'; Relative='Invoke-BootUpdateCycle.ps1'; PowerShell=$true; Batch=$false }
@@ -178,5 +178,19 @@ try {
 
 Write-Host "Verified $($release.tag_name) installed at $InstallRoot" -ForegroundColor Green
 Write-Host "Previous runtime files are recoverable from $backupRoot" -ForegroundColor DarkGray
+
+$machinePath = [Environment]::GetEnvironmentVariable('Path','Machine')
+$machineEntries = @($machinePath -split ';' | Where-Object { $_ })
+if ($machineEntries -notcontains $InstallRoot) {
+    $newMachinePath = ($machineEntries + $InstallRoot) -join ';'
+    if ($newMachinePath.Length -gt 2047) {
+        Write-Warning "Machine PATH would exceed 2047 characters; add '$InstallRoot' manually."
+    } else {
+        [Environment]::SetEnvironmentVariable('Path',$newMachinePath,'Machine')
+        Write-Host "Added $InstallRoot to the Machine PATH." -ForegroundColor Green
+    }
+}
+if (@($env:Path -split ';') -notcontains $InstallRoot) { $env:Path = "$InstallRoot;$env:Path" }
+
 & $targetBatch @CommandArguments
 exit $LASTEXITCODE
