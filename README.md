@@ -4,18 +4,30 @@
 
 A Windows boot-time automation tool that runs every configured package manager, checkpoints its work, reboots when updates require it, and resumes until the configured scope verifies clean — then retires its resume tasks.
 
-![Boot Update Cycle splash — neon gradient theme](docs/img/splash-theme0.svg)
+<img src="docs/img/splash-theme0.png" alt="Boot Update Cycle splash — neon gradient theme" width="684">
 
 The BBS-style splash defaults to the neon gradient theme above; two more ship with it (`upd splash` previews them all; switch with `BOOT_UPDATE_SPLASH_THEME=0|1|2`):
 
 <details>
 <summary>The other two themes</summary>
 
-![Outline dither theme](docs/img/splash-theme1.svg)
+<img src="docs/img/splash-theme1.png" alt="Boot Update Cycle outline dither theme" width="684">
 
-![Classic 16-color theme (also the non-VT console fallback)](docs/img/splash-theme2.svg)
+<img src="docs/img/splash-theme2.png" alt="Boot Update Cycle classic 16-color theme" width="684">
 
 </details>
+
+## Updater in action
+
+The default `Normal` view stays zoomed out while the animated `BOOT//PULSE` row shows the current operation:
+
+<img src="docs/img/updater-progress.png" alt="Boot Update Cycle updating Windows in the compact Normal console view" width="900">
+
+When the configured work, convergence checks, reboot checks, service health, and terminal cleanup all pass, the final screen has some earned personality:
+
+<img src="docs/img/updater-complete.png" alt="Boot Update Cycle configured patch pass verified completion screen" width="900">
+
+<sub>Representative v2.5.28 console captures rendered from the production UI text for deterministic, privacy-safe documentation; package counts and elapsed time are illustrative.</sub>
 
 ## What it updates
 

@@ -131,6 +131,20 @@ Describe 'Resilient rich progress rendering' {
     }
 }
 
+Describe 'README console gallery' {
+    It 'embeds raster assets so GitHub opens graphics instead of SVG source' {
+        $readme = Get-Content (Join-Path $repoRoot 'README.md') -Raw
+        $sources = @([regex]::Matches($readme, 'src="(docs/img/[^"]+\.png)"') | ForEach-Object { $_.Groups[1].Value })
+        $sources.Count | Should -BeGreaterOrEqual 5
+        foreach ($source in $sources) {
+            $path = Join-Path $repoRoot $source
+            Test-Path -LiteralPath $path | Should -BeTrue -Because "$source must be committed"
+            $signature = [IO.File]::ReadAllBytes($path)[0..7]
+            ($signature -join ',') | Should -Be '137,80,78,71,13,10,26,10'
+        }
+    }
+}
+
 Describe 'Animated progress behavior' {
     BeforeAll {
         foreach ($functionName in @(

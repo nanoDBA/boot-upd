@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="675" viewBox="0 0 1200 675">
+  <rect width="1200" height="675" rx="10" fill="#0c0c0c"/>
+  <rect width="1200" height="36" rx="10" fill="#d99858"/>
+  <rect y="26" width="1200" height="10" fill="#d99858"/>
+  <text x="16" y="24" fill="#20150d" font-family="Segoe UI, sans-serif" font-size="15">Administrator: Command Prompt — upd</text>
+  <g font-family="Cascadia Mono, Consolas, monospace" font-size="21">
+    <text x="30" y="82" fill="#16a34a">&gt;&gt;&gt; [7/10] VSCode done (0.1 min, 1 pkg)</text>
+    <text x="30" y="116" fill="#16a34a">&gt;&gt;&gt; [8/10] Defender done (0.1 min, 1 pkg)</text>
+    <text x="30" y="150" fill="#16a34a">&gt;&gt;&gt; [9/10] Office365 done (0.1 min)</text>
+    <text x="30" y="184" fill="#16a34a">&gt;&gt;&gt; [10/10] PowerShellModules done (0.1 min)</text>
+
+    <text x="30" y="238" fill="#2f8f46">==========================================================================</text>
+    <text x="62" y="298" fill="#f4a261" font-size="25" xml:space="preserve">C O N F I G U R E D   P A T C H   P A S S   V E R I F I E D</text>
+    <text x="30" y="336" fill="#2f8f46">--------------------------------------------------------------------------</text>
+
+    <text x="62" y="386" fill="#72ffb7">YOU DID IT — THE CONFIGURED PATCH PASS IS VERIFIED. NICE WORK.</text>
+    <text x="62" y="430" fill="#16a34a">[OK] 10/10 configured phases completed</text>
+    <text x="62" y="474" fill="#16a34a">[OK] Reboot state clean twice across 20 seconds</text>
+    <text x="62" y="518" fill="#16a34a">[OK] 5 critical services healthy</text>
+    <text x="62" y="562" fill="#16a34a">[OK] Resume tasks retired; no retry is queued</text>
+
+    <text x="62" y="616" fill="#d99858">18.4 min  |  3 iteration(s)  |  2 completed reboot(s)  |  14 packages updated</text>
+    <text x="30" y="650" fill="#2f8f46">==========================================================================</text>
+  </g>
+</svg>

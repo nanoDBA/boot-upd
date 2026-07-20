@@ -104,7 +104,7 @@ Remove-Item "$env:ProgramData\BootUpdateCycle" -Recurse -Force
 - **Invoke.ps1**: Self-contained orchestrator; can register its own scheduled task for reboot without needing Register.ps1
 - Log filters: spinner chars (`| / - \`), Unicode box-drawing/progress bars, any `Progress:` line, download progress lines, source refresh messages; consecutive duplicate lines collapse into one `(previous line repeated N more times)` summary
 - Progress suppressed at the source too: `choco upgrade ... --no-progress`, `winget ... --disable-interactivity --no-vt`
-- **Splash** (see bd memory `do-not-modify-ascii-art-splash-banner-screens`): theme 0 (neon gradient VT) is default; `BOOT_UPDATE_SPLASH_THEME=0|1|2` switches; `upd splash` / `-PreviewSplash` previews all three without running updates. Wordmark cells must stay spaces+background-color only (no Unicode glyphs). README embeds pixel-true SVGs at `docs/img/splash-theme{0,1,2}.svg`
+- **Splash** (see bd memory `do-not-modify-ascii-art-splash-banner-screens`): theme 0 (neon gradient VT) is default; `BOOT_UPDATE_SPLASH_THEME=0|1|2` switches; `upd splash` / `-PreviewSplash` previews all three without running updates. Wordmark cells must stay spaces+background-color only (no Unicode glyphs). Pixel-true SVG sources live at `docs/img/splash-theme{0,1,2}.svg`; README embeds their click-safe PNG renders.
 - Update functions return `@{ Success = [bool]; Count = [int] }` — Success=$true means "don't retry" (fail-forward pattern)
 - State schema v3: all phase flags use `*Done` suffix consistently; versioned with auto-migration (v1→v2→v3)
 

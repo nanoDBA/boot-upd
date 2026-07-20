@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="675" viewBox="0 0 1200 675">
+  <rect width="1200" height="675" rx="10" fill="#0c0c0c"/>
+  <rect width="1200" height="36" rx="10" fill="#d99858"/>
+  <rect y="26" width="1200" height="10" fill="#d99858"/>
+  <text x="16" y="24" fill="#20150d" font-family="Segoe UI, sans-serif" font-size="15">Administrator: Command Prompt — upd</text>
+  <g font-family="Cascadia Mono, Consolas, monospace" font-size="21">
+    <text x="30" y="82" fill="#d99858">--- [1/10] Winget</text>
+    <text x="340" y="82" fill="#2f6f3b">----------------------------------------------</text>
+    <text x="30" y="116" fill="#16a34a">&gt;&gt;&gt; [1/10] Winget done (0.4 min, 1 pkg)</text>
+
+    <text x="30" y="170" fill="#d99858">--- [2/10] Chocolatey</text>
+    <text x="395" y="170" fill="#2f6f3b">----------------------------------------</text>
+    <text x="30" y="204" fill="#16a34a">&gt;&gt;&gt; [2/10] Chocolatey done (0.1 min)</text>
+
+    <text x="30" y="258" fill="#d99858">--- [3/10] WindowsUpdate</text>
+    <text x="420" y="258" fill="#2f6f3b">--------------------------------------</text>
+    <text x="30" y="292" fill="#e5e7eb">Checking for Windows Updates (excluding SQL Server)...</text>
+    <text x="30" y="326" fill="#9ca3af">Downloading KB5060531 — 73% complete</text>
+    <text x="30" y="360" fill="#9ca3af">Servicing stack update staged successfully</text>
+
+    <text x="30" y="424" fill="#61d6d6">BOOT//PULSE  [\]  Updating Windows Update</text>
+    <text x="590" y="424" fill="#767676">::</text>
+    <text x="630" y="424" fill="#72ffb7">Security, critical, and definition updates</text>
+    <text x="30" y="462" fill="#61d6d6">[==========================--------] 73%</text>
+    <text x="30" y="510" fill="#3b82f6">[view] Normal  |  press v to cycle Quiet &gt; Normal &gt; Verbose &gt; Debug</text>
+
+    <text x="30" y="574" fill="#767676">Checkpoint armed  •  native 3010/1641 evidence persisted  •  reboot-safe resume enabled</text>
+    <text x="30" y="618" fill="#72ffb7">v2.5.28  //  unattended patch board</text>
+  </g>
+</svg>
