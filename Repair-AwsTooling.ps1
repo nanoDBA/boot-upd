@@ -243,7 +243,7 @@ catch {
         ) -Wait -PassThru -NoNewWindow
         
         if ($proc.ExitCode -ne 0) {
-            Write-Warning "AWS.Tools subprocess failed (exit code $($proc.ExitCode))"
+            throw "AWS.Tools subprocess failed (exit code $($proc.ExitCode))"
         }
     }
 }

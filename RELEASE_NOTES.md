@@ -1,8 +1,31 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.27
+**Current Version:** v2.5.28
 **Release Date:** 2026-07-20
 **Status:** STABLE
+
+---
+
+## v2.5.28 (2026-07-20)
+
+**A reboot chain that survives delayed evidence, canceled restarts, context changes, and honest provider failures.**
+
+- Persists native reboot requests in durable state and clears them only after Windows reports a different boot-session identity; reboot counts now represent observed completed boots.
+- Uses the two-probe servicing-settle detector before mutation as well as at completion, preventing late CBS or Windows Update flags from racing the next install phase.
+- Treats pending reboot evidence as a phase barrier and stops the remaining sequential/parallel work after a provider raises `3010` or `1641`.
+- Adds dated watchdogs for cancelable shutdowns, maintenance-window deferrals, transient resumed preflight failures, and staged no-reboot continuations.
+- Preserves a saved interactive identity across SYSTEM fallback runs and defers Winget user scope, Scoop, VS Code, WSL, and containers until a user-context continuation can run.
+- Round-trips behavior-changing switches and structured include/exclude arrays through scheduled resumes, then reads tasks back to verify exact action arguments, principal, trigger types, startup delay, and retry policy.
+- Stops treating provider exceptions, timeouts, failed thread jobs, or native nonzero exits as success across driver/firmware, WSL, containers, Defender, AWS, PowerShell modules, and parallel package adapters.
+- Requires a final read-only Windows Update scan to report zero applicable updates in the configured category scope.
+- Checks `shutdown.exe` results and queues recovery when restart initiation fails; unknown-user discovery retries no longer consume mutation iterations.
+- Moves the success notification and the personality-rich completion banner after hooks, task retirement, state cleanup, and terminal cleanup verification. Skipped health checks receive downgraded wording.
+- Adds behavioral state-machine tests for boot identity, evidence retention, completion disposition, dated maintenance retries, convergence scans, watchdogs, cleanup ordering, and failed parallel jobs.
+- Keeps every splash theme byte-identical.
+
+### Scope note
+
+The verified claim is intentionally limited to the configured patch pass. Full zero-work convergence for asynchronous Office Click-to-Run and additional package providers is tracked as follow-up work.
 
 ---
 

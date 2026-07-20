@@ -91,12 +91,12 @@ console feedback because isolating it would change how hook variables and side e
 
 1. Pre-flight checks validate disk space, network, battery, and conflicting installers
 2. First iteration runs in **your** console (user context) — the only chance for user-scoped winget/Scoop/VS Code
-3. Native `3010`/`1641` results and Windows reboot indicators are captured as reboot evidence
-4. Before reboot, verified resume tasks are armed: ARSO user-at-logon plus a delayed SYSTEM fallback where supported, or SYSTEM-at-startup otherwise
-5. `shutdown /g` restarts Windows; the checkpoint resumes automatically and incomplete phases retry without losing state
-6. Completion requires every enabled phase plus two clean reboot probes across a 20-second servicing-settle window (max 5 successful iterations safety valve)
-7. The final screen reports the evidence and retires both resume tasks
-6. Self-destructs: removes the scheduled task, cleans up state
+3. Before mutation, two reboot-signal probes span a 20-second servicing-settle window; an existing reboot requirement is a hard phase barrier
+4. Native `3010`/`1641` results and Windows reboot indicators are persisted as reboot evidence until a new Windows boot identity is observed
+5. Verified resume tasks are armed before updates start: user-at-logon plus a delayed SYSTEM fallback, with dated watchdogs for canceled shutdowns and deferred retries
+6. `shutdown /g` restarts Windows; the checkpoint resumes automatically, preserves user-only work for user context, and retries real provider failures without marking them complete
+7. Completion requires every enabled phase, a zero-applicable Windows Update scan, and two clean reboot probes (max 5 successful mutation iterations safety valve)
+8. Hooks run, resume tasks and state are removed and verified absent, and only then does the final screen congratulate the user and send the success notification
 
 ### Reboot delay
 
