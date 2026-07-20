@@ -1,8 +1,20 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.23
+**Current Version:** v2.5.24
 **Release Date:** 2026-07-20
 **Status:** STABLE
+
+---
+
+## v2.5.24 (2026-07-20)
+
+**Smoother BOOT//PULSE glow with a dependency-free console UI.**
+
+- Replaced the ten abrupt per-frame color jumps with a closed 48-step RGB interpolation through the splash palette's cyan, blue, magenta, and acid-green anchors.
+- Decoupled the comet motion index from the color index so the ten-frame movement does not reset or strobe the longer color fade.
+- Removed the `PwshSpectreConsole` discovery, installation, trust-validation, import, and rendering paths; its only remaining job was coloring three lines already covered by native output.
+- Phase headers and results now render directly through the existing native ANSI/console paths, eliminating a PSGallery/network dependency from elevated runs.
+- Added regression coverage that bounds every adjacent RGB channel change, including the loop seam, while preserving the splash golden hash.
 
 ---
 

@@ -13,10 +13,27 @@ $frames = @(
     '>>>.....', '.>>>....', '..>>>...', '...>>>..', '....>>>.', '.....>>>',
     '....<<<.', '...<<<..', '..<<<...', '.<<<....'
 )
-$palette = @(
-    '80;255;230', '45;225;238', '20;185;240', '95;115;255', '155;60;255',
-    '220;70;230', '255;90;205', '190;105;235', '110;210;205', '75;255;145'
-)
+function New-NeonGradient {
+    param([ValidateRange(4,64)][int]$StepsPerSegment = 12)
+    $anchors = @(
+        [int[]]@(80, 255, 230), [int[]]@(95, 115, 255),
+        [int[]]@(255, 90, 205), [int[]]@(75, 255, 145)
+    )
+    $gradient = [Collections.Generic.List[string]]::new()
+    for ($segment = 0; $segment -lt $anchors.Count; $segment++) {
+        $start = $anchors[$segment]
+        $end = $anchors[($segment + 1) % $anchors.Count]
+        for ($step = 0; $step -lt $StepsPerSegment; $step++) {
+            $amount = $step / $StepsPerSegment
+            $channels = for ($channel = 0; $channel -lt 3; $channel++) {
+                [math]::Round($start[$channel] + (($end[$channel] - $start[$channel]) * $amount))
+            }
+            $gradient.Add(($channels -join ';'))
+        }
+    }
+    return $gradient.ToArray()
+}
+$palette = New-NeonGradient
 $scenes = @(
     @('Windows Update prefetch', 'Finishing background downloads'),
     @('Container images', 'Pulling refreshed layers'),
@@ -26,6 +43,7 @@ $modes = @('Quiet','Normal','Verbose','Debug')
 $mode = 'Normal'
 $deadline = [datetime]::UtcNow.AddSeconds($DurationSeconds)
 $index = 0
+$colorIndex = 0
 $renderedWidth = 0
 $cursorWasVisible = [Console]::CursorVisible
 $vt = [bool]$Host.UI.SupportsVirtualTerminal
@@ -58,7 +76,7 @@ try {
             }
             $renderedWidth = 0
         } elseif ($vt) {
-            $rgb = $palette[$index % $palette.Count]
+            $rgb = $palette[$colorIndex]
             [Console]::Write("`r$escape[2K$escape[1;38;2;${rgb}m$line$escape[0m")
             $renderedWidth = $line.Length
         } else {
@@ -70,6 +88,7 @@ try {
             $renderedWidth = $line.Length
         }
         $index++
+        $colorIndex = ($colorIndex + 1) % $palette.Count
         Start-Sleep -Milliseconds $RefreshMilliseconds
     }
 } finally {

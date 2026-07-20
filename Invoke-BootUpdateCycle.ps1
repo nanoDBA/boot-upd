@@ -321,7 +321,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 3 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.23' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.24' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 
 <# Force UTF-8 console I/O so box-drawing/block chars (BBS splash) render in cmd.exe regardless of system code page.
    chcp 65001 sets conhost interpretation; [Console]::OutputEncoding makes .NET write proper UTF-8 bytes. #>
@@ -341,23 +341,41 @@ $script:TuiSpinnerFrames = @(
     '>>>.....', '.>>>....', '..>>>...', '...>>>..', '....>>>.', '.....>>>',
     '....<<<.', '...<<<..', '..<<<...', '.<<<....'
 )
-$script:TuiNeonPalette = @(
-    '80;255;230', '45;225;238', '20;185;240', '95;115;255', '155;60;255',
-    '220;70;230', '255;90;205', '190;105;235', '110;210;205', '75;255;145'
-)
+
+function New-BootUpdateNeonGradient {
+    param([ValidateRange(4,64)][int]$StepsPerSegment = 12)
+
+    # Closed loop through the splash palette. Interpolation keeps every 100 ms
+    # tick close to its neighbor instead of flashing between saturated anchors.
+    $anchors = @(
+        [int[]]@(80, 255, 230),  # cyan
+        [int[]]@(95, 115, 255),  # blue
+        [int[]]@(255, 90, 205),  # magenta
+        [int[]]@(75, 255, 145)   # acid green
+    )
+    $gradient = [Collections.Generic.List[string]]::new()
+    for ($segment = 0; $segment -lt $anchors.Count; $segment++) {
+        $start = $anchors[$segment]
+        $end = $anchors[($segment + 1) % $anchors.Count]
+        for ($step = 0; $step -lt $StepsPerSegment; $step++) {
+            $amount = $step / $StepsPerSegment
+            $channels = for ($channel = 0; $channel -lt 3; $channel++) {
+                [math]::Round($start[$channel] + (($end[$channel] - $start[$channel]) * $amount))
+            }
+            $gradient.Add(($channels -join ';'))
+        }
+    }
+    return $gradient.ToArray()
+}
+
+$script:TuiNeonPalette = New-BootUpdateNeonGradient
+$script:TuiColorIndex = 0
 $script:TuiRefreshMilliseconds = 100
 $script:TuiSupportsVirtualTerminal = $false
 $script:TuiRenderedWidth = 0
 $script:TuiCursorWasVisible = $true
 $script:TuiCursorHidden = $false
 $script:TuiInProgressTick = $false
-$script:SpectreModuleName = 'PwshSpectreConsole'
-$script:SpectreInstallVersion = [version]'2.6.3'
-$script:SpectreEnabled = $false
-$script:SpectreTrustedRoots = @(
-    (Join-Path $env:ProgramFiles 'PowerShell\Modules')
-    (Join-Path $env:ProgramFiles 'WindowsPowerShell\Modules')
-)
 
 function Initialize-BootUpdateConsole {
     try {
@@ -515,8 +533,9 @@ function Write-BootUpdateProgress {
     if (-not $script:TuiInteractive -or $script:OutputMode -eq 'Quiet') { return }
 
     $frame = $script:TuiSpinnerFrames[$script:TuiSpinnerIndex]
-    $paletteIndex = $script:TuiSpinnerIndex
+    $paletteIndex = $script:TuiColorIndex
     $script:TuiSpinnerIndex = ($script:TuiSpinnerIndex + 1) % $script:TuiSpinnerFrames.Count
+    $script:TuiColorIndex = ($script:TuiColorIndex + 1) % $script:TuiNeonPalette.Count
     $maxWidth = 88
     try { $maxWidth = [math]::Max(20, [math]::Min(120, [Console]::WindowWidth - 1)) } catch { }
     $text = Get-BootUpdateProgressText -Frame $frame -Activity $Activity -Status $Status `
@@ -584,138 +603,6 @@ function Invoke-BootUpdateBackgroundOperation {
         Failed = $result.Failed
         State = $result.Reason
         ExitCode = $result.ExitCode
-    }
-}
-
-function Test-BootUpdateSpectreModulePath {
-    param([Parameter(Mandatory)][string]$Path)
-    try {
-        $modulePath = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path
-        $matchedRoot = $null
-        foreach ($trustedRoot in $script:SpectreTrustedRoots) {
-            if (-not (Test-Path -LiteralPath $trustedRoot)) { continue }
-            $root = (Resolve-Path -LiteralPath $trustedRoot -ErrorAction Stop).Path.TrimEnd('\')
-            if (("$modulePath\").StartsWith("$root\", [StringComparison]::OrdinalIgnoreCase)) {
-                $matchedRoot = $root
-                break
-            }
-        }
-        if (-not $matchedRoot -or [IO.Path]::GetExtension($modulePath) -ne '.psd1') { return $false }
-
-        $trustedOwnerSids = @(
-            'S-1-5-18',       # SYSTEM
-            'S-1-5-32-544',   # BUILTIN\Administrators
-            'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464' # TrustedInstaller
-        )
-        $broadWriteSids = @('S-1-1-0', 'S-1-5-11', 'S-1-5-32-545')
-        $writeMask = [Security.AccessControl.FileSystemRights]::Write -bor
-            [Security.AccessControl.FileSystemRights]::Modify -bor
-            [Security.AccessControl.FileSystemRights]::FullControl -bor
-            [Security.AccessControl.FileSystemRights]::Delete -bor
-            [Security.AccessControl.FileSystemRights]::ChangePermissions -bor
-            [Security.AccessControl.FileSystemRights]::TakeOwnership
-
-        $current = $modulePath
-        while ($true) {
-            $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
-            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
-            $acl = Get-Acl -LiteralPath $current -ErrorAction Stop
-            $ownerSid = if ($acl.Owner -is [Security.Principal.SecurityIdentifier]) {
-                $acl.Owner.Value
-            } else {
-                ([Security.Principal.NTAccount]$acl.Owner).Translate(
-                    [Security.Principal.SecurityIdentifier]
-                ).Value
-            }
-            if ($ownerSid -notin $trustedOwnerSids) { return $false }
-            foreach ($rule in $acl.Access) {
-                if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
-                $sid = if ($rule.IdentityReference -is [Security.Principal.SecurityIdentifier]) {
-                    $rule.IdentityReference.Value
-                } else {
-                    $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
-                }
-                if ($sid -in $broadWriteSids -and (($rule.FileSystemRights -band $writeMask) -ne 0)) {
-                    return $false
-                }
-            }
-            if ($current.Equals($matchedRoot, [StringComparison]::OrdinalIgnoreCase)) { break }
-            $current = Split-Path -Parent $current
-            if ([string]::IsNullOrWhiteSpace($current)) { return $false }
-        }
-        return $true
-    } catch { return $false }
-}
-
-function Initialize-BootUpdateSpectreConsole {
-    if (-not $script:TuiInteractive) { return }
-
-    $module = Get-Module -ListAvailable -Name $script:SpectreModuleName |
-        Where-Object { $_ -and $_.Path -and (Test-BootUpdateSpectreModulePath -Path $_.Path) } |
-        Sort-Object Version -Descending | Select-Object -First 1
-
-    if (-not $module) {
-        if ($WhatIfPreference) {
-            Write-Log 'PwshSpectreConsole is not installed; skipped installation under WhatIf.' -Visibility Debug
-            return
-        }
-        if ($PSVersionTable.PSVersion -lt [version]'7.4') {
-            Write-Log "PwshSpectreConsole requires PowerShell 7.4+; using native console rendering on $($PSVersionTable.PSVersion)." -Visibility Debug
-            return
-        }
-
-        try {
-            Write-Log "Installing PwshSpectreConsole $($script:SpectreInstallVersion) for all users." -Visibility Debug
-            if (Get-Command Install-PSResource -ErrorAction SilentlyContinue) {
-                Install-PSResource -Name $script:SpectreModuleName `
-                    -Version $script:SpectreInstallVersion -Repository PSGallery `
-                    -Scope AllUsers -TrustRepository -AcceptLicense -Quiet `
-                    -ProgressAction SilentlyContinue -ErrorAction Stop
-            } elseif (Get-Command Install-Module -ErrorAction SilentlyContinue) {
-                Install-Module -Name $script:SpectreModuleName `
-                    -RequiredVersion $script:SpectreInstallVersion -Repository PSGallery `
-                    -Scope AllUsers -Force -AllowClobber `
-                    -ProgressAction SilentlyContinue -ErrorAction Stop
-            } else {
-                throw 'Neither Install-PSResource nor Install-Module is available.'
-            }
-            $module = Get-Module -ListAvailable -Name $script:SpectreModuleName |
-                Where-Object { $_ -and $_.Path -and (Test-BootUpdateSpectreModulePath -Path $_.Path) } |
-                Sort-Object Version -Descending | Select-Object -First 1
-            if (-not $module) { throw 'The module was not discoverable after installation.' }
-        } catch {
-            Write-Log "PwshSpectreConsole installation failed; using native console rendering: $_" -Level Warn
-            return
-        }
-    }
-
-    try {
-        Import-Module -Name $module.Path -ErrorAction Stop
-        if (-not (Get-Command 'PwshSpectreConsole\Write-SpectreHost' -ErrorAction SilentlyContinue)) {
-            throw 'Write-SpectreHost is unavailable.'
-        }
-        $script:SpectreEnabled = $true
-        Write-Log "PwshSpectreConsole $($module.Version) enabled for interactive phase rendering." -Visibility Debug
-    } catch {
-        Write-Log "PwshSpectreConsole import failed; using native console rendering: $_" -Level Warn
-    }
-}
-
-function Write-BootUpdateSpectreText {
-    param(
-        [Parameter(Mandatory)][string]$Message,
-        [Parameter(Mandatory)][ValidateSet('cyan bold','green','red')][string]$Style
-    )
-    Clear-BootUpdateProgressLine
-    if (-not $script:SpectreEnabled) { return $false }
-    try {
-        $escaped = [Spectre.Console.Markup]::Escape($Message)
-        PwshSpectreConsole\Write-SpectreHost -Message "[$Style]$escaped[/]"
-        return $true
-    } catch {
-        $script:SpectreEnabled = $false
-        Write-Log "Spectre rendering failed; reverting to native console rendering: $_" -Level Warn
-        return $false
     }
 }
 
@@ -3436,7 +3323,6 @@ function Write-PhaseHeader {
     $label = "[$Num/$Total] $Name"
     $pad = 66 - $label.Length; if ($pad -lt 3) { $pad = 3 }
     Write-Host ""
-    if (Write-BootUpdateSpectreText -Message "  --- $label $('-' * $pad)" -Style 'cyan bold') { return }
     Write-Host "$c$b  --- $w$label $c$('-' * $pad)$r"
 }
 
@@ -3448,12 +3334,13 @@ function Write-PhaseResult {
     $e = [char]27; $g = "$e[32m"; $red = "$e[31m"; $r = "$e[0m"
     $countMsg = if ($Count -gt 0) { ", $Count pkg" } else { '' }
     $t = "$([math]::Round($Minutes, 1)) min"
+    Clear-BootUpdateProgressLine
     if ($Success) {
         $message = ">>> [$Num/$Total] $Name done ($t$countMsg)"
-        if (-not (Write-BootUpdateSpectreText -Message "  $message" -Style green)) { Write-Host "$g  $message$r" }
+        Write-Host "$g  $message$r"
     } else {
         $message = "!!! [$Num/$Total] $Name FAILED ($t)"
-        if (-not (Write-BootUpdateSpectreText -Message "  $message" -Style red)) { Write-Host "$red  $message$r" }
+        Write-Host "$red  $message$r"
     }
 }
 
@@ -4842,10 +4729,6 @@ if (Test-BootUpdateOutputAtLeast -Minimum Normal) {
 } else {
     $script:_splashShown = $false
 }
-
-<# Optional rich rendering initializes only after preview has exited, this process owns
-   the mutex, and the splash has remained the first screen. Native rendering stays live. #>
-Initialize-BootUpdateSpectreConsole
 
 <# lz1: Self-update — runs after mutex, before pre-flight. Skips under SYSTEM.
    If a newer version is downloaded and validated, re-execs and never returns.

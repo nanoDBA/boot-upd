@@ -60,18 +60,14 @@ Press `v` at any time during an interactive run to cycle through:
 
 Choose the initial view explicitly with `-OutputMode Quiet|Normal|Verbose|Debug`, or set
 `OutputMode` in `Deploy-BootUpdateCycle.ps1`. The interactive `BOOT//PULSE` row uses a
-fixed-width ASCII comet with the splash palette's cyan, magenta, blue, and acid-green pulse.
+fixed-width ASCII comet with a smooth 48-step fade through the splash palette's cyan, blue,
+magenta, and acid-green anchors. Motion and color advance independently, avoiding abrupt flashes.
 ASCII status text is kept immutable; non-ASCII glyphs are represented safely in the live row while
 remaining untouched in the log. Key polling and animation disable themselves under SYSTEM,
 redirected output, and non-console hosts; file logging is unchanged.
 
-On an interactive PowerShell 7.4+ console, the updater uses
-[`PwshSpectreConsole`](https://github.com/ShaunLawrie/PwshSpectreConsole) for richer phase and
-result lines. If no protected all-users copy is available, the pinned stable release is installed
-from PSGallery under Program Files; user-writable module copies are never imported by the elevated
-updater. Existing protected installations are left unchanged. Offline runs, older PowerShell
-versions, `-WhatIf`, SYSTEM, redirected output, and any install/import failure automatically keep
-the native renderer. The themed splash is independent of Spectre and remains unchanged.
+All console rendering is built in; the updater does not install or import a third-party TUI module.
+Phase headers and results use native ANSI/console output, and the themed splash remains unchanged.
 
 To visually smoke-test animation without running any package updates:
 
@@ -79,7 +75,7 @@ To visually smoke-test animation without running any package updates:
 .\tools\Show-BootUpdateProgressDemo.ps1
 ```
 
-The demo renders the same ten-frame `BOOT//PULSE` comet and neon palette at the production
+The demo renders the same ten-frame `BOOT//PULSE` comet and interpolated neon gradient at the production
 100 ms cadence, includes the photographed Windows Update status text, accepts live `v` mode
 cycling, and restores its console row and cursor when complete.
 

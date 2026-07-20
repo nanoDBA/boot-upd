@@ -2,6 +2,7 @@ BeforeAll {
     $repoRoot = Split-Path $PSScriptRoot -Parent
     $invokePath = Join-Path $repoRoot 'Invoke-BootUpdateCycle.ps1'
     $deployPath = Join-Path $repoRoot 'Deploy-BootUpdateCycle.ps1'
+    $demoPath = Join-Path $repoRoot 'tools\Show-BootUpdateProgressDemo.ps1'
 
     function Get-ScriptAst {
         param([Parameter(Mandatory)][string]$Path)
@@ -30,8 +31,10 @@ BeforeAll {
 
     $invokeAst = Get-ScriptAst -Path $invokePath
     $deployAst = Get-ScriptAst -Path $deployPath
+    $demoAst = Get-ScriptAst -Path $demoPath
     $invokeSource = Get-Content -LiteralPath $invokePath -Raw
     $deploySource = Get-Content -LiteralPath $deployPath -Raw
+    $demoSource = Get-Content -LiteralPath $demoPath -Raw
 }
 
 Describe 'Concise output modes' {
@@ -85,7 +88,7 @@ Describe 'Interactive verbosity cycling' {
 }
 
 Describe 'Resilient rich progress rendering' {
-    It 'uses one custom live-row owner while retaining optional Spectre phase rendering' {
+    It 'uses one dependency-free custom live-row owner and native phase rendering' {
         $initialize = Get-FunctionText -Ast $invokeAst -Name 'Initialize-BootUpdateConsole'
         $progress = Get-FunctionText -Ast $invokeAst -Name 'Write-BootUpdateProgress'
         $writer = Get-FunctionText -Ast $invokeAst -Name 'Write-BootUpdateLiveText'
@@ -100,37 +103,9 @@ Describe 'Resilient rich progress rendering' {
         $clear | Should -Match '(?s)finally.*CursorVisible'
         $progress | Should -Not -Match 'Write-Progress'
         $invokeSource | Should -Not -Match '\$PSStyle\.Progress\.View'
-        (Get-FunctionText -Ast $invokeAst -Name 'Write-BootUpdateSpectreText') |
-            Should -Match 'PwshSpectreConsole\\Write-SpectreHost'
-    }
-
-    It 'installs a pinned stable module only for eligible interactive runs' {
-        $text = Get-FunctionText -Ast $invokeAst -Name 'Initialize-BootUpdateSpectreConsole'
-        $invokeSource | Should -Match "SpectreInstallVersion = \[version\]'2\.6\.3'"
-        $text | Should -Match '-not \$script:TuiInteractive'
-        $text | Should -Match '\$WhatIfPreference'
-        $text | Should -Match "PSVersion -lt \[version\]'7\.4'"
-        $text | Should -Match 'Install-PSResource'
-        $text | Should -Match 'Install-Module'
-        $text | Should -Match 'Scope AllUsers'
-        $text | Should -Match 'Repository PSGallery'
-        $invokeSource | Should -Match 'Join-Path \$env:ProgramFiles ''PowerShell\\Modules'''
-        $pathCheck = Get-FunctionText -Ast $invokeAst -Name 'Test-BootUpdateSpectreModulePath'
-        $pathCheck | Should -Match 'SpectreTrustedRoots'
-        $pathCheck | Should -Match 'OrdinalIgnoreCase'
-        $pathCheck | Should -Match 'ReparsePoint'
-        $pathCheck | Should -Match 'broadWriteSids'
-        $text | Should -Match 'using native console rendering'
-    }
-
-    It 'initializes Spectre only after preview exit, mutex acquisition, and the splash' {
-        $bootstrapCall = $invokeSource.LastIndexOf('Initialize-BootUpdateSpectreConsole')
-        $previewExit = $invokeSource.LastIndexOf('if ($PreviewSplash)')
-        $mutexCall = $invokeSource.LastIndexOf('if (-not (Enter-BootUpdateMutex))')
-        $splashCall = $invokeSource.LastIndexOf('Show-StartupArt')
-        $bootstrapCall | Should -BeGreaterThan $previewExit
-        $bootstrapCall | Should -BeGreaterThan $mutexCall
-        $bootstrapCall | Should -BeGreaterThan $splashCall
+        $invokeSource | Should -Not -Match '(?i)PwshSpectreConsole|Write-SpectreHost|Spectre\.Console'
+        (Get-FunctionText -Ast $invokeAst -Name 'Write-PhaseHeader') | Should -Match 'Write-Host'
+        (Get-FunctionText -Ast $invokeAst -Name 'Write-PhaseResult') | Should -Match 'Write-Host'
     }
 
     It 'connects phase, monitored-process, and parallel-cohort progress without committing the live row' {
@@ -153,55 +128,10 @@ Describe 'Resilient rich progress rendering' {
     }
 }
 
-Describe 'Spectre bootstrap behavior' {
-    BeforeAll {
-        . ([scriptblock]::Create((Get-FunctionText -Ast $invokeAst -Name 'Test-BootUpdateSpectreModulePath')))
-        . ([scriptblock]::Create((Get-FunctionText -Ast $invokeAst -Name 'Initialize-BootUpdateSpectreConsole')))
-        function Write-Log { param($Message, $Level, $Visibility) }
-    }
-
-    BeforeEach {
-        $script:TuiInteractive = $false
-        $script:SpectreEnabled = $false
-        $script:SpectreModuleName = 'PwshSpectreConsole'
-        $script:SpectreInstallVersion = [version]'2.6.3'
-        $script:SpectreTrustedRoots = @((Join-Path $env:ProgramFiles 'PowerShell\Modules'))
-        Mock Get-Module { return $null }
-        Mock Install-PSResource { }
-        Mock Import-Module { }
-    }
-
-    It 'does not discover, install, or import from a non-interactive session' {
-        Initialize-BootUpdateSpectreConsole
-        Should -Invoke Get-Module -Times 0
-        Should -Invoke Install-PSResource -Times 0
-        Should -Invoke Import-Module -Times 0
-    }
-
-    It 'does not install a missing module under WhatIf' {
-        $script:TuiInteractive = $true
-        $savedWhatIf = $WhatIfPreference
-        try {
-            $WhatIfPreference = $true
-            Initialize-BootUpdateSpectreConsole
-        } finally {
-            $WhatIfPreference = $savedWhatIf
-        }
-        Should -Invoke Get-Module -Times 1
-        Should -Invoke Install-PSResource -Times 0
-        Should -Invoke Import-Module -Times 0
-    }
-
-    It 'rejects a module manifest outside protected Program Files roots' {
-        $manifest = Join-Path $TestDrive 'PwshSpectreConsole.psd1'
-        Set-Content -LiteralPath $manifest -Value '@{}'
-        Test-BootUpdateSpectreModulePath -Path $manifest | Should -BeFalse
-    }
-}
-
 Describe 'Animated progress behavior' {
     BeforeAll {
         foreach ($functionName in @(
+            'New-BootUpdateNeonGradient',
             'Limit-BootUpdateConsoleText',
             'Get-BootUpdateProgressText',
             'Clear-BootUpdateProgressLine',
@@ -229,7 +159,8 @@ Describe 'Animated progress behavior' {
             '>>>.....', '.>>>....', '..>>>...', '...>>>..', '....>>>.', '.....>>>',
             '....<<<.', '...<<<..', '..<<<...', '.<<<....'
         )
-        $script:TuiNeonPalette = @('80;255;230','95;115;255','255;90;205','75;255;145')
+        $script:TuiNeonPalette = New-BootUpdateNeonGradient
+        $script:TuiColorIndex = 0
         $script:TuiRefreshMilliseconds = 50
         $script:TuiInProgressTick = $false
         $script:UiKeyPollCount = 0
@@ -264,6 +195,38 @@ Describe 'Animated progress behavior' {
         @($script:TuiSpinnerFrames | ForEach-Object Length | Select-Object -Unique) | Should -Be @(8)
         ($script:TuiSpinnerFrames -join '').ToCharArray() | ForEach-Object { [int]$_ | Should -BeLessOrEqual 127 }
         $script:TuiSpinnerIndex | Should -Be 2
+    }
+
+    It 'crossfades gradually around a closed splash-palette loop independent of comet motion' {
+        $script:TuiNeonPalette.Count | Should -Be 48
+        $colors = @($script:TuiNeonPalette | ForEach-Object {
+            ,([int[]]($_ -split ';'))
+        })
+        $largestStep = 0
+        for ($i = 0; $i -lt $colors.Count; $i++) {
+            $next = $colors[($i + 1) % $colors.Count]
+            for ($channel = 0; $channel -lt 3; $channel++) {
+                $largestStep = [math]::Max($largestStep, [math]::Abs($next[$channel] - $colors[$i][$channel]))
+            }
+        }
+        $largestStep | Should -BeLessOrEqual 15
+
+        1..12 | ForEach-Object {
+            Write-BootUpdateProgress -Activity 'Fade test' -Status 'Glowing'
+        }
+        @($script:ProgressCaptures.PaletteIndex) | Should -Be @(0..11)
+        $script:TuiSpinnerIndex | Should -Be 2
+        $script:TuiColorIndex | Should -Be 12
+    }
+
+    It 'keeps the visual demo on the production gradient and independent color counter' {
+        $demoGradient = & {
+            . ([scriptblock]::Create((Get-FunctionText -Ast $demoAst -Name 'New-NeonGradient')))
+            New-NeonGradient
+        }
+        @($demoGradient) | Should -Be @($script:TuiNeonPalette)
+        $demoSource | Should -Match '\$colorIndex\s*=\s*\(\$colorIndex \+ 1\) % \$palette\.Count'
+        $demoSource | Should -Not -Match '\$palette\[\$index'
     }
 
     It 'preserves the photographed status text code point for code point' {
