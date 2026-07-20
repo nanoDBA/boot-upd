@@ -5,6 +5,9 @@ scratch.ps1
 DEL_ALL*.CMD
 
 # Claude Code local settings
+# Codex local/remote conversation attachments
+.codex-remote-attachments/
+
 .claude/
 
 # Runtime artifacts (generated in ProgramData, not here, but just in case)
