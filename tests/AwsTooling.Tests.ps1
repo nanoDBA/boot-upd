@@ -27,6 +27,11 @@ BeforeAll {
 }
 
 Describe 'AWS.Tools publisher certificate rollover' {
+    It 'does not terminate unrelated PowerShell processes' {
+        $repairSource | Should -Not -Match 'Stop-Process'
+        $repairSource | Should -Not -Match 'Get-Process\s+-Name\s+[''\"]pwsh'
+    }
+
     It 'recognizes only the PowerShellGet AWS.Tools issuer-continuity error' {
         $valid = @'
 Authenticode issuer 'CN="Amazon Web Services, Inc.", OU=SDKs and Tools, O="Amazon Web Services, Inc."' of the new module 'AWS.Tools.Common' with version '5.0.256' is not matching with the authenticode issuer 'CN="Amazon Web Services, Inc.", OU=AWS, O="Amazon Web Services, Inc."' of the previously-installed module 'AWS.Tools.Common' with version '4.1.14'.

@@ -206,22 +206,10 @@ function Repair-AwsToolsModules {
     Import-Module AWS.Tools.Installer -Force
 
     if ($Mode -eq 'Remediate') {
-        # Kill other PowerShell processes that might have AWS modules loaded.
-        # Aggressive, but this runs during boot update — no user sessions should be active.
-        $myPid = $PID
-        $pwshProcs = Get-Process -Name 'pwsh', 'powershell' -ErrorAction SilentlyContinue |
-            Where-Object { $_.Id -ne $myPid }
-        
-        if ($pwshProcs) {
-            Write-Host "  Killing $($pwshProcs.Count) other PowerShell process(es) to release module locks..."
-            $pwshProcs | ForEach-Object {
-                Write-Verbose "    Killing PID $($_.Id): $($_.ProcessName)"
-                $_ | Stop-Process -Force -ErrorAction SilentlyContinue
-            }
-            Start-Sleep -Milliseconds 500  # Let file handles release
-        }
-        
         # Run update in SUBPROCESS — guarantees clean module state in child process.
+        # Do not terminate other PowerShell sessions to release module locks. If an
+        # old module is genuinely locked, verified installation may still succeed
+        # and cleanup will fail closed while retaining that old version.
         Write-Host "  Running AWS.Tools update in subprocess..."
         
         $scriptBlock = @'
