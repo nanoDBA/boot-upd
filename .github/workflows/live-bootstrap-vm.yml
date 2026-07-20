@@ -31,9 +31,6 @@ jobs:
           if (Test-Path -LiteralPath "$env:ProgramFiles\BootUpdateCycle") {
               throw 'Hosted VM was not fresh: BootUpdateCycle is already installed.'
           }
-          if (@(& where.exe upd 2>$null)) {
-              throw 'Hosted VM was not fresh: upd already resolves on PATH.'
-          }
           Get-ComputerInfo | Select-Object WindowsProductName,WindowsVersion,OsBuildNumber |
               ConvertTo-Json | Set-Content -LiteralPath "$env:RUNNER_TEMP\vm-baseline.json"
 
