@@ -1,8 +1,18 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.36
+**Current Version:** v2.5.37
 **Release Date:** 2026-07-20
 **Status:** STABLE
+
+---
+
+## v2.5.37 (2026-07-20)
+
+### Choose the command after verified installation
+
+- Adds an optional post-install prompt that appears only after the complete release bundle has passed checksum, version, syntax, transactional commit, and post-copy verification.
+- Safely tokenizes quoted commands and options with Windows command-line rules instead of evaluating user input as PowerShell.
+- Makes the short Chocolatey-style README bootstrap interactive by default while retaining explicit argument arrays for automation.
 
 ---
 

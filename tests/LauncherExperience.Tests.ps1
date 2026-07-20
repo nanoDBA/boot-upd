@@ -217,6 +217,10 @@ exit 29
         $readme |
             Should -Match 'powershell\.exe -NoProfile -ExecutionPolicy Bypass.*releases/latest/download/Install-UpdCompat\.ps1'
         $readme | Should -Match '\[ScriptBlock\]::Create\(\(Invoke-RestMethod -UseBasicParsing.*Install-UpdCompat\.ps1'
+        $readme | Should -Match 'Install-UpdCompat\.ps1''\)\)\) -PromptForArguments'
+        $compatInstallerSource | Should -Match 'PromptForArguments=\[bool\]\$PromptForArguments'
+        $compatInstallerSource.IndexOf("Write-Host 'The verified updater is ready") |
+            Should -BeGreaterThan $compatInstallerSource.IndexOf('Committed bundle verification failed')
     }
 
     It 'coheres release versions and detects cloud races around every bundle commit' {
@@ -317,6 +321,32 @@ exit 29
 }
 
 Describe 'Windows PowerShell 5.1 bootstrap with PowerShell 7 parallel runtime' {
+    It 'safely preserves quoted post-install arguments under Windows PowerShell 5.1' {
+        $converter = $compatInstallerAst.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq 'ConvertFrom-CompatCommandLine'
+        },$true) | Select-Object -First 1
+        $converter | Should -Not -BeNullOrEmpty
+
+        $helperPath = Join-Path $TestDrive 'compat-command-line.ps1'
+        Set-Content -LiteralPath $helperPath -Value $converter.Extent.Text -Encoding utf8
+        $probe = @"
+. '$($helperPath.Replace("'","''"))'
+`$actual = @(ConvertFrom-CompatCommandLine -Line 'run --exclude "Teams, One Drive" --delay 120')
+`$expected = @('run','--exclude','Teams, One Drive','--delay','120')
+if (`$actual.Count -ne `$expected.Count) { exit 7 }
+for (`$index=0; `$index -lt `$expected.Count; `$index++) {
+    if (`$actual[`$index] -cne `$expected[`$index]) { exit 8 }
+}
+exit 0
+"@
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($probe))
+        $output = @(& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -EncodedCommand $encoded 2>&1)
+        if ($LASTEXITCODE -ne 0) { throw "Windows PowerShell argument parser probe failed: $($output -join "`n")" }
+        $LASTEXITCODE | Should -Be 0
+    }
+
     It 'atomically replaces an existing file under Windows PowerShell 5.1 with a concrete backup path' {
         $replacer = $compatInstallerAst.FindAll({
             param($node)

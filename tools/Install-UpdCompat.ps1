@@ -14,6 +14,7 @@
 param(
     [string]$InstallRoot = '',
     [string[]]$CommandArguments = @('help'),
+    [switch]$PromptForArguments,
     [string]$Repository = 'nanoDBA/boot-upd',
     [Parameter(DontShow)][string]$EncodedArguments = ''
 )
@@ -24,6 +25,7 @@ if ($EncodedArguments) {
         $decoded = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($EncodedArguments)) | ConvertFrom-Json
         $InstallRoot = [string]$decoded.InstallRoot
         $CommandArguments = @($decoded.CommandArguments | ForEach-Object { [string]$_ })
+        $PromptForArguments = [bool]$decoded.PromptForArguments
         $Repository = [string]$decoded.Repository
     } catch { throw 'Compatibility-installer elevation arguments are malformed.' }
 }
@@ -102,8 +104,38 @@ function Set-CompatStagedFile {
     }
 }
 
+function ConvertFrom-CompatCommandLine {
+    param([Parameter(Mandatory)][string]$Line)
+
+    if (-not ('BootUpdateCycle.CompatNativeArgv' -as [type])) {
+        Add-Type -Namespace BootUpdateCycle -Name CompatNativeArgv -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("shell32.dll", SetLastError=true)]
+public static extern System.IntPtr CommandLineToArgvW(
+    [System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.LPWStr)] string commandLine,
+    out int argumentCount);
+
+[System.Runtime.InteropServices.DllImport("kernel32.dll")]
+public static extern System.IntPtr LocalFree(System.IntPtr memory);
+'@
+    }
+
+    $count = 0
+    $pointer = [BootUpdateCycle.CompatNativeArgv]::CommandLineToArgvW($Line,[ref]$count)
+    if ($pointer -eq [IntPtr]::Zero) { throw 'Could not parse the requested updater arguments.' }
+    try {
+        $result = @()
+        for ($index=0; $index -lt $count; $index++) {
+            $argumentPointer = [Runtime.InteropServices.Marshal]::ReadIntPtr($pointer,$index * [IntPtr]::Size)
+            $result += [Runtime.InteropServices.Marshal]::PtrToStringUni($argumentPointer)
+        }
+        return $result
+    } finally {
+        [void][BootUpdateCycle.CompatNativeArgv]::LocalFree($pointer)
+    }
+}
+
 if (-not (Test-CompatAdministrator)) {
-    $payload = [ordered]@{ InstallRoot=$InstallRoot; CommandArguments=@($CommandArguments); Repository=$Repository }
+    $payload = [ordered]@{ InstallRoot=$InstallRoot; CommandArguments=@($CommandArguments); PromptForArguments=[bool]$PromptForArguments; Repository=$Repository }
     $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject $payload -Compress)))
     $quotedScript = '"{0}"' -f $PSCommandPath
     $process = Start-Process -FilePath (Get-Process -Id $PID).Path -Verb RunAs -Wait -PassThru -ArgumentList @(
@@ -256,6 +288,19 @@ if ($machineEntries -notcontains $InstallRoot) {
     }
 }
 if (@($env:Path -split ';') -notcontains $InstallRoot) { $env:Path = "$InstallRoot;$env:Path" }
+
+if ($PromptForArguments) {
+    if ([Console]::IsInputRedirected) {
+        throw 'Cannot prompt for updater arguments because console input is redirected. Pass -CommandArguments explicitly.'
+    }
+    Write-Host ''
+    Write-Host 'The verified updater is ready. Choose what it should do now.' -ForegroundColor Cyan
+    Write-Host 'Examples: run | run --drivers --delay 120 | aws | help' -ForegroundColor DarkGray
+    $argumentLine = Read-Host 'upd command and options [run]'
+    if ([string]::IsNullOrWhiteSpace($argumentLine)) { $CommandArguments = @('run') }
+    else { $CommandArguments = @(ConvertFrom-CompatCommandLine -Line $argumentLine) }
+    if (-not $CommandArguments.Count) { $CommandArguments = @('run') }
+}
 
 & $targetBatch @CommandArguments
 exit $LASTEXITCODE

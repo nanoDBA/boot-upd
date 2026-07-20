@@ -51,7 +51,7 @@ Fresh install, repair, and run—the short Chocolatey-style paste for an elevate
 Command Prompt, PowerShell, or Win+R:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; & ([ScriptBlock]::Create((Invoke-RestMethod -UseBasicParsing 'https://github.com/nanoDBA/boot-upd/releases/latest/download/Install-UpdCompat.ps1'))) -CommandArguments run"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; & ([ScriptBlock]::Create((Invoke-RestMethod -UseBasicParsing 'https://github.com/nanoDBA/boot-upd/releases/latest/download/Install-UpdCompat.ps1'))) -PromptForArguments"
 ```
 
 If you prefer the downloaded bootstrap to remain visible in `%TEMP%` for inspection or
@@ -60,6 +60,11 @@ troubleshooting, use the equivalent download-and-run form:
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -UseBasicParsing 'https://github.com/nanoDBA/boot-upd/releases/latest/download/Install-UpdCompat.ps1' -OutFile ([IO.Path]::Combine([IO.Path]::GetTempPath(),'Install-UpdCompat.ps1')); & ([IO.Path]::Combine([IO.Path]::GetTempPath(),'Install-UpdCompat.ps1')) -CommandArguments run"
 ```
+
+The short form verifies and installs the complete bundle first, then prompts for an `upd`
+command and options; press Enter to run with defaults. To automate it, replace
+`-PromptForArguments` with an explicit array such as
+`-CommandArguments @('run','--drivers','--delay','120')`.
 
 Both convenience commands trust GitHub HTTPS and the repository's current latest release.
 The downloaded installer then verifies every runtime asset against its published SHA256
@@ -127,7 +132,7 @@ has exited**. It verifies the installer against the hash embedded below, then th
 verifies and transactionally replaces the complete release bundle before forwarding `aws`:
 
 ```powershell
-$u='https://github.com/nanoDBA/boot-upd/releases/download/v2.5.36/Install-UpdCompat.ps1'; $f=Join-Path $env:TEMP 'Install-UpdCompat-v2.5.36.ps1'; Invoke-WebRequest $u -OutFile $f; if((Get-FileHash $f -Algorithm SHA256).Hash -ne 'BEBF6F4AD105F7420B84F7DC152F72CA546D0433CC105A903671854BDD4F2293'){throw 'Compatibility installer hash mismatch'}; & $f -CommandArguments aws
+$u='https://github.com/nanoDBA/boot-upd/releases/download/v2.5.37/Install-UpdCompat.ps1'; $f=Join-Path $env:TEMP 'Install-UpdCompat-v2.5.37.ps1'; Invoke-WebRequest $u -OutFile $f; if((Get-FileHash $f -Algorithm SHA256).Hash -ne '27B5DC3F20DB7FF593900BC77CDC1DBC6B27188E6A1DB695360349510FD3FD8D'){throw 'Compatibility installer hash mismatch'}; & $f -CommandArguments aws
 ```
 
 This is the one-time chicken-and-egg escape hatch. It resolves the first `upd.cmd` on PATH,
