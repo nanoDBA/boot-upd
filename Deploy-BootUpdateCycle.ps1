@@ -13,6 +13,7 @@ param(
     [int]$RebootDelaySec,
     [ValidateSet('Quiet','Normal','Verbose','Debug')][string]$OutputMode,
     [ValidateRange(1,50)][int]$MaxIterations,
+    [ValidateRange(1,50)][int]$MaxRetryPasses,
     [ValidateRange(1,1440)][int]$PackageTimeoutMinutes,
     [switch]$StagedRollout,
     [switch]$IncludeDriverUpdates,
@@ -88,6 +89,7 @@ $Config = @{
     SkipBitLocker         = $false  # Do not suspend BitLocker for one orchestrated reboot
     DisableSelfUpdate     = $false  # Suppress GitHub release self-update
     MaxIterations         = 5       # Safety valve for reboot loops
+    MaxRetryPasses        = 5       # Consecutive same-boot recovery failures
     PackageTimeoutMin     = 30      # Minutes before killing a hung package manager (hard timeout)
                                     # Smart idle detection kills stuck processes after 5 min of no CPU
     RebootDelaySec        = 0       # Seconds before forced reboot (0 = immediate, /f = force-close apps, no abort)
@@ -122,6 +124,7 @@ $Config = @{
 if ($PSBoundParameters.ContainsKey('RebootDelaySec')) { $Config.RebootDelaySec = $RebootDelaySec }
 if ($PSBoundParameters.ContainsKey('OutputMode')) { $Config.OutputMode = $OutputMode }
 if ($PSBoundParameters.ContainsKey('MaxIterations')) { $Config.MaxIterations = $MaxIterations }
+if ($PSBoundParameters.ContainsKey('MaxRetryPasses')) { $Config.MaxRetryPasses = $MaxRetryPasses }
 if ($PSBoundParameters.ContainsKey('PackageTimeoutMinutes')) { $Config.PackageTimeoutMin = $PackageTimeoutMinutes }
 foreach ($name in @('StagedRollout','IncludeDriverUpdates','IncludeFirmwareUpdates','UpdateWsl','UpdateContainers','AllowMetered','SkipPip','SkipNpm','SkipOffice365','SkipPowerShellModules','SkipScoop','SkipVscode','SkipDefender','SkipHealthCheck','SkipBitLocker','DisableSelfUpdate')) {
     if ($PSBoundParameters.ContainsKey($name)) { $Config[$name] = $true }
@@ -479,6 +482,7 @@ Write-Host "  If reboot: Task registered for SYSTEM at startup (machine scope on
 $invokeArgs = @{
     Force                = $true
     MaxIterations        = $Config.MaxIterations
+    MaxRetryPasses       = $Config.MaxRetryPasses
     PackageTimeoutMinutes = $Config.PackageTimeoutMin
     RebootDelaySec       = $Config.RebootDelaySec
     OutputMode           = $Config.OutputMode
@@ -686,6 +690,7 @@ function Register-ScheduledTaskNow {
         '-NoProfile', '-ExecutionPolicy Bypass'
         "-File `"$scriptPath`"", '-Force'
         "-MaxIterations $($Config.MaxIterations)"
+        "-MaxRetryPasses $($Config.MaxRetryPasses)"
         "-PackageTimeoutMinutes $($Config.PackageTimeoutMin)"
         "-RebootDelaySec $($Config.RebootDelaySec)"
         "-OutputMode $($Config.OutputMode)"

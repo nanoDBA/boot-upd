@@ -29,12 +29,23 @@ BeforeAll {
     foreach ($functionName in @(
         'Update-BootUpdateStateForBootSession',
         'Resolve-BootUpdateCompletionDisposition',
+        'Stop-BootUpdateAtRebootLimit',
+        'Stop-BootUpdateAtRetryLimit',
+        'Update-BootUpdateStagedRetryCount',
         'Get-NextMaintenanceWindowStart',
         'Test-WindowsUpdateConvergence'
     )) {
         . ([scriptblock]::Create((Get-FunctionText $invokeAst $functionName)))
     }
     function Write-Log { param([string]$Message, [string]$Level) }
+    function Set-BootUpdateState { param($State) }
+    function Write-EventLogEntry { param($EventId, $EntryType, $Message) }
+    function Send-CompletionNotification { param($Kind, $Title, $Message) }
+    function Show-CycleBanner { param($Title, $AnsiColor, $Info) }
+    function Unregister-BootUpdateTask {
+        $script:UnregisterCalls++
+        if ($script:FailUnregister) { throw 'simulated task removal failure' }
+    }
     function Invoke-BootUpdateBackgroundOperation { param($Name, $Status, $TimeoutMinutes, $ScriptBlock, $ArgumentList) }
 }
 
@@ -65,6 +76,106 @@ Describe 'Delayed and explicit reboot evidence' {
         $text | Should -Match '\$pending = @\(Get-ConfirmedPendingReboot\)'
         $text.IndexOf('$pending = @(Get-ConfirmedPendingReboot)') |
             Should -BeLessThan $text.IndexOf('Update-WingetPackages')
+    }
+}
+
+Describe 'Truthful reboot safety limit' {
+    It 'checks the reboot budget only after confirmed pending evidence exists' {
+        $cycle = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
+        $guard = Get-FunctionText $invokeAst 'Stop-BootUpdateAtRebootLimit'
+        $cycle | Should -Not -Match '\$state\.Iteration -gt \$MaxIterations'
+        ([regex]::Matches($cycle, 'Stop-BootUpdateAtRebootLimit')).Count | Should -Be 2
+        $guard | Should -Match '\$State\.RebootCount -lt \$script:MaxIterations'
+        $guard | Should -Match "Phase = 'LimitReached'"
+        $guard | Should -Match 'LimitRebootSignals = \$evidence'
+        $guard | Should -Not -Match 'Clear-BootUpdateState|Invoke-Hook'
+    }
+
+    It 'allows the final reboot to converge and preserves exact evidence only when still pending' {
+        $script:MaxIterations = 5
+        $script:StatePath = 'C:\ProgramData\BootUpdateCycle\BootUpdateCycle.state.json'
+        $script:UnregisterCalls = 0
+        $script:FailUnregister = $false
+        $signal = [pscustomobject]@{ Source='CBS'; Detail='RebootPending key present' }
+        $state = [pscustomobject]@{
+            RebootCount=4; Phase='Rebooting'; StartTime='2026-07-20T09:00:00Z'
+            LastRebootSignals=$null; LimitReachedAt=$null; LimitReason=$null; LimitRebootSignals=@()
+        }
+
+        (Stop-BootUpdateAtRebootLimit -State $state -PendingSignals @($signal) -Context 'before update phases') |
+            Should -BeFalse
+        $state.RebootCount = 5
+        (Stop-BootUpdateAtRebootLimit -State $state -PendingSignals @($signal) -Context 'before update phases') |
+            Should -BeTrue
+        $state.Phase | Should -Be 'LimitReached'
+        $state.LimitRebootSignals | Should -HaveCount 1
+        $state.LimitRebootSignals[0].Source | Should -Be 'CBS'
+        $state.LimitReason | Should -Match 'CBS: RebootPending key present'
+        $script:UnregisterCalls | Should -Be 1
+    }
+
+    It 'bounds same-boot failure recovery separately from completed reboots' {
+        $script:MaxRetryPasses = 3
+        $script:UnregisterCalls = 0
+        $script:FailUnregister = $false
+        $state = [pscustomobject]@{
+            ConsecutiveRetryCount=2; Phase='RetryPending'; StartTime='2026-07-20T09:00:00Z'
+            LimitReachedAt=$null; LimitReason=$null
+        }
+        (Stop-BootUpdateAtRetryLimit -State $state -IncompletePhases @('Defender')) | Should -BeFalse
+        $state.ConsecutiveRetryCount = 3
+        (Stop-BootUpdateAtRetryLimit -State $state -IncompletePhases @('Defender')) | Should -BeTrue
+        $state.Phase | Should -Be 'RetryLimitReached'
+        $state.LimitReason | Should -Match 'incomplete phases: Defender'
+        $script:UnregisterCalls | Should -Be 1
+    }
+
+    It 'does not charge successful staged advancement against the retry budget' {
+        $state = [pscustomobject]@{ ConsecutiveRetryCount=0 }
+        foreach ($phase in 1..8) {
+            Update-BootUpdateStagedRetryCount -State $state -TargetAttempted $true -TargetComplete $true |
+                Should -Be 0
+        }
+        foreach ($failure in 1..3) {
+            Update-BootUpdateStagedRetryCount -State $state -TargetAttempted $true -TargetComplete $false |
+                Should -Be $failure
+        }
+        Update-BootUpdateStagedRetryCount -State $state -TargetAttempted $true -TargetComplete $true |
+            Should -Be 0
+    }
+
+    It 'checks a stuck staged target before registering its next near-term retry' {
+        $cycle = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
+        $stagedStart = $cycle.IndexOf('$stagedRetryCount = Update-BootUpdateStagedRetryCount')
+        $stagedStop = $cycle.IndexOf('Stop-BootUpdateAtRetryLimit', $stagedStart)
+        $stagedRegister = $cycle.IndexOf('Register-BootUpdateTaskForReboot -RetrySoon', $stagedStart)
+        $stagedStart | Should -BeGreaterThan 0
+        $stagedStop | Should -BeGreaterThan $stagedStart
+        $stagedStop | Should -BeLessThan $stagedRegister
+    }
+
+    It 'verifies both continuation tasks are absent before claiming they were removed' {
+        $text = Get-FunctionText $invokeAst 'Unregister-BootUpdateTask'
+        ([regex]::Matches($text, 'Get-ScheduledTask')).Count | Should -BeGreaterOrEqual 2
+        $text | Should -Match 'Could not verify removal of scheduled task'
+        $guard = Get-FunctionText $invokeAst 'Stop-BootUpdateAtRebootLimit'
+        $guard.IndexOf('Unregister-BootUpdateTask') | Should -BeLessThan $guard.IndexOf('Send-CompletionNotification')
+        $guard | Should -Match "Phase = 'LimitDisarmFailed'"
+    }
+
+    It 'retains a distinct terminal state when task disarming cannot be verified' {
+        $script:MaxIterations = 1
+        $script:FailUnregister = $true
+        $state = [pscustomobject]@{
+            RebootCount=1; Phase='Rebooting'; StartTime='2026-07-20T09:00:00Z'
+            LastRebootSignals=$null; LimitReachedAt=$null; LimitReason=$null; LimitRebootSignals=@()
+        }
+        $signal = [pscustomobject]@{ Source='WU'; Detail='RebootRequired key present' }
+        (Stop-BootUpdateAtRebootLimit -State $state -PendingSignals @($signal) -Context 'after update phases') |
+            Should -BeTrue
+        $state.Phase | Should -Be 'LimitDisarmFailed'
+        $state.LimitReason | Should -Match 'simulated task removal failure'
+        $script:FailUnregister = $false
     }
 }
 
@@ -137,10 +248,21 @@ Describe 'Behavioral reboot state transitions' {
         $again.RebootCount | Should -Be 3
     }
 
-    It 'clears stale explicit evidence without inventing a reboot count outside Rebooting' {
+    It 'counts a surprise reboot persisted by native 1641 evidence before the post-phase checkpoint' {
+        $state = [pscustomobject]@{
+            LastBootSessionId='boot-a'; Phase='Chocolatey'; RebootCount=2
+            ExplicitRebootRequests=@([pscustomobject]@{ Source='Chocolatey-exit-1641'; Detail='restart initiated' })
+        }
+        $actual = Update-BootUpdateStateForBootSession -State $state -CurrentBootSessionId 'boot-b'
+        $actual.RebootCount | Should -Be 3
+        $actual.ExplicitRebootRequests | Should -BeNullOrEmpty
+        $actual.ConsecutiveRetryCount | Should -Be 0
+    }
+
+    It 'counts persisted native reboot evidence even if the post-phase marker was not reached' {
         $state = [pscustomobject]@{ LastBootSessionId='boot-a'; Phase='RetryPending'; RebootCount=2; ExplicitRebootRequests=@('3010') }
         $actual = Update-BootUpdateStateForBootSession -State $state -CurrentBootSessionId 'boot-b'
-        $actual.RebootCount | Should -Be 2
+        $actual.RebootCount | Should -Be 3
         $actual.ExplicitRebootRequests | Should -BeNullOrEmpty
     }
 }
@@ -231,7 +353,7 @@ Describe 'Evidence-backed completion' {
         $retryBranch | Should -Match 'R E C O V E R Y   P A S S   Q U E U E D'
         $retryBranch | Should -Match 'No action needed.*window may close'
         $retryBranch | Should -Match 'exit\s+0'
-        $retryBranch | Should -Not -Match 'exit\s+[1-9]'
+        $retryBranch | Should -Match 'Stop-BootUpdateAtRetryLimit[\s\S]*exit\s+3'
     }
 
     It 'continues treating Defender native exit code 2 as a retryable phase failure' {

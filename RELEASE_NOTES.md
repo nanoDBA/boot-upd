@@ -1,8 +1,22 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.39
+**Current Version:** v2.5.40
 **Release Date:** 2026-07-20
 **Status:** STABLE
+
+---
+
+## v2.5.40 (2026-07-20)
+
+### Truthful reboot safety limit
+
+- Counts completed Windows boot transitions instead of update passes, so the final allowed reboot always receives a settled pending-reboot probe and can converge cleanly.
+- Counts immediate native `1641` restart evidence even when Windows reboots before the normal post-phase checkpoint is written.
+- Stops only when confirmed reboot evidence remains after the reboot budget is exhausted; notifications name the exact sources instead of guessing that a stale signal is responsible.
+- Separately bounds permanently failing same-boot recovery passes with `MaxRetryPasses`, without misreporting them as reboot failures.
+- Persists a terminal checkpoint with timestamp, reason, and signal details for diagnosis, while disarming and verifying both resume tasks without deleting the evidence or firing the success-only `PostCycle` hook.
+- Makes terminal launches idempotent: they do not re-arm tasks or repeat alerts unless an operator explicitly raises the applicable budget.
+- Distinguishes update passes from completed reboots in the startup status, log, and Event Log.
 
 ---
 

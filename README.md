@@ -132,7 +132,7 @@ has exited**. It verifies the installer against the hash embedded below, then th
 verifies and transactionally replaces the complete release bundle before forwarding `aws`:
 
 ```powershell
-$u='https://github.com/nanoDBA/boot-upd/releases/download/v2.5.39/Install-UpdCompat.ps1'; $f=Join-Path $env:TEMP 'Install-UpdCompat-v2.5.39.ps1'; Invoke-WebRequest $u -OutFile $f; if((Get-FileHash $f -Algorithm SHA256).Hash -ne '1B638EBF37A79FA171601E59AC7C8A63CFE874F29CCFE1FDC9E0002FFBB583D6'){throw 'Compatibility installer hash mismatch'}; & $f -CommandArguments aws
+$u='https://github.com/nanoDBA/boot-upd/releases/download/v2.5.40/Install-UpdCompat.ps1'; $f=Join-Path $env:TEMP 'Install-UpdCompat-v2.5.40.ps1'; Invoke-WebRequest $u -OutFile $f; if((Get-FileHash $f -Algorithm SHA256).Hash -ne '1B638EBF37A79FA171601E59AC7C8A63CFE874F29CCFE1FDC9E0002FFBB583D6'){throw 'Compatibility installer hash mismatch'}; & $f -CommandArguments aws
 ```
 
 This is the one-time chicken-and-egg escape hatch. It resolves the first `upd.cmd` on PATH,
@@ -270,7 +270,8 @@ Edit the `$Config` block in `Deploy-BootUpdateCycle.ps1`:
 
 ```powershell
 $Config = @{
-    MaxIterations         = 5       # Safety valve
+    MaxIterations         = 5       # Maximum completed reboot cycles
+    MaxRetryPasses        = 5       # Consecutive failed recovery passes per boot
     PackageTimeoutMin     = 30      # Hard timeout per package manager
     RebootDelaySec        = 120     # Countdown before reboot (0 = immediate)
     SkipPip               = $false
