@@ -5,6 +5,7 @@ BeforeAll {
     $deployPath = Join-Path $repoRoot 'Deploy-BootUpdateCycle.ps1'
     $invokePath = Join-Path $repoRoot 'Invoke-BootUpdateCycle.ps1'
     $releasePath = Join-Path $repoRoot 'tools\New-Release.ps1'
+    $ps7BootstrapPath = Join-Path $repoRoot 'tools\Install-PowerShell7.ps1'
 
     function Get-ParsedScript {
         param([Parameter(Mandatory)][string]$Path)
@@ -21,6 +22,7 @@ BeforeAll {
     $deploySource = Get-Content -LiteralPath $deployPath -Raw
     $invokeSource = Get-Content -LiteralPath $invokePath -Raw
     $releaseSource = Get-Content -LiteralPath $releasePath -Raw
+    $ps7BootstrapSource = Get-Content -LiteralPath $ps7BootstrapPath -Raw
     $cmdSource = Get-Content -LiteralPath $cmdPath -Raw
 
     function Invoke-UpdCommand {
@@ -40,6 +42,8 @@ Describe 'Friendly launcher help' {
         $result.ExitCode | Should -Be 0
         $result.Text | Should -Match 'UPD // Boot Update Cycle'
         $result.Text | Should -Match 'upd demo'
+        $result.Text | Should -Match 'upd bootstrap'
+        $result.Text | Should -Match 'upd aws'
         $result.Text | Should -Match 'RUN OPTIONS'
     }
 
@@ -90,7 +94,7 @@ Describe 'Safe fun and planning commands' {
 
 Describe 'Checksummed launcher self-update handoff' {
     It 'requires checksum sidecars for every executable bundle asset' {
-        foreach ($asset in @('Invoke-BootUpdateCycle.ps1','Deploy-BootUpdateCycle.ps1','Invoke-UpdLauncher.ps1','Show-BootUpdateProgressDemo.ps1','Repair-AwsTooling.ps1','upd.cmd')) {
+        foreach ($asset in @('Invoke-BootUpdateCycle.ps1','Deploy-BootUpdateCycle.ps1','Invoke-UpdLauncher.ps1','Show-BootUpdateProgressDemo.ps1','Install-PowerShell7.ps1','Repair-AwsTooling.ps1','upd.cmd')) {
             $launcherSource | Should -Match ([regex]::Escape("Name='$asset'"))
         }
         $launcherSource | Should -Match '\$\(\$spec\.Name\)\.sha256'
@@ -101,7 +105,7 @@ Describe 'Checksummed launcher self-update handoff' {
     It 'stages the running batch file and adopts it only after PowerShell exits' {
         $launcherSource | Should -Match 'Name=''upd\.cmd''.*StageBatch=\$true'
         $cmdSource | Should -Match 'set "UPD_LAUNCHER=.*Invoke-UpdLauncher\.ps1"'
-        $cmdSource | Should -Match 'pwsh .*"%UPD_LAUNCHER%" %\*'
+        $cmdSource | Should -Match '"%UPD_PWSH%" .*"%UPD_LAUNCHER%" %\*'
         $cmdSource.IndexOf('set "UPD_EXIT=%errorlevel%"') | Should -BeLessThan $cmdSource.IndexOf('upd.cmd.next')
         $cmdSource | Should -Match 'adopt-staged-batch'
         $launcherSource | Should -Match 'Get-FileHash -LiteralPath \$staged'
@@ -110,7 +114,7 @@ Describe 'Checksummed launcher self-update handoff' {
     }
 
     It 'publishes the complete executable bundle with sidecars' {
-        foreach ($asset in @('Deploy-BootUpdateCycle.ps1','Invoke-BootUpdateCycle.ps1','upd.cmd','tools/Invoke-UpdLauncher.ps1','tools/Show-BootUpdateProgressDemo.ps1','Repair-AwsTooling.ps1')) {
+        foreach ($asset in @('Deploy-BootUpdateCycle.ps1','Invoke-BootUpdateCycle.ps1','upd.cmd','tools/Invoke-UpdLauncher.ps1','tools/Show-BootUpdateProgressDemo.ps1','tools/Install-PowerShell7.ps1','Repair-AwsTooling.ps1')) {
             $releaseSource | Should -Match ([regex]::Escape($asset))
         }
         $releaseSource | Should -Match '"\$name\.sha256"'
@@ -174,7 +178,7 @@ Describe 'Checksummed launcher self-update handoff' {
         Copy-Item $launcherPath (Join-Path $tools 'Invoke-UpdLauncher.ps1')
         Copy-Item $invokePath (Join-Path $root 'Invoke-BootUpdateCycle.ps1')
         Copy-Item $cmdPath (Join-Path $root 'upd.cmd')
-        $stale = (Get-Content $cmdPath -Raw) -replace 'BootUpdateCycleVersion=2\.5\.29','BootUpdateCycleVersion=1.0.0'
+        $stale = (Get-Content $cmdPath -Raw) -replace 'BootUpdateCycleVersion=2\.5\.30','BootUpdateCycleVersion=1.0.0'
         Set-Content (Join-Path $root 'upd.cmd.next') $stale -NoNewline
         $hash = (Get-FileHash (Join-Path $root 'upd.cmd.next') -Algorithm SHA256).Hash
         Set-Content (Join-Path $root 'upd.cmd.next.sha256') $hash -NoNewline
@@ -182,6 +186,61 @@ Describe 'Checksummed launcher self-update handoff' {
         $LASTEXITCODE | Should -Not -Be 0
         Test-Path (Join-Path $root 'upd.cmd.next') | Should -BeFalse
         Test-Path (Join-Path $root 'upd.cmd.next.sha256') | Should -BeFalse
+    }
+}
+
+Describe 'Windows PowerShell 5.1 bootstrap with PowerShell 7 parallel runtime' {
+    It 'runs its no-op installed-runtime path under Windows PowerShell' {
+        $output = & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $ps7BootstrapPath 2>&1
+        $LASTEXITCODE | Should -Be 0
+        ($output -join "`n") | Should -Match 'pwsh\.exe'
+    }
+
+    It 'uses supported install routes and validates the MSI publisher' {
+        $ps7BootstrapSource | Should -Match '#requires -Version 5\.1'
+        $ps7BootstrapSource | Should -Match "'Microsoft\.PowerShell'"
+        $ps7BootstrapSource | Should -Match 'PowerShell/PowerShell/releases\?per_page=20'
+        $ps7BootstrapSource | Should -Match 'Get-AuthenticodeSignature'
+        $ps7BootstrapSource | Should -Match "Status -ne 'Valid'"
+        $ps7BootstrapSource | Should -Match 'O=Microsoft Corporation'
+        $ps7BootstrapSource | Should -Match '3010'
+    }
+
+    It 'keeps read-only commands ahead of automatic runtime installation' {
+        $pwshCheck = $cmdSource.IndexOf('if defined UPD_PWSH goto runtime_ready')
+        $help = $cmdSource.IndexOf('goto ps5_help')
+        $bootstrapCall = $cmdSource.IndexOf('-File "%UPD_PS7_BOOTSTRAP%"')
+        $pwshCheck | Should -BeGreaterThan 0
+        $help | Should -BeGreaterThan $pwshCheck
+        $help | Should -BeLessThan $bootstrapCall
+        $cmdSource | Should -Match ':ps7_required(?s:.*?)no changes were made'
+    }
+
+    It 'behaviorally keeps help/version non-mutating when pwsh is unavailable' {
+        $findLabel = $cmdSource.LastIndexOf(':find_pwsh')
+        $findLabel | Should -BeGreaterThan 0
+        $simulated = $cmdSource.Substring(0,$findLabel) + ":find_pwsh`r`nset `"UPD_PWSH=`"`r`nexit /b 0`r`n"
+        $simulatedPath = Join-Path $TestDrive 'upd-ps5-only.cmd'
+        Set-Content -LiteralPath $simulatedPath -Value ($simulated -split '\r?\n') -Encoding ascii
+
+        $help = & cmd.exe /d /c "`"$simulatedPath`" help" 2>&1
+        $LASTEXITCODE | Should -Be 0
+        ($help -join "`n") | Should -Match 'Help is read-only'
+
+        $version = & cmd.exe /d /c "`"$simulatedPath`" v" 2>&1
+        $LASTEXITCODE | Should -Be 0
+        ($version -join "`n") | Should -Match 'v2\.5\.30.*runtime not installed'
+
+        $demo = & cmd.exe /d /c "`"$simulatedPath`" demo" 2>&1
+        $LASTEXITCODE | Should -Be 2
+        ($demo -join "`n") | Should -Match 'no changes were made'
+    }
+
+    It 'retains the PowerShell 7-only parallel orchestration engine' {
+        $invokeSource | Should -Match '^#requires -Version 7\.0'
+        $invokeSource | Should -Match 'Start-ThreadJob'
+        $invokeSource | Should -Match 'ForEach-Object -Parallel'
+        $invokeSource | Should -Match 'Join-Path \$env:ProgramFiles ''PowerShell\\7\\pwsh\.exe'''
     }
 }
 

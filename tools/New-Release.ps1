@@ -4,8 +4,8 @@
     Create a GitHub release with script assets and SHA256 sidecar files.
 
 .DESCRIPTION
-    Publishes the orchestrator, deployer, batch/typed launchers, demo, and AWS
-    repair helper plus a
+    Publishes the orchestrator, deployer, batch/typed launchers, PS7 bootstrap,
+    demo, and AWS repair helper plus a
     matching <asset>.sha256 sidecar for each, which activates the integrity
     checks in both self-update paths (Invoke lz1 and Deploy source self-update).
 
@@ -36,6 +36,7 @@ $assetSpecs = @(
     [pscustomobject]@{ Source='upd.cmd';                           Name='upd.cmd';                    Kind='Batch' }
     [pscustomobject]@{ Source='tools/Invoke-UpdLauncher.ps1';      Name='Invoke-UpdLauncher.ps1';     Kind='PowerShell' }
     [pscustomobject]@{ Source='tools/Show-BootUpdateProgressDemo.ps1'; Name='Show-BootUpdateProgressDemo.ps1'; Kind='PowerShell' }
+    [pscustomobject]@{ Source='tools/Install-PowerShell7.ps1';        Name='Install-PowerShell7.ps1'; Kind='PowerShell' }
     [pscustomobject]@{ Source='Repair-AwsTooling.ps1';             Name='Repair-AwsTooling.ps1';      Kind='PowerShell' }
 )
 

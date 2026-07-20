@@ -1,25 +1,63 @@
 @echo off
 setlocal
-:: BootUpdateCycleVersion=2.5.29
+:: BootUpdateCycleVersion=2.5.30
 :: Friendly entry point. Argument parsing, safe demo modes, and elevation live in
 :: tools\Invoke-UpdLauncher.ps1 so quoting and validation remain testable.
 
-where pwsh >nul 2>&1
-if errorlevel 1 (
-    echo ERROR: PowerShell 7 ^(pwsh^) was not found on PATH.
-    echo Install it with:  winget install Microsoft.PowerShell
-    exit /b 1
-)
-
 set "UPD_ROOT=%~dp0"
 set "UPD_LAUNCHER=%UPD_ROOT%tools\Invoke-UpdLauncher.ps1"
+set "UPD_PS7_BOOTSTRAP=%UPD_ROOT%tools\Install-PowerShell7.ps1"
+call :find_pwsh
+if defined UPD_PWSH goto runtime_ready
+
+:: Read-only commands remain read-only even on a Windows PowerShell 5.1-only box.
+if /i "%~1"=="/?" goto ps5_help
+if /i "%~1"=="?" goto ps5_help
+if /i "%~1"=="/help" goto ps5_help
+if /i "%~1"=="help" goto ps5_help
+if /i "%~1"=="-h" goto ps5_help
+if /i "%~1"=="--help" goto ps5_help
+if /i "%~1"=="usage" goto ps5_help
+if /i "%~1"=="--usage" goto ps5_help
+if /i "%~1"=="version" goto ps5_version
+if /i "%~1"=="v" goto ps5_version
+if /i "%~1"=="plan" goto ps7_required
+if /i "%~1"=="p" goto ps7_required
+if /i "%~1"=="status" goto ps7_required
+if /i "%~1"=="st" goto ps7_required
+if /i "%~1"=="splash" goto ps7_required
+if /i "%~1"=="sp" goto ps7_required
+if /i "%~1"=="demo" goto ps7_required
+if /i "%~1"=="d" goto ps7_required
+if /i "%~1"=="fun" goto ps7_required
+if /i "%~1"=="f" goto ps7_required
+if /i "%~1"=="bootstrap" set "UPD_BOOTSTRAP_ONLY=1"
+if /i "%~1"=="b" set "UPD_BOOTSTRAP_ONLY=1"
+
+if not exist "%UPD_PS7_BOOTSTRAP%" (
+    echo ERROR: PowerShell 7 bootstrap not found: "%UPD_PS7_BOOTSTRAP%"
+    echo Install PowerShell 7 with: winget install --id Microsoft.PowerShell --exact --source winget
+    exit /b 1
+)
+echo Windows PowerShell 5.1 detected; bootstrapping PowerShell 7 for parallel execution...
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%UPD_PS7_BOOTSTRAP%"
+if errorlevel 1 exit /b %errorlevel%
+call :find_pwsh
+if not defined UPD_PWSH (
+    echo ERROR: PowerShell 7 was installed but pwsh.exe could not be located.
+    exit /b 1
+)
+if defined UPD_BOOTSTRAP_ONLY if not exist "%UPD_LAUNCHER%" goto bootstrap
+if defined UPD_BOOTSTRAP_ONLY goto bootstrap_help
+
+:runtime_ready
 if /i "%~1"=="repair" goto bootstrap
 if not exist "%UPD_LAUNCHER%" goto bootstrap
 goto launch
 
 :bootstrap
 echo Recovering the checksummed UPD launcher from the latest GitHub release...
-pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $r=Invoke-RestMethod 'https://api.github.com/repos/nanoDBA/boot-upd/releases/latest' -Headers @{'User-Agent'='BootUpdateCycle-Bootstrap'} -TimeoutSec 15; $a=$r.assets|Where-Object name -eq 'Invoke-UpdLauncher.ps1'|Select-Object -First 1; $s=$r.assets|Where-Object name -eq 'Invoke-UpdLauncher.ps1.sha256'|Select-Object -First 1; if(-not $a -or -not $s){throw 'Latest release has no launcher/checksum pair'}; $e=((Invoke-RestMethod $s.browser_download_url -TimeoutSec 15)-split '\s+')[0].ToUpperInvariant(); if($e -notmatch '^[0-9A-F]{64}$'){throw 'Invalid launcher checksum'}; $t=[IO.Path]::GetTempFileName(); try{Invoke-WebRequest $a.browser_download_url -OutFile $t -TimeoutSec 60; if((Get-FileHash $t -Algorithm SHA256).Hash -ne $e){throw 'Launcher checksum mismatch'}; $x=$null;$z=$null;[void][Management.Automation.Language.Parser]::ParseFile($t,[ref]$x,[ref]$z);if($z.Count){throw $z[0].Message};New-Item -ItemType Directory -Path (Split-Path $env:UPD_LAUNCHER) -Force|Out-Null;Copy-Item $t $env:UPD_LAUNCHER -Force}finally{Remove-Item $t -Force -ErrorAction SilentlyContinue}"
+"%UPD_PWSH%" -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $r=Invoke-RestMethod 'https://api.github.com/repos/nanoDBA/boot-upd/releases/latest' -Headers @{'User-Agent'='BootUpdateCycle-Bootstrap'} -TimeoutSec 15; $a=$r.assets|Where-Object name -eq 'Invoke-UpdLauncher.ps1'|Select-Object -First 1; $s=$r.assets|Where-Object name -eq 'Invoke-UpdLauncher.ps1.sha256'|Select-Object -First 1; if(-not $a -or -not $s){throw 'Latest release has no launcher/checksum pair'}; $e=((Invoke-RestMethod $s.browser_download_url -TimeoutSec 15)-split '\s+')[0].ToUpperInvariant(); if($e -notmatch '^[0-9A-F]{64}$'){throw 'Invalid launcher checksum'}; $t=[IO.Path]::GetTempFileName(); try{Invoke-WebRequest $a.browser_download_url -OutFile $t -TimeoutSec 60; if((Get-FileHash $t -Algorithm SHA256).Hash -ne $e){throw 'Launcher checksum mismatch'}; $x=$null;$z=$null;[void][Management.Automation.Language.Parser]::ParseFile($t,[ref]$x,[ref]$z);if($z.Count){throw $z[0].Message};New-Item -ItemType Directory -Path (Split-Path $env:UPD_LAUNCHER) -Force|Out-Null;Copy-Item $t $env:UPD_LAUNCHER -Force}finally{Remove-Item $t -Force -ErrorAction SilentlyContinue}"
 if errorlevel 1 (
     echo ERROR: Could not recover the UPD launcher.
     exit /b 1
@@ -28,12 +66,12 @@ if /i "%~1"=="repair" goto repair
 
 :launch
 
-pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%UPD_LAUNCHER%" %*
+"%UPD_PWSH%" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%UPD_LAUNCHER%" %*
 set "UPD_EXIT=%errorlevel%"
 goto adopt
 
 :repair
-pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%UPD_LAUNCHER%" update
+"%UPD_PWSH%" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%UPD_LAUNCHER%" update
 set "UPD_EXIT=%errorlevel%"
 
 :: The PowerShell bootstrap cannot safely replace the batch file that cmd.exe
@@ -41,7 +79,7 @@ set "UPD_EXIT=%errorlevel%"
 :: adopt a staged copy after the first PowerShell process exits.
 :adopt
 if exist "%UPD_ROOT%upd.cmd.next" (
-    pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%UPD_LAUNCHER%" adopt-staged-batch
+    "%UPD_PWSH%" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%UPD_LAUNCHER%" adopt-staged-batch
     if errorlevel 1 (
         echo WARNING: upd.cmd.next was rejected or could not be adopted.
     ) else (
@@ -49,3 +87,36 @@ if exist "%UPD_ROOT%upd.cmd.next" (
     )
 )
 exit /b %UPD_EXIT%
+
+:bootstrap_help
+"%UPD_PWSH%" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%UPD_LAUNCHER%" help
+exit /b %errorlevel%
+
+:ps5_help
+echo.
+echo   UPD // Boot Update Cycle
+echo   Windows PowerShell 5.1 is present; PowerShell 7 is not installed.
+echo.
+echo   upd bootstrap   Install PowerShell 7 side-by-side, then show full help
+echo   upd             Bootstrap PowerShell 7 and start the parallel update cycle
+echo   upd v           Show the bundled updater version without installing anything
+echo.
+echo   Help is read-only. Operational commands bootstrap PowerShell 7 automatically.
+exit /b 0
+
+:ps5_version
+echo Boot Update Cycle v2.5.30 ^(PowerShell 7 runtime not installed^)
+exit /b 0
+
+:ps7_required
+echo ERROR: This read-only command needs PowerShell 7; no changes were made.
+echo Run: upd bootstrap
+exit /b 2
+
+:find_pwsh
+set "UPD_PWSH="
+where pwsh.exe >nul 2>&1
+if not errorlevel 1 set "UPD_PWSH=pwsh.exe"
+if not defined UPD_PWSH if exist "%ProgramFiles%\PowerShell\7\pwsh.exe" set "UPD_PWSH=%ProgramFiles%\PowerShell\7\pwsh.exe"
+if not defined UPD_PWSH if exist "%LocalAppData%\Microsoft\WindowsApps\pwsh.exe" set "UPD_PWSH=%LocalAppData%\Microsoft\WindowsApps\pwsh.exe"
+exit /b 0

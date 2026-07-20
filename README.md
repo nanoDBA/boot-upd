@@ -27,7 +27,7 @@ When the configured work, convergence checks, reboot checks, service health, and
 
 <img src="docs/img/updater-complete.png" alt="Boot Update Cycle configured patch pass verified completion screen" width="900">
 
-<sub>Representative v2.5.29 console captures rendered from the production UI text for deterministic, privacy-safe documentation; package counts and elapsed time are illustrative.</sub>
+<sub>Representative v2.5.30 console captures rendered from the production UI text for deterministic, privacy-safe documentation; package counts and elapsed time are illustrative.</sub>
 
 ## What it updates
 
@@ -69,6 +69,7 @@ upd fun 12                       Splash parade followed by the animation
 upd update                       Refresh the checksummed launcher bundle and exit
 upd aws                          Update/repair AWS CLI v2 and AWS.Tools
 upd repair                       Recover missing/corrupt launcher and core files
+upd bootstrap                    Install/verify PowerShell 7, then show help
 upd version                      Show the bundled version
 upd status                       Show resume tasks and checkpoint state
 upd plan --drivers --delay 120   Resolve options without elevation or changes
@@ -95,6 +96,14 @@ boundary through the deployer's compatibility bridge, then use this staged hando
 subsequent runs. Use `upd u` to request the refresh explicitly or `-nu` to skip the
 automatic check for one run. `upd repair` can bootstrap a missing launcher and repair a
 missing or corrupt core bundle.
+
+Windows PowerShell 5.1 is supported as a bootstrap host. On an operational command,
+`upd.cmd` installs PowerShell 7 side-by-side using WinGet when available, or a
+Microsoft Authenticode-validated MSI on older Windows Server systems, then relaunches
+the PS7 updater. Help and version remain read-only; preview/plan/status commands ask
+the user to run `upd bootstrap` rather than silently installing anything. The updater
+itself remains PowerShell 7-only so `Start-ThreadJob` and `ForEach-Object -Parallel`
+execution are preserved.
 
 Run `upd help` for the complete list, including provider opt-ins, skip switches,
 timeouts, iteration limits, health/BitLocker controls, include/exclude filters, and
@@ -166,7 +175,7 @@ upd 120    # 2-minute countdown — users can cancel with: shutdown /a
 ## Requirements
 
 - **Windows 10/11**
-- **PowerShell 7+** (`pwsh`)
+- **PowerShell 7+ runtime** (`upd.cmd` can install it side-by-side from Windows PowerShell 5.1)
 - **Administrator privileges**
 
 Package managers are auto-detected. Missing ones are skipped with a warning.
@@ -176,6 +185,8 @@ Package managers are auto-detected. Missing ones are skipped with a warning.
 | File | Purpose |
 |------|---------|
 | `upd.cmd` | Entry point — run this |
+| `tools/Invoke-UpdLauncher.ps1` | Typed commands, compact aliases, UAC boundary, and runtime-bundle updates |
+| `tools/Install-PowerShell7.ps1` | Windows PowerShell 5.1-compatible PS7 bootstrap |
 | `Deploy-BootUpdateCycle.ps1` | Deploys scripts to ProgramData + runs first iteration |
 | `Invoke-BootUpdateCycle.ps1` | The orchestrator — runs all updates, manages reboots |
 | `Register-BootUpdateTask.ps1` | Standalone task registration (alternative to Deploy) |

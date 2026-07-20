@@ -1,8 +1,20 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.29
+**Current Version:** v2.5.30
 **Release Date:** 2026-07-20
 **Status:** STABLE
+
+---
+
+## v2.5.30 (2026-07-20)
+
+**Windows PowerShell 5.1 can open the door; PowerShell 7 still runs the machine.**
+
+- Adds a Windows PowerShell 5.1-compatible bootstrap that installs PowerShell 7 side-by-side through WinGet or a Microsoft Authenticode-validated stable MSI fallback.
+- Keeps help and version non-mutating on PS5-only systems and requires explicit `upd bootstrap` before read-only preview, plan, or status commands.
+- Automatically bootstraps PowerShell 7 for operational update, repair, and AWS commands, then relaunches the typed launcher under `pwsh`.
+- Preserves the PowerShell 7-only orchestrator, `Start-ThreadJob`, `ForEach-Object -Parallel`, and absolute-`pwsh` scheduled resume paths.
+- Adds the bootstrap to the checksummed transactional runtime bundle and release assets.
 
 ---
 

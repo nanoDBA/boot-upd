@@ -42,6 +42,7 @@ $repoRoot = Split-Path $PSScriptRoot -Parent
 $deployPath = Join-Path $repoRoot 'Deploy-BootUpdateCycle.ps1'
 $invokePath = Join-Path $repoRoot 'Invoke-BootUpdateCycle.ps1'
 $demoPath = Join-Path $PSScriptRoot 'Show-BootUpdateProgressDemo.ps1'
+$ps7BootstrapPath = Join-Path $PSScriptRoot 'Install-PowerShell7.ps1'
 $awsPath = Join-Path $repoRoot 'Repair-AwsTooling.ps1'
 
 function Show-UpdHelp {
@@ -60,12 +61,13 @@ function Show-UpdHelp {
     upd update                 Refresh the checksummed source bundle and exit
     upd aws                    Update/repair AWS CLI v2 and AWS.Tools
     upd repair                 Recover launcher/core files, then refresh the bundle
+    upd bootstrap              Verify that the PowerShell 7 runtime is ready
     upd status                 Show checkpoint/task status
     upd version                Show the bundled updater version
     upd help                   Show this screen
 
   SHORT COMMANDS
-    r=run  d=demo  f=fun  sp=splash  p=plan  u=update  a=aws  st=status  v=version
+    r=run  d=demo  f=fun  sp=splash  p=plan  u=update  a=aws  b=bootstrap  st=status  v=version
     Short commands do not take a leading dash.
 
   HELP ALIASES
@@ -210,6 +212,7 @@ function Update-UpdSourceBundle {
             [pscustomobject]@{ Name='Deploy-BootUpdateCycle.ps1'; Target=(Join-Path $repoRoot 'Deploy-BootUpdateCycle.ps1'); PowerShell=$true; StageBatch=$false }
             [pscustomobject]@{ Name='Invoke-UpdLauncher.ps1'; Target=$PSCommandPath; PowerShell=$true; StageBatch=$false }
             [pscustomobject]@{ Name='Show-BootUpdateProgressDemo.ps1'; Target=$demoPath; PowerShell=$true; StageBatch=$false }
+            [pscustomobject]@{ Name='Install-PowerShell7.ps1'; Target=$ps7BootstrapPath; PowerShell=$true; StageBatch=$false }
             [pscustomobject]@{ Name='Repair-AwsTooling.ps1'; Target=$awsPath; PowerShell=$true; StageBatch=$false }
             [pscustomobject]@{ Name='upd.cmd'; Target=(Join-Path $repoRoot 'upd.cmd'); PowerShell=$false; StageBatch=$true }
         )
@@ -357,7 +360,7 @@ if ($V -or $D -or $F -or $St) {
 
 $commandAliases = @{
     'r'='run'; 'd'='demo'; 'f'='fun'; 'sp'='splash'; 'p'='plan'
-    'u'='update'; 'a'='aws'; 'st'='status'; 'v'='version'
+    'u'='update'; 'a'='aws'; 'b'='bootstrap'; 'st'='status'; 'v'='version'
     '--demo'='demo'; '/demo'='demo'; '--fun'='fun'; '/fun'='fun'
 }
 if ($commandAliases.ContainsKey($Command.ToLowerInvariant())) {
@@ -395,6 +398,7 @@ switch ($Command.ToLowerInvariant()) {
         exit 0
     }
     'version' { Write-Host "Boot Update Cycle v$(Get-UpdVersion)"; exit 0 }
+    'bootstrap' { Write-Host "PowerShell $($PSVersionTable.PSVersion) runtime ready: $((Get-Process -Id $PID).Path)" -ForegroundColor Green; exit 0 }
     'status' { Show-UpdStatus; exit 0 }
     'plan' {
         [pscustomobject](Get-UpdDeployParameters) | Format-List
