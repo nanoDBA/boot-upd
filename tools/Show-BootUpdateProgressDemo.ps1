@@ -42,6 +42,7 @@ $deadline = [datetime]::UtcNow.AddSeconds($DurationSeconds)
 $index = 0
 $colorIndex = 0
 $renderedWidth = 0
+$renderedConsoleWidth = 0
 $cursorWasVisible = [Console]::CursorVisible
 $vt = [bool]$Host.UI.SupportsVirtualTerminal
 $escape = [char]27
@@ -72,10 +73,14 @@ try {
                 [Console]::Write("`r$(' ' * $clearWidth)`r")
             }
             $renderedWidth = 0
+            $renderedConsoleWidth = 0
         } elseif ($vt) {
             $rgb = $palette[$colorIndex]
-            [Console]::Write("`r$escape[2K$escape[1;38;2;${rgb}m$line$escape[0m")
+            $erase = if ($renderedConsoleWidth -gt 0 -and $renderedConsoleWidth -ne $width) { "$escape[2K" } else { '' }
+            $padding = [math]::Min([math]::Max(0, $renderedWidth - $line.Length), [math]::Max(0, $width - $line.Length))
+            [Console]::Write("`r$erase$escape[1;38;2;${rgb}m$line$(' ' * $padding)$escape[0m")
             $renderedWidth = $line.Length
+            $renderedConsoleWidth = $width
         } else {
             $padding = [math]::Min(
                 [math]::Max(0, $renderedWidth - $line.Length),
@@ -83,6 +88,7 @@ try {
             )
             [Console]::Write("`r$line$(' ' * $padding)")
             $renderedWidth = $line.Length
+            $renderedConsoleWidth = $width
         }
         $index++
         $colorIndex = ($colorIndex + 1) % $palette.Count

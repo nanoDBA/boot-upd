@@ -321,7 +321,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 3 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.25' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.26' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 
 <# Force UTF-8 console I/O so box-drawing/block chars (BBS splash) render in cmd.exe regardless of system code page.
    chcp 65001 sets conhost interpretation; [Console]::OutputEncoding makes .NET write proper UTF-8 bytes. #>
@@ -370,6 +370,7 @@ $script:TuiColorIndex = 0
 $script:TuiRefreshMilliseconds = 100
 $script:TuiSupportsVirtualTerminal = $false
 $script:TuiRenderedWidth = 0
+$script:TuiRenderedConsoleWidth = 0
 $script:TuiCursorWasVisible = $true
 $script:TuiCursorHidden = $false
 $script:TuiInProgressTick = $false
@@ -477,6 +478,7 @@ function Clear-BootUpdateProgressLine {
         }
         $script:TuiProgressActive = $false
         $script:TuiRenderedWidth = 0
+        $script:TuiRenderedConsoleWidth = 0
         $script:TuiCursorHidden = $false
     }
 }
@@ -500,13 +502,18 @@ function Write-BootUpdateLiveText {
         if ($script:TuiSupportsVirtualTerminal) {
             $escape = [char]27
             $rgb = $script:TuiNeonPalette[[math]::Abs($PaletteIndex % $script:TuiNeonPalette.Count)]
-            [Console]::Write("`r$escape[2K$escape[1;38;2;${rgb}m$Text$escape[0m")
+            $erase = if ($script:TuiRenderedConsoleWidth -gt 0 -and
+                $script:TuiRenderedConsoleWidth -ne $availableWidth) { "$escape[2K" } else { '' }
+            $paddingCount = [math]::Max(0, $script:TuiRenderedWidth - $Text.Length)
+            $paddingCount = [math]::Min($paddingCount, [math]::Max(0, $availableWidth - $Text.Length))
+            [Console]::Write("`r$erase$escape[1;38;2;${rgb}m$Text$(' ' * $paddingCount)$escape[0m")
         } else {
             $paddingCount = [math]::Max(0, $script:TuiRenderedWidth - $Text.Length)
             $paddingCount = [math]::Min($paddingCount, [math]::Max(0, $availableWidth - $Text.Length))
             [Console]::Write("`r$Text$(' ' * $paddingCount)")
         }
         $script:TuiRenderedWidth = $Text.Length
+        $script:TuiRenderedConsoleWidth = $availableWidth
         $script:TuiProgressActive = $true
     } catch {
         Clear-BootUpdateProgressLine

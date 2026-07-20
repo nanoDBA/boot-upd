@@ -1,8 +1,20 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.25
+**Current Version:** v2.5.26
 **Release Date:** 2026-07-20
 **Status:** STABLE
+
+---
+
+## v2.5.26 (2026-07-20)
+
+**Smooth ConsoleHost repaint without blank-frame stagger.**
+
+- Removed the full `CSI 2K` erase from every steady-state VT animation tick; frames now overwrite the owned row directly with bounded tail padding.
+- Retained full-line erasure for console-width changes, logs, verbosity transitions, completion, and error cleanup.
+- Preserved the v2.5.25 `| / - \` propeller, 100 ms cadence, and exact 48-step cyan/blue/magenta/acid-green glow.
+- Updated the demo and regression suite to enforce flicker-free steady-state writes and resize-safe clearing.
+- Kept every splash theme byte-identical.
 
 ---
 

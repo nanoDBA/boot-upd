@@ -66,6 +66,9 @@ ASCII status text is kept immutable; non-ASCII glyphs are represented safely in 
 remaining untouched in the log. Key polling and animation disable themselves under SYSTEM,
 redirected output, and non-console hosts; file logging is unchanged.
 
+On VT consoles, steady-state frames overwrite the owned row in place to avoid ConsoleHost flicker;
+a full erase is reserved for width changes, ordinary output, mode transitions, and cleanup.
+
 All console rendering is built in; the updater does not install or import a third-party TUI module.
 Phase headers and results use native ANSI/console output, and the themed splash remains unchanged.
 

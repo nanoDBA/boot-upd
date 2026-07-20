@@ -98,6 +98,9 @@ Describe 'Resilient rich progress rendering' {
         $progress | Should -Match 'TuiSpinnerFrames'
         $writer | Should -Match '\[Console\]::Write'
         $writer | Should -Match '\[2K'
+        $writer | Should -Match 'TuiRenderedConsoleWidth -ne \$availableWidth'
+        $writer | Should -Match '\$Text\$\('' '' \* \$paddingCount\)'
+        $writer | Should -Not -Match '\[Console\]::Write\("`r\$escape\[2K'
         $writer | Should -Not -Match 'ValidateRange\(0,1000000\)'
         $clear | Should -Match '\[2K'
         $clear | Should -Match '(?s)finally.*CursorVisible'
@@ -158,6 +161,7 @@ Describe 'Animated progress behavior' {
         $script:TuiSpinnerFrames = @('|', '/', '-', '\')
         $script:TuiNeonPalette = New-BootUpdateNeonGradient
         $script:TuiColorIndex = 0
+        $script:TuiRenderedConsoleWidth = 0
         $script:TuiRefreshMilliseconds = 50
         $script:TuiInProgressTick = $false
         $script:UiKeyPollCount = 0
@@ -177,6 +181,7 @@ Describe 'Animated progress behavior' {
             if ($script:TuiProgressActive) { $script:ClearCount++ }
             $script:TuiProgressActive = $false
             $script:TuiRenderedWidth = 0
+            $script:TuiRenderedConsoleWidth = 0
             $script:TuiCursorHidden = $false
         }
     }
@@ -228,6 +233,8 @@ Describe 'Animated progress behavior' {
         $demoSource | Should -Match ([regex]::Escape($demoFrames))
         $demoSource | Should -Match '\$colorIndex\s*=\s*\(\$colorIndex \+ 1\) % \$palette\.Count'
         $demoSource | Should -Not -Match '\$palette\[\$index'
+        $demoSource | Should -Match '\$renderedConsoleWidth -ne \$width'
+        $demoSource | Should -Not -Match '\[Console\]::Write\("`r\$escape\[2K\$escape\[1;38'
     }
 
     It 'preserves the photographed status text code point for code point' {
