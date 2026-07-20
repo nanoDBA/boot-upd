@@ -1,8 +1,17 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.41
+**Current Version:** v2.5.42
 **Release Date:** 2026-07-20
 **Status:** STABLE
+
+---
+
+## v2.5.42 (2026-07-20)
+
+### Resume-task verification and batch self-update fixes
+
+- Resume-chain verification no longer throws a false "wrong principal" for user-context tasks: Task Scheduler reports `DOMAIN\user` back as a bare user name, so the check now compares account SIDs (falling back to the leaf name) instead of raw strings.
+- `upd.cmd` no longer misreads itself after `adopt-staged-batch` replaces it on disk: the adopt call and the final exit are now a single physical line, so cmd.exe buffers the whole command before the file swap and never resumes reading the new file at a stale byte offset (previously surfaced as a garbled `'UPD_PWSHUPD_LAUNCHER" help' is not recognized` error).
 
 ---
 

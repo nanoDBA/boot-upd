@@ -337,7 +337,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 4 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.41' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.42' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 Set-Variable -Name 'RebootSignalSettleSeconds' -Value 20 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 $script:ExplicitRebootRequests = [System.Collections.Generic.List[object]]::new()
 
@@ -3256,7 +3256,19 @@ function Register-BootUpdateTaskForReboot {
         $expectedUser = [string]$expectedPrincipal[$registeredName]
         if ($expectedUser -eq 'SYSTEM') {
             if ($actualPrincipal -notin @('SYSTEM','S-1-5-18')) { throw "Resume task '$registeredName' has the wrong principal." }
-        } elseif ($actualPrincipal -ne $expectedUser) { throw "Resume task '$registeredName' has the wrong principal." }
+        } else {
+            <# Task Scheduler normalizes 'DOMAIN\user' to a bare user name on read-back;
+               compare SIDs (falling back to the leaf name) instead of raw strings. #>
+            $principalMatches = $false
+            try {
+                $expectedSid = ([System.Security.Principal.NTAccount]$expectedUser).Translate([System.Security.Principal.SecurityIdentifier]).Value
+                $actualSid   = ([System.Security.Principal.NTAccount]$actualPrincipal).Translate([System.Security.Principal.SecurityIdentifier]).Value
+                $principalMatches = ($expectedSid -eq $actualSid)
+            } catch {
+                $principalMatches = (($actualPrincipal -split '\\')[-1] -eq ($expectedUser -split '\\')[-1])
+            }
+            if (-not $principalMatches) { throw "Resume task '$registeredName' has the wrong principal." }
+        }
         if ([int]$task.Settings.RestartCount -ne 3) { throw "Resume task '$registeredName' is missing its retry policy." }
         $matchingAction = @($task.Actions | Where-Object {
             $_.Execute -eq $pwshPath -and $_.Arguments -eq $argString -and $_.WorkingDirectory -eq $PSScriptRoot

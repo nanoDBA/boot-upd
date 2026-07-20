@@ -1,6 +1,6 @@
 @echo off
 setlocal
-:: BootUpdateCycleVersion=2.5.41
+:: BootUpdateCycleVersion=2.5.42
 :: Friendly entry point. Argument parsing, safe demo modes, and elevation live in
 :: tools\Invoke-UpdLauncher.ps1 so quoting and validation remain testable.
 
@@ -102,19 +102,13 @@ goto adopt
 set "UPD_EXIT=%errorlevel%"
 
 :: The PowerShell bootstrap cannot safely replace the batch file that cmd.exe
-:: is currently reading. Ask the launcher to checksum/version-gate and atomically
-:: adopt a staged copy after the first PowerShell process exits.
+:: is currently reading. Adoption swaps this file on disk, so the adopt call and
+:: everything after it must be ONE physical line — cmd buffers a full line before
+:: executing, so nothing is re-read from the replaced file at a stale byte offset.
 :adopt
-if exist "%UPD_ROOT%upd.cmd.next" (
-    "%UPD_PWSH%" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%UPD_LAUNCHER%" adopt-staged-batch
-    if errorlevel 1 (
-        echo WARNING: upd.cmd.next was rejected or could not be adopted.
-    ) else (
-        echo Updated upd.cmd from the checksummed release bundle.
-    )
-)
 if defined UPD_BOOTSTRAP_ACTIVE del /f /q "%UPD_BOOTSTRAP_ACTIVE%" >nul 2>&1
-exit /b %UPD_EXIT%
+if not exist "%UPD_ROOT%upd.cmd.next" exit /b %UPD_EXIT%
+"%UPD_PWSH%" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%UPD_LAUNCHER%" adopt-staged-batch && (echo Updated upd.cmd from the checksummed release bundle.) || (echo WARNING: upd.cmd.next was rejected or could not be adopted.) & exit /b %UPD_EXIT%
 
 :bootstrap_help
 "%UPD_PWSH%" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%UPD_LAUNCHER%" help
@@ -133,7 +127,7 @@ echo   Help is read-only. Operational commands bootstrap PowerShell 7 automatica
 exit /b 0
 
 :ps5_version
-echo Boot Update Cycle v2.5.41 ^(PowerShell 7 runtime not installed^)
+echo Boot Update Cycle v2.5.42 ^(PowerShell 7 runtime not installed^)
 exit /b 0
 
 :ps7_required
