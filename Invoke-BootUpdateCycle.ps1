@@ -321,7 +321,9 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 3 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.26' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.27' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'RebootSignalSettleSeconds' -Value 20 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+$script:ExplicitRebootRequests = [System.Collections.Generic.List[object]]::new()
 
 <# Force UTF-8 console I/O so box-drawing/block chars (BBS splash) render in cmd.exe regardless of system code page.
    chcp 65001 sets conhost interpretation; [Console]::OutputEncoding makes .NET write proper UTF-8 bytes. #>
@@ -721,6 +723,7 @@ function New-BootUpdateStateV2 {
         LastPreflightNetworkOk = $null
         LastPreflightNetworkAt = $null
         LastRebootSignals     = $null
+        RebootCount           = 0
         Summary               = [pscustomobject]@{
             Winget = 0; Chocolatey = 0; WindowsUpdate = 0; Pip = 0; Npm = 0; Office365 = 0
             PowerShellModules = 0; Scoop = 0; DotnetTools = 0; Vscode = 0
@@ -767,6 +770,7 @@ function Update-BootUpdateStateSchema {
     foreach ($f in @('LastPhaseStarted','LastPhaseTimestamp','StagedNextPhase','LastPreflightNetworkOk','LastPreflightNetworkAt','LastRebootSignals')) {
         if ($props -notcontains $f) { $State | Add-Member -NotePropertyName $f -NotePropertyValue $null -Force }
     }
+    if ($props -notcontains 'RebootCount') { $State | Add-Member -NotePropertyName 'RebootCount' -NotePropertyValue ([math]::Max(0, [int]$State.Iteration - 1)) -Force }
     foreach ($f in @('WindowsUpdateDone','AwsToolingDone','PowerShellModulesDone','ScoopDone','DotnetToolsDone','VscodeDone','DefenderDone','DriverFirmwareDone','WslDone','ContainersDone')) {
         if ($props -notcontains $f) { $State | Add-Member -NotePropertyName $f -NotePropertyValue $false -Force }
     }
@@ -1224,6 +1228,29 @@ function Test-PendingReboot {
 
     return @($results)
 }
+
+function Get-ConfirmedPendingReboot {
+    <# Reboot indicators are not guaranteed to appear synchronously with an installer
+       returning. A clean result is therefore provisional: keep the live UI moving,
+       allow CBS/WU/installers to settle, then require a second independent clean read.
+       Explicit 3010/1641 evidence is durable for the process and bypasses the wait. #>
+    if ($script:ExplicitRebootRequests.Count -gt 0) {
+        return @($script:ExplicitRebootRequests)
+    }
+
+    $first = @(Test-PendingReboot)
+    if ($first.Count -gt 0) { return $first }
+
+    Write-Log "Final verification: first reboot probe is clean; allowing $($script:RebootSignalSettleSeconds)s for delayed servicing signals." -Visibility Verbose
+    Wait-BootUpdateUiInterval -Seconds $script:RebootSignalSettleSeconds `
+        -Activity 'VERIFY//SETTLE' -Status 'Watching for delayed Windows reboot signals' -PercentComplete 99
+
+    $second = @(Test-PendingReboot)
+    if ($script:ExplicitRebootRequests.Count -gt 0) {
+        return @($script:ExplicitRebootRequests) + $second
+    }
+    return $second
+}
 #endregion
 
 #region Smart Timeout
@@ -1341,7 +1368,11 @@ $sbText
 `$argList = (`'$argsJson`' | ConvertFrom-Json -NoEnumerate)
 if (`$argList -isnot [array]) { `$argList = @(`$argList) }
 try {
+    `$global:LASTEXITCODE = `$null
     & `$sb @argList 2>&1 | ForEach-Object { `$_.ToString() } | Out-File -FilePath '$($outputFile -replace "'","''")' -Encoding UTF8 -Append
+    if (`$null -ne `$LASTEXITCODE) {
+        "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-File -FilePath '$($outputFile -replace "'","''")' -Encoding UTF8 -Append
+    }
 } catch {
     "BOOTUPDATE_ERROR|`$(`$_.Exception.Message)" | Out-File -FilePath '$($outputFile -replace "'","''")' -Encoding UTF8 -Append
     exit 1
@@ -1364,13 +1395,32 @@ try {
         -IdleTimeoutMinutes $IdleTimeoutMinutes -HardTimeoutMinutes $HardTimeoutMinutes -PollIntervalSeconds 1
 
     $output = @()
-    if (Test-Path $outputFile) { $output = Get-Content $outputFile -Encoding UTF8 -EA SilentlyContinue; Remove-Item $outputFile -Force -EA SilentlyContinue }
+    if (Test-Path $outputFile) { $output = @(Get-Content $outputFile -Encoding UTF8 -EA SilentlyContinue); Remove-Item $outputFile -Force -EA SilentlyContinue }
+    $nativeExitCode = $null
+    $visibleOutput = [System.Collections.Generic.List[string]]::new()
+    foreach ($line in $output) {
+        if ($line -match '^BOOTUPDATE_NATIVE_EXIT\|(-?\d+)$') {
+            $nativeExitCode = [int]$Matches[1]
+            continue
+        }
+        $visibleOutput.Add($line)
+    }
+    $effectiveExitCode = if ($null -ne $nativeExitCode) { $nativeExitCode } else { $result.ExitCode }
+    $rebootRequired = $effectiveExitCode -in @(1641, 3010)
+    if ($rebootRequired) {
+        $script:ExplicitRebootRequests.Add([pscustomobject]@{
+            Source = "$Name-exit-$effectiveExitCode"
+            Status = 'Pending'
+            Detail = "$Name requested a reboot (native exit code $effectiveExitCode)"
+        })
+        Write-Log "$Name requested a reboot (native exit code $effectiveExitCode)." -Level Warn
+    }
     $timedOut = $result.Reason -in @('IdleTimeout','HardTimeout')
-    $failed = $timedOut -or $result.Reason -ne 'Completed' -or $result.ExitCode -ne 0
+    $failed = $timedOut -or $result.Reason -ne 'Completed' -or $effectiveExitCode -notin @(0, 1641, 3010)
     if ($timedOut) { Write-Log "${Name}: Killed ($($result.Reason)) after $([math]::Round($result.Elapsed.TotalMinutes,1))m. Will retry next boot." -Level Warn }
-    elseif ($failed) { Write-Log "${Name}: child process exited with code $($result.ExitCode)." -Level Warn }
+    elseif ($failed) { Write-Log "${Name}: child process exited with code $effectiveExitCode." -Level Warn }
     else { Write-Log "${Name}: Done in $([math]::Round($result.Elapsed.TotalMinutes,1))m" }
-    return @{ Output = $output; TimedOut = $timedOut; Failed = $failed; Reason = $result.Reason; Elapsed = $result.Elapsed; ExitCode = $result.ExitCode }
+    return @{ Output = $visibleOutput.ToArray(); TimedOut = $timedOut; Failed = $failed; Reason = $result.Reason; Elapsed = $result.Elapsed; ExitCode = $effectiveExitCode; RebootRequired = $rebootRequired }
 }
 #endregion
 
@@ -2752,6 +2802,7 @@ function Test-ArsoAvailable {
 }
 
 function Register-BootUpdateTaskForReboot {
+    param([switch]$RetrySoon)
     $taskName = 'BootUpdateCycle'
     $pwshPath = (Get-Command pwsh -EA SilentlyContinue).Source
     if (-not $pwshPath) { $pwshPath = "$env:ProgramFiles\PowerShell\7\pwsh.exe" }
@@ -2795,7 +2846,11 @@ function Register-BootUpdateTaskForReboot {
     if ($script:NotificationLevel -ne 'Full') { $taskArgs += "-NotificationLevel $($script:NotificationLevel)" }
     $argString = $taskArgs -join ' '
     $action   = New-ScheduledTaskAction -Execute $pwshPath -Argument $argString -WorkingDirectory $PSScriptRoot
-    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 4)
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+        -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 4) `
+        -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 2) -MultipleInstances IgnoreNew
+    $registeredTaskNames = [System.Collections.Generic.List[string]]::new()
+    $retryTrigger = if ($RetrySoon) { New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(2) } else { $null }
 
     <# ARSO user-context resume (2ql): reboots use `shutdown /g`, so where ARSO is
        available winlogon signs the user back in — the primary task then triggers at
@@ -2809,23 +2864,41 @@ function Register-BootUpdateTaskForReboot {
         $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
         $userTrigger   = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
         $userPrincipal = New-ScheduledTaskPrincipal -UserId $currentUser -LogonType Interactive -RunLevel Highest
-        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $userTrigger -Principal $userPrincipal -Settings $settings `
-            -Description 'Boot update loop: patches everything, reboots until clean. (user context via ARSO)' -Force | Out-Null
+        $userTriggers = if ($retryTrigger) { @($userTrigger, $retryTrigger) } else { @($userTrigger) }
+        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $userTriggers -Principal $userPrincipal -Settings $settings `
+            -Description 'Boot update loop: patches everything, reboots until clean. (user context via ARSO)' -Force -ErrorAction Stop | Out-Null
+        $registeredTaskNames.Add($taskName)
         Write-Log "Scheduled task registered: $taskName ($currentUser at logon — ARSO resume)"
 
         $fbTrigger = New-ScheduledTaskTrigger -AtStartup
         $fbTrigger.Delay = 'PT3M'
         $fbPrincipal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
         Register-ScheduledTask -TaskName 'BootUpdateCycleFallback' -Action $action -Trigger $fbTrigger -Principal $fbPrincipal -Settings $settings `
-            -Description 'Boot update loop fallback: runs as SYSTEM if ARSO sign-on does not occur.' -Force | Out-Null
+            -Description 'Boot update loop fallback: runs as SYSTEM if ARSO sign-on does not occur.' -Force -ErrorAction Stop | Out-Null
+        $registeredTaskNames.Add('BootUpdateCycleFallback')
         Write-Log 'Scheduled task registered: BootUpdateCycleFallback (SYSTEM at startup +3min, mutex-arbitrated)'
     } else {
         $trigger  = New-ScheduledTaskTrigger -AtStartup
         $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings `
-            -Description 'Boot update loop: patches everything, reboots until clean.' -Force | Out-Null
+        $systemTriggers = if ($retryTrigger) { @($trigger, $retryTrigger) } else { @($trigger) }
+        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $systemTriggers -Principal $principal -Settings $settings `
+            -Description 'Boot update loop: patches everything, reboots until clean.' -Force -ErrorAction Stop | Out-Null
+        $registeredTaskNames.Add($taskName)
         Write-Log "Scheduled task registered: $taskName (SYSTEM at startup — ARSO unavailable)"
     }
+
+    <# Fail closed before rebooting: registration success is not enough if policy or a
+       task-store race leaves the task disabled or with the wrong action. #>
+    foreach ($registeredName in $registeredTaskNames) {
+        $task = Get-ScheduledTask -TaskName $registeredName -ErrorAction Stop
+        if ($task.State -eq 'Disabled') { throw "Resume task '$registeredName' is disabled." }
+        $matchingAction = @($task.Actions | Where-Object {
+            $_.Execute -eq $pwshPath -and $_.Arguments -match [regex]::Escape('Invoke-BootUpdateCycle.ps1')
+        })
+        if ($matchingAction.Count -eq 0) { throw "Resume task '$registeredName' does not contain the expected orchestrator action." }
+    }
+    Write-Log "Resume chain verified: $($registeredTaskNames -join ', ') (3 retries, 2-minute interval)."
+    return $registeredTaskNames.ToArray()
 }
 
 function Suspend-BitLockerForReboot {
@@ -3883,18 +3956,25 @@ function Invoke-BootUpdateCycle {
         exit 0
     }
 
-    <# Commit iteration increment only after maintenance window gate passes #>
-    $state.Iteration++
-    Set-BootUpdateState -State $state
-
     <# Pre-flight checks (every iteration — disk/network can change between reboots) #>
     $preflight = Test-PreFlightChecks -Force:$Force -State $state
     if (-not $preflight.CanProceed) {
         Write-Log 'Update cycle aborted by pre-flight checks.' -Level Error
         Write-EventLogEntry -EventId 1003 -EntryType Error -Message "Cycle aborted by pre-flight checks.`nErrors: $($preflight.Errors -join '; ')"
-        if (-not $WhatIfPreference) { Unregister-BootUpdateTask; Clear-BootUpdateState }
+        if (-not $WhatIfPreference -and $isFirstIteration) {
+            Unregister-BootUpdateTask
+            Clear-BootUpdateState
+        } elseif (-not $WhatIfPreference) {
+            Write-Log 'Resume checkpoint and scheduled tasks preserved; Task Scheduler will retry this transient post-boot failure.' -Level Warn
+        }
         exit 1
     }
+
+    <# Only a run which passed pre-flight consumes an iteration. A slow network or
+       service during boot can therefore use Task Scheduler retries without burning
+       through the reboot-loop safety valve. #>
+    $state.Iteration++
+    Set-BootUpdateState -State $state
 
     <# Max iterations safety valve — PostCycle fires here so callers get a final callback even on cap-exceeded exit #>
     if ($state.Iteration -gt $MaxIterations) {
@@ -3904,6 +3984,15 @@ function Invoke-BootUpdateCycle {
         Invoke-Hook -Path $script:PostCycleScript -HookName 'PostCycle'
         if (-not $WhatIfPreference) { Unregister-BootUpdateTask; Clear-BootUpdateState }
         return
+    }
+
+    <# Arm the checkpoint before the first mutating phase, not merely after detecting
+       a reboot. Native exit 1641 means an installer has already initiated restart;
+       pre-registration is what makes that surprise reboot resumable. Completion
+       removes both tasks, and the mutex prevents a scheduled collision. #>
+    if (-not $WhatIfPreference) {
+        $null = Register-BootUpdateTaskForReboot
+        Write-Log 'Resume checkpoint armed before update phases.' -Visibility Verbose
     }
 
     <# Crash recovery #>
@@ -4513,7 +4602,7 @@ function Invoke-BootUpdateCycle {
 
     <# ---- Post-update reboot decision ---- #>
     <# In WhatIf mode, always report clean — no reboot or task registration ever happens #>
-    $pending = if ($WhatIfPreference) { @() } else { Test-PendingReboot }
+    $pending = if ($WhatIfPreference) { @() } else { Get-ConfirmedPendingReboot }
     if ($pending) {
         Write-Log 'Pending reboot after updates: YES' -Level Warn
         $pending | ForEach-Object { Write-Log "  - $($_.Source): $($_.Detail)" -Level Warn }
@@ -4527,6 +4616,7 @@ function Invoke-BootUpdateCycle {
             Write-Log "Same reboot-signal set as the previous reboot ($signalKey). If this repeats to the max-iterations limit, one of these signals is likely stale or perpetually repopulated — see the per-signal detail above." -Level Warn
         }
         $state.LastRebootSignals = $signalKey
+        $state.RebootCount = [int]$state.RebootCount + 1
 
         <# Reset phase Done flags for next iteration.
            Staged mode: reset ONLY the current phase's flag — completed phases are not re-run
@@ -4549,7 +4639,7 @@ function Invoke-BootUpdateCycle {
 
         <# Guard task registration and reboot — neither must fire in WhatIf mode #>
         if (-not $WhatIfPreference) {
-            Register-BootUpdateTaskForReboot
+            $null = Register-BootUpdateTaskForReboot
             Send-RebootWarning -SecondsUntilReboot $script:RebootDelaySec
 
             <# Notify operators that a reboot is imminent (best-effort; never throws) #>
@@ -4597,29 +4687,61 @@ function Invoke-BootUpdateCycle {
                 Set-BootUpdateState -State $state
                 Write-Log "Staged rollout: $($remainingPhases.Count) phase(s) remaining. Next boot will run [$($nextPhase.Name)]. Task stays registered." -Level Info
                 Write-Log "  Remaining: $(($remainingPhases | ForEach-Object { $_.Name }) -join ', ')"
-                if (-not $WhatIfPreference) { Register-BootUpdateTaskForReboot }
+                if (-not $WhatIfPreference) { $null = Register-BootUpdateTaskForReboot }
                 Write-BootUpdateProgress -Completed
                 return  <# Cycle not complete — exit without cleanup #>
             }
             Write-Log 'Staged rollout: all phases complete, no pending reboots — cycle done.' -Level Info
         }
 
+        <# A clean reboot probe is not a successful cycle if an enabled phase failed or
+           timed out. Queue a near-term checkpoint retry instead of printing a false
+           all-clear. The same task also retains its boot/logon trigger. #>
+        $incompletePhases = @($enabledPhases | Where-Object { -not [bool]$state.($_.Flag) })
+        if (-not $WhatIfPreference -and $incompletePhases.Count -gt 0) {
+            $state.Phase = 'RetryPending'
+            Set-BootUpdateState -State $state
+            $incompleteNames = $incompletePhases.Name -join ', '
+            Write-Log "Verification withheld: incomplete phase(s): $incompleteNames. Automatic retry queued for two minutes." -Level Warn
+            $null = Register-BootUpdateTaskForReboot -RetrySoon
+            Write-BootUpdateProgress -Completed
+            Show-CycleBanner -Title 'R E C O V E R Y   P A S S   Q U E U E D' -AnsiColor "$([char]27)[33m" -Info @(
+                'Not calling this complete yet — the checkpoint is safe.'
+                "Retrying in about 2 minutes: $incompleteNames"
+                'The reboot/logon resume chain remains armed.'
+            )
+            exit 1
+        }
+
         if ($WhatIfPreference) { Write-Log '[WHATIF] Pending reboot check skipped — reporting clean (no actual updates ran)' }
         $duration = if ($state.StartTime) { (Get-Date) - [datetime]$state.StartTime } else { [timespan]::Zero }
         $s = $state.Summary
         $total = $s.Winget + $s.Chocolatey + $s.WindowsUpdate + $s.Pip + $s.Npm + $s.Office365 + $s.PowerShellModules + $s.Scoop + $s.DotnetTools + $s.Vscode
-        $reboots = $state.Iteration - 1
+        $reboots = [int]$state.RebootCount
         $durMin = [math]::Round($duration.TotalMinutes, 1)
         $pkgLine = "Winget=$($s.Winget) Choco=$($s.Chocolatey) WU=$($s.WindowsUpdate) Pip=$($s.Pip) Npm=$($s.Npm) O365=$($s.Office365) PSMod=$($s.PowerShellModules) Scoop=$($s.Scoop) Dotnet=$($s.DotnetTools) VSCode=$($s.Vscode)"
 
         <# Console: styled completion banner #>
-        $completionTitle = if ($WhatIfPreference) { 'W H A T I F   C H E C K   C O M P L E T E' } else { 'M I S S I O N   C O M P L E T E' }
+        $healthIsGreen = $null -eq $healthCheck -or $healthCheck.AllHealthy
+        $completionTitle = if ($WhatIfPreference) { 'W H A T I F   C H E C K   C O M P L E T E' }
+                           elseif ($healthIsGreen) { 'P A T C H   C Y C L E   V E R I F I E D' }
+                           else { 'P A T C H   P A S S   C O M P L E T E' }
+        $congratulations = if ($WhatIfPreference) { 'Preview complete — no changes were made.' }
+                           elseif ($healthIsGreen) { 'YOU DID IT — THIS MACHINE IS GREEN. NICE WORK.' }
+                           else { 'Updates landed, but one health check needs attention.' }
+        $healthLine = if ($null -eq $healthCheck) { '[--] Service health check skipped by policy' }
+                      elseif ($healthCheck.AllHealthy) { "[OK] $($healthCheck.CheckedServices.Count) critical service(s) healthy" }
+                      else { "[!!] Service attention: $($healthCheck.FailedServices -join ', ')" }
         Write-BootUpdateProgress -Completed
         Show-CycleBanner -Title $completionTitle -AnsiColor "$([char]27)[32m" -Info @(
+            $congratulations
+            "[OK] $($enabledPhases.Count)/$($enabledPhases.Count) configured phases completed"
+            if (-not $WhatIfPreference) { "[OK] Reboot state clean twice across $($script:RebootSignalSettleSeconds) seconds" }
+            $healthLine
+            if (-not $WhatIfPreference) { '[OK] No additional reboot or retry is queued' }
             "$durMin min | $($state.Iteration) iteration(s) | $reboots reboot(s)"
             "$total packages updated"
             $pkgLine
-            if ($WhatIfPreference) { 'WHATIF MODE - No actual changes were made' } else { 'FULLY PATCHED - No pending reboots' }
         )
         <# Log file: structured entries #>
         Write-Log "BOOT UPDATE CYCLE${whatIfTag} COMPLETE | $durMin min | $($state.Iteration) iteration(s) | $reboots reboot(s) | $total packages"

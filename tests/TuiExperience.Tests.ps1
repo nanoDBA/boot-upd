@@ -339,6 +339,19 @@ Describe 'Animated progress behavior' {
         $script:ProgressCaptures.Count | Should -BeGreaterOrEqual 2
     }
 
+    It 'surfaces a native 3010 result as successful explicit reboot evidence' {
+        $script:ExplicitRebootRequests = [System.Collections.Generic.List[object]]::new()
+        $result = Invoke-PackageManagerWithTimeout -Name 'RebootExitProbe' -ScriptBlock {
+            & cmd.exe /d /c exit 3010
+        } -IdleTimeoutMinutes 1 -HardTimeoutMinutes 1 -Status 'Testing reboot exit propagation'
+
+        $result.Failed | Should -BeFalse
+        $result.RebootRequired | Should -BeTrue
+        $result.ExitCode | Should -Be 3010
+        $script:ExplicitRebootRequests.Count | Should -Be 1
+        $script:ExplicitRebootRequests[0].Source | Should -Be 'RebootExitProbe-exit-3010'
+    }
+
     It 'captures partial output and kills a silent native process tree at timeout' {
         $pwshPath = (Get-Process -Id $PID).Path
         $result = Invoke-BootUpdateBackgroundOperation -Name 'Process-tree timeout test' `

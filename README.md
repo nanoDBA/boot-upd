@@ -2,7 +2,7 @@
 
 **Run `upd` as admin. Walk away. Come back fully patched.**
 
-A Windows boot-time automation tool that runs every package manager you have, reboots when updates require it, and repeats until no pending reboots remain — then self-destructs. Solves the "restart required" whack-a-mole problem once and for all.
+A Windows boot-time automation tool that runs every configured package manager, checkpoints its work, reboots when updates require it, and resumes until the configured scope verifies clean — then retires its resume tasks.
 
 ![Boot Update Cycle splash — neon gradient theme](docs/img/splash-theme0.svg)
 
@@ -21,7 +21,7 @@ The BBS-style splash defaults to the neon gradient theme above; two more ship wi
 
 | Phase | Package Manager | Default | Notes |
 |-------|----------------|---------|-------|
-| 1 | **Winget** | On | User + machine scope on first run; machine-only after reboot |
+| 1 | **Winget** | On | User + machine scope; ARSO resumes user scope after reboot, with a delayed SYSTEM safety net |
 | 2 | **Chocolatey** | On | `choco upgrade all -y` |
 | 3 | **Windows Update** | On | Security, Critical, Definition updates (excludes SQL Server) |
 | 4 | **AWS Tooling** | Off | Optional CLI v2 + AWS.Tools repair |
@@ -91,9 +91,11 @@ console feedback because isolating it would change how hook variables and side e
 
 1. Pre-flight checks validate disk space, network, battery, and conflicting installers
 2. First iteration runs in **your** console (user context) — the only chance for user-scoped winget/Scoop/VS Code
-3. If any updates need a reboot, a scheduled task is registered and `shutdown /r` fires
-4. Post-reboot iterations run as SYSTEM via the scheduled task
-5. Repeats until no pending reboots remain (max 5 iterations safety valve)
+3. Native `3010`/`1641` results and Windows reboot indicators are captured as reboot evidence
+4. Before reboot, verified resume tasks are armed: ARSO user-at-logon plus a delayed SYSTEM fallback where supported, or SYSTEM-at-startup otherwise
+5. `shutdown /g` restarts Windows; the checkpoint resumes automatically and incomplete phases retry without losing state
+6. Completion requires every enabled phase plus two clean reboot probes across a 20-second servicing-settle window (max 5 successful iterations safety valve)
+7. The final screen reports the evidence and retires both resume tasks
 6. Self-destructs: removes the scheduled task, cleans up state
 
 ### Reboot delay

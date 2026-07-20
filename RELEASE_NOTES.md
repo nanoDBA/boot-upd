@@ -1,8 +1,24 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.26
+**Current Version:** v2.5.27
 **Release Date:** 2026-07-20
 **Status:** STABLE
+
+---
+
+## v2.5.27 (2026-07-20)
+
+**Reboot-resilient checkpoints and a completion screen that earns its confidence.**
+
+- Arms and verifies the durable resume checkpoint before any mutating phase, so even an installer-initiated `1641` surprise reboot has a continuation waiting after boot.
+- Captures native installer exit codes `3010` and `1641` as explicit reboot requests instead of losing them at the PowerShell child-process boundary.
+- Requires two clean reboot-signal probes across a 20-second animated servicing-settle window before completion.
+- Gives resume tasks three two-minute retries, rejects overlapping instances, and reads every registration back before permitting a reboot.
+- Preserves the checkpoint and retry chain when a resumed run encounters a transient preflight failure; failed preflights no longer consume an iteration.
+- Withholds success when any enabled phase is incomplete and queues a two-minute recovery pass.
+- Tracks actual orchestrated reboot count in durable state.
+- Replaces the optimistic `FULLY PATCHED` footer with a warm, evidence-backed `PATCH CYCLE VERIFIED` screen: configured phases, double reboot check, service health, and queue state.
+- Keeps every splash theme byte-identical.
 
 ---
 

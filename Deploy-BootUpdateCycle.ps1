@@ -608,7 +608,9 @@ function Register-ScheduledTaskNow {
 
     $argString = $taskArgs -join ' '
     $action   = New-ScheduledTaskAction -Execute $pwshPath -Argument $argString -WorkingDirectory $installDir
-    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 4)
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+        -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 4) `
+        -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 2) -MultipleInstances IgnoreNew
 
     if ($Config.RunAsUser) {
         $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
@@ -622,7 +624,9 @@ function Register-ScheduledTaskNow {
     }
 
     Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings `
-        -Description 'Boot update loop: patches everything, reboots until clean.' -Force | Out-Null
+        -Description 'Boot update loop: patches everything, reboots until clean.' -Force -ErrorAction Stop | Out-Null
+    $registeredTask = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
+    if ($registeredTask.State -eq 'Disabled') { throw "Registered task '$taskName' is disabled." }
     Write-Host "Registered task: $taskName ($runAsDesc)" -ForegroundColor Green
 }
 
