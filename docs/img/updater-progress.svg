@@ -25,6 +25,6 @@
     <text x="30" y="510" fill="#3b82f6">[view] Normal  |  press v to cycle Quiet &gt; Normal &gt; Verbose &gt; Debug</text>
 
     <text x="30" y="574" fill="#767676">Checkpoint armed  •  native 3010/1641 evidence persisted  •  reboot-safe resume enabled</text>
-    <text x="30" y="618" fill="#72ffb7">v2.5.28  //  unattended patch board</text>
+    <text x="30" y="618" fill="#72ffb7">v2.5.29  //  unattended patch board</text>
   </g>
 </svg>

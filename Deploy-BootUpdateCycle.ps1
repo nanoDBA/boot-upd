@@ -10,6 +10,30 @@
 [CmdletBinding()]
 param(
     [int]$RebootDelaySec,
+    [ValidateSet('Quiet','Normal','Verbose','Debug')][string]$OutputMode,
+    [ValidateRange(1,50)][int]$MaxIterations,
+    [ValidateRange(1,1440)][int]$PackageTimeoutMinutes,
+    [switch]$StagedRollout,
+    [switch]$IncludeDriverUpdates,
+    [switch]$IncludeFirmwareUpdates,
+    [switch]$UpdateWsl,
+    [switch]$UpdateContainers,
+    [switch]$AllowMetered,
+    [switch]$EnableRestorePoint,
+    [switch]$EnableDotnetTools,
+    [switch]$EnableAwsTooling,
+    [switch]$SkipPip,
+    [switch]$SkipNpm,
+    [switch]$SkipOffice365,
+    [switch]$SkipPowerShellModules,
+    [switch]$SkipScoop,
+    [switch]$SkipVscode,
+    [switch]$SkipDefender,
+    [switch]$SkipHealthCheck,
+    [switch]$SkipBitLocker,
+    [switch]$DisableSelfUpdate,
+    [string[]]$ExcludePatterns = @(),
+    [string[]]$IncludePatterns = @(),
     [switch]$NonInteractive
 )
 <#
@@ -51,9 +75,17 @@ $Config = @{
     SkipScoop             = $false  # Set $true to skip Scoop package updates
     SkipDotnetTools       = $true   # OFF by default - can break SDK-dependent builds!
     SkipVscode            = $false  # Set $true to skip VS Code extension updates
+    SkipDefender          = $false  # Set $true to skip Defender signature updates
     SkipRestorePoint      = $true   # Skip system restore point creation (opt-in: set $false to enable)
     SkipHealthCheck       = $false  # Skip post-update health check for critical services
     StagedRollout         = $false  # Run one package manager per boot instead of all at once. Slower but safer.
+    IncludeDriverUpdates  = $false  # Opt in to Windows driver updates
+    IncludeFirmwareUpdates = $false # Opt in to firmware updates
+    UpdateWsl             = $false  # Opt in to WSL kernel/distribution updates
+    UpdateContainers      = $false  # Opt in to Docker/Podman image refresh
+    AllowMetered          = $false  # Permit metered network use
+    SkipBitLocker         = $false  # Do not suspend BitLocker for one orchestrated reboot
+    DisableSelfUpdate     = $false  # Suppress GitHub release self-update
     MaxIterations         = 5       # Safety valve for reboot loops
     PackageTimeoutMin     = 30      # Minutes before killing a hung package manager (hard timeout)
                                     # Smart idle detection kills stuck processes after 5 min of no CPU
@@ -82,10 +114,22 @@ $Config = @{
 
     # Package name patterns to skip (substring match, case-insensitive). e.g. @('Teams', 'OneDrive')
     ExcludePatterns        = @()
+    IncludePatterns        = @()
 }
 
 # Apply command-line parameter overrides
 if ($PSBoundParameters.ContainsKey('RebootDelaySec')) { $Config.RebootDelaySec = $RebootDelaySec }
+if ($PSBoundParameters.ContainsKey('OutputMode')) { $Config.OutputMode = $OutputMode }
+if ($PSBoundParameters.ContainsKey('MaxIterations')) { $Config.MaxIterations = $MaxIterations }
+if ($PSBoundParameters.ContainsKey('PackageTimeoutMinutes')) { $Config.PackageTimeoutMin = $PackageTimeoutMinutes }
+foreach ($name in @('StagedRollout','IncludeDriverUpdates','IncludeFirmwareUpdates','UpdateWsl','UpdateContainers','AllowMetered','SkipPip','SkipNpm','SkipOffice365','SkipPowerShellModules','SkipScoop','SkipVscode','SkipDefender','SkipHealthCheck','SkipBitLocker','DisableSelfUpdate')) {
+    if ($PSBoundParameters.ContainsKey($name)) { $Config[$name] = $true }
+}
+if ($EnableRestorePoint) { $Config.SkipRestorePoint = $false }
+if ($EnableDotnetTools) { $Config.SkipDotnetTools = $false }
+if ($EnableAwsTooling) { $Config.SkipAwsTooling = $false }
+if ($PSBoundParameters.ContainsKey('ExcludePatterns')) { $Config.ExcludePatterns = @($ExcludePatterns) }
+if ($PSBoundParameters.ContainsKey('IncludePatterns')) { $Config.IncludePatterns = @($IncludePatterns) }
 if ($NonInteractive) { $Config.NonInteractive = $true }
 #endregion
 
@@ -202,7 +246,7 @@ if (-not (Test-Path $sourceInvoke)) {
    step, every deploy re-copies the stale source and re-downloads the same update.
    Updating the source here makes the update stick and skips the redundant download.
    Best-effort: any failure logs a warning and deploys the existing source. #>
-if ([string]::IsNullOrEmpty($env:BOOT_UPDATE_NO_SELF_UPDATE)) {
+if ([string]::IsNullOrEmpty($env:BOOT_UPDATE_NO_SELF_UPDATE) -and -not $Config.DisableSelfUpdate) {
     try {
         $srcRaw = Get-Content $sourceInvoke -Raw -ErrorAction Stop
         $currentVer = $null
@@ -219,58 +263,106 @@ if ([string]::IsNullOrEmpty($env:BOOT_UPDATE_NO_SELF_UPDATE)) {
             -ErrorAction Stop
         $remoteVer = [System.Version]::new(($releaseInfo.tag_name -replace '^v', ''))
 
-        if ($remoteVer -le $currentVer) {
-            Write-Host "Source self-update: already on latest (v$currentVer)."
-        } else {
+        $coreUpdateNeeded = $remoteVer -gt $currentVer
+        $bundleEligible = $remoteVer -ge $currentVer
+        if ($remoteVer -lt $currentVer) { Write-Host "Source self-update: local v$currentVer is newer than published v$remoteVer; no downgrade." -ForegroundColor Yellow }
+        elseif (-not $coreUpdateNeeded) { Write-Host "Source self-update: already on latest core (v$currentVer); verifying launcher companions." }
+        else {
             Write-Host "Source self-update: v$currentVer -> v$remoteVer." -ForegroundColor Cyan
-            <# Update both source scripts. Replacing this running Deploy script is safe:
-               pwsh parsed the whole file at startup, so the new copy applies next run. #>
-            foreach ($assetName in @('Invoke-BootUpdateCycle.ps1', 'Deploy-BootUpdateCycle.ps1')) {
-                $asset = $releaseInfo.assets | Where-Object { $_.name -eq $assetName } | Select-Object -First 1
-                if (-not $asset) {
-                    if ($assetName -eq 'Invoke-BootUpdateCycle.ps1') { throw "release $($releaseInfo.tag_name) has no '$assetName' asset" }
-                    Write-Host "Source self-update: release has no '$assetName' asset - skipping it." -ForegroundColor Yellow
+        }
+        <# Replacing this running Deploy script is safe: pwsh parsed the whole file
+           at startup, so the new copy applies next run. Launcher companions are
+           verified even when the core version is current, which bootstraps them
+           on the run after an older Deploy script updates itself. #>
+        $sourceAssets = @(
+            [pscustomobject]@{ Name='Invoke-BootUpdateCycle.ps1';   RelativeTarget='Invoke-BootUpdateCycle.ps1'; Required=$true;  PowerShell=$true;  Core=$true }
+            [pscustomobject]@{ Name='Deploy-BootUpdateCycle.ps1';   RelativeTarget='Deploy-BootUpdateCycle.ps1'; Required=$true; PowerShell=$true;  Core=$true }
+            [pscustomobject]@{ Name='Invoke-UpdLauncher.ps1';        RelativeTarget='tools\Invoke-UpdLauncher.ps1'; Required=$true; PowerShell=$true; Core=$false }
+            [pscustomobject]@{ Name='Show-BootUpdateProgressDemo.ps1'; RelativeTarget='tools\Show-BootUpdateProgressDemo.ps1'; Required=$true; PowerShell=$true; Core=$false }
+            [pscustomobject]@{ Name='Repair-AwsTooling.ps1';         RelativeTarget='Repair-AwsTooling.ps1';      Required=$true; PowerShell=$true; Core=$false }
+            [pscustomobject]@{ Name='upd.cmd';                       RelativeTarget='upd.cmd';                    Required=$true; PowerShell=$false; Core=$false }
+        )
+        $sourceTempRoot = Join-Path ([IO.Path]::GetTempPath()) ('boot-upd-source-bundle-{0}' -f [guid]::NewGuid().ToString('N'))
+        $null = New-Item -ItemType Directory -Path $sourceTempRoot -ErrorAction Stop
+        $verifiedSourceAssets = [Collections.Generic.List[object]]::new()
+        foreach ($sourceAsset in $sourceAssets) {
+            if (-not $bundleEligible) { break }
+            if ($sourceAsset.Core -and -not $coreUpdateNeeded) { continue }
+            $assetName = $sourceAsset.Name
+            $asset = $releaseInfo.assets | Where-Object { $_.name -eq $assetName } | Select-Object -First 1
+            $shaAsset = $releaseInfo.assets | Where-Object { $_.name -eq "$assetName.sha256" } | Select-Object -First 1
+            if (-not $asset -or -not $shaAsset) { throw "release $($releaseInfo.tag_name) has no '$assetName' asset/checksum pair" }
+            Write-Host "Source self-update: downloading $assetName..."
+            $tempPath = Join-Path $sourceTempRoot $assetName
+            Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $tempPath -TimeoutSec 60 -Headers @{ 'User-Agent' = 'BootUpdateCycle' } -ErrorAction Stop
+            if ($sourceAsset.PowerShell) { $null = [scriptblock]::Create((Get-Content $tempPath -Raw -ErrorAction Stop)) }
+            else {
+                $batchText = Get-Content $tempPath -Raw -ErrorAction Stop
+                if ($batchText -notmatch '(?im)^@echo off\s*$' -or $batchText -notmatch 'Invoke-UpdLauncher\.ps1') { throw 'Downloaded upd.cmd failed its launcher structure check.' }
+            }
+            $shaContent = Invoke-RestMethod -Uri $shaAsset.browser_download_url -TimeoutSec 15 -Headers @{ 'User-Agent' = 'BootUpdateCycle' } -ErrorAction Stop
+            $expectedSha = ($shaContent -split '\s+')[0].Trim().ToUpperInvariant()
+            if ($expectedSha -notmatch '^[0-9A-F]{64}$') { throw "release $($releaseInfo.tag_name) provides no valid SHA256 for $assetName" }
+            $actualSha = (Get-FileHash -Path $tempPath -Algorithm SHA256).Hash.ToUpperInvariant()
+            if ($actualSha -ne $expectedSha) { throw "SHA256 mismatch for $assetName (expected=$expectedSha actual=$actualSha)" }
+            $verifiedSourceAssets.Add([pscustomobject]@{ Spec=$sourceAsset; Temp=$tempPath; Hash=$actualSha })
+            Write-Host "Source self-update: $assetName SHA256 verified."
+        }
+
+        $sourceCommitted = [Collections.Generic.List[object]]::new()
+        try {
+            foreach ($item in $verifiedSourceAssets) {
+                $sourceAsset = $item.Spec
+                $target = Join-Path $PSScriptRoot $sourceAsset.RelativeTarget
+                $targetDirectory = Split-Path -Parent $target
+                if (-not (Test-Path -LiteralPath $targetDirectory)) { New-Item -ItemType Directory -Path $targetDirectory -Force | Out-Null }
+                $destination = $target
+                if ($sourceAsset.Name -eq 'upd.cmd' -and (Test-Path -LiteralPath $target)) {
+                    $currentBatch = Get-Content -LiteralPath $target -Raw -ErrorAction SilentlyContinue
+                    if ($currentBatch -match 'upd\.cmd\.next') { $destination = "$target.next" }
+                }
+                if ((Test-Path -LiteralPath $target) -and (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash -eq $item.Hash) {
+                    if ($destination -ne $target) { Remove-Item -LiteralPath $destination,"$destination.sha256" -Force -ErrorAction SilentlyContinue }
                     continue
                 }
-
-                Write-Host "Source self-update: downloading $assetName..."
-                $tempPath = [System.IO.Path]::GetTempFileName() -replace '\.tmp$', '.ps1'
-                Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $tempPath `
-                    -TimeoutSec 60 -Headers @{ 'User-Agent' = 'BootUpdateCycle' } -ErrorAction Stop
-
-                <# Validate: must parse as PowerShell #>
-                $null = [scriptblock]::Create((Get-Content $tempPath -Raw -ErrorAction Stop))
-
-                <# SHA256 integrity check when the release ships one #>
-                $expectedSha = $null
-                $shaAsset = $releaseInfo.assets | Where-Object { $_.name -eq "$assetName.sha256" } | Select-Object -First 1
-                if ($shaAsset) {
-                    $shaContent = Invoke-RestMethod -Uri $shaAsset.browser_download_url -TimeoutSec 15 -Headers @{ 'User-Agent' = 'BootUpdateCycle' } -ErrorAction Stop
-                    $expectedSha = ($shaContent -split '\s+')[0].Trim().ToUpperInvariant()
-                } elseif ($releaseInfo.body -match "(?i)$([regex]::Escape($assetName))[^\n]*?([0-9a-fA-F]{64})") {
-                    $expectedSha = $matches[1].ToUpperInvariant()
-                }
-                if ($expectedSha -notmatch '^[0-9A-F]{64}$') {
-                    throw "release $($releaseInfo.tag_name) provides no valid SHA256 for $assetName"
-                }
-                $actualSha = (Get-FileHash -Path $tempPath -Algorithm SHA256).Hash.ToUpperInvariant()
-                if ($actualSha -ne $expectedSha) { throw "SHA256 mismatch for $assetName (expected=$expectedSha actual=$actualSha)" }
-                Write-Host "Source self-update: $assetName SHA256 verified."
-
-                <# Atomic replace with backup #>
-                $target = Join-Path $PSScriptRoot $assetName
-                Copy-Item $target "$target.bak" -Force -ErrorAction Stop
-                Move-Item $tempPath $target -Force -ErrorAction Stop
-                Write-Host "Source self-update: $assetName updated (backup: $assetName.bak)" -ForegroundColor Green
+                $snapshot = Join-Path $sourceTempRoot ("rollback-{0}" -f $sourceCommitted.Count)
+                $existed = Test-Path -LiteralPath $destination
+                if ($existed) { Copy-Item -LiteralPath $destination -Destination $snapshot -Force }
+                $isStaged = $destination -ne $target
+                $sidecarPath = "$destination.sha256"
+                $sidecarSnapshot = "$snapshot.sha256"
+                $sidecarExisted = $isStaged -and (Test-Path -LiteralPath $sidecarPath)
+                if ($sidecarExisted) { Copy-Item -LiteralPath $sidecarPath -Destination $sidecarSnapshot -Force }
+                $sourceCommitted.Add([pscustomobject]@{ Destination=$destination; Snapshot=$snapshot; Existed=$existed; SidecarPath=$sidecarPath; SidecarSnapshot=$sidecarSnapshot; SidecarExisted=$sidecarExisted; Staged=$isStaged })
+                $sourceMutationStarted = $true
+                $incoming = "$destination.incoming-$PID"
+                Copy-Item -LiteralPath $item.Temp -Destination $incoming -Force
+                Move-Item -LiteralPath $incoming -Destination $destination -Force
+                if ($isStaged) { Set-Content -LiteralPath $sidecarPath -Value $item.Hash -Encoding ascii -NoNewline }
+                Write-Host "Source self-update: $($sourceAsset.Name) verified and installed." -ForegroundColor Green
             }
-            Write-Host "Source self-update: source updated to v$remoteVer." -ForegroundColor Green
+        } catch {
+            for ($index=$sourceCommitted.Count-1; $index -ge 0; $index--) {
+                $entry=$sourceCommitted[$index]
+                if ($entry.Existed) { Copy-Item -LiteralPath $entry.Snapshot -Destination $entry.Destination -Force }
+                else { Remove-Item -LiteralPath $entry.Destination -Force -ErrorAction SilentlyContinue }
+                if ($entry.Staged) {
+                    if ($entry.SidecarExisted) { Copy-Item -LiteralPath $entry.SidecarSnapshot -Destination $entry.SidecarPath -Force }
+                    else { Remove-Item -LiteralPath $entry.SidecarPath -Force -ErrorAction SilentlyContinue }
+                }
+            }
+            throw "source bundle commit failed and was rolled back: $_"
         }
+        if ($coreUpdateNeeded) { Write-Host "Source self-update: source updated to v$remoteVer." -ForegroundColor Green }
     } catch {
+        if ($sourceTempRoot -and (Test-Path -LiteralPath $sourceTempRoot)) { Remove-Item -LiteralPath $sourceTempRoot -Recurse -Force -ErrorAction SilentlyContinue }
+        if ($sourceMutationStarted) { throw }
         Write-Host "Source self-update: skipped — $_" -ForegroundColor Yellow
-        if ($tempPath -and (Test-Path $tempPath)) { Remove-Item $tempPath -Force -ErrorAction SilentlyContinue }
+    } finally {
+        if ($sourceTempRoot -and (Test-Path -LiteralPath $sourceTempRoot)) { Remove-Item -LiteralPath $sourceTempRoot -Recurse -Force -ErrorAction SilentlyContinue }
     }
 } else {
-    Write-Host 'Source self-update: disabled via BOOT_UPDATE_NO_SELF_UPDATE env var.'
+    Write-Host 'Source self-update: disabled by configuration or BOOT_UPDATE_NO_SELF_UPDATE.'
 }
 
 $scriptPath = Join-Path $installDir 'Invoke-BootUpdateCycle.ps1'
@@ -395,14 +487,23 @@ $invokeArgs = @{
     SkipScoop            = $Config.SkipScoop
     SkipDotnetTools      = $Config.SkipDotnetTools
     SkipVscode           = $Config.SkipVscode
+    SkipDefender         = $Config.SkipDefender
+    IncludeDriverUpdates = $Config.IncludeDriverUpdates
+    IncludeFirmwareUpdates = $Config.IncludeFirmwareUpdates
+    UpdateWsl            = $Config.UpdateWsl
+    UpdateContainers     = $Config.UpdateContainers
     SkipRestorePoint     = $Config.SkipRestorePoint
     SkipHealthCheck      = $Config.SkipHealthCheck
+    SkipBitLocker        = $Config.SkipBitLocker
+    AllowMetered         = $Config.AllowMetered
+    DisableSelfUpdate    = $Config.DisableSelfUpdate
     StagedRollout        = $Config.StagedRollout
     NotifyEmail             = $Config.NotifyEmail
     SmtpServer              = $Config.SmtpServer
     MaintenanceWindowStart  = $Config.MaintenanceWindowStart
     MaintenanceWindowEnd    = $Config.MaintenanceWindowEnd
     ExcludePatterns         = $Config.ExcludePatterns
+    IncludePatterns         = $Config.IncludePatterns
 }
 
 function Invoke-DeployedCycle {
@@ -594,8 +695,16 @@ function Register-ScheduledTaskNow {
     if ($Config.SkipScoop)            { $taskArgs += '-SkipScoop' }
     if ($Config.SkipDotnetTools)      { $taskArgs += '-SkipDotnetTools' }
     if ($Config.SkipVscode)           { $taskArgs += '-SkipVscode' }
+    if ($Config.SkipDefender)         { $taskArgs += '-SkipDefender' }
+    if ($Config.IncludeDriverUpdates) { $taskArgs += '-IncludeDriverUpdates' }
+    if ($Config.IncludeFirmwareUpdates) { $taskArgs += '-IncludeFirmwareUpdates' }
+    if ($Config.UpdateWsl)            { $taskArgs += '-UpdateWsl' }
+    if ($Config.UpdateContainers)     { $taskArgs += '-UpdateContainers' }
     if ($Config.SkipRestorePoint)     { $taskArgs += '-SkipRestorePoint' }
     if ($Config.SkipHealthCheck)      { $taskArgs += '-SkipHealthCheck' }
+    if ($Config.SkipBitLocker)        { $taskArgs += '-SkipBitLocker' }
+    if ($Config.AllowMetered)         { $taskArgs += '-AllowMetered' }
+    if ($Config.DisableSelfUpdate)    { $taskArgs += '-DisableSelfUpdate' }
     if ($Config.StagedRollout)        { $taskArgs += '-StagedRollout' }
     if ($Config.MaintenanceWindowStart -ge 0) { $taskArgs += "-MaintenanceWindowStart $($Config.MaintenanceWindowStart)" }
     if ($Config.MaintenanceWindowEnd   -ge 0) { $taskArgs += "-MaintenanceWindowEnd $($Config.MaintenanceWindowEnd)" }
@@ -604,6 +713,10 @@ function Register-ScheduledTaskNow {
     if ($Config.ExcludePatterns.Count -gt 0) {
         $encodedPatterns = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($Config.ExcludePatterns | ConvertTo-Json -Compress)))
         $taskArgs += "-ExcludePatternsBase64 $encodedPatterns"
+    }
+    if ($Config.IncludePatterns.Count -gt 0) {
+        $encodedPatterns = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($Config.IncludePatterns | ConvertTo-Json -Compress)))
+        $taskArgs += "-IncludePatternsBase64 $encodedPatterns"
     }
 
     $argString = $taskArgs -join ' '

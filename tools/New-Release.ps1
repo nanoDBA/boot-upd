@@ -4,7 +4,8 @@
     Create a GitHub release with script assets and SHA256 sidecar files.
 
 .DESCRIPTION
-    Publishes Deploy-BootUpdateCycle.ps1 and Invoke-BootUpdateCycle.ps1 plus a
+    Publishes the orchestrator, deployer, batch/typed launchers, demo, and AWS
+    repair helper plus a
     matching <asset>.sha256 sidecar for each, which activates the integrity
     checks in both self-update paths (Invoke lz1 and Deploy source self-update).
 
@@ -29,7 +30,14 @@ if (-not $NotesPath -and -not $Notes) { throw 'Provide -Notes or -NotesPath.' }
 if ($NotesPath -and $Notes) { throw 'Provide only one of -Notes or -NotesPath.' }
 
 $root = Split-Path $PSScriptRoot -Parent
-$assetNames = @('Deploy-BootUpdateCycle.ps1', 'Invoke-BootUpdateCycle.ps1')
+$assetSpecs = @(
+    [pscustomobject]@{ Source='Deploy-BootUpdateCycle.ps1';       Name='Deploy-BootUpdateCycle.ps1'; Kind='PowerShell' }
+    [pscustomobject]@{ Source='Invoke-BootUpdateCycle.ps1';       Name='Invoke-BootUpdateCycle.ps1'; Kind='PowerShell' }
+    [pscustomobject]@{ Source='upd.cmd';                           Name='upd.cmd';                    Kind='Batch' }
+    [pscustomobject]@{ Source='tools/Invoke-UpdLauncher.ps1';      Name='Invoke-UpdLauncher.ps1';     Kind='PowerShell' }
+    [pscustomobject]@{ Source='tools/Show-BootUpdateProgressDemo.ps1'; Name='Show-BootUpdateProgressDemo.ps1'; Kind='PowerShell' }
+    [pscustomobject]@{ Source='Repair-AwsTooling.ps1';             Name='Repair-AwsTooling.ps1';      Kind='PowerShell' }
+)
 
 function Export-GitBlob {
     param(
@@ -107,23 +115,31 @@ try {
     New-Item -ItemType Directory -Path $stage -ErrorAction Stop -WhatIf:$false | Out-Null
     $uploads = @()
 
-    foreach ($name in $assetNames) {
+    foreach ($spec in $assetSpecs) {
+        $name = $spec.Name
         $stagedAsset = Join-Path $stage $name
-        $expectedBlob = "$( & git -C $root rev-parse "$headSha`:$name" )".Trim()
-        Export-GitBlob -RepositoryRoot $root -ObjectSpec "$headSha`:$name" -Destination $stagedAsset
+        $expectedBlob = "$( & git -C $root rev-parse "$headSha`:$($spec.Source)" )".Trim()
+        Export-GitBlob -RepositoryRoot $root -ObjectSpec "$headSha`:$($spec.Source)" -Destination $stagedAsset
         $stagedBlob = "$( & git -C $root hash-object --no-filters -- $stagedAsset )".Trim()
         if ($LASTEXITCODE -ne 0 -or $stagedBlob -ne $expectedBlob) {
             throw "Staged asset '$name' does not match committed HEAD."
         }
 
-        $tokens = $null
-        $errors = $null
-        $null = [System.Management.Automation.Language.Parser]::ParseFile(
-            $stagedAsset,
-            [ref]$tokens,
-            [ref]$errors
-        )
-        if ($errors) { throw "Parse errors in ${name}: $($errors[0].Message)" }
+        if ($spec.Kind -eq 'PowerShell') {
+            $tokens = $null
+            $errors = $null
+            $null = [System.Management.Automation.Language.Parser]::ParseFile(
+                $stagedAsset,
+                [ref]$tokens,
+                [ref]$errors
+            )
+            if ($errors) { throw "Parse errors in ${name}: $($errors[0].Message)" }
+        } else {
+            $batchText = Get-Content -LiteralPath $stagedAsset -Raw
+            if ($batchText -notmatch '(?im)^@echo off\s*$' -or $batchText -notmatch 'Invoke-UpdLauncher\.ps1') {
+                throw 'upd.cmd failed its launcher structure check.'
+            }
+        }
 
         $hash = (Get-FileHash -LiteralPath $stagedAsset -Algorithm SHA256).Hash.ToLowerInvariant()
         $sidecar = Join-Path $stage "$name.sha256"
@@ -140,8 +156,12 @@ try {
     if ("v$($matches[1])" -ne $Tag) {
         throw "Tag $Tag does not match script version v$($matches[1]) - bump the version first."
     }
+    $batchRaw = Get-Content -LiteralPath (Join-Path $stage 'upd.cmd') -Raw
+    if ($batchRaw -notmatch '(?m)^:: BootUpdateCycleVersion=([\d.]+)\s*$' -or "v$($matches[1])" -ne $Tag) {
+        throw "upd.cmd version marker does not match $Tag."
+    }
 
-    $ghArgs = @('release', 'create', $Tag, '--repo', $Repo, '--target', $headSha, '--title', $Title)
+    $ghArgs = @('release', 'create', $Tag, '--repo', $Repo, '--target', $headSha, '--title', $Title, '--draft')
     if ($NotesPath) {
         $ghArgs += @('--notes-file', $NotesPath)
     } else {
@@ -152,9 +172,40 @@ try {
         if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
             throw 'GitHub CLI (gh) is required to create a release.'
         }
-        & gh @ghArgs @uploads
-        if ($LASTEXITCODE -ne 0) { throw "gh release create failed (exit $LASTEXITCODE)" }
-        Write-Host "Released $Tag with SHA256 sidecars." -ForegroundColor Green
+        $draftCreated = $false
+        try {
+            & gh @ghArgs @uploads
+            if ($LASTEXITCODE -ne 0) { throw "gh release create failed (exit $LASTEXITCODE)" }
+            $draftCreated = $true
+            $releaseJson = & gh release view $Tag --repo $Repo --json isDraft,assets,targetCommitish
+            if ($LASTEXITCODE -ne 0) { throw 'Could not inspect the draft release.' }
+            $published = $releaseJson | ConvertFrom-Json
+            if (-not $published.isDraft) { throw 'Release was unexpectedly public before verification.' }
+            if ($published.targetCommitish -ne $headSha) { throw 'Draft release target does not match the pushed commit.' }
+            $expectedNames = @($uploads | ForEach-Object { Split-Path -Leaf $_ } | Sort-Object)
+            $actualNames = @($published.assets.name | Sort-Object)
+            if (Compare-Object $expectedNames $actualNames) { throw 'Draft release asset set does not match the prepared bundle.' }
+            $verifyDir = Join-Path $stage 'verify-download'
+            $null = New-Item -ItemType Directory -Path $verifyDir -ErrorAction Stop
+            & gh release download $Tag --repo $Repo --dir $verifyDir
+            if ($LASTEXITCODE -ne 0) { throw 'Could not download the draft release for verification.' }
+            foreach ($upload in $uploads) {
+                $downloaded = Join-Path $verifyDir (Split-Path -Leaf $upload)
+                if ((Get-FileHash -LiteralPath $upload -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath $downloaded -Algorithm SHA256).Hash) {
+                    throw "Uploaded asset verification failed: $(Split-Path -Leaf $upload)"
+                }
+            }
+            & gh release edit $Tag --repo $Repo --draft=false
+            if ($LASTEXITCODE -ne 0) { throw 'Draft assets verified, but publishing the release failed.' }
+            Write-Host "Released $Tag with verified SHA256 sidecars." -ForegroundColor Green
+        } catch {
+            $existingDraft = $null
+            try { $existingDraft = (& gh release view $Tag --repo $Repo --json isDraft 2>$null | ConvertFrom-Json) } catch {}
+            if ($draftCreated -or $existingDraft.isDraft) {
+                & gh release delete $Tag --repo $Repo --cleanup-tag --yes 2>$null
+            }
+            throw
+        }
     } else {
         Write-Host "Prepared and validated $Tag release assets; publication skipped." -ForegroundColor Yellow
     }

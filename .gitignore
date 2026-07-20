@@ -17,6 +17,10 @@ DEL_ALL*.CMD
 BootUpdateCycle.log
 BootUpdateCycle.*.log
 BootUpdateCycle.history.json
+upd.cmd.next
+upd.cmd.next.sha256
+upd.cmd.bak
+*.incoming-*
 
 # Beads / Dolt files (added by bd init)
 .dolt/

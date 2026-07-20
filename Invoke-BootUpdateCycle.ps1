@@ -1,5 +1,4 @@
 #requires -Version 7.0
-#requires -RunAsAdministrator
 # ------------------------------------------------------------------------------
 # File:        Invoke-BootUpdateCycle.ps1
 # Description: Boot-time update orchestrator with automatic reboot loop
@@ -333,7 +332,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 3 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.28' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.29' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 Set-Variable -Name 'RebootSignalSettleSeconds' -Value 20 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 $script:ExplicitRebootRequests = [System.Collections.Generic.List[object]]::new()
 
@@ -5087,7 +5086,15 @@ if ($PreviewSplash) {
         Show-StartupArt
     }
     $env:BOOT_UPDATE_SPLASH_THEME = $savedTheme
-    exit 0
+    return
+}
+
+<# Keep the splash preview genuinely safe and frictionless while retaining a
+   fail-closed administrator boundary for every operational path. #>
+$entryIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$entryPrincipal = [Security.Principal.WindowsPrincipal]$entryIdentity
+if (-not $entryPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw "Boot Update Cycle requires administrator access. Use 'upd help' or 'upd demo' for safe non-elevated commands."
 }
 
 function Enter-BootUpdateMutex {

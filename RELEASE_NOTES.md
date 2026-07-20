@@ -1,8 +1,23 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.28
+**Current Version:** v2.5.29
 **Release Date:** 2026-07-20
 **Status:** STABLE
+
+---
+
+## v2.5.29 (2026-07-20)
+
+**A friendly, compact launcher with safe previews and a checksummed self-updating handoff.**
+
+- Adds typed `upd` commands for help, plan, status, version, explicit update, splash, demo, and fun, with compact aliases such as `upd d`, `upd p`, `upd u`, and `upd v`.
+- Adds short run flags (`-r`, `-o`, `-n`, `-t`, `-s`, `-drv`, `-fw`, `-w`, `-c`, `-m`, `-x`, and `-i`) while retaining descriptive long forms.
+- Keeps help, planning, splash, demo, fun, version, and status non-elevated and non-mutating; operational execution still fails closed without administrator rights.
+- Passes validated options across UAC as Base64-encoded structured JSON instead of rebuilding a free-form command line.
+- Refreshes the full runtime bundle only from release assets with mandatory SHA256 sidecars, validates every asset before mutation, rolls back failed commits, and checksum/version-gates atomic `upd.cmd.next` adoption.
+- Preserves a compatibility bridge for older two-script installations, adds `upd repair` recovery, and publishes all six executable runtime assets plus matching checksums through a verified draft-release gate.
+- Adds `upd aws` (`upd a`) for focused AWS CLI v2 and AWS.Tools repair/update work and rejects ambiguous dashed short commands before they can become a default update run.
+- Adds launcher behavior and forwarding tests while keeping every splash theme byte-identical.
 
 ---
 

@@ -1,124 +1,51 @@
 @echo off
-:: Quick launcher for Deploy-BootUpdateCycle.ps1
-:: Usage: upd [delay_seconds | splash]
-::   upd        - immediate reboot (0 sec delay)
-::   upd 30     - 30 second delay before reboot
-::   upd splash - preview all splash themes, no updates
-::   upd /?     - show this help
-:: Self-adds to system PATH on first run (idempotent)
-:: Can be run from: elevated cmd, Run dialog (Ctrl+Shift+Enter), or double-click
-setlocal EnableDelayedExpansion
+setlocal
+:: BootUpdateCycleVersion=2.5.29
+:: Friendly entry point. Argument parsing, safe demo modes, and elevation live in
+:: tools\Invoke-UpdLauncher.ps1 so quoting and validation remain testable.
 
-:: Help
-if /i "%~1"=="/?" goto :help
-if /i "%~1"=="-h" goto :help
-if /i "%~1"=="--help" goto :help
-
-:: Validate optional argument BEFORE elevating: "splash" or a numeric delay
-set "DELAY=0"
-set "MODE=run"
-if "%~1"=="" goto :argok
-if /i "%~1"=="splash" (
-    set "MODE=splash"
-    goto :argok
-)
-echo %~1| findstr /r /x "[0-9][0-9]*" >nul
-if errorlevel 1 goto :badarg
-set "DELAY=%~1"
-:argok
-
-:: Verify PowerShell 7 is available before doing anything else
 where pwsh >nul 2>&1
-if %errorlevel% neq 0 (
-    echo ERROR: PowerShell 7 ^(pwsh^) not found on PATH.
-    echo Install it first:  winget install Microsoft.PowerShell
-    pause
+if errorlevel 1 (
+    echo ERROR: PowerShell 7 ^(pwsh^) was not found on PATH.
+    echo Install it with:  winget install Microsoft.PowerShell
     exit /b 1
 )
 
-:: Check for admin rights - if not elevated, relaunch elevated via PowerShell
-net session >nul 2>&1
-if %errorlevel% neq 0 (
-    echo Requesting elevation...
-    if "%~1"=="" (
-        powershell -NoProfile -Command "Start-Process -Verb RunAs -FilePath '%~f0'"
+set "UPD_ROOT=%~dp0"
+set "UPD_LAUNCHER=%UPD_ROOT%tools\Invoke-UpdLauncher.ps1"
+if /i "%~1"=="repair" goto bootstrap
+if not exist "%UPD_LAUNCHER%" goto bootstrap
+goto launch
+
+:bootstrap
+echo Recovering the checksummed UPD launcher from the latest GitHub release...
+pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $r=Invoke-RestMethod 'https://api.github.com/repos/nanoDBA/boot-upd/releases/latest' -Headers @{'User-Agent'='BootUpdateCycle-Bootstrap'} -TimeoutSec 15; $a=$r.assets|Where-Object name -eq 'Invoke-UpdLauncher.ps1'|Select-Object -First 1; $s=$r.assets|Where-Object name -eq 'Invoke-UpdLauncher.ps1.sha256'|Select-Object -First 1; if(-not $a -or -not $s){throw 'Latest release has no launcher/checksum pair'}; $e=((Invoke-RestMethod $s.browser_download_url -TimeoutSec 15)-split '\s+')[0].ToUpperInvariant(); if($e -notmatch '^[0-9A-F]{64}$'){throw 'Invalid launcher checksum'}; $t=[IO.Path]::GetTempFileName(); try{Invoke-WebRequest $a.browser_download_url -OutFile $t -TimeoutSec 60; if((Get-FileHash $t -Algorithm SHA256).Hash -ne $e){throw 'Launcher checksum mismatch'}; $x=$null;$z=$null;[void][Management.Automation.Language.Parser]::ParseFile($t,[ref]$x,[ref]$z);if($z.Count){throw $z[0].Message};New-Item -ItemType Directory -Path (Split-Path $env:UPD_LAUNCHER) -Force|Out-Null;Copy-Item $t $env:UPD_LAUNCHER -Force}finally{Remove-Item $t -Force -ErrorAction SilentlyContinue}"
+if errorlevel 1 (
+    echo ERROR: Could not recover the UPD launcher.
+    exit /b 1
+)
+if /i "%~1"=="repair" goto repair
+
+:launch
+
+pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%UPD_LAUNCHER%" %*
+set "UPD_EXIT=%errorlevel%"
+goto adopt
+
+:repair
+pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%UPD_LAUNCHER%" update
+set "UPD_EXIT=%errorlevel%"
+
+:: The PowerShell bootstrap cannot safely replace the batch file that cmd.exe
+:: is currently reading. Ask the launcher to checksum/version-gate and atomically
+:: adopt a staged copy after the first PowerShell process exits.
+:adopt
+if exist "%UPD_ROOT%upd.cmd.next" (
+    pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%UPD_LAUNCHER%" adopt-staged-batch
+    if errorlevel 1 (
+        echo WARNING: upd.cmd.next was rejected or could not be adopted.
     ) else (
-        powershell -NoProfile -Command "Start-Process -Verb RunAs -FilePath '%~f0' -ArgumentList '%~1'"
+        echo Updated upd.cmd from the checksummed release bundle.
     )
-    exit /b
 )
-
-:: Now we're elevated - proceed
-
-:: Get the directory where this batch file lives (remove trailing backslash)
-set "SCRIPT_DIR=%~dp0"
-set "SCRIPT_DIR=%SCRIPT_DIR:~0,-1%"
-
-:: Sanity check: the deploy script must exist next to this launcher
-if not exist "%SCRIPT_DIR%\Deploy-BootUpdateCycle.ps1" (
-    echo ERROR: Deploy-BootUpdateCycle.ps1 not found in "%SCRIPT_DIR%"
-    pause
-    exit /b 1
-)
-
-:: Splash preview mode - render all splash themes and exit, no updates
-if /i "%MODE%"=="splash" (
-    if not exist "%SCRIPT_DIR%\Invoke-BootUpdateCycle.ps1" (
-        echo ERROR: Invoke-BootUpdateCycle.ps1 not found in "%SCRIPT_DIR%"
-        pause
-        exit /b 1
-    )
-    pwsh -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%\Invoke-BootUpdateCycle.ps1" -PreviewSplash
-    pause
-    exit /b 0
-)
-
-:: Check Machine PATH via registry (not process PATH) to avoid stale-inherit false negatives
-powershell -NoProfile -Command ^
-    "$machinePath = [Environment]::GetEnvironmentVariable('Path','Machine');" ^
-    "$dir = '%SCRIPT_DIR%';" ^
-    "$entries = $machinePath -split ';' | Where-Object { $_ };" ^
-    "if ($entries -notcontains $dir) {" ^
-    "    $newPath = ($entries + $dir) -join ';';" ^
-    "    if ($newPath.Length -gt 2047) {" ^
-    "        Write-Host 'WARNING: Machine PATH would exceed 2047 chars - aborting PATH update';" ^
-    "        exit 1;" ^
-    "    }" ^
-    "    [Environment]::SetEnvironmentVariable('Path', $newPath, 'Machine');" ^
-    "    Write-Host 'Added %SCRIPT_DIR% to Machine PATH. Future sessions will find upd automatically.';" ^
-    "} else {" ^
-    "    Write-Host 'Already in Machine PATH.';" ^
-    "}"
-
-if %errorlevel% neq 0 (
-    echo WARNING: PATH update failed or was aborted.
-)
-
-:: Brief startup message
-echo.
-echo Starting Boot Update Cycle in 5 seconds... (reboot delay: %DELAY%s)
-echo (NonInteractive mode - no keypress required)
-echo.
-
-:: Launch PowerShell 7 with the deploy script (NonInteractive mode)
-pwsh -NoProfile -ExecutionPolicy Bypass -Command "Start-Sleep -Seconds 5; & '%SCRIPT_DIR%\Deploy-BootUpdateCycle.ps1' -RebootDelaySec %DELAY% -NonInteractive; if ($LASTEXITCODE -ne 0) { Write-Host 'Press Enter to exit...' -ForegroundColor Red; Read-Host }"
-exit /b %errorlevel%
-
-:help
-echo upd - Boot Update Cycle launcher
-echo.
-echo Usage: upd [delay_seconds ^| splash]
-echo   upd        Run update cycle, immediate reboot if needed
-echo   upd 30     Run update cycle, 30 second warning before reboot
-echo   upd splash Preview all splash screen themes (no updates)
-echo   upd /?     Show this help
-echo.
-echo Self-elevates via UAC if not already admin.
-echo Adds its own directory to the Machine PATH on first run.
-echo Monitor progress:  Get-Content "$env:ProgramData\BootUpdateCycle\BootUpdateCycle.log" -Tail 50 -Wait
-exit /b 0
-
-:badarg
-echo ERROR: delay must be a whole number of seconds, got "%~1"
-echo Run "upd /?" for usage.
-exit /b 1
+exit /b %UPD_EXIT%

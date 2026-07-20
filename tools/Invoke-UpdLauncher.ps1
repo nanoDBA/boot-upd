@@ -1,0 +1,438 @@
+#requires -Version 7.0
+[CmdletBinding()]
+param(
+    [Parameter(Position=0)][string]$Command = 'run',
+    [Alias('h','?','usage')][switch]$Help,
+    [Alias('r','delay','reboot-delay')][ValidateRange(0,86400)][int]$RebootDelaySec = 0,
+    [Alias('o','output-mode')][ValidateSet('Quiet','Normal','Verbose','Debug')][string]$OutputMode = 'Normal',
+    [Alias('n','max-iterations')][ValidateRange(1,50)][int]$MaxIterations = 5,
+    [Alias('t','timeout','timeout-minutes','package-timeout-minutes')][ValidateRange(1,1440)][int]$PackageTimeoutMinutes = 30,
+    [Alias('duration')][ValidateRange(2,60)][int]$DurationSeconds = 8,
+    [Alias('s','StagedRollout')][switch]$Staged,
+    [Alias('drv','IncludeDriverUpdates')][switch]$Drivers,
+    [Alias('fw','IncludeFirmwareUpdates')][switch]$Firmware,
+    [Alias('w','UpdateWsl')][switch]$Wsl,
+    [Alias('c','UpdateContainers')][switch]$Containers,
+    [Alias('m','allow-metered')][switch]$AllowMetered,
+    [Alias('rp','restore-point','EnableRestorePoint')][switch]$RestorePoint,
+    [Alias('dn','dotnet-tools','EnableDotnetTools')][switch]$DotnetTools,
+    [Alias('aws','aws-tooling','EnableAwsTooling')][switch]$AwsTooling,
+    [Alias('no-pip','skip-pip')][switch]$SkipPip,
+    [Alias('no-npm','skip-npm')][switch]$SkipNpm,
+    [Alias('no-o365','skip-office365')][switch]$SkipOffice365,
+    [Alias('no-psm','skip-power-shell-modules')][switch]$SkipPowerShellModules,
+    [Alias('no-scoop','skip-scoop')][switch]$SkipScoop,
+    [Alias('no-code','skip-vscode')][switch]$SkipVscode,
+    [Alias('no-def','skip-defender')][switch]$SkipDefender,
+    [Alias('no-check','skip-health-check')][switch]$SkipHealthCheck,
+    [Alias('no-bl','skip-bit-locker')][switch]$SkipBitLocker,
+    [Alias('nu','no-update','disable-self-update')][switch]$DisableSelfUpdate,
+    [Alias('x','ExcludePatterns')][string[]]$Exclude = @(),
+    [Alias('i','IncludePatterns')][string[]]$Include = @(),
+    [Parameter(DontShow)][switch]$V,
+    [Parameter(DontShow)][switch]$D,
+    [Parameter(DontShow)][switch]$F,
+    [Parameter(DontShow)][switch]$St,
+    [Parameter(DontShow)][string]$EncodedArguments = '',
+    [Parameter(ValueFromRemainingArguments)][string[]]$RemainingArguments = @()
+)
+
+$ErrorActionPreference = 'Stop'
+$repoRoot = Split-Path $PSScriptRoot -Parent
+$deployPath = Join-Path $repoRoot 'Deploy-BootUpdateCycle.ps1'
+$invokePath = Join-Path $repoRoot 'Invoke-BootUpdateCycle.ps1'
+$demoPath = Join-Path $PSScriptRoot 'Show-BootUpdateProgressDemo.ps1'
+$awsPath = Join-Path $repoRoot 'Repair-AwsTooling.ps1'
+
+function Show-UpdHelp {
+    @'
+
+  UPD // Boot Update Cycle
+  Run as admin, walk away, come back to a verified configured patch pass.
+
+  USAGE
+    upd [run] [options]        Start an update cycle
+    upd <seconds>              Legacy shorthand for --delay <seconds>
+    upd splash                 Preview every splash theme; no updates or UAC
+    upd demo [seconds]         Animate BOOT//PULSE; no updates or UAC
+    upd fun [seconds]          Splash parade + animation; no updates or UAC
+    upd plan [options]         Show the resolved deployment parameters only
+    upd update                 Refresh the checksummed source bundle and exit
+    upd aws                    Update/repair AWS CLI v2 and AWS.Tools
+    upd repair                 Recover launcher/core files, then refresh the bundle
+    upd status                 Show checkpoint/task status
+    upd version                Show the bundled updater version
+    upd help                   Show this screen
+
+  SHORT COMMANDS
+    r=run  d=demo  f=fun  sp=splash  p=plan  u=update  a=aws  st=status  v=version
+    Short commands do not take a leading dash.
+
+  HELP ALIASES
+    /?  ?  /help  help  -h  --help  usage  --usage
+
+  RUN OPTIONS
+    -r, --delay <seconds>      Reboot countdown; default 0
+    -o, --output-mode <mode>   Quiet | Normal | Verbose | Debug
+    -n, --max-iterations <n>   Reboot-loop safety limit; default 5
+    -t, --timeout <minutes>    Per-provider hard timeout; default 30
+    -s, --staged               Run one provider per checkpoint
+    -drv, --drivers            Include Windows driver updates
+    -fw, --firmware            Include firmware updates
+    -w, --wsl                  Update WSL kernel and distributions
+    -c, --containers           Refresh Docker/Podman images
+    -m, --allow-metered        Permit metered network use
+    --restore-point            Opt in to a restore point
+    --dotnet-tools             Opt in to .NET global-tool updates
+    --aws-tooling              Opt in to AWS CLI/module repair
+    -x, --exclude <pattern>    Skip matching packages; repeat or comma-separate
+    -i, --include <pattern>    Allow only matching packages; repeat or comma-separate
+    --skip-pip                 Skip pip
+    --skip-npm                 Skip npm
+    --skip-office365           Skip Office Click-to-Run
+    --skip-power-shell-modules Skip PowerShell modules
+    --skip-scoop               Skip Scoop
+    --skip-vscode              Skip VS Code extensions
+    --skip-defender            Skip Defender signatures
+    --skip-health-check        Skip service verification (completion is downgraded)
+    --skip-bit-locker          Do not suspend BitLocker for an orchestrated reboot
+    --disable-self-update      Do not check GitHub releases
+
+  EXAMPLES
+    upd -r 120 -drv -fw
+    upd r -s -o Verbose
+    upd -x Teams,OneDrive -no-o365
+    upd p -w -c -m
+    upd d 12
+
+  During a live interactive run, press v to cycle output detail.
+'@ | Write-Host
+}
+
+function Get-UpdVersion {
+    param([switch]$AllowUnknown)
+    try { $raw = Get-Content -LiteralPath $invokePath -Raw -ErrorAction Stop }
+    catch { if ($AllowUnknown) { return [version]'0.0.0' }; throw }
+    if ($raw -notmatch "BootUpdateCycleVersion'\s*-Value\s*'([\d.]+)'") {
+        if ($AllowUnknown) { return [version]'0.0.0' }
+        throw 'Could not read the bundled updater version.'
+    }
+    return [version]$Matches[1]
+}
+
+function Install-UpdStagedBatch {
+    $target = Join-Path $repoRoot 'upd.cmd'
+    $staged = "$target.next"
+    $sidecar = "$staged.sha256"
+    if (-not (Test-Path -LiteralPath $staged)) { return $false }
+    try {
+        if (-not (Test-Path -LiteralPath $sidecar)) { throw 'staged checksum is missing' }
+        $expected = ((Get-Content -LiteralPath $sidecar -Raw) -split '\s+')[0].ToUpperInvariant()
+        if ($expected -notmatch '^[0-9A-F]{64}$') { throw 'staged checksum is malformed' }
+        $actual = (Get-FileHash -LiteralPath $staged -Algorithm SHA256).Hash.ToUpperInvariant()
+        if ($actual -ne $expected) { throw 'staged checksum does not match' }
+        $batch = Get-Content -LiteralPath $staged -Raw
+        if ($batch -notmatch '(?m)^:: BootUpdateCycleVersion=([\d.]+)\s*$') { throw 'staged version marker is missing' }
+        $stagedVersion = [version]$Matches[1]
+        $coreVersion = Get-UpdVersion
+        if ($stagedVersion -ne $coreVersion) { throw "staged v$stagedVersion does not match core v$coreVersion" }
+        if ($batch -notmatch '(?im)^@echo off\s*$' -or $batch -notmatch 'Invoke-UpdLauncher\.ps1') { throw 'staged launcher structure is invalid' }
+        [IO.File]::Replace($staged, $target, "$target.bak", $true)
+        Remove-Item -LiteralPath $sidecar -Force -ErrorAction SilentlyContinue
+        return $true
+    } catch {
+        Write-Warning "Rejected upd.cmd.next: $_"
+        Remove-Item -LiteralPath $staged,$sidecar -Force -ErrorAction SilentlyContinue
+        throw
+    }
+}
+
+function Get-UpdDeployParameters {
+    $result = [ordered]@{
+        RebootDelaySec        = $RebootDelaySec
+        OutputMode            = $OutputMode
+        MaxIterations         = $MaxIterations
+        PackageTimeoutMinutes = $PackageTimeoutMinutes
+        NonInteractive        = $true
+    }
+    $switchMap = [ordered]@{
+        Staged='StagedRollout'; Drivers='IncludeDriverUpdates'; Firmware='IncludeFirmwareUpdates'
+        Wsl='UpdateWsl'; Containers='UpdateContainers'; AllowMetered='AllowMetered'
+        RestorePoint='EnableRestorePoint'; DotnetTools='EnableDotnetTools'; AwsTooling='EnableAwsTooling'
+        SkipPip='SkipPip'; SkipNpm='SkipNpm'; SkipOffice365='SkipOffice365'
+        SkipPowerShellModules='SkipPowerShellModules'; SkipScoop='SkipScoop'; SkipVscode='SkipVscode'
+        SkipDefender='SkipDefender'; SkipHealthCheck='SkipHealthCheck'; SkipBitLocker='SkipBitLocker'
+        DisableSelfUpdate='DisableSelfUpdate'
+    }
+    foreach ($entry in $switchMap.GetEnumerator()) {
+        if ((Get-Variable -Name $entry.Key -ValueOnly)) { $result[$entry.Value] = $true }
+    }
+    if ($Exclude.Count) { $result.ExcludePatterns = @($Exclude | ForEach-Object { $_ -split ',' } | Where-Object { $_ }) }
+    if ($Include.Count) { $result.IncludePatterns = @($Include | ForEach-Object { $_ -split ',' } | Where-Object { $_ }) }
+    return $result
+}
+
+function Test-UpdAdministrator {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    return ([Security.Principal.WindowsPrincipal]$identity).IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator
+    )
+}
+
+function Add-UpdToMachinePath {
+    $machinePath = [Environment]::GetEnvironmentVariable('Path','Machine')
+    $entries = @($machinePath -split ';' | Where-Object { $_ })
+    if ($entries -contains $repoRoot) { return }
+    $newPath = ($entries + $repoRoot) -join ';'
+    if ($newPath.Length -gt 2047) {
+        Write-Warning 'Machine PATH would exceed 2047 characters; launcher path was not added.'
+        return
+    }
+    [Environment]::SetEnvironmentVariable('Path', $newPath, 'Machine')
+    Write-Host "Added $repoRoot to the Machine PATH." -ForegroundColor Green
+}
+
+function Update-UpdSourceBundle {
+    param([switch]$Explicit)
+    $tempRoot = $null
+    try {
+        $localVersion = Get-UpdVersion -AllowUnknown
+        $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/nanoDBA/boot-upd/releases/latest' `
+            -Headers @{ 'User-Agent'='BootUpdateCycle-Launcher' } -TimeoutSec 15 -ErrorAction Stop
+        $remoteVersion = [version]($release.tag_name -replace '^v','')
+        if ($remoteVersion -lt $localVersion) {
+            Write-Host "Checksummed bundle check: local v$localVersion is newer than published v$remoteVersion; no downgrade." -ForegroundColor Yellow
+            return $false
+        }
+
+        $specs = @(
+            [pscustomobject]@{ Name='Invoke-BootUpdateCycle.ps1'; Target=(Join-Path $repoRoot 'Invoke-BootUpdateCycle.ps1'); PowerShell=$true; StageBatch=$false }
+            [pscustomobject]@{ Name='Deploy-BootUpdateCycle.ps1'; Target=(Join-Path $repoRoot 'Deploy-BootUpdateCycle.ps1'); PowerShell=$true; StageBatch=$false }
+            [pscustomobject]@{ Name='Invoke-UpdLauncher.ps1'; Target=$PSCommandPath; PowerShell=$true; StageBatch=$false }
+            [pscustomobject]@{ Name='Show-BootUpdateProgressDemo.ps1'; Target=$demoPath; PowerShell=$true; StageBatch=$false }
+            [pscustomobject]@{ Name='Repair-AwsTooling.ps1'; Target=$awsPath; PowerShell=$true; StageBatch=$false }
+            [pscustomobject]@{ Name='upd.cmd'; Target=(Join-Path $repoRoot 'upd.cmd'); PowerShell=$false; StageBatch=$true }
+        )
+        $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ('boot-upd-bundle-{0}' -f [guid]::NewGuid().ToString('N'))
+        $null = New-Item -ItemType Directory -Path $tempRoot -ErrorAction Stop
+        $verified = [Collections.Generic.List[object]]::new()
+
+        <# Validate the complete release before replacing any local executable. #>
+        foreach ($spec in $specs) {
+            $asset = $release.assets | Where-Object name -eq $spec.Name | Select-Object -First 1
+            $shaAsset = $release.assets | Where-Object name -eq "$($spec.Name).sha256" | Select-Object -First 1
+            if (-not $asset -or -not $shaAsset) { throw "Release $($release.tag_name) is missing $($spec.Name) or its SHA256 sidecar." }
+            $expected = ((Invoke-RestMethod -Uri $shaAsset.browser_download_url -Headers @{ 'User-Agent'='BootUpdateCycle-Launcher' } -TimeoutSec 15) -split '\s+')[0].ToUpperInvariant()
+            if ($expected -notmatch '^[0-9A-F]{64}$') { throw "Release $($release.tag_name) has an invalid SHA256 for $($spec.Name)." }
+            $temp = Join-Path $tempRoot $spec.Name
+            Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $temp -Headers @{ 'User-Agent'='BootUpdateCycle-Launcher' } -TimeoutSec 60
+            $actual = (Get-FileHash -LiteralPath $temp -Algorithm SHA256).Hash.ToUpperInvariant()
+            if ($actual -ne $expected) { throw "SHA256 mismatch for $($spec.Name)." }
+            if ($spec.PowerShell) {
+                $tokens=$null; $errors=$null
+                [void][Management.Automation.Language.Parser]::ParseFile($temp,[ref]$tokens,[ref]$errors)
+                if ($errors.Count) { throw "Downloaded $($spec.Name) has a PowerShell parse error: $($errors[0].Message)" }
+            } else {
+                $batch = Get-Content -LiteralPath $temp -Raw
+                if ($batch -notmatch '(?im)^@echo off\s*$' -or $batch -notmatch 'Invoke-UpdLauncher\.ps1') { throw 'Downloaded upd.cmd failed its launcher structure check.' }
+            }
+            $verified.Add([pscustomobject]@{ Spec=$spec; Temp=$temp; Hash=$actual })
+        }
+
+        $changed = [Collections.Generic.List[string]]::new()
+        $committed = [Collections.Generic.List[object]]::new()
+        $commitStarted = $false
+        try {
+            foreach ($item in $verified) {
+                $spec = $item.Spec
+                $destination = if ($spec.StageBatch) { "$($spec.Target).next" } else { $spec.Target }
+                if ((Test-Path -LiteralPath $spec.Target) -and (Get-FileHash -LiteralPath $spec.Target -Algorithm SHA256).Hash -eq $item.Hash) {
+                    if ($spec.StageBatch) { Remove-Item -LiteralPath $destination,"$destination.sha256" -Force -ErrorAction SilentlyContinue }
+                    continue
+                }
+                $snapshot = Join-Path $tempRoot ("rollback-{0}" -f $committed.Count)
+                $existed = Test-Path -LiteralPath $destination
+                if ($existed) { Copy-Item -LiteralPath $destination -Destination $snapshot -Force }
+                $sidecarPath = "$destination.sha256"
+                $sidecarSnapshot = "$snapshot.sha256"
+                $sidecarExisted = $spec.StageBatch -and (Test-Path -LiteralPath $sidecarPath)
+                if ($sidecarExisted) { Copy-Item -LiteralPath $sidecarPath -Destination $sidecarSnapshot -Force }
+                $committed.Add([pscustomobject]@{ Destination=$destination; Snapshot=$snapshot; Existed=$existed; SidecarPath=$sidecarPath; SidecarSnapshot=$sidecarSnapshot; SidecarExisted=$sidecarExisted; Staged=$spec.StageBatch })
+                $commitStarted = $true
+                $incoming = "$destination.incoming-$PID"
+                try {
+                    Copy-Item -LiteralPath $item.Temp -Destination $incoming -Force
+                    Move-Item -LiteralPath $incoming -Destination $destination -Force
+                    if ($spec.StageBatch) { Set-Content -LiteralPath $sidecarPath -Value $item.Hash -Encoding ascii -NoNewline }
+                    $changed.Add($spec.Name)
+                } finally {
+                    if (Test-Path -LiteralPath $incoming) { Remove-Item -LiteralPath $incoming -Force -ErrorAction SilentlyContinue }
+                }
+            }
+        } catch {
+            for ($index = $committed.Count - 1; $index -ge 0; $index--) {
+                $entry = $committed[$index]
+                if ($entry.Existed) { Copy-Item -LiteralPath $entry.Snapshot -Destination $entry.Destination -Force }
+                else { Remove-Item -LiteralPath $entry.Destination -Force -ErrorAction SilentlyContinue }
+                if ($entry.Staged) {
+                    if ($entry.SidecarExisted) { Copy-Item -LiteralPath $entry.SidecarSnapshot -Destination $entry.SidecarPath -Force }
+                    else { Remove-Item -LiteralPath $entry.SidecarPath -Force -ErrorAction SilentlyContinue }
+                }
+            }
+            throw "Bundle commit failed and was rolled back: $_"
+        }
+        if ($changed.Count) { Write-Host "Checksummed bundle updated to v${remoteVersion}: $($changed -join ', ')" -ForegroundColor Green }
+        else { Write-Host "Checksummed bundle already current at v$localVersion." -ForegroundColor Green }
+        return ($changed.Count -gt 0)
+    } catch {
+        if ($Explicit -or $commitStarted) { throw }
+        Write-Warning "Checksummed source-bundle update skipped: $_"
+        return $false
+    } finally {
+        if ($tempRoot -and (Test-Path -LiteralPath $tempRoot)) {
+            Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Invoke-UpdElevated {
+    param([Parameter(Mandatory)][string[]]$CanonicalArguments)
+    $json = ConvertTo-Json -InputObject @($CanonicalArguments) -Compress
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
+    $quotedScript = '"{0}"' -f $PSCommandPath
+    $process = Start-Process -FilePath (Get-Command pwsh).Source -Verb RunAs -Wait -PassThru -ArgumentList @(
+        '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $quotedScript,
+        '-EncodedArguments', $encoded
+    )
+    return $process.ExitCode
+}
+
+function Get-UpdCanonicalRunArguments {
+    param([Parameter(Mandatory)][Collections.IDictionary]$DeployParameters)
+    $arguments = [Collections.Generic.List[string]]::new()
+    $arguments.Add('run')
+    foreach ($entry in $DeployParameters.GetEnumerator()) {
+        if ($entry.Key -eq 'NonInteractive') { continue }
+        if ($entry.Value -is [bool]) {
+            if ($entry.Value) { $arguments.Add("-$($entry.Key)") }
+        } elseif ($entry.Value -is [array]) {
+            foreach ($value in $entry.Value) { $arguments.Add("-$($entry.Key -replace 'Patterns$','')"); $arguments.Add([string]$value) }
+        } else {
+            $launcherName = switch ($entry.Key) {
+                'PackageTimeoutMinutes' { '-PackageTimeoutMinutes' }
+                default { "-$($entry.Key)" }
+            }
+            $arguments.Add($launcherName); $arguments.Add([string]$entry.Value)
+        }
+    }
+    return $arguments.ToArray()
+}
+
+function Show-UpdStatus {
+    $statePath = Join-Path $env:ProgramData 'BootUpdateCycle\BootUpdateCycle.state.json'
+    $taskNames = @('BootUpdateCycle','BootUpdateCycleFallback')
+    Write-Host "Boot Update Cycle v$(Get-UpdVersion)" -ForegroundColor Cyan
+    foreach ($name in $taskNames) {
+        $task = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+        if ($task) { Write-Host ("  task  {0,-24} {1}" -f $name,$task.State) }
+    }
+    if (Test-Path -LiteralPath $statePath) {
+        $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+        Write-Host "  state $($state.Phase)  iteration $($state.Iteration)/$($state.MaxIterations ?? '?')"
+    } else { Write-Host '  state no active checkpoint' }
+}
+
+if ($EncodedArguments) {
+    $decoded = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($EncodedArguments)) | ConvertFrom-Json
+    & $PSCommandPath @($decoded)
+    exit $LASTEXITCODE
+}
+
+$helpNames = @('/?','?','/help','help','-help','--help','-h','usage','--usage')
+if ($Help -or $Command -in $helpNames) { Show-UpdHelp; exit 0 }
+
+if ($V -or $D -or $F -or $St) {
+    throw "Short commands do not take a dash. Use 'upd v', 'upd f', or 'upd st'."
+}
+
+$commandAliases = @{
+    'r'='run'; 'd'='demo'; 'f'='fun'; 'sp'='splash'; 'p'='plan'
+    'u'='update'; 'a'='aws'; 'st'='status'; 'v'='version'
+    '--demo'='demo'; '/demo'='demo'; '--fun'='fun'; '/fun'='fun'
+}
+if ($commandAliases.ContainsKey($Command.ToLowerInvariant())) {
+    $Command = $commandAliases[$Command.ToLowerInvariant()]
+}
+
+if ($Command -match '^\d+$') {
+    if ($PSBoundParameters.ContainsKey('RebootDelaySec')) { throw 'Specify the reboot delay only once.' }
+    $RebootDelaySec = [int]$Command
+    $Command = 'run'
+} elseif ($Command -eq 'run' -and $RemainingArguments.Count -eq 1 -and $RemainingArguments[0] -match '^\d+$') {
+    if ($PSBoundParameters.ContainsKey('RebootDelaySec')) { throw 'Specify the reboot delay only once.' }
+    $RebootDelaySec = [int]$RemainingArguments[0]
+    $RemainingArguments = @()
+}
+
+if ($Command -in @('demo','fun') -and $RemainingArguments.Count -eq 1 -and $RemainingArguments[0] -match '^\d+$') {
+    $DurationSeconds = [int]$RemainingArguments[0]
+    $RemainingArguments = @()
+}
+if ($RemainingArguments.Count) { throw "Unexpected argument(s): $($RemainingArguments -join ' '). Run 'upd help'." }
+
+switch ($Command.ToLowerInvariant()) {
+    'splash' {
+        & $invokePath -PreviewSplash
+        exit 0
+    }
+    'demo' {
+        & $demoPath -DurationSeconds $DurationSeconds
+        exit 0
+    }
+    'fun' {
+        & $invokePath -PreviewSplash
+        & $demoPath -DurationSeconds $DurationSeconds
+        exit 0
+    }
+    'version' { Write-Host "Boot Update Cycle v$(Get-UpdVersion)"; exit 0 }
+    'status' { Show-UpdStatus; exit 0 }
+    'plan' {
+        [pscustomobject](Get-UpdDeployParameters) | Format-List
+        Write-Host 'PLAN ONLY — no elevation, deployment, updates, tasks, or reboots.' -ForegroundColor Cyan
+        exit 0
+    }
+    'update' {
+        if (-not (Test-UpdAdministrator)) {
+            Write-Host 'Requesting administrator access to update the checksummed source bundle...' -ForegroundColor Yellow
+            exit (Invoke-UpdElevated -CanonicalArguments @('update'))
+        }
+        $null = Update-UpdSourceBundle -Explicit
+        exit 0
+    }
+    'adopt-staged-batch' {
+        $null = Install-UpdStagedBatch
+        exit 0
+    }
+    'aws' {
+        if (-not (Test-UpdAdministrator)) {
+            Write-Host 'Requesting administrator access to update AWS tooling...' -ForegroundColor Yellow
+            exit (Invoke-UpdElevated -CanonicalArguments @('aws'))
+        }
+        $null = Update-UpdSourceBundle
+        if (-not (Test-Path -LiteralPath $awsPath)) { throw 'Repair-AwsTooling.ps1 is unavailable. Run upd repair.' }
+        & $awsPath -Mode Remediate
+        exit $LASTEXITCODE
+    }
+    'run' {
+        $deployParameters = Get-UpdDeployParameters
+        if (-not (Test-UpdAdministrator)) {
+            Write-Host 'Requesting administrator access for the update cycle...' -ForegroundColor Yellow
+            exit (Invoke-UpdElevated -CanonicalArguments (Get-UpdCanonicalRunArguments -DeployParameters $deployParameters))
+        }
+        Add-UpdToMachinePath
+        if (-not $DisableSelfUpdate) { $null = Update-UpdSourceBundle }
+        & $deployPath @deployParameters
+        exit $LASTEXITCODE
+    }
+    default { throw "Unknown command '$Command'. Run 'upd help'." }
+}

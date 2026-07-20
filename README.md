@@ -27,7 +27,7 @@ When the configured work, convergence checks, reboot checks, service health, and
 
 <img src="docs/img/updater-complete.png" alt="Boot Update Cycle configured patch pass verified completion screen" width="900">
 
-<sub>Representative v2.5.28 console captures rendered from the production UI text for deterministic, privacy-safe documentation; package counts and elapsed time are illustrative.</sub>
+<sub>Representative v2.5.29 console captures rendered from the production UI text for deterministic, privacy-safe documentation; package counts and elapsed time are illustrative.</sub>
 
 ## What it updates
 
@@ -54,6 +54,52 @@ upd
 That's it. Runs from an elevated command prompt, PowerShell, or the Run dialog (Win+R → `upd` → Ctrl+Shift+Enter).
 
 `upd.cmd` auto-adds itself to your system PATH on first run, so it works from anywhere after that.
+
+### Friendly launcher
+
+The launcher accepts both commands and typed run options. Help, previews, planning,
+version, and status do not request elevation; only `run` starts the UAC-protected updater.
+
+```text
+upd help                         Full command and option reference
+upd /?                           Same help (also ?, /help, -h, --help, usage)
+upd splash                       Preview all splash themes; no updates
+upd demo 12                      Run the production BOOT//PULSE animation for 12 seconds
+upd fun 12                       Splash parade followed by the animation
+upd update                       Refresh the checksummed launcher bundle and exit
+upd aws                          Update/repair AWS CLI v2 and AWS.Tools
+upd repair                       Recover missing/corrupt launcher and core files
+upd version                      Show the bundled version
+upd status                       Show resume tasks and checkpoint state
+upd plan --drivers --delay 120   Resolve options without elevation or changes
+
+upd                              Run with defaults
+upd 120                          Legacy shorthand: run with a 120-second reboot warning
+upd --delay 120 --drivers --firmware
+upd --staged --output-mode Verbose
+upd --wsl --containers --allow-metered
+upd --exclude Teams,OneDrive --skip-office365
+```
+
+Short forms keep everyday commands light: `upd d 12`, `upd f`, `upd p -drv -r 120`,
+`upd r -s -o Verbose`, `upd a`, `upd u`, and `upd v`. Short commands do not use a
+leading dash; ambiguous dashed forms fail before they can reach the update path. Long
+names remain available for scripts and discoverability.
+
+A real `upd` run checks the latest GitHub release before deployment. Every executable
+asset must have a valid SHA256 sidecar or the refresh is rejected. These checksums detect
+corruption but are not code-signing signatures. PowerShell files are
+verified and installed first; `upd.cmd` is staged as `upd.cmd.next` and adopted only after
+the current PowerShell launcher exits, after a second checksum and version check. Older two-script installs cross the chicken-and-egg
+boundary through the deployer's compatibility bridge, then use this staged handoff on
+subsequent runs. Use `upd u` to request the refresh explicitly or `-nu` to skip the
+automatic check for one run. `upd repair` can bootstrap a missing launcher and repair a
+missing or corrupt core bundle.
+
+Run `upd help` for the complete list, including provider opt-ins, skip switches,
+timeouts, iteration limits, health/BitLocker controls, include/exclude filters, and
+self-update control. `demo`, `fun`, and `splash` never deploy files, register tasks,
+update packages, or reboot Windows.
 
 ### Console views
 
