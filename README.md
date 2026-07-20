@@ -47,14 +47,21 @@ When the configured work, convergence checks, reboot checks, service health, and
 
 ## Quick start
 
-Fresh install, repair, and run—the Chocolatey-style convenience form for an elevated
+Fresh install, repair, and run—the short Chocolatey-style paste for an elevated
 Command Prompt, PowerShell, or Win+R:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; & ([ScriptBlock]::Create((Invoke-RestMethod -UseBasicParsing 'https://github.com/nanoDBA/boot-upd/releases/latest/download/Install-UpdCompat.ps1'))) -CommandArguments run"
+```
+
+If you prefer the downloaded bootstrap to remain visible in `%TEMP%` for inspection or
+troubleshooting, use the equivalent download-and-run form:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -UseBasicParsing 'https://github.com/nanoDBA/boot-upd/releases/latest/download/Install-UpdCompat.ps1' -OutFile ([IO.Path]::Combine([IO.Path]::GetTempPath(),'Install-UpdCompat.ps1')); & ([IO.Path]::Combine([IO.Path]::GetTempPath(),'Install-UpdCompat.ps1')) -CommandArguments run"
 ```
 
-This convenience command trusts GitHub HTTPS and the repository's current latest release.
+Both convenience commands trust GitHub HTTPS and the repository's current latest release.
 The downloaded installer then verifies every runtime asset against its published SHA256
 sidecar and installs to `Program Files\BootUpdateCycle`, or transactionally repairs the
 existing `upd.cmd` PATH winner. For a version-and-hash-pinned bootstrap, use the stricter

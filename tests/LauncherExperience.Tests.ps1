@@ -216,6 +216,7 @@ exit 29
         $readme | Should -Match (Get-FileHash -LiteralPath $compatInstallerPath -Algorithm SHA256).Hash
         $readme |
             Should -Match 'powershell\.exe -NoProfile -ExecutionPolicy Bypass.*releases/latest/download/Install-UpdCompat\.ps1'
+        $readme | Should -Match '\[ScriptBlock\]::Create\(\(Invoke-RestMethod -UseBasicParsing.*Install-UpdCompat\.ps1'
     }
 
     It 'coheres release versions and detects cloud races around every bundle commit' {
