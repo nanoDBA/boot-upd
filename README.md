@@ -156,7 +156,8 @@ update packages, or reboot Windows.
 
 Interactive runs use a compact progress view by default: current phase, overall progress,
 phase results, warnings, and errors. The complete timestamped detail stream still goes to
-`BootUpdateCycle.log`.
+`BootUpdateCycle.log`. Raw Winget and Chocolatey output is retained separately in
+`BootUpdateCycle.providers.log` for troubleshooting without overwhelming the normal run log.
 
 Press `v` at any time during an interactive run to cycle through:
 
@@ -243,6 +244,9 @@ Package managers are auto-detected. Missing ones are skipped with a warning.
 ```powershell
 # Live log tail
 Get-Content "$env:ProgramData\BootUpdateCycle\BootUpdateCycle.log" -Tail 50 -Wait
+
+# Unabridged package-manager transcript
+Get-Content "$env:ProgramData\BootUpdateCycle\BootUpdateCycle.providers.log" -Tail 100 -Wait
 
 # Cycle history (last 50 runs with package counts)
 Get-Content "$env:ProgramData\BootUpdateCycle\BootUpdateCycle.history.json" | ConvertFrom-Json

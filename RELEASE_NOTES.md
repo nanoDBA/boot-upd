@@ -1,8 +1,20 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.44
+**Current Version:** v2.5.45
 **Release Date:** 2026-07-21
 **Status:** STABLE
+
+---
+
+## v2.5.45 (2026-07-21)
+
+### Calmer provider diagnostics and correct BitLocker targeting
+
+- Keeps verbose Winget and Chocolatey transcripts in `BootUpdateCycle.providers.log` while the primary log reports concise attempted, updated, failed, pinned, deferred, and retry summaries.
+- Promotes individual Winget installer failures to warnings with package identity, decimal and hexadecimal exit codes, and a plain-language reason for common Windows Installer failures.
+- Makes partial progress explicit: a provider can report successful updates while clearly stating that failed packages are queued for another convergence pass.
+- Suspends BitLocker only on the Windows operating-system volume before reboot; protected data volumes are no longer probed or needlessly warned about.
+- Adds regression coverage using the real noisy Winget failure transcript and OS-volume-only BitLocker assertions.
 
 ---
 

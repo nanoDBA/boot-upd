@@ -40,4 +40,14 @@ Describe 'Claude Code project compatibility' {
         $names | Should -Contain 'test-gates'
         $names | Should -Contain 'reboot-resilience-review'
     }
+
+    It 'gives Claude and release gates an automatic batch-line-ending repair path' {
+        $claude = Get-Content $claudePath -Raw
+        $testGate = Get-Content (Join-Path $repoRoot 'tools\Invoke-TestGates.ps1') -Raw
+        $releaseGate = Get-Content (Join-Path $repoRoot 'tools\New-Release.ps1') -Raw
+        Test-Path (Join-Path $repoRoot 'tools\Repair-LineEndings.ps1') | Should -BeTrue
+        $claude | Should -Match 'Repair-LineEndings\.ps1'
+        $testGate | Should -Match 'Repair-LineEndings\.ps1'
+        $releaseGate | Should -Match 'Repair-LineEndings\.ps1'
+    }
 }

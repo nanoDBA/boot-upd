@@ -7,7 +7,7 @@
 - This is a Windows PowerShell 7 updater whose correctness depends on real Windows identities, Task Scheduler, package-manager exit codes, and reboot persistence.
 - Read `README.md` for supported behavior and `docs/TESTING.md` before changing lifecycle, launcher, task, mutex, state, or reboot logic.
 - Treat `Invoke-BootUpdateCycle.ps1` as the authoritative orchestrator and `upd.cmd` plus `tools/Invoke-UpdLauncher.ps1` as one launcher system.
-- Preserve CRLF bytes in `upd.cmd`; its tests enforce this because `cmd.exe` can misparse LF-only launchers.
+- Preserve CRLF bytes in every `.cmd` file because `cmd.exe` can misparse mixed or LF-only launchers. After any batch-file edit, run `./tools/Repair-LineEndings.ps1`; the test and release gates also run it automatically, so fix line endings instead of reporting them as a user-facing blocker.
 
 ## Working safely
 

@@ -17,6 +17,8 @@ DEL_ALL*.CMD
 *.state.json.tmp
 *.state.json.corrupt-*.json
 BootUpdateCycle.log
+BootUpdateCycle.providers.log
+BootUpdateCycle.providers.*.log
 BootUpdateCycle.*.log
 BootUpdateCycle.history.json
 upd.cmd.next

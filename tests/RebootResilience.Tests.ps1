@@ -33,7 +33,10 @@ BeforeAll {
         'Stop-BootUpdateAtRetryLimit',
         'Update-BootUpdateStagedRetryCount',
         'Get-NextMaintenanceWindowStart',
-        'Test-WindowsUpdateConvergence'
+        'Test-WindowsUpdateConvergence',
+        'Format-NativeExitCode',
+        'Get-InstallerExitSummary',
+        'Get-WingetOutputSummary'
     )) {
         . ([scriptblock]::Create((Get-FunctionText $invokeAst $functionName)))
     }
@@ -47,6 +50,65 @@ BeforeAll {
         if ($script:FailUnregister) { throw 'simulated task removal failure' }
     }
     function Invoke-BootUpdateBackgroundOperation { param($Name, $Status, $TimeoutMinutes, $ScriptBlock, $ArgumentList) }
+}
+
+Describe 'Concise provider diagnostics' {
+    It 'extracts package failures and inventory notes from noisy Winget output' {
+        $lines = @(
+            '1 package(s) have pins that prevent upgrade.',
+            '(1/4) Found Logitech G HUB [Logitech.GHUB] Version 2026.4',
+            'Successfully installed',
+            '(2/4) Found Pandoc [JohnMacFarlane.Pandoc] Version 3.10',
+            '   Uninstall failed with exit code: 1605',
+            '(3/4) Found Windows PC Health Check [Microsoft.WindowsPCHealthCheck] Version 4.0',
+            'Uninstall failed with exit code: 1612',
+            '(4/4) Found Corsair iCUE5 Software [Corsair.iCUE.5] Version 5.48',
+            'Installer failed with exit code: 3221226525',
+            '4 package(s) have version numbers that cannot be determined.',
+            '1 package(s) have upgrades blocked because newer versions use a different install technology than the current installation.'
+        )
+        $summary = Get-WingetOutputSummary -Lines $lines
+        $summary.Attempted | Should -Be 4
+        $summary.Updated | Should -Be 1
+        $summary.Failures.Count | Should -Be 3
+        $summary.Failures[0].Id | Should -Be 'JohnMacFarlane.Pandoc'
+        $summary.Failures[0].Summary | Should -Be 'product is not currently installed'
+        $summary.Failures[1].Summary | Should -Be 'installation source is unavailable'
+        $summary.Failures[2].Hex | Should -Be '0xC000041D'
+        $summary.Pinned | Should -Be 1
+        $summary.Unknown | Should -Be 4
+        $summary.TechnologyBlocked | Should -Be 1
+    }
+
+    It 'renders signed provider HRESULTs in recognizable hexadecimal form' {
+        Format-NativeExitCode -Code -1978335188 | Should -Be '0x8A15002C'
+    }
+
+    It 'keeps raw provider chatter out of the primary structured log path' {
+        $winget = Get-FunctionText $invokeAst 'Update-WingetPackages'
+        $choco = Get-FunctionText $invokeAst 'Update-ChocolateyPackages'
+        $winget | Should -Match 'Write-WingetScopeSummary'
+        $choco | Should -Match 'Write-ProviderTranscript'
+        $winget | Should -Not -Match 'foreach \(\$line in \$jr\.Lines\)[\s\S]*?Write-Log \$line'
+        $choco | Should -Not -Match 'Write-Log \$_'
+    }
+
+    It 'fails closed when a parallel Winget child process cannot start' {
+        $winget = Get-FunctionText $invokeAst 'Update-WingetPackages'
+        $winget | Should -Match 'StartFailed = \$startFailed'
+        $winget | Should -Match 'if \(\$jr\.StartFailed\)[\s\S]*?\$anyTimeout = \$true[\s\S]*?continue'
+    }
+}
+
+Describe 'BitLocker reboot targeting' {
+    It 'queries and suspends only the Windows OS volume' {
+        $text = Get-FunctionText $invokeAst 'Suspend-BitLockerForReboot'
+        $text | Should -Match '\$osDrive = \[IO\.Path\]::GetPathRoot\(\$env:SystemRoot\)'
+        $text | Should -Match 'Get-BitLockerVolume -MountPoint \$osDrive'
+        $text | Should -Match '\$osVolume \| Suspend-BitLocker -RebootCount 1'
+        $text | Should -Match 'protection is not currently On'
+        $text | Should -Not -Match 'foreach \(\$vol in \$protectedVolumes\)'
+    }
 }
 
 Describe 'Delayed and explicit reboot evidence' {

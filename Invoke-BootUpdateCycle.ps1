@@ -254,6 +254,7 @@ function Get-BootUpdateWebhookSecret {
 }
 
 $script:LogPath               = Join-Path $PSScriptRoot 'BootUpdateCycle.log'
+$script:ProviderTranscriptPath = Join-Path $PSScriptRoot 'BootUpdateCycle.providers.log'
 $script:StatePath             = Join-Path $PSScriptRoot 'BootUpdateCycle.state.json'
 $script:HistoryPath           = Join-Path $PSScriptRoot 'BootUpdateCycle.history.json'
 $script:MaxLogSizeMB          = 5
@@ -337,7 +338,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 4 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.44' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.45' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 Set-Variable -Name 'RebootSignalSettleSeconds' -Value 20 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 $script:ExplicitRebootRequests = [System.Collections.Generic.List[object]]::new()
 
@@ -766,6 +767,125 @@ function Write-Log {
             Write-Host $entry -ForegroundColor Red
         }
     }
+}
+
+function Write-ProviderTranscript {
+    param(
+        [Parameter(Mandatory)][string]$Provider,
+        [string]$Scope = '',
+        [object[]]$Lines = @()
+    )
+    if (-not $Lines.Count) { return }
+    if ((Test-Path $script:ProviderTranscriptPath) -and
+        (Get-Item $script:ProviderTranscriptPath).Length -gt ($script:MaxLogSizeMB * 2MB)) {
+        $archive = $script:ProviderTranscriptPath -replace '\.log$', ".$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
+        Move-Item $script:ProviderTranscriptPath $archive -Force
+    }
+    $label = if ($Scope) { "$Provider/$Scope" } else { $Provider }
+    Add-Content -Path $script:ProviderTranscriptPath -Value "`r`n[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] --- $label ---" -Force
+    foreach ($line in $Lines) {
+        if ($null -eq $line) { continue }
+        Add-Content -Path $script:ProviderTranscriptPath -Value ([string]$line) -Force
+        if (Test-BootUpdateOutputAtLeast -Minimum Debug) {
+            Clear-BootUpdateProgressLine
+            Write-Host "[$label] $line" -ForegroundColor DarkGray
+        }
+    }
+}
+
+function Format-NativeExitCode {
+    param([Parameter(Mandatory)][long]$Code)
+    $unsigned = if ($Code -lt 0) { $Code + 4294967296L } else { $Code }
+    return ('0x{0:X8}' -f $unsigned)
+}
+
+function Get-InstallerExitSummary {
+    param([Parameter(Mandatory)][long]$Code)
+    switch ($Code) {
+        1605 { return 'product is not currently installed' }
+        1612 { return 'installation source is unavailable' }
+        3221226525 { return 'installer terminated with a fatal exception' }
+        default { return "installer exit $(Format-NativeExitCode $Code)"
+        }
+    }
+}
+
+function Get-WingetOutputSummary {
+    param([object[]]$Lines = @())
+    $attempted = 0
+    $updated = 0
+    $pinned = 0
+    $unknown = 0
+    $technologyBlocked = 0
+    $noApplicable = $false
+    $currentName = 'Unknown package'
+    $currentId = ''
+    $failures = [Collections.Generic.List[object]]::new()
+    foreach ($rawLine in $Lines) {
+        # Winget may indent records or leave ANSI/VT control sequences even with
+        # --no-vt. Normalize before matching so failures cannot become false green.
+        $line = ([string]$rawLine) -replace "`e\[[0-?]*[ -/]*[@-~]", ''
+        $line = $line.Trim()
+        if ($line -match '^\((\d+)/(\d+)\)\s+Found\s+(.+?)\s+\[([^\]]+)\]') {
+            $attempted = [math]::Max($attempted, [int]$Matches[2])
+            $currentName = $Matches[3].Trim()
+            $currentId = $Matches[4].Trim()
+        } elseif ($line -match '^Successfully installed\s*$') {
+            $updated++
+        } elseif ($line -match '^(?:Uninstall|Installer) failed with exit code:\s*(-?\d+)') {
+            $code = [long]$Matches[1]
+            $failures.Add([pscustomobject]@{
+                Name=$currentName; Id=$currentId; Code=$code
+                Hex=(Format-NativeExitCode $code); Summary=(Get-InstallerExitSummary $code)
+            })
+        } elseif ($line -match '^(\d+) package\(s\) have pins') {
+            $pinned = [int]$Matches[1]
+        } elseif ($line -match '^(\d+) package\(s\) have version numbers that cannot be determined') {
+            $unknown = [math]::Max($unknown, [int]$Matches[1])
+        } elseif ($line -match '^(\d+) package\(s\) have upgrades blocked because newer versions use a different install technology') {
+            $technologyBlocked = [int]$Matches[1]
+        } elseif ($line -match '^No installed package found matching input criteria') {
+            $noApplicable = $true
+        }
+    }
+    return [pscustomobject]@{
+        Attempted=$attempted; Updated=$updated; Pinned=$pinned; Unknown=$unknown
+        TechnologyBlocked=$technologyBlocked; NoApplicable=$noApplicable; Failures=$failures.ToArray()
+        Recognized=($attempted -gt 0 -or $updated -gt 0 -or $pinned -gt 0 -or $unknown -gt 0 -or
+            $technologyBlocked -gt 0 -or $noApplicable -or $failures.Count -gt 0)
+    }
+}
+
+function Write-WingetScopeSummary {
+    param(
+        [Parameter(Mandatory)][string]$Scope,
+        [object[]]$Lines = @(),
+        [AllowNull()][object]$ExitCode
+    )
+    Write-ProviderTranscript -Provider Winget -Scope $Scope -Lines $Lines
+    $summary = Get-WingetOutputSummary -Lines $Lines
+    if ($summary.NoApplicable -and $summary.Attempted -eq 0) {
+        $suffix = if ($summary.Pinned) { " ($($summary.Pinned) pinned)" } else { '' }
+        Write-Log "Winget ${Scope}: no applicable upgrades$suffix."
+    } elseif ($summary.Recognized) {
+        $level = if ($summary.Failures.Count -gt 0) { 'Warn' } else { 'Info' }
+        Write-Log "Winget ${Scope}: $($summary.Attempted) attempted, $($summary.Updated) updated, $($summary.Failures.Count) failed." -Level $level
+    } else {
+        Write-Log "Winget ${Scope}: provider finished without recognizable English summary output; raw transcript retained for verification." -Level Warn
+    }
+    foreach ($failure in $summary.Failures) {
+        $identity = if ($failure.Id) { "$($failure.Name) [$($failure.Id)]" } else { $failure.Name }
+        Write-Log "Winget ${Scope}: $identity failed — $($failure.Summary) ($($failure.Code), $($failure.Hex))." -Level Warn
+    }
+    $notes = @()
+    if ($summary.Pinned) { $notes += "$($summary.Pinned) pinned" }
+    if ($summary.Unknown) { $notes += "$($summary.Unknown) unknown-version" }
+    if ($summary.TechnologyBlocked) { $notes += "$($summary.TechnologyBlocked) install-technology blocked" }
+    if ($notes.Count) { Write-Log "Winget ${Scope}: deferred inventory — $($notes -join ', ')." -Level Warn }
+    if ($null -ne $ExitCode -and [long]$ExitCode -notin @(0,1641,3010)) {
+        Write-Log "Winget ($Scope) returned $ExitCode ($(Format-NativeExitCode ([long]$ExitCode))); partial failure, retry required." -Level Error
+    }
+    return $summary
 }
 #endregion
 
@@ -1673,11 +1793,9 @@ function Update-WingetPackages {
         foreach ($c in $candidates) { if ($c -and (Test-Path $c)) { $wingetPath = $c; break } }
     }
     if (-not $wingetPath) { Write-Log 'Winget not found, skipping.' -Level Warn; return @{ Success = $true; Count = 0 } }
-    Write-Log "Using winget: $wingetPath"
-
     $isSystem = ([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value -eq 'S-1-5-18')
-    if ($isSystem) { $scopes = @('machine'); Write-Log 'SYSTEM context: machine scope only' }
-    else { $scopes = @('user', 'machine'); Write-Log 'User context: updating BOTH user + machine scopes' }
+    if ($isSystem) { $scopes = @('machine'); Write-Log 'Winget: checking machine scope (SYSTEM context).' }
+    else { $scopes = @('user', 'machine') }
 
     $totalCount = 0; $anyTimeout = $false
 
@@ -1688,7 +1806,7 @@ function Update-WingetPackages {
        The filtered path (ExcludePatterns active) stays sequential — per-package iteration is
        order-sensitive and scopes cannot safely enumerate the same winget DB concurrently. #>
     if ($script:ExcludePatterns.Count -eq 0 -and $script:IncludePatterns.Count -eq 0 -and $scopes.Count -gt 1) {
-        Write-Log 'Winget: running user + machine scopes in parallel (no package filters)'
+        Write-Log 'Winget: checking user + machine scopes in parallel.'
         if ($PSCmdlet.ShouldProcess('Winget (user + machine parallel)', 'Run Winget upgrades for both scopes concurrently')) {
             $hardTimeoutSec = $TimeoutMinutes * 60
 
@@ -1706,12 +1824,17 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
                 $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($childScript))
                 $pw = (Get-Command pwsh -ErrorAction SilentlyContinue)?.Source
                 if (-not $pw) { $pw = Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe' }
-                $proc = [System.Diagnostics.Process]::Start([System.Diagnostics.ProcessStartInfo]@{
-                    FileName        = $pw
-                    Arguments       = "-NoProfile -NonInteractive -EncodedCommand $encoded"
-                    UseShellExecute = $false
-                    CreateNoWindow  = $true
-                })
+                $proc = $null
+                $startFailed = $false
+                try {
+                    $proc = [System.Diagnostics.Process]::Start([System.Diagnostics.ProcessStartInfo]@{
+                        FileName        = $pw
+                        Arguments       = "-NoProfile -NonInteractive -EncodedCommand $encoded"
+                        UseShellExecute = $false
+                        CreateNoWindow  = $true
+                    })
+                    if (-not $proc) { $startFailed = $true }
+                } catch { $startFailed = $true }
                 $timedOut = $false
                 if ($proc) {
                     $exited = $proc.WaitForExit($TimeoutSec * 1000)
@@ -1733,7 +1856,7 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
                 }
                 $lines = $visibleLines.ToArray()
                 $count = @($lines | Where-Object { $_ -match 'Successfully installed' }).Count
-                return @{ Scope = $Scope; Lines = $lines; TimedOut = $timedOut; Count = $count; ExitCode = $nativeExit; RebootRequired = ($nativeExit -in @(1641,3010)) }
+                return @{ Scope = $Scope; Lines = $lines; TimedOut = $timedOut; StartFailed = $startFailed; Count = $count; ExitCode = $nativeExit; RebootRequired = ($nativeExit -in @(1641,3010)) }
             }
             $scopeJobs = foreach ($sc in $scopes) {
                 Start-ThreadJob -ScriptBlock $wingetJobSb -ArgumentList $sc, $wingetPath, $hardTimeoutSec
@@ -1756,13 +1879,13 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
                 }
 
                 $sc = $jr.Scope
-                Write-Log "--- Winget upgrade (--scope $sc) [parallel] ---"
-                $installBlocked = $false
-                foreach ($line in $jr.Lines) {
-                    if ($line -match 'install.+in progress|in progress.+install|0x8A15') { $installBlocked = $true; Write-Log $line -Level Warn }
-                    elseif ($line -match 'Successfully installed') { Write-Log $line }
-                    else { Write-Log $line }
+                if ($jr.StartFailed) {
+                    Write-Log "Winget ($sc): child process could not be started; retry required." -Level Error
+                    $anyTimeout = $true
+                    continue
                 }
+                $installBlocked = @($jr.Lines | Where-Object { $_ -match 'install.+in progress|in progress.+install' }).Count -gt 0
+                $null = Write-WingetScopeSummary -Scope $sc -Lines $jr.Lines -ExitCode $jr.ExitCode
                 if ($jr.TimedOut) {
                     Write-Log "Winget ($sc): Hard timeout ($TimeoutMinutes min). Will retry next boot." -Level Warn
                     $anyTimeout = $true
@@ -1773,7 +1896,6 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
                     if ($script:CurrentState) { $script:CurrentState.ExplicitRebootRequests = @($script:ExplicitRebootRequests); Set-BootUpdateState -State $script:CurrentState }
                     Write-Log $rebootEvidence.Detail -Level Warn
                 } elseif ($null -ne $jr.ExitCode -and $jr.ExitCode -ne 0) {
-                    Write-Log "Winget ($sc) exited with code $($jr.ExitCode); retry required." -Level Error
                     $anyTimeout = $true
                 }
                 <# Retry if blocked — sequential, after parallel phase completes #>
@@ -1785,13 +1907,12 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
                         param($wp, $sc2)
                         & $wp upgrade --all --scope $sc2 --accept-source-agreements --accept-package-agreements --disable-interactivity --no-vt 2>&1
                     } -ArgumentList @($wingetPath, $sc) -IdleTimeoutMinutes 5 -HardTimeoutMinutes $TimeoutMinutes
-                    $retryCount = 0
-                    foreach ($line in $retryResult.Output) { if ($line -match 'Successfully installed') { $retryCount++ }; Write-Log $line }
+                    $retrySummary = Write-WingetScopeSummary -Scope "$sc-retry" -Lines $retryResult.Output -ExitCode $retryResult.ExitCode
+                    $retryCount = $retrySummary.Updated
                     $totalCount += $retryCount
                     if ($retryResult.TimedOut) { $anyTimeout = $true }
                 }
                 $totalCount += $jr.Count
-                Write-Log "--- Winget ($sc): $($jr.Count) package(s) updated ---"
             }
         } else {
             Write-Log '  [WHATIF] Would run: winget upgrade --all --scope user (parallel)'
@@ -1802,7 +1923,6 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
 
     <# ── Sequential path: single scope (SYSTEM: machine only) OR ExcludePatterns active ── #>
     foreach ($scope in $scopes) {
-        Write-Log "--- Winget upgrade (--scope $scope) ---"
         if ($PSCmdlet.ShouldProcess("Winget ($scope)", "Run Winget $scope-scope upgrades")) {
 
             if ($script:ExcludePatterns.Count -eq 0 -and $script:IncludePatterns.Count -eq 0) {
@@ -1812,12 +1932,9 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
                     & $wp upgrade --all --scope $sc --accept-source-agreements --accept-package-agreements --disable-interactivity --no-vt 2>&1
                 } -ArgumentList @($wingetPath, $scope) -IdleTimeoutMinutes 5 -HardTimeoutMinutes $TimeoutMinutes
 
-                $count = 0; $installBlocked = $false
-                foreach ($line in $result.Output) {
-                    if ($line -match 'install.+in progress|in progress.+install|0x8A15') { $installBlocked = $true; Write-Log $line -Level Warn }
-                    elseif ($line -match 'Successfully installed') { $count++; Write-Log $line }
-                    else { Write-Log $line }
-                }
+                $installBlocked = @($result.Output | Where-Object { $_ -match 'install.+in progress|in progress.+install' }).Count -gt 0
+                $scopeSummary = Write-WingetScopeSummary -Scope $scope -Lines $result.Output -ExitCode $result.ExitCode
+                $count = $scopeSummary.Updated
                 if ($result.TimedOut) { $anyTimeout = $true }
 
                 <# One retry if blocked by another installer #>
@@ -1829,7 +1946,8 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
                         param($wp, $sc)
                         & $wp upgrade --all --scope $sc --accept-source-agreements --accept-package-agreements --disable-interactivity --no-vt 2>&1
                     } -ArgumentList @($wingetPath, $scope) -IdleTimeoutMinutes 5 -HardTimeoutMinutes $TimeoutMinutes
-                    foreach ($line in $retry.Output) { if ($line -match 'Successfully installed') { $count++ }; Write-Log $line }
+                    $retrySummary = Write-WingetScopeSummary -Scope "$scope-retry" -Lines $retry.Output -ExitCode $retry.ExitCode
+                    $count += $retrySummary.Updated
                     if ($retry.TimedOut) { $anyTimeout = $true }
                 }
                 $totalCount += $count
@@ -1860,8 +1978,8 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
                         param($wp, $sc)
                         & $wp upgrade --all --scope $sc --accept-source-agreements --accept-package-agreements --disable-interactivity --no-vt 2>&1
                     } -ArgumentList @($wingetPath, $scope) -IdleTimeoutMinutes 5 -HardTimeoutMinutes $TimeoutMinutes
-                    $count = 0
-                    foreach ($line in $fbResult.Output) { if ($line -match 'Successfully installed') { $count++ }; Write-Log $line }
+                    $fallbackSummary = Write-WingetScopeSummary -Scope "$scope-fallback" -Lines $fbResult.Output -ExitCode $fbResult.ExitCode
+                    $count = $fallbackSummary.Updated
                     if ($fbResult.TimedOut) { $anyTimeout = $true }
                     $totalCount += $count
                     continue
@@ -1909,10 +2027,8 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
                         param($wp, $id, $sc)
                         & $wp upgrade --id $id --scope $sc -e --accept-source-agreements --accept-package-agreements --disable-interactivity --no-vt 2>&1
                     } -ArgumentList @($wingetPath, $pkgId, $scope) -IdleTimeoutMinutes 5 -HardTimeoutMinutes $TimeoutMinutes
-                    foreach ($line in $pkgResult.Output) {
-                        if ($line -match 'Successfully installed') { $count++ }
-                        Write-Log $line
-                    }
+                    $packageSummary = Write-WingetScopeSummary -Scope "$scope/$pkgId" -Lines $pkgResult.Output -ExitCode $pkgResult.ExitCode
+                    $count += $packageSummary.Updated
                     if ($pkgResult.TimedOut) { $anyTimeout = $true }
                 }
                 $totalCount += $count
@@ -1926,7 +2042,6 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
                 Write-Log "  [WHATIF] ExcludePatterns: $($script:ExcludePatterns -join ', ')"
             }
         }
-        Write-Log "--- Winget ($scope): $totalCount package(s) updated so far ---"
     }
     return @{ Success = (-not $anyTimeout); Count = $totalCount }
 }
@@ -1937,7 +2052,6 @@ function Update-ChocolateyPackages {
     $choco = Get-Command choco -EA SilentlyContinue
     if (-not $choco) { Write-Log 'Chocolatey not found, skipping.' -Level Warn; return @{ Success = $true; Count = 0 } }
     $chocoPath = $choco.Source
-    Write-Log 'Updating Chocolatey packages...'
     $count = 0; $failed = $false
     if ($PSCmdlet.ShouldProcess('Chocolatey', 'Run choco upgrade all')) {
         if ($script:ExcludePatterns.Count -eq 0 -and $script:IncludePatterns.Count -eq 0) {
@@ -1948,8 +2062,8 @@ function Update-ChocolateyPackages {
                 -ArgumentList @($chocoPath)
             $result.Output | ForEach-Object {
                 if ($_ -match 'upgraded (\d+)/\d+ package') { $count = [int]$Matches[1] }
-                Write-Log $_
             }
+            Write-ProviderTranscript -Provider Chocolatey -Lines $result.Output
             if ($result.Failed -or $result.TimedOut) { $failed = $true; Write-Log 'Chocolatey upgrade failed or timed out; retry required.' -Level Error }
         } else {
             <# Filtered path: enumerate outdated packages, exclude by pattern, upgrade individually #>
@@ -1996,8 +2110,8 @@ function Update-ChocolateyPackages {
                     -ArgumentList @($chocoPath, $pkgName)
                 $result.Output | ForEach-Object {
                     if ($_ -match 'upgraded (\d+)/\d+ package|Software installed') { $count++ }
-                    Write-Log $_
                 }
+                Write-ProviderTranscript -Provider Chocolatey -Scope $pkgName -Lines $result.Output
                 if ($result.Failed -or $result.TimedOut) { $failed = $true; Write-Log "Chocolatey $pkgName failed or timed out; retry required." -Level Error }
             }
         }
@@ -2009,6 +2123,7 @@ function Update-ChocolateyPackages {
             Write-Log "  [WHATIF] ExcludePatterns: $($script:ExcludePatterns -join ', ')"
         }
     }
+    Write-Log "Chocolatey: $count package(s) updated$(if ($failed) { ' (partial failure)' } else { '' })." -Level $(if ($failed) { 'Warn' } else { 'Info' })
     return @{ Success = (-not $failed); Count = $count }
 }
 
@@ -3301,39 +3416,39 @@ function Suspend-BitLockerForReboot {
             return
         }
 
-        $protectedVolumes = Get-BitLockerVolume -ErrorAction Stop |
-            Where-Object { $_.ProtectionStatus -eq 'On' }
-
-        if (-not $protectedVolumes) {
-            Write-Log 'BitLocker: no protected volumes found — nothing to suspend.'
+        <# RebootCount is meaningful for the OS boot chain. Suspending protected
+           data volumes is unnecessary and some providers reject it with 0x80310028. #>
+        $osDrive = [IO.Path]::GetPathRoot($env:SystemRoot).TrimEnd('\')
+        $osVolume = Get-BitLockerVolume -MountPoint $osDrive -ErrorAction Stop
+        if (-not $osVolume -or $osVolume.ProtectionStatus -ne 'On') {
+            $status = if ($osVolume) { [string]$osVolume.ProtectionStatus } else { 'not reported' }
+            Write-Log "BitLocker: OS volume $osDrive protection is not currently On (status: $status); no additional suspension needed."
             return
         }
 
-        foreach ($vol in $protectedVolumes) {
-            $drive = $vol.MountPoint
-            $suspended = $false
+        $drive = $osVolume.MountPoint
+        $suspended = $false
 
-            # Primary path: BitLocker cmdlet (preferred — returns structured objects)
+        # Primary path: BitLocker cmdlet (preferred — returns structured objects)
+        try {
+            $osVolume | Suspend-BitLocker -RebootCount 1 -ErrorAction Stop | Out-Null
+            Write-Log "BitLocker suspended for 1 reboot on $drive"
+            $suspended = $true
+        } catch {
+            Write-Log "BitLocker cmdlet failed on $drive (${_}); trying manage-bde fallback." -Level Warn
+        }
+
+        # Fallback: manage-bde.exe (available even when the PS module is broken)
+        if (-not $suspended) {
             try {
-                $vol | Suspend-BitLocker -RebootCount 1 -ErrorAction Stop | Out-Null
-                Write-Log "BitLocker suspended for 1 reboot on $drive"
-                $suspended = $true
-            } catch {
-                Write-Log "BitLocker cmdlet failed on $drive (${_}); trying manage-bde fallback." -Level Warn
-            }
-
-            # Fallback: manage-bde.exe (available even when the PS module is broken)
-            if (-not $suspended) {
-                try {
-                    $bdeOut = & manage-bde.exe -protectors -disable $drive -RebootCount 1 2>&1
-                    if ($LASTEXITCODE -eq 0) {
-                        Write-Log "BitLocker suspended via manage-bde on $drive"
-                    } else {
-                        Write-Log "manage-bde failed on $drive (exit $LASTEXITCODE): $bdeOut" -Level Warn
-                    }
-                } catch {
-                    Write-Log "manage-bde.exe unavailable on ${drive}: $_" -Level Warn
+                $bdeOut = & manage-bde.exe -protectors -disable $drive -RebootCount 1 2>&1
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Log "BitLocker suspended via manage-bde on $drive"
+                } else {
+                    Write-Log "manage-bde failed on $drive (exit $LASTEXITCODE): $bdeOut" -Level Warn
                 }
+            } catch {
+                Write-Log "manage-bde.exe unavailable on ${drive}: $_" -Level Warn
             }
         }
     } catch {

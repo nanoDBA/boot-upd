@@ -30,6 +30,7 @@ if (-not $NotesPath -and -not $Notes) { throw 'Provide -Notes or -NotesPath.' }
 if ($NotesPath -and $Notes) { throw 'Provide only one of -Notes or -NotesPath.' }
 
 $root = Split-Path $PSScriptRoot -Parent
+& (Join-Path $PSScriptRoot 'Repair-LineEndings.ps1') -RepositoryRoot $root
 $assetSpecs = @(
     [pscustomobject]@{ Source='Deploy-BootUpdateCycle.ps1';       Name='Deploy-BootUpdateCycle.ps1'; Kind='PowerShell' }
     [pscustomobject]@{ Source='Invoke-BootUpdateCycle.ps1';       Name='Invoke-BootUpdateCycle.ps1'; Kind='PowerShell' }

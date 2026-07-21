@@ -24,6 +24,7 @@ function Invoke-Gate {
 
 Push-Location $root
 try {
+    & ./tools/Repair-LineEndings.ps1
     Invoke-Gate 'unit-and-process-behavior' {
         Import-Module Pester -RequiredVersion 5.7.1
         $configuration = New-PesterConfiguration
