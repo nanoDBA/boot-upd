@@ -81,11 +81,20 @@ Authenticode issuer 'CN="Amazon Web Services, Inc.", OU=SDKs and Tools, O="Amazo
         $fallback = $childSource.IndexOf('Update-AWSToolsModule -RequiredVersion $candidate.Version')
         $postVerify = $childSource.IndexOf('Test-AwsToolsSignedModuleDirectory -ModuleRoot $installed.ModuleBase', $fallback)
         $fullHashVerify = $childSource.IndexOf('Test-AwsToolsDirectoryManifest -ModuleRoot $installed.ModuleBase', $fallback)
-        $cleanup = $childSource.IndexOf('Uninstall-AWSToolsModule -ExceptVersion $candidate.Version', $fallback)
+        $cleanup = $childSource.IndexOf('Invoke-VerifiedAwsToolsCleanup -ExceptVersion $candidate.Version', $fallback)
         $fallback | Should -BeGreaterThan 0
         $postVerify | Should -BeGreaterThan $fallback
         $fullHashVerify | Should -BeGreaterThan $postVerify
         $cleanup | Should -BeGreaterThan $fullHashVerify
         $childSource | Should -Not -Match 'Where-Object Version -eq \$candidate.Version \| Select-Object -First 1'
+    }
+
+    It 'suppresses only exact already-absent cleanup records and inventories stale copies' {
+        $cleanup = Get-ChildFunctionText -Name 'Invoke-VerifiedAwsToolsCleanup'
+        $cleanup | Should -Match '\^NoMatchFoundForCriteria'
+        $cleanup | Should -Match "MyCommand\.Name -eq 'Uninstall-Package'"
+        $cleanup | Should -Match 'unexpectedErrors\.Count'
+        $cleanup | Should -Match 'Get-Module -ListAvailable'
+        $cleanup | Should -Match 'older managed module copies remain'
     }
 }

@@ -1,10 +1,15 @@
 @echo off
+if not defined UPD_TRAMPOLINE_ACTIVE goto trampoline_wrapper
+if /i "%~f0"=="%UPD_TRAMPOLINE_PATH%" goto trampoline_active
+goto trampoline_wrapper
+
+:trampoline_active
 setlocal
-:: BootUpdateCycleVersion=2.5.43
+:: BootUpdateCycleVersion=2.5.44
 :: Friendly entry point. Argument parsing, safe demo modes, and elevation live in
 :: tools\Invoke-UpdLauncher.ps1 so quoting and validation remain testable.
 
-set "UPD_ROOT=%~dp0"
+set "UPD_ROOT=%UPD_ORIGINAL_ROOT%"
 set "UPD_LAUNCHER=%UPD_ROOT%tools\Invoke-UpdLauncher.ps1"
 set "UPD_BOOTSTRAP=%UPD_ROOT%tools\Invoke-UpdBootstrap.ps1"
 set "UPD_PS7_BOOTSTRAP=%UPD_ROOT%tools\Install-PowerShell7.ps1"
@@ -108,7 +113,10 @@ set "UPD_EXIT=%errorlevel%"
 :adopt
 if defined UPD_BOOTSTRAP_ACTIVE del /f /q "%UPD_BOOTSTRAP_ACTIVE%" >nul 2>&1
 if not exist "%UPD_ROOT%upd.cmd.next" exit /b %UPD_EXIT%
-"%UPD_PWSH%" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%UPD_LAUNCHER%" adopt-staged-batch && (echo Updated upd.cmd from the checksummed release bundle.) || (echo WARNING: upd.cmd.next was rejected or could not be adopted.) & exit /b %UPD_EXIT%
+"%UPD_PWSH%" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%UPD_LAUNCHER%" adopt-staged-batch
+if errorlevel 1 echo WARNING: upd.cmd.next was rejected or could not be adopted.
+if not errorlevel 1 echo Updated upd.cmd from the checksummed release bundle.
+exit /b %UPD_EXIT%
 
 :bootstrap_help
 "%UPD_PWSH%" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%UPD_LAUNCHER%" help
@@ -127,7 +135,7 @@ echo   Help is read-only. Operational commands bootstrap PowerShell 7 automatica
 exit /b 0
 
 :ps5_version
-echo Boot Update Cycle v2.5.43 ^(PowerShell 7 runtime not installed^)
+echo Boot Update Cycle v2.5.44 ^(PowerShell 7 runtime not installed^)
 exit /b 0
 
 :ps7_required
@@ -157,3 +165,19 @@ if /i "%~1"=="--no-update" set "UPD_NO_UPDATE=1"
 if /i "%~1"=="--disable-self-update" set "UPD_NO_UPDATE=1"
 shift
 goto classify_no_update_loop
+
+:: Keep the wrapper at physical EOF. The nested cmd returns its exit code naturally,
+:: and the original cmd.exe never resumes reading the replaced source file.
+:trampoline_wrapper
+setlocal
+set "UPD_ORIGINAL_ROOT=%~dp0"
+set "UPD_TRAMPOLINE_DIR=%TEMP%\BootUpdateCycle"
+if not exist "%UPD_TRAMPOLINE_DIR%" mkdir "%UPD_TRAMPOLINE_DIR%" >nul 2>&1
+set "UPD_TRAMPOLINE_PATH=%UPD_TRAMPOLINE_DIR%\upd-trampoline-%RANDOM%-%RANDOM%.cmd"
+copy /b /y "%~f0" "%UPD_TRAMPOLINE_PATH%" >nul
+if errorlevel 1 (
+    echo ERROR: Could not create the temporary UPD launcher trampoline.
+    exit /b 1
+)
+set "UPD_TRAMPOLINE_ACTIVE=1"
+cmd.exe /d /s /c ""%UPD_TRAMPOLINE_PATH%" %*"

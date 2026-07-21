@@ -34,6 +34,7 @@ param(
     [Parameter(DontShow)][switch]$F,
     [Parameter(DontShow)][switch]$St,
     [Parameter(DontShow)][switch]$BundlePreflighted,
+    [Parameter(DontShow)][switch]$LegacyAdoptionWorker,
     [Parameter(DontShow)][string]$EncodedArguments = '',
     [Parameter(ValueFromRemainingArguments)][string[]]$RemainingArguments = @()
 )
@@ -167,6 +168,21 @@ function Install-UpdStagedBatch {
         Remove-Item -LiteralPath $staged,$sidecar,$baselineSidecar -Force -ErrorAction SilentlyContinue
         throw
     }
+}
+
+function Start-UpdLegacyBatchAdoption {
+    <# v2.5.43 invokes adoption from the batch file it is still reading. Give that
+       one legacy caller time to return before a detached worker performs the same
+       checksum-, baseline-, and version-verified adoption. v2.5.44+ never uses
+       this bridge because its temporary trampoline proves it is safe to swap. #>
+    $workerLog = Join-Path $repoRoot 'upd.cmd.adoption.log'
+    $arguments = @(
+        '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass',
+        '-File', ('"{0}"' -f $PSCommandPath),
+        'adopt-staged-batch', '-LegacyAdoptionWorker'
+    )
+    $null = Start-Process -FilePath (Get-Command pwsh).Source -WindowStyle Hidden -ArgumentList $arguments
+    Set-Content -LiteralPath $workerLog -Value "$(Get-Date -Format o) Legacy launcher adoption queued." -Encoding utf8
 }
 
 function Get-UpdDeployParameters {
@@ -487,7 +503,22 @@ switch ($Command.ToLowerInvariant()) {
         exit 0
     }
     'adopt-staged-batch' {
-        $null = Install-UpdStagedBatch
+        if ($LegacyAdoptionWorker) {
+            Start-Sleep -Milliseconds 1500
+            try {
+                $adopted = Install-UpdStagedBatch
+                if ($adopted) {
+                    Set-Content -LiteralPath (Join-Path $repoRoot 'upd.cmd.adoption.log') -Value "$(Get-Date -Format o) Legacy launcher adoption completed." -Encoding utf8
+                }
+            } catch {
+                Set-Content -LiteralPath (Join-Path $repoRoot 'upd.cmd.adoption.log') -Value "$(Get-Date -Format o) Legacy launcher adoption failed: $_" -Encoding utf8
+                throw
+            }
+        } elseif ($env:UPD_TRAMPOLINE_ACTIVE -and $env:UPD_TRAMPOLINE_PATH) {
+            $null = Install-UpdStagedBatch
+        } else {
+            Start-UpdLegacyBatchAdoption
+        }
         exit 0
     }
     'aws' {

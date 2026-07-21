@@ -24,6 +24,7 @@ BeforeAll {
 
     . ([scriptblock]::Create((Get-ProductionFunctionText -Name 'Test-SelfUpdateHandoff')))
     . ([scriptblock]::Create((Get-ProductionFunctionText -Name 'Repair-OrchestratorSourceCopy')))
+    . ([scriptblock]::Create((Get-ProductionFunctionText -Name 'Enter-BootUpdateMutex')))
 
     function Get-OrchestratorFileVersion { }
     function Write-Log { }
@@ -53,6 +54,29 @@ Describe 'Repair-OrchestratorSourceCopy' {
         { Repair-OrchestratorSourceCopy -VerifiedReleaseVersion ([version]'2.5.42') } |
             Should -Not -Throw
         Should -Invoke Write-Log -ParameterFilter { $Level -eq 'Warn' } -Times 0
+    }
+}
+
+Describe 'Enter-BootUpdateMutex safety boundary' {
+    BeforeEach {
+        $script:BootUpdateMutex = $null
+        Mock Write-Log { }
+    }
+
+    It 'fails closed when the cross-context mutex cannot be opened' {
+        { Enter-BootUpdateMutex -MutexName 'Global\DeniedForTest' -MutexFactory {
+            throw [System.UnauthorizedAccessException]::new('mock access denied')
+        } } | Should -Throw '*could not establish its cross-context safety guard*'
+        $script:BootUpdateMutex | Should -BeNullOrEmpty
+        (Get-ProductionFunctionText -Name 'Enter-BootUpdateMutex') |
+            Should -Match 'Named mutex safety guard failed; refusing to run'
+    }
+
+    It 'creates a mutex whose DACL names SYSTEM and built-in Administrators' {
+        $functionText = Get-ProductionFunctionText -Name 'Enter-BootUpdateMutex'
+        $functionText | Should -Match "S-1-5-18"
+        $functionText | Should -Match "S-1-5-32-544"
+        $functionText | Should -Match 'MutexAcl\]::Create'
     }
 }
 

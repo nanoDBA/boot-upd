@@ -337,7 +337,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 4 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.43' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.44' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 Set-Variable -Name 'RebootSignalSettleSeconds' -Value 20 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 $script:ExplicitRebootRequests = [System.Collections.Generic.List[object]]::new()
 
@@ -960,14 +960,15 @@ function Set-BootUpdateState {
     <# Skip disk writes in WhatIf mode — state is read-only during dry runs #>
     if ($WhatIfPreference) { return }
     $State.LastRun = (Get-Date).ToUniversalTime().ToString('o')
-    $tmpPath = $script:StatePath + '.tmp'
-    <# Remove any pre-existing .tmp left by a prior failed write #>
-    if (Test-Path $tmpPath) { Remove-Item $tmpPath -Force -EA SilentlyContinue }
+    <# A unique same-directory temporary file prevents an overlapping or orphaned
+       writer from deleting another process's in-flight checkpoint. The mutex is the
+       authoritative exclusion boundary; this is defense in depth. #>
+    $tmpPath = '{0}.{1}.{2}.tmp' -f $script:StatePath, $PID, [guid]::NewGuid().ToString('N')
     try {
         $json = $State | ConvertTo-Json -Depth 10
         [System.IO.File]::WriteAllText($tmpPath, $json, [System.Text.Encoding]::UTF8)
         try {
-            Move-Item -Path $tmpPath -Destination $script:StatePath -Force -ErrorAction Stop
+            [System.IO.File]::Move($tmpPath, $script:StatePath, $true)
         } catch {
             Write-Log "Failed to promote state file (Move-Item): $_" -Level Error
             if (Test-Path $tmpPath) { Remove-Item $tmpPath -Force -EA SilentlyContinue }
@@ -3200,6 +3201,10 @@ function Register-BootUpdateTaskForReboot {
     $expectedTriggerTypes = @{}
     $retryTime = if ($RetryAt.HasValue) { $RetryAt.Value } elseif ($RetrySoon) { (Get-Date).AddMinutes(2) } else { $null }
     $retryTrigger = if ($retryTime) { New-ScheduledTaskTrigger -Once -At $retryTime } else { $null }
+    <# Do not launch the user and SYSTEM retry tasks at the same instant. The fallback
+       remains available when the interactive principal cannot run, but waits long
+       enough for the primary to acquire the cross-context guard first. #>
+    $fallbackRetryTrigger = if ($retryTime) { New-ScheduledTaskTrigger -Once -At $retryTime.AddMinutes(3) } else { $null }
 
     <# ARSO user-context resume (2ql): reboots use `shutdown /g`, so where ARSO is
        available winlogon signs the user back in — the primary task then triggers at
@@ -3227,7 +3232,7 @@ function Register-BootUpdateTaskForReboot {
 
         $fbTrigger = New-ScheduledTaskTrigger -AtStartup
         $fbTrigger.Delay = 'PT3M'
-        $fallbackTriggers = if ($retryTrigger) { @($fbTrigger, $retryTrigger) } else { @($fbTrigger) }
+        $fallbackTriggers = if ($fallbackRetryTrigger) { @($fbTrigger, $fallbackRetryTrigger) } else { @($fbTrigger) }
         $fbPrincipal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
         Register-ScheduledTask -TaskName 'BootUpdateCycleFallback' -Action $action -Trigger $fallbackTriggers -Principal $fbPrincipal -Settings $settings `
             -Description 'Boot update loop fallback: runs as SYSTEM if ARSO sign-on does not occur.' -Force -ErrorAction Stop | Out-Null
@@ -4477,6 +4482,14 @@ function Invoke-BootUpdateCycle {
             exit 2
         }
         if (-not $WhatIfPreference) {
+            $state.ConsecutiveRetryCount = [int]$state.ConsecutiveRetryCount + 1
+            $pendingNames = @($pending.Source | Sort-Object -Unique | ForEach-Object { "Pending reboot: $_" })
+            if (Stop-BootUpdateAtRetryLimit -State $state -IncompletePhases $pendingNames) {
+                Write-BootUpdateProgress -Completed
+                exit 3
+            }
+        }
+        if (-not $WhatIfPreference) {
             $state.LastRebootSignals = (($pending.Source | Sort-Object) -join ',')
             foreach ($flag in @('WingetDone','ChocolateyDone','WindowsUpdateDone','AwsToolingDone','PipDone','NpmDone','Office365Done','PowerShellModulesDone','ScoopDone','DotnetToolsDone','VscodeDone','DefenderDone','DriverFirmwareDone','WslDone','ContainersDone')) { $state.$flag = $false }
             $state.Phase = 'Rebooting'
@@ -5125,6 +5138,14 @@ function Invoke-BootUpdateCycle {
             Write-BootUpdateProgress -Completed
             exit 2
         }
+        if (-not $WhatIfPreference) {
+            $state.ConsecutiveRetryCount = [int]$state.ConsecutiveRetryCount + 1
+            $pendingNames = @($pending.Source | Sort-Object -Unique | ForEach-Object { "Pending reboot: $_" })
+            if (Stop-BootUpdateAtRetryLimit -State $state -IncompletePhases $pendingNames) {
+                Write-BootUpdateProgress -Completed
+                exit 3
+            }
+        }
 
         <# Stale-signal loop visibility: if this reboot is driven by exactly the same
            signal set as the previous one, say so — PendingFileRenameOperations in
@@ -5352,10 +5373,33 @@ function Enter-BootUpdateMutex {
     <# Acquire the cycle mutex or validate that this process is the replacement
        child of its current owner. Returning false keeps the exit decision at
        script scope and makes the complete arbitration path process-testable. #>
-    param([string]$MutexName = 'Global\BootUpdateCycle')
+    param(
+        [string]$MutexName = 'Global\BootUpdateCycle',
+        [Parameter(DontShow)][scriptblock]$MutexFactory
+    )
 
     try {
-        $script:BootUpdateMutex = [System.Threading.Mutex]::new($false, $MutexName)
+        <# The first creator may be SYSTEM or an elevated interactive administrator.
+           Apply an explicit DACL so either trusted context can open the same global
+           object on later continuations. Never grant ordinary users mutex rights. #>
+        if ($MutexFactory) {
+            $script:BootUpdateMutex = & $MutexFactory $MutexName
+        } else {
+            $mutexSecurity = [System.Security.AccessControl.MutexSecurity]::new()
+            foreach ($sidValue in @('S-1-5-18', 'S-1-5-32-544')) {
+                $sid = [System.Security.Principal.SecurityIdentifier]::new($sidValue)
+                $rule = [System.Security.AccessControl.MutexAccessRule]::new(
+                    $sid,
+                    [System.Security.AccessControl.MutexRights]::FullControl,
+                    [System.Security.AccessControl.AccessControlType]::Allow
+                )
+                $mutexSecurity.AddAccessRule($rule)
+            }
+            $createdNew = $false
+            $script:BootUpdateMutex = [System.Threading.MutexAcl]::Create(
+                $false, $MutexName, [ref]$createdNew, $mutexSecurity
+            )
+        }
         $acquired = $false
         try {
             $acquired = $script:BootUpdateMutex.WaitOne(0)
@@ -5380,9 +5424,17 @@ function Enter-BootUpdateMutex {
         $script:BootUpdateMutex = $null
         return $true
     } catch {
-        Write-Log "Named mutex acquisition failed (non-fatal): $_" -Level Warn
+        <# Exclusion is a safety requirement. Failing open lets the user-primary and
+           SYSTEM-fallback tasks race package managers and overwrite checkpoint state. #>
+        if ($script:BootUpdateMutex) {
+            try { $script:BootUpdateMutex.Dispose() } catch { }
+        }
         $script:BootUpdateMutex = $null
-        return $true
+        try { Write-Log "Named mutex safety guard failed; refusing to run: $_" -Level Error } catch { }
+        throw [System.InvalidOperationException]::new(
+            'Boot Update Cycle could not establish its cross-context safety guard.',
+            $_.Exception
+        )
     }
 }
 

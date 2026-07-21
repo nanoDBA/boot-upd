@@ -1,8 +1,20 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.43
-**Release Date:** 2026-07-20
+**Current Version:** v2.5.44
+**Release Date:** 2026-07-21
 **Status:** STABLE
+
+---
+
+## v2.5.44 (2026-07-21)
+
+### Cross-context exclusion and safe launcher activation
+
+- Creates the global updater mutex with an explicit SYSTEM/Administrators ACL and fails closed if exclusion cannot be established, preventing concurrent user and SYSTEM continuation passes from racing the checkpoint.
+- Staggers the user-primary and SYSTEM-fallback dated retries and gives every checkpoint write a process-unique temporary file.
+- Applies the same-boot retry budget to repeated pending-reboot restart requests, so a canceled or ineffective restart cannot grow the pass counter indefinitely.
+- Runs v2.5.44+ launchers from a verified temporary trampoline before activating `upd.cmd.next`; a delayed compatibility worker safely bridges the one upgrade from pre-trampoline v2.5.43.
+- Condenses exact AWS.Tools already-absent cleanup records, then independently inventories and reports any genuinely retained older module copies.
 
 ---
 

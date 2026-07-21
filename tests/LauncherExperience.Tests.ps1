@@ -117,13 +117,18 @@ Describe 'Checksummed launcher self-update handoff' {
         $launcherSource | Should -Match 'SHA256 mismatch'
     }
 
-    It 'stages the running batch file and adopts it only after PowerShell exits' {
+    It 'runs from a trampoline so the active batch is never the adoption target' {
         $launcherSource | Should -Match 'Name=''upd\.cmd''.*StageBatch=\$true'
         $cmdSource | Should -Match 'set "UPD_LAUNCHER=.*Invoke-UpdLauncher\.ps1"'
         $cmdSource | Should -Match 'set "UPD_BOOTSTRAP=.*Invoke-UpdBootstrap\.ps1"'
         $cmdSource | Should -Match '"%UPD_PWSH%" .*"%UPD_BOOTSTRAP_ACTIVE%" %\*'
         $cmdSource.IndexOf('set "UPD_EXIT=%errorlevel%"') | Should -BeLessThan $cmdSource.IndexOf('upd.cmd.next')
-        $cmdSource | Should -Match 'adopt-staged-batch'
+        $cmdSource | Should -Match 'UPD_TRAMPOLINE_ACTIVE'
+        $cmdSource | Should -Match 'cmd\.exe /d /s /c ""%UPD_TRAMPOLINE_PATH%" %\*"\s*$'
+        $cmdSource.TrimEnd() | Should -Match 'cmd\.exe /d /s /c ""%UPD_TRAMPOLINE_PATH%" %\*"$'
+        $cmdSource | Should -Match 'set "UPD_ROOT=%UPD_ORIGINAL_ROOT%"'
+        $deploySource | Should -Match '\$destination\.baseline'
+        $deploySource | Should -Match 'verified and staged for delayed activation'
         $launcherSource | Should -Match 'Get-FileHash -LiteralPath \$staged'
         $launcherSource | Should -Match '\$stagedVersion -ne \$coreVersion'
         $launcherSource | Should -Match '\[IO\.File\]::Replace'
@@ -302,11 +307,98 @@ exit 29
         Set-Content (Join-Path $root 'upd.cmd.next.sha256') $hash -NoNewline
         $baseline = (Get-FileHash (Join-Path $root 'upd.cmd') -Algorithm SHA256).Hash
         Set-Content (Join-Path $root 'upd.cmd.next.baseline') $baseline -NoNewline
-        & pwsh -NoLogo -NoProfile -File (Join-Path $tools 'Invoke-UpdLauncher.ps1') adopt-staged-batch
+        $priorActive = $env:UPD_TRAMPOLINE_ACTIVE
+        $priorPath = $env:UPD_TRAMPOLINE_PATH
+        try {
+            $env:UPD_TRAMPOLINE_ACTIVE = '1'
+            $env:UPD_TRAMPOLINE_PATH = Join-Path $TestDrive 'proved-trampoline.cmd'
+            & pwsh -NoLogo -NoProfile -File (Join-Path $tools 'Invoke-UpdLauncher.ps1') adopt-staged-batch
+        } finally {
+            $env:UPD_TRAMPOLINE_ACTIVE = $priorActive
+            $env:UPD_TRAMPOLINE_PATH = $priorPath
+        }
         $LASTEXITCODE | Should -Be 0
         Test-Path (Join-Path $root 'upd.cmd.next') | Should -BeFalse
         Test-Path (Join-Path $root 'upd.cmd.next.sha256') | Should -BeFalse
         Test-Path (Join-Path $root 'upd.cmd.next.baseline') | Should -BeFalse
+    }
+
+    It 'replaces the original launcher exactly once while executing from a spaced trampoline path' {
+        $root = Join-Path $TestDrive 'live batch adoption with spaces'
+        $tools = Join-Path $root 'tools'
+        $null = New-Item -ItemType Directory -Path $tools
+        Copy-Item $launcherPath (Join-Path $tools 'Invoke-UpdLauncher.ps1')
+        Copy-Item $invokePath (Join-Path $root 'Invoke-BootUpdateCycle.ps1')
+        $target = Join-Path $root 'upd.cmd'
+        Copy-Item $cmdPath $target
+        [IO.File]::AppendAllText($target, "`r`n:: intentionally old launcher bytes", [Text.UTF8Encoding]::new($false))
+        Copy-Item $cmdPath "$target.next"
+        $nextHash = (Get-FileHash "$target.next" -Algorithm SHA256).Hash
+        Set-Content "$target.next.sha256" $nextHash -NoNewline
+        Set-Content "$target.next.baseline" (Get-FileHash $target -Algorithm SHA256).Hash -NoNewline
+
+        $output = & cmd.exe /d /c "`"$target`" help" 2>&1
+        $exitCode = $LASTEXITCODE
+        $text = $output -join "`n"
+
+        $exitCode | Should -Be 0
+        ([regex]::Matches($text, 'Updated upd\.cmd from the checksummed release bundle\.')).Count |
+            Should -Be 1
+        $text | Should -Not -Match 'The system cannot find the path specified|Terminate batch job'
+        (Get-FileHash $target -Algorithm SHA256).Hash | Should -Be $nextHash
+        Test-Path "$target.next" | Should -BeFalse
+    }
+
+    It 'does not trust an inherited trampoline marker when the invoked batch path differs' {
+        $root = Join-Path $TestDrive 'inherited marker guard'
+        $tools = Join-Path $root 'tools'
+        $null = New-Item -ItemType Directory -Path $tools
+        Copy-Item $cmdPath (Join-Path $root 'upd.cmd')
+        @'
+param([Parameter(ValueFromRemainingArguments)][string[]]$Arguments)
+"launcher reached: $($Arguments -join ' ')"
+'@ | Set-Content -LiteralPath (Join-Path $tools 'Invoke-UpdLauncher.ps1') -Encoding utf8
+        $priorActive = $env:UPD_TRAMPOLINE_ACTIVE
+        $priorPath = $env:UPD_TRAMPOLINE_PATH
+        try {
+            $env:UPD_TRAMPOLINE_ACTIVE = '1'
+            $env:UPD_TRAMPOLINE_PATH = Join-Path $TestDrive 'some-other-process.cmd'
+            $output = & cmd.exe /d /c "`"$(Join-Path $root 'upd.cmd')`" help" 2>&1
+            $LASTEXITCODE | Should -Be 0
+            ($output -join "`n") | Should -Match 'launcher reached: help'
+        } finally {
+            $env:UPD_TRAMPOLINE_ACTIVE = $priorActive
+            $env:UPD_TRAMPOLINE_PATH = $priorPath
+        }
+    }
+
+    It 'bridges a pre-trampoline launcher without replacing the batch while cmd is reading it' {
+        $root = Join-Path $TestDrive 'legacy 2543 bridge'
+        $tools = Join-Path $root 'tools'
+        $null = New-Item -ItemType Directory -Path $tools
+        Copy-Item $launcherPath (Join-Path $tools 'Invoke-UpdLauncher.ps1')
+        Copy-Item $invokePath (Join-Path $root 'Invoke-BootUpdateCycle.ps1')
+        $target = Join-Path $root 'upd.cmd'
+        @"
+@echo off
+:: BootUpdateCycleVersion=2.5.43
+pwsh -NoLogo -NoProfile -File "$tools\Invoke-UpdLauncher.ps1" adopt-staged-batch
+echo legacy caller returned cleanly
+exit /b 0
+"@ | Set-Content -LiteralPath $target -Encoding ascii
+        Copy-Item $cmdPath "$target.next"
+        $nextHash = (Get-FileHash "$target.next" -Algorithm SHA256).Hash
+        Set-Content "$target.next.sha256" $nextHash -NoNewline
+        Set-Content "$target.next.baseline" (Get-FileHash $target -Algorithm SHA256).Hash -NoNewline
+
+        $output = & cmd.exe /d /c "`"$target`"" 2>&1
+        $LASTEXITCODE | Should -Be 0
+        ($output -join "`n") | Should -Match 'legacy caller returned cleanly'
+        $deadline = [DateTime]::UtcNow.AddSeconds(10)
+        while ((Test-Path "$target.next") -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 100 }
+        Test-Path "$target.next" | Should -BeFalse
+        (Get-FileHash $target -Algorithm SHA256).Hash | Should -Be $nextHash
+        (Get-Content (Join-Path $root 'upd.cmd.adoption.log') -Raw) | Should -Match 'completed'
     }
 
     It 'behaviorally rejects and removes a stale staged batch' {
@@ -322,7 +414,16 @@ exit 29
         Set-Content (Join-Path $root 'upd.cmd.next.sha256') $hash -NoNewline
         $baseline = (Get-FileHash (Join-Path $root 'upd.cmd') -Algorithm SHA256).Hash
         Set-Content (Join-Path $root 'upd.cmd.next.baseline') $baseline -NoNewline
-        & pwsh -NoLogo -NoProfile -File (Join-Path $tools 'Invoke-UpdLauncher.ps1') adopt-staged-batch 2>$null
+        $priorActive = $env:UPD_TRAMPOLINE_ACTIVE
+        $priorPath = $env:UPD_TRAMPOLINE_PATH
+        try {
+            $env:UPD_TRAMPOLINE_ACTIVE = '1'
+            $env:UPD_TRAMPOLINE_PATH = Join-Path $TestDrive 'proved-trampoline.cmd'
+            & pwsh -NoLogo -NoProfile -File (Join-Path $tools 'Invoke-UpdLauncher.ps1') adopt-staged-batch 2>$null
+        } finally {
+            $env:UPD_TRAMPOLINE_ACTIVE = $priorActive
+            $env:UPD_TRAMPOLINE_PATH = $priorPath
+        }
         $LASTEXITCODE | Should -Not -Be 0
         Test-Path (Join-Path $root 'upd.cmd.next') | Should -BeFalse
         Test-Path (Join-Path $root 'upd.cmd.next.sha256') | Should -BeFalse
@@ -522,6 +623,9 @@ exit 0
         $findLabel = $cmdSource.LastIndexOf(':find_pwsh')
         $findLabel | Should -BeGreaterThan 0
         $simulated = $cmdSource.Substring(0,$findLabel) + ":find_pwsh`r`nset `"UPD_PWSH=`"`r`nexit /b 0`r`n"
+        $simulated = $simulated -replace '(?m)^if not defined UPD_TRAMPOLINE_ACTIVE goto trampoline_wrapper\r?\n',''
+        $simulated = $simulated -replace '(?m)^if /i "%~f0"=="%UPD_TRAMPOLINE_PATH%" goto trampoline_active\r?\n',''
+        $simulated = $simulated -replace '(?m)^goto trampoline_wrapper\r?\n',''
         $simulatedPath = Join-Path $TestDrive 'upd-ps5-only.cmd'
         Set-Content -LiteralPath $simulatedPath -Value ($simulated -split '\r?\n') -Encoding ascii
 

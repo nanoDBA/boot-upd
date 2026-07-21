@@ -341,6 +341,43 @@ function Test-AwsToolsPublisherMismatchMessage {
     return $true
 }
 
+function Invoke-VerifiedAwsToolsCleanup {
+    param(
+        [Parameter(Mandatory)][version]$ExceptVersion,
+        [Parameter(Mandatory)][string[]]$ModuleNames
+    )
+    $cleanupRecords = @(Uninstall-AWSToolsModule -ExceptVersion $ExceptVersion -Force -Confirm:$false -ErrorAction Continue 2>&1)
+    $benignAlreadyAbsent = 0
+    $unexpectedErrors = [Collections.Generic.List[object]]::new()
+    foreach ($record in $cleanupRecords) {
+        if ($record -is [Management.Automation.ErrorRecord]) {
+            $isAlreadyAbsent = $record.FullyQualifiedErrorId -match '^NoMatchFoundForCriteria(?:,|$)' -and
+                $record.InvocationInfo.MyCommand.Name -eq 'Uninstall-Package' -and
+                $record.Exception.Message -like 'No match was found for the specified search criteria*'
+            if ($isAlreadyAbsent) { $benignAlreadyAbsent++; continue }
+            $unexpectedErrors.Add($record)
+            continue
+        }
+        Write-Host $record
+    }
+    if ($unexpectedErrors.Count) {
+        throw "AWS.Tools cleanup reported unexpected error(s): $($unexpectedErrors -join '; ')"
+    }
+    if ($benignAlreadyAbsent) {
+        Write-Host "AWS.Tools cleanup skipped $benignAlreadyAbsent already-absent package record(s)."
+    }
+
+    $stale = @($ModuleNames | ForEach-Object {
+        Get-Module -ListAvailable $_ | Where-Object Version -ne $ExceptVersion
+    } | Sort-Object Name,Version,ModuleBase -Unique)
+    if ($stale.Count) {
+        Write-Warning ("Verified AWS.Tools $ExceptVersion is installed; locked or independently installed older copies were retained:`n  " +
+            (($stale | ForEach-Object { "$($_.Name) v$($_.Version) @ $($_.ModuleBase)" }) -join "`n  "))
+    } else {
+        Write-Host "AWS.Tools cleanup verified: no older managed module copies remain."
+    }
+}
+
 try {
     Import-Module AWS.Tools.Installer -Force -ErrorAction Stop
     try {
@@ -362,7 +399,7 @@ try {
                 }
             }
         }
-        Uninstall-AWSToolsModule -ExceptVersion $candidate.Version -Force -Confirm:$false -ErrorAction Stop
+        Invoke-VerifiedAwsToolsCleanup -ExceptVersion $candidate.Version -ModuleNames $candidate.ModuleNames
     }
     exit 0
 }

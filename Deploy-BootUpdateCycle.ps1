@@ -328,7 +328,7 @@ if ([string]::IsNullOrEmpty($env:BOOT_UPDATE_NO_SELF_UPDATE) -and -not $Config.D
                     if ($currentBatch -match 'upd\.cmd\.next') { $destination = "$target.next" }
                 }
                 if ((Test-Path -LiteralPath $target) -and (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash -eq $item.Hash) {
-                    if ($destination -ne $target) { Remove-Item -LiteralPath $destination,"$destination.sha256" -Force -ErrorAction SilentlyContinue }
+                    if ($destination -ne $target) { Remove-Item -LiteralPath $destination,"$destination.sha256","$destination.baseline" -Force -ErrorAction SilentlyContinue }
                     continue
                 }
                 $snapshot = Join-Path $sourceTempRoot ("rollback-{0}" -f $sourceCommitted.Count)
@@ -337,15 +337,24 @@ if ([string]::IsNullOrEmpty($env:BOOT_UPDATE_NO_SELF_UPDATE) -and -not $Config.D
                 $isStaged = $destination -ne $target
                 $sidecarPath = "$destination.sha256"
                 $sidecarSnapshot = "$snapshot.sha256"
+                $baselinePath = "$destination.baseline"
+                $baselineSnapshot = "$snapshot.baseline"
                 $sidecarExisted = $isStaged -and (Test-Path -LiteralPath $sidecarPath)
+                $baselineExisted = $isStaged -and (Test-Path -LiteralPath $baselinePath)
                 if ($sidecarExisted) { Copy-Item -LiteralPath $sidecarPath -Destination $sidecarSnapshot -Force }
-                $sourceCommitted.Add([pscustomobject]@{ Destination=$destination; Snapshot=$snapshot; Existed=$existed; SidecarPath=$sidecarPath; SidecarSnapshot=$sidecarSnapshot; SidecarExisted=$sidecarExisted; Staged=$isStaged })
+                if ($baselineExisted) { Copy-Item -LiteralPath $baselinePath -Destination $baselineSnapshot -Force }
+                $sourceCommitted.Add([pscustomobject]@{ Destination=$destination; Snapshot=$snapshot; Existed=$existed; SidecarPath=$sidecarPath; SidecarSnapshot=$sidecarSnapshot; SidecarExisted=$sidecarExisted; BaselinePath=$baselinePath; BaselineSnapshot=$baselineSnapshot; BaselineExisted=$baselineExisted; Staged=$isStaged })
                 $sourceMutationStarted = $true
                 $incoming = "$destination.incoming-$PID"
                 Copy-Item -LiteralPath $item.Temp -Destination $incoming -Force
                 Move-Item -LiteralPath $incoming -Destination $destination -Force
-                if ($isStaged) { Set-Content -LiteralPath $sidecarPath -Value $item.Hash -Encoding ascii -NoNewline }
-                Write-Host "Source self-update: $($sourceAsset.Name) verified and installed." -ForegroundColor Green
+                if ($isStaged) {
+                    Set-Content -LiteralPath $sidecarPath -Value $item.Hash -Encoding ascii -NoNewline
+                    $baselineHash = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash.ToUpperInvariant()
+                    Set-Content -LiteralPath $baselinePath -Value $baselineHash -Encoding ascii -NoNewline
+                }
+                $commitVerb = if ($isStaged) { 'verified and staged for delayed activation' } else { 'verified and installed' }
+                Write-Host "Source self-update: $($sourceAsset.Name) $commitVerb." -ForegroundColor Green
             }
         } catch {
             for ($index=$sourceCommitted.Count-1; $index -ge 0; $index--) {
@@ -355,6 +364,8 @@ if ([string]::IsNullOrEmpty($env:BOOT_UPDATE_NO_SELF_UPDATE) -and -not $Config.D
                 if ($entry.Staged) {
                     if ($entry.SidecarExisted) { Copy-Item -LiteralPath $entry.SidecarSnapshot -Destination $entry.SidecarPath -Force }
                     else { Remove-Item -LiteralPath $entry.SidecarPath -Force -ErrorAction SilentlyContinue }
+                    if ($entry.BaselineExisted) { Copy-Item -LiteralPath $entry.BaselineSnapshot -Destination $entry.BaselinePath -Force }
+                    else { Remove-Item -LiteralPath $entry.BaselinePath -Force -ErrorAction SilentlyContinue }
                 }
             }
             throw "source bundle commit failed and was rolled back: $_"

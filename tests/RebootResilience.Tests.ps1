@@ -130,6 +130,28 @@ Describe 'Truthful reboot safety limit' {
         $script:UnregisterCalls | Should -Be 1
     }
 
+    It 'charges repeated same-boot pending-reboot requests against the retry budget' {
+        $cycle = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
+        ([regex]::Matches($cycle, '\$state\.ConsecutiveRetryCount\s*=\s*\[int\]\$state\.ConsecutiveRetryCount \+ 1')).Count |
+            Should -BeGreaterOrEqual 3
+        ([regex]::Matches($cycle, 'Pending reboot: \$_')).Count | Should -Be 2
+        foreach ($restartCall in @(
+            "Start-BootUpdateRestart -State `$state -Reason 'A reboot was already pending",
+            'Start-BootUpdateRestart -State $state -Reason "Iteration'
+        )) {
+            $restart = $cycle.IndexOf($restartCall)
+            $guard = $cycle.LastIndexOf('Stop-BootUpdateAtRetryLimit', $restart)
+            $guard | Should -BeGreaterThan 0
+            $guard | Should -BeLessThan $restart
+        }
+    }
+
+    It 'does not mutate or enforce the retry budget during WhatIf' {
+        $cycle = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
+        ([regex]::Matches($cycle, '(?s)if \(-not \$WhatIfPreference\) \{\s*\$state\.ConsecutiveRetryCount.*?Pending reboot: \$_.*?Stop-BootUpdateAtRetryLimit')).Count |
+            Should -Be 2
+    }
+
     It 'does not charge successful staged advancement against the retry budget' {
         $state = [pscustomobject]@{ ConsecutiveRetryCount=0 }
         foreach ($phase in 1..8) {
@@ -185,6 +207,8 @@ Describe 'Durable resume chain' {
         $text | Should -Match 'New-ScheduledTaskTrigger -AtLogOn'
         $text | Should -Match 'BootUpdateCycleFallback'
         $text | Should -Match "Delay = 'PT3M'"
+        $text | Should -Match 'fallbackRetryTrigger.*retryTime\.AddMinutes\(3\)'
+        $text | Should -Match 'fallbackTriggers = if \(\$fallbackRetryTrigger\)'
     }
 
     It 'retries failures, rejects overlap, and verifies task registration' {
@@ -203,6 +227,13 @@ Describe 'Durable resume chain' {
         $text = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
         $text | Should -Match 'Resume checkpoint preserved.*retry.*triggers are armed'
         $text.IndexOf('$state.Iteration++') | Should -BeGreaterThan $text.IndexOf('Test-PreFlightChecks')
+    }
+
+    It 'uses process-unique checkpoint temporary files' {
+        $text = Get-FunctionText $invokeAst 'Set-BootUpdateState'
+        $text | Should -Match '\$PID'
+        $text | Should -Match '\[guid\]::NewGuid'
+        $text | Should -Match '\[System\.IO\.File\]::Move'
     }
 
     It 'arms the resume checkpoint before any mutating update phase' {
