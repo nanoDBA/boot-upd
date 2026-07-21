@@ -24,7 +24,7 @@ A Windows boot-time automation tool that runs every configured package manager, 
 Open **Windows PowerShell as Administrator**, paste this command, and press Enter:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; & ([ScriptBlock]::Create((Invoke-RestMethod -UseBasicParsing -TimeoutSec 30 'https://github.com/nanoDBA/boot-upd/releases/latest/download/Install-UpdCompat.ps1'))) -PromptForArguments"
+[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; & ([ScriptBlock]::Create((Invoke-RestMethod -UseBasicParsing -TimeoutSec 30 'https://github.com/nanoDBA/boot-upd/releases/latest/download/Install-UpdCompat.ps1'))) -PromptForArguments
 ```
 
 After the compatibility installer starts, it verifies every runtime asset against the
