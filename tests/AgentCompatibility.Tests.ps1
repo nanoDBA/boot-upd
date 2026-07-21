@@ -18,8 +18,8 @@ Describe 'Claude Code project compatibility' {
         $settings = Get-Content $settingsPath -Raw | ConvertFrom-Json
         @($settings.permissions.deny).Count | Should -BeGreaterOrEqual 1
         $gitignore = Get-Content (Join-Path $repoRoot '.gitignore') -Raw
-        $gitignore | Should -Match '(?m)^\.claude/settings\.local\.json$'
-        $gitignore | Should -Not -Match '(?m)^\.claude/$'
+        $gitignore | Should -Match '(?m)^\.claude/settings\.local\.json\r?$'
+        $gitignore | Should -Not -Match '(?m)^\.claude/\r?$'
     }
 
     It 'denies common credential-file classes without pre-approving mutation commands' {
