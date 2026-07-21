@@ -1,8 +1,17 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.50
+**Current Version:** v2.5.51
 **Release Date:** 2026-07-21
 **Status:** STABLE
+
+---
+
+## v2.5.51 (2026-07-21)
+
+- Uses `winget repair` only for missing MSI-source error 1612; installers such as iCUE that do not support repair retain force-reinstall guidance.
+- Persists a normalized Winget package/error signature and treats its first occurrence as retryable.
+- Stops and disarms automatic continuation after the identical non-transient signature repeats, preserving an `AttentionRequired` checkpoint and withholding all fully-patched congratulations.
+- Clears the failure signature after a clean Winget pass so a later unrelated incident gets its own bounded retry opportunity.
 
 ---
 

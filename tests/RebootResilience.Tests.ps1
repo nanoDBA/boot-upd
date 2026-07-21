@@ -35,9 +35,10 @@ BeforeAll {
         'Get-NextMaintenanceWindowStart',
         'Test-WindowsUpdateConvergence',
         'Format-NativeExitCode',
-        'Get-InstallerExitSummary',
+          'Get-InstallerExitSummary',
           'Get-WingetOutputSummary',
-          'Get-WingetRemediationCommand'
+          'Get-WingetRemediationCommand',
+          'Complete-WingetFailureClassification'
     )) {
         . ([scriptblock]::Create((Get-FunctionText $invokeAst $functionName)))
     }
@@ -84,7 +85,20 @@ Describe 'Concise provider diagnostics' {
     It 'creates paste-ready remediation only from safe package identifiers' {
         Get-WingetRemediationCommand -PackageId 'JohnMacFarlane.Pandoc' |
             Should -Be 'winget install --id JohnMacFarlane.Pandoc -e --source winget --force --accept-source-agreements --accept-package-agreements'
+        Get-WingetRemediationCommand -PackageId 'Microsoft.WindowsPCHealthCheck' -Code 1612 |
+            Should -Be 'winget repair --id Microsoft.WindowsPCHealthCheck -e --source winget --force --accept-source-agreements --accept-package-agreements'
+        Get-WingetRemediationCommand -PackageId 'Corsair.iCUE.5' -Code 3221226525 |
+            Should -Be 'winget install --id Corsair.iCUE.5 -e --source winget --force --accept-source-agreements --accept-package-agreements'
         Get-WingetRemediationCommand -PackageId 'safe; Remove-Item C:\' | Should -BeNullOrEmpty
+    }
+
+    It 'escalates only an identical Winget failure signature that repeats' {
+        $state = [pscustomobject]@{ WingetFailureSignature=''; WingetFailureRepeatCount=0 }
+        $failure = [pscustomobject]@{ Name='Health Check'; Id='Microsoft.WindowsPCHealthCheck'; Code=1612; Hex='0x0000064C' }
+        (Complete-WingetFailureClassification -State $state -Failures @($failure)).TerminalFailure | Should -BeFalse
+        (Complete-WingetFailureClassification -State $state -Failures @($failure)).TerminalFailure | Should -BeTrue
+        $changed = [pscustomobject]@{ Name='iCUE'; Id='Corsair.iCUE.5'; Code=3221226525; Hex='0xC000041D' }
+        (Complete-WingetFailureClassification -State $state -Failures @($changed)).TerminalFailure | Should -BeFalse
     }
 
     It 'renders signed provider HRESULTs in recognizable hexadecimal form' {
@@ -375,6 +389,15 @@ Describe 'Behavioral completion disposition' {
         )
         $result.Kind | Should -Be 'Retry'
         $result.Phases.Name | Should -Contain 'WindowsUpdate'
+    }
+
+    It 'stops automatic retries for a persistent terminal provider failure' {
+        $result = Resolve-BootUpdateCompletionDisposition -IncompletePhases @(
+            @{ Name='Winget'; UserCompletionDeferred=$false; TerminalFailure=$true; AttentionDetails=@('iCUE') }
+        )
+        $result.Kind | Should -Be 'Attention'
+        $cycle = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
+        $cycle | Should -Match "disposition\.Kind -eq 'Attention'[\s\S]*?Stop-BootUpdateForManualAttention"
     }
 
     It 'retains a user-context pass when only user-scoped work remains' {

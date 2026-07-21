@@ -338,7 +338,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 4 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.50' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.51' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 Set-Variable -Name 'RebootSignalSettleSeconds' -Value 20 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 $script:ExplicitRebootRequests = [System.Collections.Generic.List[object]]::new()
 
@@ -895,10 +895,33 @@ function Get-WingetOutputSummary {
 }
 
 function Get-WingetRemediationCommand {
-    param([Parameter(Mandatory)][string]$PackageId)
+    param([Parameter(Mandatory)][string]$PackageId,[long]$Code = 0)
     # Never echo arbitrary provider output into a shell command.
     if ($PackageId -notmatch '^[A-Za-z0-9][A-Za-z0-9._+-]*$') { return $null }
-    return "winget install --id $PackageId -e --source winget --force --accept-source-agreements --accept-package-agreements"
+    $verb = if ($Code -eq 1612) { 'repair' } else { 'install' }
+    return "winget $verb --id $PackageId -e --source winget --force --accept-source-agreements --accept-package-agreements"
+}
+
+function Complete-WingetFailureClassification {
+    param([Parameter(Mandatory)][pscustomobject]$State,[object[]]$Failures = @())
+    $signature = (@($Failures | ForEach-Object { "$($_.Id):$($_.Code)" } | Sort-Object -Unique) -join '|')
+    if (-not $signature) {
+        $State | Add-Member WingetFailureSignature '' -Force
+        $State | Add-Member WingetFailureRepeatCount 0 -Force
+        Set-BootUpdateState -State $State
+        return [pscustomobject]@{ TerminalFailure=$false; Details=@() }
+    }
+    $prior = if ($State.PSObject.Properties.Name -contains 'WingetFailureSignature') { [string]$State.WingetFailureSignature } else { '' }
+    $priorCount = if ($State.PSObject.Properties.Name -contains 'WingetFailureRepeatCount') { [int]$State.WingetFailureRepeatCount } else { 0 }
+    $repeat = if ($prior -eq $signature) { $priorCount + 1 } else { 1 }
+    $State | Add-Member WingetFailureSignature $signature -Force
+    $State | Add-Member WingetFailureRepeatCount $repeat -Force
+    Set-BootUpdateState -State $State
+    $persistent = $repeat -ge 2
+    return [pscustomobject]@{
+        TerminalFailure=$persistent
+        Details=@($Failures | ForEach-Object { "$($_.Name) [$($_.Id)] ($($_.Code), $($_.Hex))" })
+    }
 }
 
 function Write-WingetScopeSummary {
@@ -909,6 +932,10 @@ function Write-WingetScopeSummary {
     )
     Write-ProviderTranscript -Provider Winget -Scope $Scope -Lines $Lines
     $summary = Get-WingetOutputSummary -Lines $Lines
+    $collector = Get-Variable -Name CurrentWingetFailures -Scope Script -ErrorAction SilentlyContinue
+    if ($collector -and $null -ne $collector.Value -and $summary.Failures.Count) {
+        foreach ($failure in $summary.Failures) { $collector.Value.Add($failure) }
+    }
     if ($summary.NoApplicable -and $summary.Attempted -eq 0) {
         $suffix = if ($summary.Pinned) { " ($($summary.Pinned) pinned)" } else { '' }
         Write-Log "Winget ${Scope}: no applicable upgrades$suffix."
@@ -921,7 +948,7 @@ function Write-WingetScopeSummary {
     foreach ($failure in $summary.Failures) {
         $identity = if ($failure.Id) { "$($failure.Name) [$($failure.Id)]" } else { $failure.Name }
         Write-Log "Winget ${Scope}: $identity failed — $($failure.Summary) ($($failure.Code), $($failure.Hex))." -Level Warn
-        $command = Get-WingetRemediationCommand -PackageId $failure.Id
+        $command = Get-WingetRemediationCommand -PackageId $failure.Id -Code $failure.Code
         if ($command) { Write-Log "Winget ${Scope}: suggested remediation (elevated): $command" -Level Warn }
     }
     $notes = @()
@@ -970,8 +997,10 @@ function Update-BootUpdateStateForBootSession {
 
 function Resolve-BootUpdateCompletionDisposition {
     param([object[]]$IncompletePhases = @())
+    $terminal = @($IncompletePhases | Where-Object { $_.TerminalFailure })
     $userDeferred = @($IncompletePhases | Where-Object { $_.UserCompletionDeferred })
-    $retryable = @($IncompletePhases | Where-Object { -not $_.UserCompletionDeferred })
+    $retryable = @($IncompletePhases | Where-Object { -not $_.UserCompletionDeferred -and -not $_.TerminalFailure })
+    if ($terminal.Count -gt 0) { return [pscustomobject]@{ Kind='Attention'; Phases=$terminal } }
     if ($retryable.Count -gt 0) { return [pscustomobject]@{ Kind='Retry'; Phases=$retryable } }
     if ($userDeferred.Count -gt 0) { return [pscustomobject]@{ Kind='UserContext'; Phases=$userDeferred } }
     return [pscustomobject]@{ Kind='Complete'; Phases=@() }
@@ -1637,6 +1666,34 @@ function Stop-BootUpdateAtRetryLimit {
     return $true
 }
 
+function Stop-BootUpdateForManualAttention {
+    param([Parameter(Mandatory)][pscustomobject]$State,[Parameter(Mandatory)][object[]]$Phases)
+    $names = @($Phases.Name) -join ', '
+    $details = @($Phases | ForEach-Object { @($_.AttentionDetails) }) -join '; '
+    $reason = "Persistent non-transient failure requires manual attention: $names"
+    $State.Phase = 'AttentionRequired'
+    $State.LimitReachedAt = [datetime]::UtcNow.ToString('o')
+    $State.LimitReason = if ($details) { "$reason — $details" } else { $reason }
+    Set-BootUpdateState -State $State
+    $disarmed = $true
+    try { Unregister-BootUpdateTask } catch {
+        $disarmed = $false
+        $State.Phase = 'AttentionDisarmFailed'
+        $State.LimitReason = "$($State.LimitReason) Continuation-task removal failed: $($_.Exception.Message)"
+        Set-BootUpdateState -State $State
+    }
+    $disposition = if ($disarmed) { 'Automatic continuation tasks were removed and verified absent.' } else { 'WARNING: continuation-task removal failed; remove both BootUpdateCycle tasks manually.' }
+    Write-Log "$($State.LimitReason) $disposition" -Level Error
+    Send-CompletionNotification -Kind Error -Title 'Boot Update Cycle NEEDS ATTENTION' -Message "$($State.LimitReason). $disposition"
+    Show-CycleBanner -Title 'M A N U A L   A T T E N T I O N   N E E D E D' -AnsiColor "$([char]27)[31m" -Info @(
+        'Automatic retries stopped because the same non-transient failure repeated.'
+        "Incomplete phase(s): $names"
+        $(if ($details) { "Failures: $details" } else { 'See the diagnostic log for the exact provider failure.' })
+        $disposition
+        "Diagnostic state preserved: $($script:StatePath)"
+    )
+}
+
 function Update-BootUpdateStagedRetryCount {
     param(
         [Parameter(Mandatory)][pscustomobject]$State,
@@ -1833,6 +1890,7 @@ function Update-WingetPackages {
     [CmdletBinding(SupportsShouldProcess)]
     param()
     $TimeoutMinutes = $script:PackageTimeoutMinutes
+    $script:CurrentWingetFailures = [Collections.Generic.List[object]]::new()
     $wingetPath = $null
     $wg = Get-Command winget -EA SilentlyContinue
     if ($wg) { $wingetPath = $wg.Source }
@@ -1969,7 +2027,8 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
             Write-Log '  [WHATIF] Would run: winget upgrade --all --scope user (parallel)'
             Write-Log '  [WHATIF] Would run: winget upgrade --all --scope machine (parallel)'
         }
-        return @{ Success = (-not $anyTimeout); Count = $totalCount }
+        $classification = Complete-WingetFailureClassification -State $script:CurrentState -Failures $script:CurrentWingetFailures.ToArray()
+        return @{ Success = (-not $anyTimeout); Count = $totalCount; TerminalFailure=$classification.TerminalFailure; AttentionDetails=$classification.Details }
     }
 
     <# ── Sequential path: single scope (SYSTEM: machine only) OR ExcludePatterns active ── #>
@@ -2094,7 +2153,8 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
             }
         }
     }
-    return @{ Success = (-not $anyTimeout); Count = $totalCount }
+    $classification = Complete-WingetFailureClassification -State $script:CurrentState -Failures $script:CurrentWingetFailures.ToArray()
+    return @{ Success = (-not $anyTimeout); Count = $totalCount; TerminalFailure=$classification.TerminalFailure; AttentionDetails=$classification.Details }
 }
 
 function Update-ChocolateyPackages {
@@ -4784,6 +4844,8 @@ function Invoke-BootUpdateCycle {
                     $r = @{ Success = $true; Count = 0 }
                 }
                 $phaseSucceeded = [bool]$r.Success -and (-not $targetPhase.UserCompletionDeferred)
+                $targetPhase.TerminalFailure = [bool]$r.TerminalFailure
+                $targetPhase.AttentionDetails = @($r.AttentionDetails)
                 $state.($targetPhase.Flag) = $phaseSucceeded
                 $phaseCount = if ($targetPhase.Key -and $r.Count) { $state.Summary.($targetPhase.Key) += $r.Count; $r.Count } else { 0 }
                 $elapsed = (Get-Date) - $phaseStart
@@ -4851,6 +4913,8 @@ function Invoke-BootUpdateCycle {
                     $r = @{ Success = $true; Count = 0 }
                 }
                 $phaseSucceeded = [bool]$r.Success -and (-not $phase.UserCompletionDeferred)
+                $phase.TerminalFailure = [bool]$r.TerminalFailure
+                $phase.AttentionDetails = @($r.AttentionDetails)
                 $state.($phase.Flag) = $phaseSucceeded
                 $phaseCount = if ($phase.Key -and $r.Count) { $state.Summary.($phase.Key) += $r.Count; $r.Count } else { 0 }
                 $elapsed = (Get-Date) - $phaseStart
@@ -5398,6 +5462,11 @@ function Invoke-BootUpdateCycle {
            all-clear. The same task also retains its boot/logon trigger. #>
         $incompletePhases = @($enabledPhases | Where-Object { -not [bool]$state.($_.Flag) })
         $disposition = Resolve-BootUpdateCompletionDisposition -IncompletePhases $incompletePhases
+        if (-not $WhatIfPreference -and $disposition.Kind -eq 'Attention') {
+            Stop-BootUpdateForManualAttention -State $state -Phases $disposition.Phases
+            Write-BootUpdateProgress -Completed
+            exit 3
+        }
         if (-not $WhatIfPreference -and $disposition.Kind -eq 'Retry') {
             $state.ConsecutiveRetryCount = [int]$state.ConsecutiveRetryCount + 1
             $incompleteNames = $disposition.Phases.Name -join ', '
