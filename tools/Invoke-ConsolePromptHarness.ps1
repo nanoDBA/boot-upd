@@ -4,6 +4,7 @@ param(
     [Parameter(Mandatory)][string]$CommandLine,
     [Parameter(Mandatory)][string]$InputLine,
     [Parameter(Mandatory)][string]$TranscriptPath,
+    [ValidateSet('CommandPrompt','WindowsPowerShell')][string]$Shell = 'CommandPrompt',
     [string]$WorkingDirectory = (Get-Location).Path,
     [ValidateRange(5,1800)][int]$TimeoutSeconds = 900,
     [ValidateRange(100,10000)][int]$InputDelayMilliseconds = 1500
@@ -188,18 +189,27 @@ $transcriptParent = Split-Path -Parent $transcriptFullPath
 $null = New-Item -ItemType Directory -Path $transcriptParent -Force
 Remove-Item -LiteralPath $transcriptFullPath -Force -ErrorAction SilentlyContinue
 
-# cmd owns the new console. Its PowerShell child inherits console input while
-# stdout/stderr go to the transcript artifact for deterministic CI assertions.
-# A temporary batch avoids cmd.exe's fragile nested /c quoting while preserving
-# the exact user-facing command as its own executable line.
-$runnerPath = "$transcriptFullPath.runner.cmd"
-$runnerLines = @(
-    '@echo off'
-    "$CommandLine 1> `"$transcriptFullPath`" 2>&1"
-    'exit /b %ERRORLEVEL%'
-)
-[IO.File]::WriteAllLines($runnerPath,$runnerLines,[Text.Encoding]::ASCII)
-$childCommand = 'cmd.exe /d /s /c ""{0}""' -f $runnerPath
+# The selected shell owns the new console. Its descendants inherit console input
+# while stdout/stderr go to the transcript artifact for deterministic assertions.
+# A temporary native script preserves the exact user-facing command as its own line.
+if ($Shell -eq 'WindowsPowerShell') {
+    $runnerPath = "$transcriptFullPath.runner.ps1"
+    $runnerLines = @(
+        '$ErrorActionPreference = ''Stop'''
+        $CommandLine
+    )
+    [IO.File]::WriteAllLines($runnerPath,$runnerLines,[Text.UTF8Encoding]::new($false))
+    $childCommand = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{0}" 1> "{1}" 2>&1' -f $runnerPath,$transcriptFullPath
+} else {
+    $runnerPath = "$transcriptFullPath.runner.cmd"
+    $runnerLines = @(
+        '@echo off'
+        "$CommandLine 1> `"$transcriptFullPath`" 2>&1"
+        'exit /b %ERRORLEVEL%'
+    )
+    [IO.File]::WriteAllLines($runnerPath,$runnerLines,[Text.Encoding]::ASCII)
+    $childCommand = 'cmd.exe /d /s /c ""{0}""' -f $runnerPath
+}
 $workingDirectoryFullPath = [IO.Path]::GetFullPath($WorkingDirectory)
 $child = [BootUpdateCycle.ConsolePromptDriver]::Start($childCommand,$workingDirectoryFullPath)
 try {

@@ -54,9 +54,9 @@ jobs:
         shell: pwsh
         run: |
           $commands = @(Get-Content -LiteralPath README.md | Where-Object {
-              $_ -match '^powershell\.exe -NoProfile -ExecutionPolicy Bypass' -and
+              $_ -match '^\[Net\.ServicePointManager\]::SecurityProtocol=' -and
               $_ -match '\[ScriptBlock\]::Create' -and
-              $_ -match '-PromptForArguments"$'
+              $_ -match '-PromptForArguments$'
           })
           if ($commands.Count -ne 1) {
               throw "Expected exactly one interactive README bootstrap; found $($commands.Count)."
@@ -65,6 +65,7 @@ jobs:
           $transcript = Join-Path $env:RUNNER_TEMP 'live-bootstrap-transcript.txt'
           $result = ./tools/Invoke-ConsolePromptHarness.ps1 `
               -CommandLine $commands[0] `
+              -Shell WindowsPowerShell `
               -InputLine 'help' `
               -TranscriptPath $transcript `
               -WorkingDirectory $env:RUNNER_TEMP `
