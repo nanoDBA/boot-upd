@@ -344,7 +344,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 5 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.56' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.57' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 Set-Variable -Name 'RebootSignalSettleSeconds' -Value 20 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 $script:ExplicitRebootRequests = [System.Collections.Generic.List[object]]::new()
 
@@ -909,8 +909,16 @@ function Get-WingetRemediationCommand {
 }
 
 function Complete-WingetFailureClassification {
-    param([Parameter(Mandatory)][pscustomobject]$State,[object[]]$Failures = @())
-    $signature = (@($Failures | ForEach-Object { "$($_.Id):$($_.Code)" } | Sort-Object -Unique) -join '|')
+    param(
+        [Parameter(Mandatory)][pscustomobject]$State,
+        [object[]]$Failures = @(),
+        [string[]]$ExecutionFailures = @()
+    )
+    $signatureParts = @(
+        @($Failures | ForEach-Object { "$($_.Id):$($_.Code)" })
+        @($ExecutionFailures | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { "execution:$_" })
+    ) | Sort-Object -Unique
+    $signature = ($signatureParts -join '|')
     if (-not $signature) {
         $State | Add-Member WingetFailureSignature '' -Force
         $State | Add-Member WingetFailureRepeatCount 0 -Force
@@ -2176,6 +2184,7 @@ function Update-WingetPackages {
     param()
     $TimeoutMinutes = $script:PackageTimeoutMinutes
     $script:CurrentWingetFailures = [Collections.Generic.List[object]]::new()
+    $executionFailures = [Collections.Generic.List[string]]::new()
     $wingetPath = $null
     $wg = Get-Command winget -EA SilentlyContinue
     if ($wg) { $wingetPath = $wg.Source }
@@ -2199,7 +2208,12 @@ function Update-WingetPackages {
        parent thread after both jobs complete or the combined hard timeout fires.
        The filtered path (ExcludePatterns active) stays sequential — per-package iteration is
        order-sensitive and scopes cannot safely enumerate the same winget DB concurrently. #>
-    if ($script:ExcludePatterns.Count -eq 0 -and $script:IncludePatterns.Count -eq 0 -and $scopes.Count -gt 1) {
+    # Winget scopes share App Installer source/package state. Running two winget
+    # processes against it concurrently can make one exit 0x8A150001 without any
+    # diagnostic output. Keep scopes sequential; independent providers still run
+    # concurrently in the later parallel cohort.
+    $runWingetScopesInParallel = $false
+    if ($runWingetScopesInParallel -and $script:ExcludePatterns.Count -eq 0 -and $script:IncludePatterns.Count -eq 0 -and $scopes.Count -gt 1) {
         Write-Log 'Winget: checking user + machine scopes in parallel.'
         if ($PSCmdlet.ShouldProcess('Winget (user + machine parallel)', 'Run Winget upgrades for both scopes concurrently')) {
             $hardTimeoutSec = $TimeoutMinutes * 60
@@ -2291,6 +2305,8 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
                     Write-Log $rebootEvidence.Detail -Level Warn
                 } elseif ($null -ne $jr.ExitCode -and $jr.ExitCode -ne 0) {
                     $anyTimeout = $true
+                    $kind = if (@($jr.Lines).Count -eq 0) { 'no-output' } else { 'unclassified' }
+                    $executionFailures.Add("$sc`:$($jr.ExitCode):$kind")
                 }
                 <# Retry if blocked — sequential, after parallel phase completes #>
                 if ($installBlocked -and -not $jr.TimedOut) {
@@ -2312,7 +2328,7 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
             Write-Log '  [WHATIF] Would run: winget upgrade --all --scope user (parallel)'
             Write-Log '  [WHATIF] Would run: winget upgrade --all --scope machine (parallel)'
         }
-        $classification = Complete-WingetFailureClassification -State $script:CurrentState -Failures $script:CurrentWingetFailures.ToArray()
+        $classification = Complete-WingetFailureClassification -State $script:CurrentState -Failures $script:CurrentWingetFailures.ToArray() -ExecutionFailures $executionFailures.ToArray()
         if ($script:AggressiveRepair -and $classification.Signature) {
             if (Register-WingetAggressiveRepairAttempt -State $script:CurrentState -Signature $classification.Signature) {
                 Invoke-WingetAggressiveRepair -WingetPath $wingetPath -Failures $script:CurrentWingetFailures.ToArray() -TimeoutMinutes $TimeoutMinutes
@@ -2351,6 +2367,11 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
                 $scopeSummary = Write-WingetScopeSummary -Scope $scope -Lines $result.Output -ExitCode $result.ExitCode
                 $count = $scopeSummary.Updated
                 if ($result.TimedOut) { $anyTimeout = $true }
+                if ($null -ne $result.ExitCode -and $result.ExitCode -notin @(0,1641,3010) -and @($scopeSummary.Failures).Count -eq 0) {
+                    $kind = if (@($result.Output).Count -eq 0) { 'no-output' } else { 'unclassified' }
+                    $executionFailures.Add("$scope`:$($result.ExitCode):$kind")
+                    $anyTimeout = $true
+                }
 
                 <# One retry if blocked by another installer #>
                 if ($installBlocked -and -not $result.TimedOut) {
@@ -2458,7 +2479,7 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
             }
         }
     }
-    $classification = Complete-WingetFailureClassification -State $script:CurrentState -Failures $script:CurrentWingetFailures.ToArray()
+    $classification = Complete-WingetFailureClassification -State $script:CurrentState -Failures $script:CurrentWingetFailures.ToArray() -ExecutionFailures $executionFailures.ToArray()
     if ($script:AggressiveRepair -and $classification.Signature) {
         if (Register-WingetAggressiveRepairAttempt -State $script:CurrentState -Signature $classification.Signature) {
             Invoke-WingetAggressiveRepair -WingetPath $wingetPath -Failures $script:CurrentWingetFailures.ToArray() -TimeoutMinutes $TimeoutMinutes
@@ -3739,7 +3760,11 @@ function Update-VscodeExtensions {
                 -ScriptBlock { param($Path) & $Path --update-extensions 2>&1 } `
                 -ArgumentList @($codeCmd.Source)
             $output = $result.Output
-            $output | ForEach-Object { Write-Log $_ }
+            Write-ProviderTranscript -Provider Vscode -Lines $output
+            $output | Where-Object {
+                $_ -notmatch '\[DEP0169\].*url\.parse\(\)' -and
+                $_ -notmatch '^\(Use `Code --trace-deprecation'
+            } | ForEach-Object { Write-Log $_ }
             if ($result.Failed -or $result.TimedOut) {
                 Write-Log 'VS Code extension update failed or timed out.' -Level Error
                 return @{ Success = $false; Count = 0 }
@@ -5163,6 +5188,49 @@ function Apply-RemoteConfig {
 #endregion
 
 #region Main Orchestration
+function Get-BootUpdateLaunchContract {
+    param(
+        [Parameter(Mandatory)][bool]$IsFirstIteration,
+        [Parameter(Mandatory)][bool]$IsSystem
+    )
+
+    $mode = if ($script:AggressiveRepair) { 'aggressive-repair' } else { 'standard' }
+    $origin = if ($IsFirstIteration) {
+        if ($IsSystem) { 'initial-system' } else { 'initial-user' }
+    } else {
+        if ($IsSystem) { 'resume-system' } else { 'resume-user' }
+    }
+    $scope = if ($IsSystem) { 'machine' } else { 'user+machine' }
+    $flags = [Collections.Generic.List[string]]::new()
+    if ($Force)                         { $flags.Add('Force') }
+    if ($WhatIfPreference)              { $flags.Add('WhatIf') }
+    if ($script:AggressiveRepair)        { $flags.Add('AggressiveRepair') }
+    if ($script:StagedRollout)           { $flags.Add('StagedRollout') }
+    if ($script:IncludeDriverUpdates)    { $flags.Add('Drivers') }
+    if ($script:IncludeFirmwareUpdates)  { $flags.Add('Firmware') }
+    if ($script:UpdateWsl)               { $flags.Add('WSL') }
+    if ($script:UpdateContainers)        { $flags.Add('Containers') }
+    if ($script:AllowMetered)            { $flags.Add('Metered') }
+    if ($script:DisableSelfUpdate)       { $flags.Add('NoSelfUpdate') }
+    $skips = @(
+        if ($script:SkipPip)               { 'Pip' }
+        if ($script:SkipNpm)               { 'Npm' }
+        if ($script:SkipOffice365)         { 'Office365' }
+        if ($script:SkipAwsTooling)        { 'AWS' }
+        if ($script:SkipPowerShellModules) { 'PowerShellModules' }
+        if ($script:SkipScoop)             { 'Scoop' }
+        if ($script:SkipDotnetTools)       { 'DotnetTools' }
+        if ($script:SkipVscode)            { 'VSCode' }
+        if ($script:SkipDefender)          { 'Defender' }
+        if ($script:SkipRestorePoint)      { 'RestorePoint' }
+        if ($script:SkipHealthCheck)       { 'HealthCheck' }
+        if ($script:SkipBitLocker)         { 'BitLocker' }
+    )
+    $flagText = if ($flags.Count) { $flags -join ',' } else { 'none' }
+    $skipText = if ($skips.Count) { $skips -join ',' } else { 'none' }
+    return "Launch contract | Mode: $mode | Origin: $origin | Scope: $scope | Output: $($script:OutputMode) | Flags: $flagText | Skips: $skipText | Filters: include=$(@($script:IncludePatterns).Count),exclude=$(@($script:ExcludePatterns).Count)"
+}
+
 function Invoke-BootUpdateCycle {
     Invoke-LogRotation
 
@@ -5231,6 +5299,8 @@ function Invoke-BootUpdateCycle {
     <# Log file: clean greppable entry #>
     $whatIfTag = if ($WhatIfPreference) { ' [WHATIF]' } else { '' }
     Write-Log "BOOT UPDATE CYCLE$whatIfTag $cycleVerb | Session: $sessionId | Pass: $pendingIteration | Reboots: $($state.RebootCount)/$MaxIterations | Context: $context"
+    $isSystemContext = $currentIdentity.User.Value -eq 'S-1-5-18'
+    Write-Log (Get-BootUpdateLaunchContract -IsFirstIteration $isFirstIteration -IsSystem $isSystemContext)
     if ($script:MaintenanceWindowStart -ge 0) { Write-Log "Maintenance window: $($script:MaintenanceWindowStart):00 - $($script:MaintenanceWindowEnd):00" -Level Info }
 
     <# Event Log: cycle started #>
@@ -5712,7 +5782,12 @@ function Invoke-BootUpdateCycle {
                         else { $log.Add('VS Code extensions: update ran (exact count unavailable).'); $count = 1 }
                     } else { $log.Add("VS Code extensions: $count updated.") }
                 } catch { $success = $false; $log.Add("[Error] VS Code: $_") }
-                return @{ Phase='Vscode'; Success=$success; Count=$count; LogLines=$log.ToArray() }
+                $providerLines = @($output | ForEach-Object { $_.ToString() })
+                $displayLines = @($log | Where-Object {
+                    $_ -notmatch '\[DEP0169\].*url\.parse\(\)' -and
+                    $_ -notmatch '^\(Use `Code --trace-deprecation'
+                })
+                return @{ Phase='Vscode'; Success=$success; Count=$count; LogLines=$displayLines; ProviderLines=$providerLines }
             }
 
             $defenderSb = {
@@ -5909,6 +5984,9 @@ function Invoke-BootUpdateCycle {
                 }
 
                 <# Replay log lines through Write-Log on the parent thread #>
+                if ($phaseName -eq 'Vscode' -and $jr.PSObject.Properties.Name -contains 'ProviderLines') {
+                    Write-ProviderTranscript -Provider Vscode -Lines @($jr.ProviderLines)
+                }
                 foreach ($line in $jr.LogLines) {
                     $lvl = if ($line -match '^\[Warn\]') { 'Warn' }
                           elseif ($line -match '^\[Error\]') { 'Error' }

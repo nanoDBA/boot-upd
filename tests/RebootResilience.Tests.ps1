@@ -28,6 +28,7 @@ BeforeAll {
 
     foreach ($functionName in @(
         'Update-BootUpdateStateForBootSession',
+        'Get-BootUpdateLaunchContract',
         'Get-BootUpdateBootSessionId',
         'Get-ActionablePendingFileRenameOperations',
         'Resolve-BootUpdateCompletionDisposition',
@@ -76,6 +77,49 @@ BeforeAll {
 }
 
 Describe 'Concise provider diagnostics' {
+    It 'records a sanitized normalized launch contract for every session' {
+        $script:AggressiveRepair = $true
+        $script:StagedRollout = $false
+        $script:IncludeDriverUpdates = $false
+        $script:IncludeFirmwareUpdates = $false
+        $script:UpdateWsl = $false
+        $script:UpdateContainers = $false
+        $script:AllowMetered = $false
+        $script:DisableSelfUpdate = $false
+        $script:OutputMode = 'Normal'
+        $script:IncludePatterns = @()
+        $script:ExcludePatterns = @()
+        foreach ($name in @('SkipPip','SkipNpm','SkipOffice365','SkipAwsTooling','SkipPowerShellModules','SkipScoop','SkipDotnetTools','SkipVscode','SkipDefender','SkipRestorePoint','SkipHealthCheck','SkipBitLocker')) {
+            Set-Variable -Scope Script -Name $name -Value $false
+        }
+        $Force = $true
+
+        $contract = Get-BootUpdateLaunchContract -IsFirstIteration $false -IsSystem $true
+
+        $contract | Should -Be 'Launch contract | Mode: aggressive-repair | Origin: resume-system | Scope: machine | Output: Normal | Flags: Force,AggressiveRepair | Skips: none | Filters: include=0,exclude=0'
+        $contract | Should -Not -Match '(?i)user(name)?|domain|[A-Z]:\\'
+    }
+
+    It 'serializes Winget scopes because App Installer state is shared' {
+        $invokeSource | Should -Match '\$runWingetScopesInParallel\s*=\s*\$false'
+        $invokeSource | Should -Match '0x8A150001'
+    }
+
+    It 'learns repeated blank Winget execution failures as terminal' {
+        $state = [pscustomobject]@{}
+        $first = Complete-WingetFailureClassification -State $state -ExecutionFailures @('machine:-1978335231:no-output')
+        $second = Complete-WingetFailureClassification -State $state -ExecutionFailures @('machine:-1978335231:no-output')
+
+        $first.TerminalFailure | Should -BeFalse
+        $second.TerminalFailure | Should -BeTrue
+        $second.Signature | Should -Be 'execution:machine:-1978335231:no-output'
+    }
+
+    It 'keeps the VS Code url.parse deprecation out of the primary log replay' {
+        $invokeSource | Should -Match "Write-ProviderTranscript -Provider Vscode"
+        $invokeSource | Should -Match "DEP0169.*url\\\.parse"
+    }
+
     It 'clears a stale Winget repair plan without relying on an undefined install path' {
         $script:InstallDir = $TestDrive
         $state = [pscustomobject]@{}

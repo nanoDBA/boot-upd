@@ -1,8 +1,17 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.56
+**Current Version:** v2.5.57
 **Release Date:** 2026-07-21
 **Status:** STABLE
+
+---
+
+## v2.5.57 (2026-07-21)
+
+- Serializes Winget user and machine scopes because both processes share App Installer state; independent providers remain parallel.
+- Learns identical unclassified Winget execution failures, including `0x8A150001` with no output, and stops automatic continuation after one verification retry.
+- Records a sanitized normalized launch contract on every initial and resumed pass: standard versus aggressive repair, origin, scope, output mode, enabled flags, skips, and filter counts.
+- Keeps VS Code's Node `url.parse()` deprecation warning in the provider transcript instead of presenting it as a boot-upd problem.
 
 ---
 
