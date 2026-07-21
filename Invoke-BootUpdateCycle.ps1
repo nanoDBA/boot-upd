@@ -255,6 +255,7 @@ function Get-BootUpdateWebhookSecret {
 }
 
 $script:LogPath               = Join-Path $PSScriptRoot 'BootUpdateCycle.log'
+$script:InstallDir            = $PSScriptRoot
 $script:ProviderTranscriptPath = Join-Path $PSScriptRoot 'BootUpdateCycle.providers.log'
 $script:StatePath             = Join-Path $PSScriptRoot 'BootUpdateCycle.state.json'
 $script:WingetQuarantinePath  = Join-Path $PSScriptRoot 'BootUpdateCycle-winget-quarantine.json'
@@ -343,7 +344,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 5 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.55' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.56' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 Set-Variable -Name 'RebootSignalSettleSeconds' -Value 20 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 $script:ExplicitRebootRequests = [System.Collections.Generic.List[object]]::new()
 
@@ -1677,6 +1678,29 @@ function Test-NotificationAllowed {
 #endregion
 
 #region Pending Reboot Detection
+function Get-ActionablePendingFileRenameOperations {
+    param([AllowNull()][object[]]$Entries = @())
+    $operations = [System.Collections.Generic.List[object]]::new()
+    $windowsSystemTemp = Join-Path $env:windir 'SystemTemp'
+    for ($index = 0; $index -lt @($Entries).Count; $index += 2) {
+        $source = [string]$Entries[$index]
+        $destination = if (($index + 1) -lt @($Entries).Count) { [string]$Entries[$index + 1] } else { '' }
+        $cleanSource = $source -replace '^[!*]*\\\?\?\\', ''
+        $cleanDestination = $destination -replace '^[!*]*\\\?\?\\', ''
+        if ([string]::IsNullOrWhiteSpace($cleanSource)) { continue }
+
+        # Chocolatey 2.8.x can leave delete-on-reboot entries for its disposable
+        # prototype extraction directory. A blank destination means deletion,
+        # not a file replacement. It is not evidence that servicing needs a boot.
+        $isDisposableChocolateyDelete = [string]::IsNullOrWhiteSpace($cleanDestination) -and
+            $cleanSource.StartsWith("$windowsSystemTemp\ChocolateyPrototype-", [StringComparison]::OrdinalIgnoreCase)
+        if ($isDisposableChocolateyDelete) { continue }
+
+        $operations.Add([pscustomobject]@{ Source=$cleanSource; Destination=$cleanDestination })
+    }
+    return $operations.ToArray()
+}
+
 function Test-PendingReboot {
     <# Comprehensive pending-reboot detection based on Boxstarter/Brian Wilhite's
        Get-PendingReboot approach.  Checks every OS-level signal that a reboot is
@@ -1699,9 +1723,13 @@ function Test-PendingReboot {
     }
     $val = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name 'PendingFileRenameOperations' -EA Ignore
     if ($val -and $val.PendingFileRenameOperations.Count -gt 0) {
-        $entries = @($val.PendingFileRenameOperations | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-        $sample = @($entries | Select-Object -First 3 | ForEach-Object { $_ -replace '^[!*\d]*\\\?\?\\', '' })
-        & $report 'FileRename' "$($entries.Count) pending file rename op(s); e.g. $($sample -join '; ')"
+        $operations = @(Get-ActionablePendingFileRenameOperations -Entries @($val.PendingFileRenameOperations))
+        if ($operations.Count -gt 0) {
+            $sample = @($operations | Select-Object -First 3 | ForEach-Object {
+                if ($_.Destination) { "$($_.Source) -> $($_.Destination)" } else { "$($_.Source) (delete)" }
+            })
+            & $report 'FileRename' "$($operations.Count) pending file rename op(s); e.g. $($sample -join '; ')"
+        }
     }
     $r = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName' -EA Ignore
     $a = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ActiveComputerName' -EA Ignore

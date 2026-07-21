@@ -1,8 +1,16 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.55
+**Current Version:** v2.5.56
 **Release Date:** 2026-07-21
 **Status:** STABLE
+
+---
+
+## v2.5.56 (2026-07-21)
+
+- Parses `PendingFileRenameOperations` as source/destination pairs and excludes only blank-destination deletions beneath `Windows\SystemTemp\ChocolateyPrototype-*` from hard reboot evidence.
+- Preserves genuine Chocolatey prototype renames, ordinary file replacements, and non-Chocolatey deletions as reboot barriers.
+- Initializes the runtime install directory used by Winget repair-plan cleanup, preventing a secondary null-`Path` exception from masking provider HRESULTs such as `0x8A150001`.
 
 ---
 

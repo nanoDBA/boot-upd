@@ -4,7 +4,7 @@
   <text x="16" y="24" fill="#20150d" font-family="Segoe UI, sans-serif" font-size="15">Administrator: Command Prompt — upd</text>
   <g font-family="Cascadia Mono, Consolas, monospace" font-size="19">
     <text x="28" y="73" fill="#61d6d6">.:==========================================================================:.</text>
-    <text x="28" y="105" fill="#d63bad">BOOT UPDATE CYCLE</text><text x="240" y="105" fill="#767676">//</text><text x="275" y="105" fill="#f2f2f2">unattended patch board</text><text x="542" y="105" fill="#767676">//</text><text x="578" y="105" fill="#f3f315">v2.5.55</text>
+    <text x="28" y="105" fill="#d63bad">BOOT UPDATE CYCLE</text><text x="240" y="105" fill="#767676">//</text><text x="275" y="105" fill="#f2f2f2">unattended patch board</text><text x="542" y="105" fill="#767676">//</text><text x="578" y="105" fill="#f3f315">v2.5.56</text>
     <text x="28" y="137" fill="#16c60c">[RESUMED after reboot]</text><text x="275" y="137" fill="#f2f2f2">Pass 3  |  Reboots 2/5  |  user context</text>
     <text x="28" y="169" fill="#3b9eee">[view] Normal  |  press v to cycle Quiet &gt; Normal &gt; Verbose &gt; Debug</text>
 

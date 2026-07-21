@@ -29,6 +29,7 @@ BeforeAll {
     foreach ($functionName in @(
         'Update-BootUpdateStateForBootSession',
         'Get-BootUpdateBootSessionId',
+        'Get-ActionablePendingFileRenameOperations',
         'Resolve-BootUpdateCompletionDisposition',
         'Stop-BootUpdateAtRebootLimit',
         'Stop-BootUpdateAtRetryLimit',
@@ -75,6 +76,13 @@ BeforeAll {
 }
 
 Describe 'Concise provider diagnostics' {
+    It 'clears a stale Winget repair plan without relying on an undefined install path' {
+        $script:InstallDir = $TestDrive
+        $state = [pscustomobject]@{}
+        { Complete-WingetFailureClassification -State $state -Failures @() } | Should -Not -Throw
+        $state.WingetFailureSignature | Should -Be ''
+    }
+
     It 'extracts package failures and inventory notes from noisy Winget output' {
         $lines = @(
             '1 package(s) have pins that prevent upgrade.',
@@ -275,6 +283,36 @@ Describe 'BitLocker reboot targeting' {
 }
 
 Describe 'Delayed and explicit reboot evidence' {
+    It 'ignores only Chocolatey prototype delete-on-reboot entries and preserves real rename pairs' {
+        $priorWindir = $env:windir
+        try {
+            $env:windir = 'C:\Windows'
+            $entries = @(
+                '\??\C:\Windows\SystemTemp\ChocolateyPrototype-2.8.5.130\1', '',
+                '\??\C:\Program Files\Vendor\old.dll', '\??\C:\Program Files\Vendor\new.dll',
+                '\??\C:\Windows\System32\pending.tmp', ''
+            )
+            $operations = @(Get-ActionablePendingFileRenameOperations -Entries $entries)
+            $operations.Count | Should -Be 2
+            $operations[0].Source | Should -Be 'C:\Program Files\Vendor\old.dll'
+            $operations[0].Destination | Should -Be 'C:\Program Files\Vendor\new.dll'
+            $operations[1].Source | Should -Be 'C:\Windows\System32\pending.tmp'
+            $operations[1].Destination | Should -BeNullOrEmpty
+        } finally { $env:windir = $priorWindir }
+    }
+
+    It 'does not ignore a Chocolatey prototype rename with a real destination' {
+        $priorWindir = $env:windir
+        try {
+            $env:windir = 'C:\Windows'
+            $operations = @(Get-ActionablePendingFileRenameOperations -Entries @(
+                '\??\C:\Windows\SystemTemp\ChocolateyPrototype-2.8.5.130\1',
+                '\??\C:\Windows\System32\not-disposable.dll'
+            ))
+            $operations.Count | Should -Be 1
+        } finally { $env:windir = $priorWindir }
+    }
+
     It 'requires two clean registry probes separated by an animated settle interval' {
         $text = Get-FunctionText $invokeAst 'Get-ConfirmedPendingReboot'
         ([regex]::Matches($text, 'Test-PendingReboot')).Count | Should -Be 2
