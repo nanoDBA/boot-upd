@@ -46,10 +46,13 @@ Describe 'Sanitized diagnostic export' {
         $redactions = @('ACME','Alice','BUILD-PC','acme.example','ACME Holdings')
         $exportArguments = @{
             SourceDirectory = $source; OutputDirectory = $output; AdditionalRedaction = $redactions
+            NoClipboard = $true
         }
-        $result = & $exportPath @exportArguments
-        $zip = @($result | Where-Object { $_ -is [IO.FileInfo] })[0]
+        $display = & $exportPath @exportArguments 6>&1
+        $zip = @(Get-ChildItem -LiteralPath $output -Filter 'BootUpdateCycle-diagnostics-*.zip')[0]
         $zip | Should -Not -BeNullOrEmpty
+        ($display -join "`n") | Should -Match ([regex]::Escape($zip.FullName))
+        @($display | Where-Object { $_ -is [IO.FileInfo] }).Count | Should -Be 0
         $expanded = Join-Path $TestDrive 'expanded'
         Expand-Archive -LiteralPath $zip.FullName -DestinationPath $expanded
         $safe = Get-Content (Join-Path $expanded 'BootUpdateCycle.sanitized.log') -Raw
@@ -57,6 +60,14 @@ Describe 'Sanitized diagnostic export' {
         $safe | Should -Match 'BootUpdateCycle\.providers\.20260721-010203\.log'
         $safe | Should -Not -Match 'ACME|Alice|BUILD-PC|acme\.example|C:\\|E:\\|192\.168\.10\.4'
         (Get-Content (Join-Path $expanded 'manifest.json') -Raw | ConvertFrom-Json).Sanitized | Should -BeTrue
+    }
+
+    It 'copies the one absolute ZIP path to the clipboard with a graceful fallback' {
+        $source = Get-Content -LiteralPath $exportPath -Raw
+        $source | Should -Match 'Set-Clipboard -Value \$Text'
+        $source | Should -Match '\$Text \| & clip\.exe'
+        $source | Should -Match 'Full ZIP path copied to the clipboard'
+        $source | Should -Match 'could not be copied to the clipboard'
     }
 }
 

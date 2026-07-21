@@ -1,8 +1,14 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.49
+**Current Version:** v2.5.50
 **Release Date:** 2026-07-21
 **Status:** STABLE
+
+---
+
+## v2.5.50 (2026-07-21)
+
+- Makes `upd logs` display one absolute diagnostic ZIP path and copy that exact path to the Windows clipboard, while treating clipboard unavailability as a non-fatal warning.
 
 ---
 

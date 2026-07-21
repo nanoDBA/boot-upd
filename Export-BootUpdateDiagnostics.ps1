@@ -6,7 +6,8 @@ param(
         $desktop = [Environment]::GetFolderPath('Desktop')
         if ($desktop) { $desktop } else { [IO.Path]::GetTempPath() }
     ),
-    [string[]]$AdditionalRedaction = @()
+    [string[]]$AdditionalRedaction = @(),
+    [switch]$NoClipboard
 )
 
 $ErrorActionPreference = 'Stop'
@@ -77,6 +78,21 @@ function Enable-NtfsCompression {
     try { $null = & compact.exe /C /I /Q $Path 2>$null } catch { }
 }
 
+function Set-BootUpdateClipboardText {
+    param([Parameter(Mandatory)][string]$Text)
+    try {
+        if (Get-Command Set-Clipboard -ErrorAction SilentlyContinue) {
+            Set-Clipboard -Value $Text -ErrorAction Stop
+            return $true
+        }
+        if (Get-Command clip.exe -ErrorAction SilentlyContinue) {
+            $Text | & clip.exe
+            return ($LASTEXITCODE -eq 0)
+        }
+    } catch { }
+    return $false
+}
+
 if (-not (Test-Path -LiteralPath $SourceDirectory -PathType Container)) {
     throw "Boot Update Cycle data directory was not found: $SourceDirectory"
 }
@@ -114,8 +130,15 @@ try {
     $manifest | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $stage 'manifest.json') -Encoding UTF8
     Compress-Archive -LiteralPath $sanitizedPath,(Join-Path $stage 'manifest.json') -DestinationPath $zipPath -CompressionLevel Optimal -Force
     Enable-NtfsCompression -Path $zipPath
-    Write-Host "Sanitized diagnostic bundle: $zipPath" -ForegroundColor Green
-    return Get-Item -LiteralPath $zipPath
+    $fullZipPath = (Get-Item -LiteralPath $zipPath).FullName
+    $clipboardCopied = if ($NoClipboard) { $false } else { Set-BootUpdateClipboardText -Text $fullZipPath }
+    Write-Host 'Sanitized diagnostic ZIP:' -ForegroundColor Green
+    Write-Host $fullZipPath -ForegroundColor Cyan
+    if ($clipboardCopied) {
+        Write-Host 'Full ZIP path copied to the clipboard.' -ForegroundColor DarkGray
+    } elseif (-not $NoClipboard) {
+        Write-Warning 'The ZIP was created, but its path could not be copied to the clipboard.'
+    }
 } finally {
     if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue }
 }
