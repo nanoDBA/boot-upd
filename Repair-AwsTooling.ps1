@@ -371,14 +371,12 @@ function Invoke-VerifiedAwsToolsCleanup {
         [Parameter(Mandatory)][version]$ExceptVersion,
         [Parameter(Mandatory)][string[]]$ModuleNames
     )
-    $cleanupRecords = @(Uninstall-AWSToolsModule -ExceptVersion $ExceptVersion -Force -Confirm:$false -ErrorAction Continue 2>&1)
+    $cleanupRecords = @(Uninstall-AWSToolsModule -ExceptVersion $ExceptVersion -Force -Confirm:$false -ErrorAction Continue *>&1)
     $benignAlreadyAbsent = 0
     $unexpectedErrors = [Collections.Generic.List[object]]::new()
     foreach ($record in $cleanupRecords) {
         if ($record -is [Management.Automation.ErrorRecord]) {
-            $isAlreadyAbsent = $record.FullyQualifiedErrorId -match '^NoMatchFoundForCriteria(?:,|$)' -and
-                $record.InvocationInfo.MyCommand.Name -eq 'Uninstall-Package' -and
-                $record.Exception.Message -like 'No match was found for the specified search criteria*'
+            $isAlreadyAbsent = Test-AwsToolsAlreadyAbsentCleanupError -Record $record
             if ($isAlreadyAbsent) { $benignAlreadyAbsent++; continue }
             $unexpectedErrors.Add($record)
             continue
@@ -402,6 +400,15 @@ function Invoke-VerifiedAwsToolsCleanup {
     } else {
         Write-Host "AWS.Tools cleanup verified: no older managed module copies remain."
     }
+}
+
+function Test-AwsToolsAlreadyAbsentCleanupError {
+    param([Parameter(Mandatory)][Management.Automation.ErrorRecord]$Record)
+    # PowerShellGet changes FullyQualifiedErrorId and InvocationInfo across
+    # versions. The exact provider message is stable; constrain it to an
+    # AWS.Tools module name and rely on the following exact-path inventory to
+    # report any copy that truly remains.
+    return $Record.Exception.Message -match "^No match was found for the specified search criteria and module names 'AWS\.Tools\.[A-Za-z0-9.]+'\.$"
 }
 
 try {

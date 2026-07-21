@@ -1,8 +1,19 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.47
+**Current Version:** v2.5.48
 **Release Date:** 2026-07-21
 **Status:** STABLE
+
+---
+
+## v2.5.48 (2026-07-21)
+
+### PowerShellGet cleanup metadata compatibility
+
+- Recognizes the fully anchored, AWS.Tools-specific “No match was found” cleanup message regardless of PowerShellGet's variable error ID and invocation metadata.
+- Continues rejecting lookalike legacy-module messages, augmented messages, access failures, and all other cleanup errors.
+- Captures every cleanup output stream so provider “Uninstalling…” chatter no longer leaks into the normal console.
+- Retains the final exact path/version inventory as the authoritative report of any locked or independently installed older module copies.
 
 ---
 

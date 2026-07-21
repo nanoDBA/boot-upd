@@ -34,6 +34,7 @@ BeforeAll {
     }
 
     . ([scriptblock]::Create((Get-ChildFunctionText -Name 'Test-AwsToolsPublisherMismatchMessage')))
+    . ([scriptblock]::Create((Get-ChildFunctionText -Name 'Test-AwsToolsAlreadyAbsentCleanupError')))
 }
 
 Describe 'AWS.Tools publisher certificate rollover' {
@@ -103,11 +104,33 @@ Authenticode issuer 'CN="Amazon Web Services, Inc.", OU=SDKs and Tools, O="Amazo
 
     It 'suppresses only exact already-absent cleanup records and inventories stale copies' {
         $cleanup = Get-ChildFunctionText -Name 'Invoke-VerifiedAwsToolsCleanup'
-        $cleanup | Should -Match '\^NoMatchFoundForCriteria'
-        $cleanup | Should -Match "MyCommand\.Name -eq 'Uninstall-Package'"
+        $cleanup | Should -Match 'Test-AwsToolsAlreadyAbsentCleanupError'
+        $cleanup | Should -Match '\*>&1'
         $cleanup | Should -Match 'unexpectedErrors\.Count'
         $cleanup | Should -Match 'Get-Module -ListAvailable'
         $cleanup | Should -Match 'older managed module copies remain'
+    }
+
+    It 'accepts PowerShellGet metadata variants only for an exact absent AWS.Tools message' {
+        $message = "No match was found for the specified search criteria and module names 'AWS.Tools.EC2'."
+        foreach ($id in @('NoMatchFoundForCriteria,Microsoft.PowerShell.PackageManagement.Cmdlets.UninstallPackage','Uninstall-Package,VariantProvider','AnythingElse')) {
+            $record = [Management.Automation.ErrorRecord]::new(
+                [InvalidOperationException]::new($message), $id,
+                [Management.Automation.ErrorCategory]::ObjectNotFound, $null)
+            Test-AwsToolsAlreadyAbsentCleanupError -Record $record | Should -BeTrue
+        }
+    }
+
+    It 'rejects lookalike and genuinely unexpected cleanup failures' -TestCases @(
+        @{ Message="No match was found for the specified search criteria and module names 'AWSPowerShell'." }
+        @{ Message="No match was found for the specified search criteria and module names 'AWS.Tools.Common'; access denied." }
+        @{ Message='Access to the module path is denied.' }
+    ) {
+        param($Message)
+        $record = [Management.Automation.ErrorRecord]::new(
+            [InvalidOperationException]::new($Message), 'AnyMetadata',
+            [Management.Automation.ErrorCategory]::InvalidOperation, $null)
+        Test-AwsToolsAlreadyAbsentCleanupError -Record $record | Should -BeFalse
     }
 }
 
