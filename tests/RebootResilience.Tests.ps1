@@ -35,6 +35,12 @@ BeforeAll {
         'Update-BootUpdateStagedRetryCount',
         'Get-NextMaintenanceWindowStart',
         'Get-WindowsUpdateVerificationScope',
+        'Get-WindowsUpdateEnvironmentFingerprint',
+        'Remove-WindowsUpdateAssessmentCache',
+        'Set-WindowsUpdateAssessmentCache',
+        'Invoke-WindowsUpdateOfflineAssessment',
+        'Test-WindowsUpdateAssessmentRecord',
+        'Test-WindowsUpdateAssessmentCache',
         'Test-WindowsUpdateZeroEvidence',
         'Get-WindowsUpdateInstallOutputSummary',
         'Test-WindowsUpdateConvergence',
@@ -613,6 +619,7 @@ Describe 'Behavioral Windows Update convergence' {
         Mock Get-Module { [pscustomobject]@{ Name='PSWindowsUpdate' } }
         Mock Get-BootUpdateBootSessionId { 'boot-a' }
         Mock Write-Log {}
+        Mock Set-WindowsUpdateAssessmentCache {}
     }
 
     It 'verifies zero applicable updates' {
@@ -649,7 +656,9 @@ Describe 'Behavioral Windows Update convergence' {
     }
 
     It 'reports remaining applicable updates' {
-        Mock Invoke-BootUpdateBackgroundOperation { [pscustomobject]@{ Output=@('BOOTUPDATE_APPLICABLE|KB1|Update','BOOTUPDATE_SCAN_COMPLETE|1'); Failed=$false; TimedOut=$false } }
+        Mock Get-WindowsUpdateEnvironmentFingerprint { 'fingerprint' }
+        Mock Set-WindowsUpdateAssessmentCache {}
+        Mock Invoke-BootUpdateBackgroundOperation { [pscustomobject]@{ Output=@('BOOTUPDATE_APPLICABLE|id-1|7|Update','BOOTUPDATE_SCAN_COMPLETE|1'); Failed=$false; TimedOut=$false } }
         $result = Test-WindowsUpdateConvergence
         $result.Verified | Should -BeTrue
         $result.Count | Should -Be 1
@@ -667,18 +676,19 @@ Describe 'Behavioral Windows Update convergence' {
 
     It 'withholds verification when the completion count disagrees with update records' {
         Mock Invoke-BootUpdateBackgroundOperation { [pscustomobject]@{
-            Output=@('BOOTUPDATE_APPLICABLE|KB1|Update','BOOTUPDATE_SCAN_COMPLETE|0')
+            Output=@('BOOTUPDATE_APPLICABLE|id-1|7|Update','BOOTUPDATE_SCAN_COMPLETE|0')
             Failed=$false; TimedOut=$false
         } }
         (Test-WindowsUpdateConvergence).Verified | Should -BeFalse
     }
 
     It 'reuses exact post-search zero evidence only on the same boot and scope' {
-        $scope = Get-WindowsUpdateVerificationScope
-        $script:CurrentState = [pscustomobject]@{ WindowsUpdateZeroEvidence = [pscustomobject]@{
-            BootSessionId='boot-a'; ScopeSignature=$scope.Signature
-            Source='PSWindowsUpdate-post-search-zero'; ObservedAt='2026-07-21T00:00:00Z'
-        } }
+        $verificationScope = Get-WindowsUpdateVerificationScope
+        $evidence = [pscustomobject]@{
+            BootSessionId='boot-a'; ScopeSignature=$verificationScope.Signature
+            Source='PSWindowsUpdate-post-search-zero'; ObservedAt=[datetime]::UtcNow.ToString('o')
+        }
+        $script:CurrentState = [pscustomobject]@{ WindowsUpdateZeroEvidence = $evidence }
         Mock Invoke-BootUpdateBackgroundOperation { throw 'redundant scan should not run' }
         $result = Test-WindowsUpdateConvergence
         $result.Verified | Should -BeTrue
@@ -687,11 +697,12 @@ Describe 'Behavioral Windows Update convergence' {
     }
 
     It 'invalidates cached zero evidence after a boot change and performs the scan' {
-        $scope = Get-WindowsUpdateVerificationScope
-        $script:CurrentState = [pscustomobject]@{ WindowsUpdateZeroEvidence = [pscustomobject]@{
-            BootSessionId='old-boot'; ScopeSignature=$scope.Signature
-            Source='PSWindowsUpdate-post-search-zero'
-        } }
+        $verificationScope = Get-WindowsUpdateVerificationScope
+        $evidence = [pscustomobject]@{
+            BootSessionId='old-boot'; ScopeSignature=$verificationScope.Signature
+            Source='PSWindowsUpdate-post-search-zero'; ObservedAt=[datetime]::UtcNow.ToString('o')
+        }
+        $script:CurrentState = [pscustomobject]@{ WindowsUpdateZeroEvidence = $evidence }
         Mock Invoke-BootUpdateBackgroundOperation { [pscustomobject]@{ Output=@('BOOTUPDATE_SCAN_COMPLETE|0'); Failed=$false; TimedOut=$false } }
         (Test-WindowsUpdateConvergence).Verified | Should -BeTrue
         $script:CurrentState.WindowsUpdateZeroEvidence | Should -BeNullOrEmpty
@@ -700,14 +711,77 @@ Describe 'Behavioral Windows Update convergence' {
 
     It 'invalidates cached zero evidence when exclusions change' {
         $oldScope = Get-WindowsUpdateVerificationScope
-        $script:CurrentState = [pscustomobject]@{ WindowsUpdateZeroEvidence = [pscustomobject]@{
+        $evidence = [pscustomobject]@{
             BootSessionId='boot-a'; ScopeSignature=$oldScope.Signature
-            Source='PSWindowsUpdate-post-search-zero'
-        } }
+            Source='PSWindowsUpdate-post-search-zero'; ObservedAt=[datetime]::UtcNow.ToString('o')
+        }
+        $script:CurrentState = [pscustomobject]@{ WindowsUpdateZeroEvidence = $evidence }
         $script:ExcludePatterns = @('SQL','Preview')
         Mock Invoke-BootUpdateBackgroundOperation { [pscustomobject]@{ Output=@('BOOTUPDATE_SCAN_COMPLETE|0'); Failed=$false; TimedOut=$false } }
         (Test-WindowsUpdateConvergence).Verified | Should -BeTrue
         Assert-MockCalled Invoke-BootUpdateBackgroundOperation -Times 1
+    }
+
+}
+
+Describe 'Cross-session Windows Update assessment cache' {
+    BeforeEach {
+        $script:WindowsUpdateAssessmentPath = Join-Path $TestDrive 'wu-assessment.json'
+        $script:WindowsUpdateOnlineAssessmentTtlHours = 6
+        $script:ExcludePatterns = @('SQL')
+        Mock Get-WindowsUpdateEnvironmentFingerprint { 'same-environment' }
+    }
+
+    It 'accepts a fresh assessment across a boot boundary when scope and environment match' {
+        $verificationScope = Get-WindowsUpdateVerificationScope
+        $record = [pscustomobject]@{ SchemaVersion=1; ObservedAtUtc=[datetime]::UtcNow.AddHours(-1).ToString('o');
+           BootSessionId='previous-boot'; ScopeSignature=$verificationScope.Signature;
+           EnvironmentFingerprint='same-environment'; ApplicableUpdates=@() }
+        Test-WindowsUpdateAssessmentRecord -Record $record -Scope $verificationScope -EnvironmentFingerprint 'same-environment' -TtlHours 6 | Should -BeTrue
+    }
+
+    It 'requires an online assessment when the TTL expires' {
+        $verificationScope = Get-WindowsUpdateVerificationScope
+        $record = [pscustomobject]@{ SchemaVersion=1; ObservedAtUtc=[datetime]::UtcNow.AddHours(-7).ToString('o');
+           BootSessionId='previous-boot'; ScopeSignature=$verificationScope.Signature;
+           EnvironmentFingerprint='same-environment'; ApplicableUpdates=@() }
+        Test-WindowsUpdateAssessmentRecord -Record $record -Scope $verificationScope -EnvironmentFingerprint 'same-environment' -TtlHours 6 | Should -BeFalse
+    }
+
+    It 'requires online work when the local catalog still has applicable updates' {
+        $verificationScope = Get-WindowsUpdateVerificationScope
+        @{ SchemaVersion=1; ObservedAtUtc=[datetime]::UtcNow.AddMinutes(-20).ToString('o');
+           BootSessionId='previous-boot'; ScopeSignature=$verificationScope.Signature;
+           EnvironmentFingerprint='same-environment'; ApplicableUpdates=@() } |
+            ConvertTo-Json | Set-Content $script:WindowsUpdateAssessmentPath
+        $offline = [pscustomobject]@{ Verified=$true; Updates=@([pscustomobject]@{UpdateID='id';RevisionNumber=2}); Error=$null }
+        (Test-WindowsUpdateAssessmentCache -Scope $verificationScope -Path $script:WindowsUpdateAssessmentPath -TtlHours 6 -EnvironmentFingerprint 'same-environment' -OfflineAssessmentResult $offline) | Should -BeFalse
+    }
+
+    It 'bounds offline WUA work and requires a count-matched completion contract' {
+        $text = Get-FunctionText $invokeAst 'Invoke-WindowsUpdateOfflineAssessment'
+        $text | Should -Match 'Invoke-BootUpdateBackgroundOperation'
+        $text | Should -Match 'TimeoutMinutes'
+        $text | Should -Match 'BOOTUPDATE_SCAN_COMPLETE'
+        $text | Should -Match '\$declared -ne \$records.Count'
+    }
+
+    It 'fingerprints registered update services as well as policy and history' {
+        $text = Get-FunctionText $invokeAst 'Get-WindowsUpdateEnvironmentFingerprint'
+        $text | Should -Match 'Microsoft.Update.ServiceManager'
+        $text | Should -Match 'ServerSelection'
+        $text | Should -Match 'ServiceID'
+    }
+
+    It 'uses a count-preserving identity fallback for PSWindowsUpdate result shapes' {
+        $text = Get-FunctionText $invokeAst 'Test-WindowsUpdateConvergence'
+        $text | Should -Match '\$_.Identity'
+        $text | Should -Match 'identity-unavailable'
+        $text | Should -Match 'RevisionNumber'
+    }
+
+    It 'does not delete assessment evidence during WhatIf' {
+        (Get-FunctionText $invokeAst 'Remove-WindowsUpdateAssessmentCache') | Should -Match '\$WhatIfPreference -and -not \$Force'
     }
 }
 

@@ -258,6 +258,8 @@ $script:LogPath               = Join-Path $PSScriptRoot 'BootUpdateCycle.log'
 $script:ProviderTranscriptPath = Join-Path $PSScriptRoot 'BootUpdateCycle.providers.log'
 $script:StatePath             = Join-Path $PSScriptRoot 'BootUpdateCycle.state.json'
 $script:WingetQuarantinePath  = Join-Path $PSScriptRoot 'BootUpdateCycle-winget-quarantine.json'
+$script:WindowsUpdateAssessmentPath = Join-Path $PSScriptRoot 'BootUpdateCycle.wu-assessment.json'
+$script:WindowsUpdateOnlineAssessmentTtlHours = 6
 $script:HistoryPath           = Join-Path $PSScriptRoot 'BootUpdateCycle.history.json'
 $script:MaxLogSizeMB          = 5
 $script:MaxHistoryEntries     = 50
@@ -341,7 +343,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 5 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.54' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.55' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 Set-Variable -Name 'RebootSignalSettleSeconds' -Value 20 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 $script:ExplicitRebootRequests = [System.Collections.Generic.List[object]]::new()
 
@@ -2545,6 +2547,7 @@ function Repair-WindowsUpdateComponents {
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param()
+    Remove-WindowsUpdateAssessmentCache
     Write-Log 'WU remediation: resetting Windows Update components (SoftwareDistribution / catroot2)...' -Level Warn
     if (-not $PSCmdlet.ShouldProcess('Windows Update components', 'Stop services, rename SoftwareDistribution/catroot2, restart')) { return }
     $svcs = @('wuauserv', 'cryptsvc', 'bits', 'msiserver')
@@ -2586,6 +2589,172 @@ function Get-WindowsUpdateVerificationScope {
         ExcludedTitle = $excludedTitle
         Categories = $categories
         Signature = "notTitle=$excludedTitle;categories=$(($categories | Sort-Object) -join ',')"
+    }
+}
+
+function Get-WindowsUpdateEnvironmentFingerprint {
+    <# A catalog assessment is reusable only while the configured WU source/policy and
+       recent servicing history are unchanged. UpdateID/RevisionNumber identify update
+       revisions; they are deliberately not treated as a global sequence number. #>
+    $parts = [System.Collections.Generic.List[string]]::new()
+    foreach ($keyPath in @(
+        'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate',
+        'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'
+    )) {
+        $item = Get-ItemProperty -LiteralPath $keyPath -ErrorAction SilentlyContinue
+        foreach ($name in @('WUServer','WUStatusServer','UseWUServer','DoNotConnectToWindowsUpdateInternetLocations','DisableWindowsUpdateAccess')) {
+            $value = if ($item -and $item.PSObject.Properties.Name -contains $name) { [string]$item.$name } else { '' }
+            $parts.Add("$keyPath|$name|$value")
+        }
+    }
+    try {
+        $session = New-Object -ComObject Microsoft.Update.Session
+        $searcher = $session.CreateUpdateSearcher()
+        $parts.Add("searcher|ServerSelection|$($searcher.ServerSelection)")
+        $parts.Add("searcher|ServiceID|$($searcher.ServiceID)")
+        $serviceManager = New-Object -ComObject Microsoft.Update.ServiceManager
+        $services = $serviceManager.Services
+        for ($serviceIndex=0; $serviceIndex -lt $services.Count; $serviceIndex++) {
+            $service = $services.Item($serviceIndex)
+            $parts.Add("service|$($service.ServiceID)|$($service.IsDefaultAUService)|$($service.IsManaged)|$($service.Name)")
+        }
+        $total = $searcher.GetTotalHistoryCount()
+        if ($total -gt 0) {
+            foreach ($entry in @($searcher.QueryHistory(0, [math]::Min(32, $total)))) {
+                $id = if ($entry.UpdateIdentity) { $entry.UpdateIdentity.UpdateID } else { '' }
+                $rev = if ($entry.UpdateIdentity) { $entry.UpdateIdentity.RevisionNumber } else { '' }
+                $parts.Add("history|$($entry.Date.ToUniversalTime().ToString('o'))|$($entry.Operation)|$($entry.ResultCode)|$id|$rev")
+            }
+        }
+    } catch { return $null }
+    $bytes = [Text.Encoding]::UTF8.GetBytes(($parts -join "`n"))
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-','').ToLowerInvariant() }
+    finally { $sha.Dispose() }
+}
+
+function Remove-WindowsUpdateAssessmentCache {
+    param([switch]$Force)
+    if ($WhatIfPreference -and -not $Force) { return }
+    Remove-Item -LiteralPath $script:WindowsUpdateAssessmentPath -Force -ErrorAction SilentlyContinue
+}
+
+function Set-WindowsUpdateAssessmentCache {
+    param([Parameter(Mandatory)][object]$Scope,[object[]]$ApplicableUpdates = @())
+    if ($WhatIfPreference -or [string]::IsNullOrWhiteSpace($script:WindowsUpdateAssessmentPath)) { return }
+    $fingerprint = Get-WindowsUpdateEnvironmentFingerprint
+    if (-not $fingerprint) { Remove-WindowsUpdateAssessmentCache; return }
+    $record = [ordered]@{
+        SchemaVersion = 1
+        ObservedAtUtc = [datetime]::UtcNow.ToString('o')
+        BootSessionId = Get-BootUpdateBootSessionId
+        ScopeSignature = $Scope.Signature
+        EnvironmentFingerprint = $fingerprint
+        ApplicableUpdates = @($ApplicableUpdates | ForEach-Object {
+            [ordered]@{ UpdateID=[string]$_.UpdateID; RevisionNumber=[int]$_.RevisionNumber }
+        })
+    }
+    $temp = "$($script:WindowsUpdateAssessmentPath).$PID.tmp"
+    try {
+        $record | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $temp -Encoding UTF8
+        Move-Item -LiteralPath $temp -Destination $script:WindowsUpdateAssessmentPath -Force
+        Enable-BootUpdateNtfsCompression -Path $script:WindowsUpdateAssessmentPath
+    } finally { Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue }
+}
+
+function Invoke-WindowsUpdateOfflineAssessment {
+    param([Parameter(Mandatory)][object]$Scope)
+    $operation = Invoke-BootUpdateBackgroundOperation -Name 'Reconciling cached Windows Update assessment' `
+        -Status 'Checking the local Windows Update catalog' -TimeoutMinutes ([math]::Min(5, $script:PackageTimeoutMinutes)) `
+        -ScriptBlock {
+            param($Categories,$ExcludedTitle)
+            try {
+                $session = New-Object -ComObject Microsoft.Update.Session
+                $searcher = $session.CreateUpdateSearcher()
+                $searcher.Online = $false
+                $result = $searcher.Search('IsInstalled=0 and IsHidden=0')
+                $count = 0
+                for ($i=0; $i -lt $result.Updates.Count; $i++) {
+                    $update = $result.Updates.Item($i)
+                    $categoryNames = @()
+                    for ($categoryIndex=0; $categoryIndex -lt $update.Categories.Count; $categoryIndex++) {
+                        $categoryNames += [string]$update.Categories.Item($categoryIndex).Name
+                    }
+                    if (-not ($categoryNames | Where-Object { $Categories -contains $_ })) { continue }
+                    if ($ExcludedTitle -and $update.Title -match $ExcludedTitle) { continue }
+                    $count++
+                    "BOOTUPDATE_APPLICABLE|$($update.Identity.UpdateID)|$($update.Identity.RevisionNumber)|$($update.Title)"
+                }
+                "BOOTUPDATE_SCAN_COMPLETE|$count"
+            } catch { "BOOTUPDATE_ERROR|$($_.Exception.Message)" }
+        } -ArgumentList @($Scope.Categories,$Scope.ExcludedTitle)
+    $records = @($operation.Output | Where-Object { $_ -match '^BOOTUPDATE_APPLICABLE\|[^|]+\|\d+\|\S' })
+    $errors = @($operation.Output | Where-Object { $_ -match '^BOOTUPDATE_ERROR\|' })
+    $markers = @($operation.Output | Where-Object { $_ -match '^BOOTUPDATE_SCAN_COMPLETE\|(\d+)$' })
+    $declared = if ($markers.Count -eq 1 -and $markers[0] -match '^BOOTUPDATE_SCAN_COMPLETE\|(\d+)$') { [int]$Matches[1] } else { -1 }
+    if ($operation.Failed -or $operation.TimedOut -or $errors.Count -or $markers.Count -ne 1 -or $declared -ne $records.Count) {
+        return [pscustomobject]@{ Verified=$false; Updates=@(); Error=$(if($errors){$errors[0] -replace '^BOOTUPDATE_ERROR\|',''}elseif($operation.TimedOut){'offline assessment timed out'}else{'offline assessment completion contract failed'}) }
+    }
+    $updates = @($records | ForEach-Object {
+        $fields = $_ -split '\|',4
+        [pscustomobject]@{
+            UpdateID=$fields[1]
+            RevisionNumber=[int]$fields[2]
+            Title=$fields[3]
+        }
+    })
+    return [pscustomobject]@{ Verified=$true; Updates=$updates; Error=$null }
+}
+
+function Test-WindowsUpdateAssessmentRecord {
+    param(
+        [Parameter(Mandatory)][object]$Record,
+        [Parameter(Mandatory)][object]$Scope,
+        [Parameter(Mandatory)][string]$EnvironmentFingerprint,
+        [double]$TtlHours = 6,
+        [datetime]$NowUtc = [datetime]::UtcNow
+    )
+    try {
+        $observed = [datetime]::Parse([string]$Record.ObservedAtUtc).ToUniversalTime()
+        $age = $NowUtc.ToUniversalTime() - $observed
+        return ([int]$Record.SchemaVersion -eq 1 -and
+            $age.TotalSeconds -ge -300 -and $age.TotalHours -le $TtlHours -and
+            [string]$Record.ScopeSignature -eq [string]$Scope.Signature -and
+            [string]$Record.EnvironmentFingerprint -eq $EnvironmentFingerprint)
+    } catch { return $false }
+}
+
+function Test-WindowsUpdateAssessmentCache {
+    param(
+        [Parameter(Mandatory)][object]$Scope,
+        [string]$Path = $script:WindowsUpdateAssessmentPath,
+        [double]$TtlHours = $script:WindowsUpdateOnlineAssessmentTtlHours,
+        [string]$EnvironmentFingerprint,
+        [scriptblock]$OfflineAssessment,
+        [object]$OfflineAssessmentResult
+    )
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) { return $false }
+    try {
+        $cached = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        $fingerprint = if ($PSBoundParameters.ContainsKey('EnvironmentFingerprint')) { $EnvironmentFingerprint } else { Get-WindowsUpdateEnvironmentFingerprint }
+        if (-not $fingerprint -or -not (Test-WindowsUpdateAssessmentRecord -Record $cached -Scope $Scope -EnvironmentFingerprint $fingerprint -TtlHours $TtlHours)) { return $false }
+        $offline = if ($PSBoundParameters.ContainsKey('OfflineAssessmentResult')) { $OfflineAssessmentResult } elseif ($OfflineAssessment) { & $OfflineAssessment $Scope } else { Invoke-WindowsUpdateOfflineAssessment -Scope $Scope }
+        if (-not $offline.Verified) {
+            Write-Log "Windows Update cache: offline reassessment failed; an online assessment is required ($($offline.Error))." -Level Warn
+            Remove-WindowsUpdateAssessmentCache -Force
+            return $false
+        }
+        if (@($offline.Updates).Count -gt 0) {
+            Write-Log "Windows Update cache: $(@($offline.Updates).Count) applicable update(s) remain in the local catalog; continuing with Windows Update."
+            return $false
+        }
+        $ageHours = ([datetime]::UtcNow - [datetime]::Parse([string]$cached.ObservedAtUtc).ToUniversalTime()).TotalHours
+        Write-Log "Windows Update: skipped redundant online poll; a $([math]::Round($ageHours,1))h-old online assessment was reconciled against the local WUA catalog and servicing history."
+        return $true
+    } catch {
+        Write-Log "Windows Update cache: cached assessment was unreadable or invalid ($($_.Exception.Message)); an online assessment is required." -Level Warn
+        Remove-WindowsUpdateAssessmentCache -Force
+        return $false
     }
 }
 
@@ -2667,6 +2836,7 @@ function Install-WindowsUpdates {
             $script:CurrentState.WindowsUpdateZeroEvidence = $null
             Set-BootUpdateState -State $script:CurrentState
         }
+        Remove-WindowsUpdateAssessmentCache
         try {
             $result = Invoke-BootUpdateBackgroundOperation -Name 'Installing Windows Updates' `
                 -Status 'Windows Update scan and installation are running' `
@@ -2702,13 +2872,15 @@ function Install-WindowsUpdates {
                 Write-Log 'Windows Update operation failed or timed out.' -Level Error
             }
             if (-not $failed -and $postSearchZero -and $script:CurrentState) {
-                $script:CurrentState.WindowsUpdateZeroEvidence = [pscustomobject]@{
+                $evidence = [pscustomobject]@{
                     BootSessionId = Get-BootUpdateBootSessionId
                     ScopeSignature = $verificationScope.Signature
                     ObservedAt = [datetime]::UtcNow.ToString('o')
                     Source = 'PSWindowsUpdate-post-search-zero'
                 }
+                $script:CurrentState.WindowsUpdateZeroEvidence = $evidence
                 Set-BootUpdateState -State $script:CurrentState
+                Set-WindowsUpdateAssessmentCache -Scope $verificationScope -ApplicableUpdates @()
             } elseif ($script:CurrentState) {
                 $script:CurrentState.WindowsUpdateZeroEvidence = $null
                 Set-BootUpdateState -State $script:CurrentState
@@ -2758,7 +2930,10 @@ function Test-WindowsUpdateConvergence {
                     -RootCategories @('Security Updates','Critical Updates','Definition Updates') `
                     -IgnoreReboot -Confirm:$false -ErrorAction Stop) | Where-Object { $null -ne $_ }
                 $applicable | ForEach-Object {
-                        "BOOTUPDATE_APPLICABLE|$($_.KB)|$($_.Title)"
+                        $identity = $_.Identity
+                        $updateId = if ($_.PSObject.Properties.Name -contains 'UpdateID' -and $_.UpdateID) { $_.UpdateID } elseif ($identity -and $identity.UpdateID) { $identity.UpdateID } else { 'identity-unavailable' }
+                        $revision = if ($_.PSObject.Properties.Name -contains 'RevisionNumber' -and $null -ne $_.RevisionNumber) { [int]$_.RevisionNumber } elseif ($identity -and $null -ne $identity.RevisionNumber) { [int]$identity.RevisionNumber } else { 0 }
+                        "BOOTUPDATE_APPLICABLE|$updateId|$revision|$($_.Title)"
                     }
                 "BOOTUPDATE_SCAN_COMPLETE|$($applicable.Count)"
             } catch { "BOOTUPDATE_ERROR|$($_.Exception.Message)" }
@@ -2766,7 +2941,7 @@ function Test-WindowsUpdateConvergence {
     <# @($null) contains one element in PowerShell. Older scan workers therefore
        emitted BOOTUPDATE_APPLICABLE|| for a clean, empty result. Require a real
        title after the second delimiter so that sentinel cannot become an update. #>
-    $updates = @($result.Output | Where-Object { $_ -match '^BOOTUPDATE_APPLICABLE\|[^|]*\|\S' })
+    $updates = @($result.Output | Where-Object { $_ -match '^BOOTUPDATE_APPLICABLE\|[^|]+\|\d+\|\S' })
     $errors = @($result.Output | Where-Object { $_ -match '^BOOTUPDATE_ERROR\|' })
     $completionMarkers = @($result.Output | Where-Object { $_ -match '^BOOTUPDATE_SCAN_COMPLETE\|(\d+)$' })
     foreach ($line in $updates) { Write-Log "Final WU scan: $($line -replace '^BOOTUPDATE_APPLICABLE\|','')" -Level Warn }
@@ -2774,6 +2949,13 @@ function Test-WindowsUpdateConvergence {
     $declaredCount = if ($completionMarkers.Count -eq 1 -and $completionMarkers[0] -match '^BOOTUPDATE_SCAN_COMPLETE\|(\d+)$') { [int]$Matches[1] } else { -1 }
     $verified = -not $result.Failed -and -not $result.TimedOut -and $errors.Count -eq 0 -and
         $completionMarkers.Count -eq 1 -and $declaredCount -eq $updates.Count
+    if ($verified) {
+        $identities = @($updates | ForEach-Object {
+            $fields = $_ -split '\|', 4
+            [pscustomobject]@{ UpdateID=$fields[1]; RevisionNumber=[int]$fields[2] }
+        })
+        Set-WindowsUpdateAssessmentCache -Scope $verificationScope -ApplicableUpdates $identities
+    }
     return [pscustomobject]@{ Verified=$verified; Count=$updates.Count; Detail=$(if($verified){"$($updates.Count) applicable update(s)"}else{'scan failed'}) }
 }
 
@@ -2795,6 +2977,7 @@ function Install-DriverFirmwareUpdates {
     if (-not (Initialize-BootUpdateWindowsUpdateModule)) {
         return @{ Success = $false; Count = 0 }
     }
+    Remove-WindowsUpdateAssessmentCache
     $count = 0; $failed = $false
     $excludeTitle = ((@('SQL') + ($script:ExcludePatterns | ForEach-Object { [regex]::Escape($_) })) -join '|')
 
@@ -5110,6 +5293,19 @@ function Invoke-BootUpdateCycle {
        boot), WhatIf, WU already done, or PSWindowsUpdate not yet installed (the module
        install belongs to the WU phase — no racing it from here). #>
     $script:WuPrefetchJob = $null
+    if (-not $state.WindowsUpdateDone -and -not $WhatIfPreference) {
+        $wuScope = Get-WindowsUpdateVerificationScope
+        if (Test-WindowsUpdateAssessmentCache -Scope $wuScope) {
+            $state.WindowsUpdateDone = $true
+            $state.WindowsUpdateZeroEvidence = [pscustomobject]@{
+                BootSessionId = Get-BootUpdateBootSessionId
+                ScopeSignature = $wuScope.Signature
+                ObservedAt = [datetime]::UtcNow.ToString('o')
+                Source = 'PSWindowsUpdate-post-search-zero'
+            }
+            Set-BootUpdateState -State $state
+        }
+    }
     if (-not $script:StagedRollout -and -not $WhatIfPreference -and -not $state.WindowsUpdateDone -and (Get-Module -ListAvailable PSWindowsUpdate)) {
         try {
             $prefetchNotTitle = ((@('SQL') + ($script:ExcludePatterns | ForEach-Object { [regex]::Escape($_) })) -join '|')

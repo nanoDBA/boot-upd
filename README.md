@@ -1,10 +1,64 @@
 # Boot Update Cycle
 
-**Run `upd` as admin. Walk away. Come back fully patched.**
+**Run `upd` as admin. Walk away. Come back patched—or with a clear, reversible exception report.**
 
 A Windows boot-time automation tool that runs every configured package manager, checkpoints its work, reboots when updates require it, and resumes until the configured scope verifies clean — then retires its resume tasks.
 
 <img src="docs/img/splash-theme0.png" alt="Boot Update Cycle splash — neon gradient theme" width="684">
+
+<a id="navigate"></a>
+## 🧭 Navigate
+
+- [Quick start](#quick-start)
+- [See it in action](#updater-in-action)
+- [What it updates](#what-it-updates)
+- [Commands](#friendly-launcher)
+- [How reboot/resume works](#what-happens)
+- [Status and recovery](#status-and-recovery)
+- [Security model](#security-model)
+- [Configuration](#configuration) · [Testing](#testing)
+
+<a id="quick-start"></a>
+## 🚀 Quick start
+
+Open **Windows PowerShell as Administrator**, paste this command, and press Enter:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; & ([ScriptBlock]::Create((Invoke-RestMethod -UseBasicParsing -TimeoutSec 30 'https://github.com/nanoDBA/boot-upd/releases/latest/download/Install-UpdCompat.ps1'))) -PromptForArguments"
+```
+
+After the compatibility installer starts, it verifies every runtime asset against the
+release bundle's SHA256 sidecars before installing the runtime bundle. At the
+prompt, press Enter to use the defaults. After installation, everyday use is deliberately
+short:
+
+```powershell
+upd          # update, reboot when required, and resume automatically
+upd status   # show the current checkpoint and continuation tasks
+upd logs     # create a sanitized support ZIP on the Desktop
+upd help     # commands, short aliases, and every option
+```
+
+> [!IMPORTANT]
+> `upd` installs software and can restart Windows immediately by default. Save your work
+> first, or use `upd -r 120` for a two-minute reboot warning. Cancel a pending restart with
+> `shutdown /a`.
+
+Want to look around without changing the machine? These commands are read-only and do not
+request elevation:
+
+```powershell
+upd splash
+upd demo 12
+upd plan -drv -r 120
+upd version
+```
+
+**Trust boundary:** the one-liner trusts GitHub HTTPS and this project's latest release;
+the downloaded compatibility installer then requires a valid SHA256 sidecar for every
+runtime asset. Checksums protect integrity but are not publisher signatures. See
+[Security model](#security-model) and the [version-pinned recovery path](#install-details-and-compatibility)
+before using it in a controlled environment.
 
 The BBS-style splash defaults to the neon gradient theme above; two more ship with it (`upd splash` previews them all; switch with `BOOT_UPDATE_SPLASH_THEME=0|1|2`):
 
@@ -44,15 +98,14 @@ When the configured work, convergence checks, reboot checks, service health, and
 | 9 | **Scoop** | On | User-scoped; skipped under SYSTEM |
 | 10 | **.NET Global Tools** | **Off** | High risk — can break SDK-dependent builds |
 | 11 | **VS Code Extensions** | On | User-scoped; skipped under SYSTEM |
+| 12 | **Microsoft Defender** | On | Signature refresh through `MpCmdRun.exe` |
+| 13 | **Drivers / firmware** | **Off** | Explicit opt-in with `-drv` / `-fw` |
+| 14 | **WSL / containers** | **Off** | Explicit opt-in; user-context work resumes at logon |
 
-## Quick start
+## Install details and compatibility
 
-Fresh install, repair, and run—the short Chocolatey-style paste for an elevated
-Command Prompt, PowerShell, or Win+R:
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; & ([ScriptBlock]::Create((Invoke-RestMethod -UseBasicParsing 'https://github.com/nanoDBA/boot-upd/releases/latest/download/Install-UpdCompat.ps1'))) -PromptForArguments"
-```
+The [quick-start command](#quick-start) is the shortest supported fresh-install,
+repair, and run path for an elevated Command Prompt, PowerShell, or Win+R.
 
 If you prefer the downloaded bootstrap to remain visible in `%TEMP%` for inspection or
 troubleshooting, use the equivalent download-and-run form:
@@ -100,6 +153,8 @@ upd repair                       Recover missing/corrupt launcher and core files
 upd bootstrap                    Install/verify PowerShell 7, then show help
 upd version                      Show the bundled version
 upd status                       Show resume tasks and checkpoint state
+upd uq                           Remove every recorded Winget quarantine pin
+upd uq Corsair.iCUE.5            Remove one quarantine pin and reconcile its record
 upd plan --drivers --delay 120   Resolve options without elevation or changes
 
 upd                              Run with defaults
@@ -134,7 +189,7 @@ has exited**. It verifies the installer against the hash embedded below, then th
 verifies and transactionally replaces the complete release bundle before forwarding `aws`:
 
 ```powershell
-$u='https://github.com/nanoDBA/boot-upd/releases/download/v2.5.54/Install-UpdCompat.ps1'; $f=Join-Path $env:TEMP 'Install-UpdCompat-v2.5.54.ps1'; Invoke-WebRequest $u -OutFile $f; if((Get-FileHash $f -Algorithm SHA256).Hash -ne '67662B3B02252FF6DE045FCDF28FB74D8DEB6FDA8080C46B1DAFC7BFBE54ABE3'){throw 'Compatibility installer hash mismatch'}; & $f -CommandArguments aws
+$u='https://github.com/nanoDBA/boot-upd/releases/download/v2.5.55/Install-UpdCompat.ps1'; $f=Join-Path $env:TEMP 'Install-UpdCompat-v2.5.55.ps1'; Invoke-WebRequest $u -OutFile $f; if((Get-FileHash $f -Algorithm SHA256).Hash -ne '67662B3B02252FF6DE045FCDF28FB74D8DEB6FDA8080C46B1DAFC7BFBE54ABE3'){throw 'Compatibility installer hash mismatch'}; & $f -CommandArguments aws
 ```
 
 This is the one-time chicken-and-egg escape hatch. It resolves the first `upd.cmd` on PATH,
@@ -220,8 +275,10 @@ console feedback because isolating it would change how hook variables and side e
 4. Native `3010`/`1641` results and Windows reboot indicators are persisted as reboot evidence until a new Windows boot identity is observed
 5. Verified resume tasks are armed before updates start: user-at-logon plus a delayed SYSTEM fallback, with dated watchdogs for canceled shutdowns and deferred retries
 6. `shutdown /g` restarts Windows; the checkpoint resumes automatically, preserves user-only work for user context, and retries real provider failures without marking them complete
-7. Completion requires every enabled phase, a zero-applicable Windows Update scan, and two clean reboot probes (max 5 successful mutation iterations safety valve)
-8. Hooks run, resume tasks and state are removed and verified absent, and only then does the final screen congratulate the user and send the success notification
+7. A successful online Windows Update assessment is reusable for six hours—even across reboots—only after an offline WUA catalog check confirms zero applicable work and the update source, scope, and recent servicing history fingerprints still match
+8. Completion requires every enabled phase, a zero-applicable Windows Update assessment, and two clean reboot probes (max 5 successful mutation iterations safety valve)
+9. Hooks run, resume tasks and transient state are removed and verified absent, and only then does the final screen congratulate the user and send the success notification
+10. If explicit aggressive mode quarantined a persistent Winget failure, its durable record survives cleanup and the final screen reports degraded completion with an `upd uq` reversal command
 
 ### Reboot delay
 
@@ -255,7 +312,31 @@ Package managers are auto-detected. Missing ones are skipped with a warning.
 | `Export-BootUpdateDiagnostics.ps1` | Sanitized, compressed diagnostic bundle export |
 | `tools/Initialize-BootUpdateWebhook.ps1` | Securely configures a notification webhook outside Git and task arguments |
 
-## Monitoring
+<a id="status-and-recovery"></a>
+## 🛟 Status and recovery
+
+Start with the built-in commands; they keep the common support path short and preserve
+useful evidence:
+
+```powershell
+upd status    # checkpoint, resume tasks, and reversible Winget quarantines
+upd logs      # sanitized compressed diagnostics on the Desktop
+upd repair    # restore checksummed launcher/core files
+upd update    # refresh the verified source bundle without starting an update cycle
+```
+
+If explicit `-ar` mode quarantines a repeatedly failing Winget package, completion is
+reported as **complete with quarantine**, never fully patched. The durable status record
+includes the reversal command:
+
+```powershell
+upd uq Package.Id    # remove one blocking pin
+upd uq               # remove all recorded blocking pins
+```
+
+Records are removed only after Winget confirms that the corresponding pin was removed.
+
+### More monitoring
 
 ```powershell
 # Live log tail
@@ -274,7 +355,7 @@ Get-Content "$env:ProgramData\BootUpdateCycle\BootUpdateCycle.history.json" | Co
 Get-WinEvent -FilterHashtable @{LogName='Application'; ProviderName='BootUpdateCycle'} | Select-Object -First 10
 ```
 
-## Emergency stop
+### Emergency stop
 
 ```powershell
 # Cancel a pending reboot
@@ -286,6 +367,29 @@ Unregister-ScheduledTask -TaskName 'BootUpdateCycle' -Confirm:$false
 # Full cleanup
 & "$env:ProgramData\BootUpdateCycle\Uninstall.ps1" -RemoveFolder
 ```
+
+<a id="security-model"></a>
+## 🔐 Security model
+
+- Release self-update fails closed when an executable asset or valid SHA256 sidecar is
+  missing, malformed, or mismatched.
+- The running batch launcher is updated through a temporary trampoline so it never
+  replaces the file that `cmd.exe` is actively reading.
+- Scheduled continuation arguments contain configuration references, not webhook bearer
+  credentials. Webhook secrets live in an administrator/SYSTEM-protected local file.
+- Administrator hooks must remain under the protected deployed directory and pass path,
+  ACL, reparse-point, and optional signature/hash checks before elevated execution.
+- Diagnostic export redacts identities, network addresses, URLs, registry paths, and local
+  paths, then verifies the sanitized output before creating the ZIP.
+- Aggressive Winget repair is opt-in (`-ar`). An identical persistent failure can be moved
+  to a reversible blocking pin, which is recorded outside transient checkpoint state and
+  shown by `upd status`.
+
+For the most conservative bootstrap, use the version-and-hash-pinned command in
+[Install details and compatibility](#install-details-and-compatibility). Never commit real
+webhook URLs or other credentials to this public repository. Report vulnerabilities through
+GitHub's [private vulnerability reporting](https://github.com/nanoDBA/boot-upd/security/advisories/new); otherwise open a minimal public issue
+without secrets or exploit details so a private channel can be arranged.
 
 ## Configuration
 

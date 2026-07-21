@@ -1,8 +1,24 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.54
+**Current Version:** v2.5.55
 **Release Date:** 2026-07-21
 **Status:** STABLE
+
+---
+
+## v2.5.55 (2026-07-21)
+
+### Smarter Windows Update assessment reuse
+
+- Reuses a successful online Windows Update assessment for up to six hours across reboot boundaries, after reconciling it against the local Windows Update Agent catalog.
+- Invalidates the cache when update scope, Windows Update policy/source settings, or recent servicing history changes; failures fall back to an online assessment.
+- Records only minimal diagnostic metadata: `UpdateID`, `RevisionNumber`, timestamps, and non-sensitive fingerprints; sanitized diagnostic bundles include this breadcrumb. Update revisions are identities, not a global sequence counter.
+- Clears cached evidence before Windows Update, driver/firmware, or component-reset mutations and stores the sidecar atomically with NTFS compression.
+
+### README refresh
+
+- Moves the copy-ready quick start, everyday commands, reboot warning, screenshots, navigation, status/recovery, and security model toward the top.
+- Adds clearer phase coverage and read-only preview paths while preserving the default splash presentation.
 
 ---
 
