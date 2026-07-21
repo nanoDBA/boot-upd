@@ -75,13 +75,13 @@ The BBS-style splash defaults to the neon gradient theme above; two more ship wi
 
 The default `Normal` view stays zoomed out while the animated `BOOT//PULSE` row shows the current operation:
 
-<img src="docs/img/updater-progress.png" alt="Boot Update Cycle updating Windows in the compact Normal console view" width="900">
+<img src="docs/img/updater-progress.png" alt="Boot Update Cycle resumed after reboot, reusing a verified Windows Update assessment and refreshing Defender in the compact Normal console view" width="900">
 
 When the configured work, convergence checks, reboot checks, service health, and terminal cleanup all pass, the final screen has some earned personality:
 
 <img src="docs/img/updater-complete.png" alt="Boot Update Cycle configured patch pass verified completion screen" width="900">
 
-<sub>Representative v2.5.30 console captures rendered from the production UI text for deterministic, privacy-safe documentation; package counts and elapsed time are illustrative.</sub>
+<sub>Representative v2.5.55 console captures rendered from the production UI text for deterministic, privacy-safe documentation; package counts and elapsed time are illustrative.</sub>
 
 ## What it updates
 
