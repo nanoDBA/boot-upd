@@ -454,14 +454,23 @@ catch {
 }
 '@
         
-        $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($scriptBlock))
         $engine = if (Get-Command pwsh.exe -ErrorAction SilentlyContinue) { 'pwsh.exe' } else { 'powershell.exe' }
-        $proc = Start-Process $engine -ArgumentList @(
-            '-NoProfile', '-NonInteractive', '-EncodedCommand', $encodedCommand
-        ) -Wait -PassThru -NoNewWindow
-        
-        if ($proc.ExitCode -ne 0) {
-            throw "AWS.Tools subprocess failed (exit code $($proc.ExitCode))"
+        # The verification program is deliberately substantial and exceeds the
+        # Windows process command-line limit when Base64-encoded. Execute it from
+        # a random temporary file instead; it contains code only, never secrets.
+        $childPath = Join-Path ([IO.Path]::GetTempPath()) ('Repair-AwsTools-child-{0}.ps1' -f [guid]::NewGuid().ToString('N'))
+        try {
+            # UTF-8 BOM keeps Windows PowerShell 5.1 parsing deterministic.
+            [IO.File]::WriteAllText($childPath, $scriptBlock, [Text.UTF8Encoding]::new($true))
+            $proc = Start-Process $engine -ArgumentList @(
+                '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', "`"$childPath`""
+            ) -Wait -PassThru -NoNewWindow
+
+            if ($proc.ExitCode -ne 0) {
+                throw "AWS.Tools subprocess failed (exit code $($proc.ExitCode))"
+            }
+        } finally {
+            Remove-Item -LiteralPath $childPath -Force -ErrorAction SilentlyContinue
         }
     }
 }

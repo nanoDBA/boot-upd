@@ -138,4 +138,14 @@ Describe 'AWS tooling inventory and host compatibility' {
         $childSource | Should -Match 'AWS\.Tools verified:'
         $childSource | Should -Not -Match 'Write-Host \$record'
     }
+
+    It 'uses a temporary script file instead of overflowing the Windows command line' {
+        $repairSource | Should -Not -Match '-EncodedCommand'
+        $repairSource | Should -Match 'Repair-AwsTools-child-\{0\}\.ps1'
+        $repairSource | Should -Match '\[IO\.File\]::WriteAllText\(\$childPath, \$scriptBlock'
+        $repairSource | Should -Match "'-File'"
+        $repairSource | Should -Match '\$childPath'
+        $repairSource | Should -Match 'finally\s*\{\s*Remove-Item -LiteralPath \$childPath'
+        $childSource.Length | Should -BeGreaterThan 8191
+    }
 }

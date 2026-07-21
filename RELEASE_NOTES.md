@@ -1,8 +1,18 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.46
+**Current Version:** v2.5.47
 **Release Date:** 2026-07-21
 **Status:** STABLE
+
+---
+
+## v2.5.47 (2026-07-21)
+
+### AWS subprocess command-line overflow correction
+
+- Executes the substantial AWS verification program from a random temporary script file instead of an oversized Base64 `-EncodedCommand`, eliminating Windows' process command-line length failure.
+- Writes the child file with a UTF-8 BOM for deterministic Windows PowerShell 5.1 parsing, passes only the short file path to the isolated subprocess, and removes the temporary file in `finally` on success or failure.
+- Adds a regression guard proving the child program exceeds the historical command-line ceiling and that the production launcher no longer uses `-EncodedCommand`.
 
 ---
 
