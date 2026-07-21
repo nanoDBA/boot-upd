@@ -196,10 +196,13 @@ if ($Shell -eq 'WindowsPowerShell') {
     $runnerPath = "$transcriptFullPath.runner.ps1"
     $runnerLines = @(
         '$ErrorActionPreference = ''Stop'''
+        '& {'
         $CommandLine
+        "} *> '$($transcriptFullPath.Replace("'","''"))'"
+        'exit $LASTEXITCODE'
     )
     [IO.File]::WriteAllLines($runnerPath,$runnerLines,[Text.UTF8Encoding]::new($false))
-    $childCommand = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{0}" 1> "{1}" 2>&1' -f $runnerPath,$transcriptFullPath
+    $childCommand = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{0}"' -f $runnerPath
 } else {
     $runnerPath = "$transcriptFullPath.runner.cmd"
     $runnerLines = @(
