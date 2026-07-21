@@ -95,3 +95,32 @@ jobs:
               $changes | Write-Error
               throw 'Quality checks modified the worktree.'
           }
+
+  cross-context-mutex:
+    name: User/SYSTEM exclusion gate
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+      - name: Exercise production mutex across security contexts
+        shell: pwsh
+        run: |
+          $result = ./tests/integration/Invoke-CrossContextMutexGate.ps1 | Tee-Object -Variable transcript
+          $result
+          "### User/SYSTEM exclusion gate`n``````json`n$($transcript -join "`n")`n``````" >> $env:GITHUB_STEP_SUMMARY
+
+  published-launcher-upgrade:
+    name: Published launcher upgrade gate
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+      - name: Upgrade the immutable v2.5.43 launcher to this candidate
+        shell: pwsh
+        run: |
+          $result = ./tests/integration/Invoke-PublishedLauncherUpgradeGate.ps1 -FromTag v2.5.43 |
+              Tee-Object -Variable transcript
+          $result
+          "### Published launcher upgrade gate`n``````json`n$($transcript -join "`n")`n``````" >> $env:GITHUB_STEP_SUMMARY

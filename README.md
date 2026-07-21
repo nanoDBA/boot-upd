@@ -321,6 +321,10 @@ Package managers get killed if they're truly stuck, but busy installs are left a
 
 This means Visual Studio can install for 45 minutes (busy CPU = fine), but a hung winget source refresh gets killed in 5 minutes (zero CPU = stuck).
 
+## Testing
+
+Testing is split into explicit confidence gates rather than a single test count. See [Testing Boot Update Cycle](docs/TESTING.md), or run `./tools/Invoke-TestGates.ps1` from an elevated PowerShell 7 console.
+
 ## License
 
 MIT

@@ -394,11 +394,16 @@ exit /b 0
         $output = & cmd.exe /d /c "`"$target`"" 2>&1
         $LASTEXITCODE | Should -Be 0
         ($output -join "`n") | Should -Match 'legacy caller returned cleanly'
+        $adoptionLog = Join-Path $root 'upd.cmd.adoption.log'
         $deadline = [DateTime]::UtcNow.AddSeconds(10)
-        while ((Test-Path "$target.next") -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 100 }
+        do {
+            $completed = (Test-Path $adoptionLog) -and
+                ((Get-Content $adoptionLog -Raw) -match 'completed')
+            if (-not $completed) { Start-Sleep -Milliseconds 100 }
+        } while (-not $completed -and [DateTime]::UtcNow -lt $deadline)
         Test-Path "$target.next" | Should -BeFalse
         (Get-FileHash $target -Algorithm SHA256).Hash | Should -Be $nextHash
-        (Get-Content (Join-Path $root 'upd.cmd.adoption.log') -Raw) | Should -Match 'completed'
+        (Get-Content $adoptionLog -Raw) | Should -Match 'completed'
     }
 
     It 'behaviorally rejects and removes a stale staged batch' {
