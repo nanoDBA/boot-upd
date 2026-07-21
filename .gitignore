@@ -5,11 +5,12 @@ testResults.xml
 # Temp cleanup utilities (not part of the tool)
 DEL_ALL*.CMD
 
-# Claude Code local settings
+# Claude Code machine-local settings (shared settings and skills are tracked)
 # Codex local/remote conversation attachments
 .codex-remote-attachments/
 
-.claude/
+.claude/settings.local.json
+.claude/*.local.json
 
 # Runtime artifacts (generated in ProgramData, not here, but just in case)
 *.state.json

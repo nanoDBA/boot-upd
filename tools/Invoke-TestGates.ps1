@@ -38,9 +38,13 @@ try {
     }
     if (-not $SkipOsBoundary) {
         Invoke-Gate 'user-system-security-boundary' { & ./tests/integration/Invoke-CrossContextMutexGate.ps1 | Write-Host }
+    } else {
+        $results.Add([pscustomobject]@{ Gate='user-system-security-boundary'; Result='not_run'; Reason='SkipOsBoundary was specified.' })
     }
     if (-not $SkipPublishedUpgrade) {
         Invoke-Gate 'published-launcher-upgrade' { & ./tests/integration/Invoke-PublishedLauncherUpgradeGate.ps1 | Write-Host }
+    } else {
+        $results.Add([pscustomobject]@{ Gate='published-launcher-upgrade'; Result='not_run'; Reason='SkipPublishedUpgrade was specified.' })
     }
 } finally {
     Pop-Location

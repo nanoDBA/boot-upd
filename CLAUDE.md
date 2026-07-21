@@ -1,268 +1,31 @@
-# CLAUDE.md
+# Claude Code project instructions
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+@AGENTS.md
 
-## Purpose
+## Repository orientation
 
-Windows boot-time update automation. Runs package managers (Winget, Chocolatey, PSWindowsUpdate) and reboots in a loop until no pending reboots remain, then self-removes.
+- This is a Windows PowerShell 7 updater whose correctness depends on real Windows identities, Task Scheduler, package-manager exit codes, and reboot persistence.
+- Read `README.md` for supported behavior and `docs/TESTING.md` before changing lifecycle, launcher, task, mutex, state, or reboot logic.
+- Treat `Invoke-BootUpdateCycle.ps1` as the authoritative orchestrator and `upd.cmd` plus `tools/Invoke-UpdLauncher.ps1` as one launcher system.
+- Preserve CRLF bytes in `upd.cmd`; its tests enforce this because `cmd.exe` can misparse LF-only launchers.
 
-## Architecture
+## Working safely
 
-**Two deployment models:**
+- The checkout may be inside Google Drive. Keep edits narrow, preserve unrelated changes, and do not bulk-copy another tree over the repository.
+- Never place credentials, webhook URLs, tokens, or passwords in tracked files, task arguments, command lines, or chat. Use Windows Credential Manager and the existing credential helpers.
+- Do not run the live update cycle, install packages, register continuation tasks, or reboot a machine merely to test a code change unless the user explicitly authorized that live-system effect.
+- Do not replace `upd.cmd` while `cmd.exe` is reading it. Preserve the verified trampoline and the v2.5.43 compatibility bridge.
+- The global mutex is a fail-closed safety boundary shared by elevated-user and SYSTEM tasks. Preserve its explicit SYSTEM/Administrators ACL.
 
-1. **Modular scripts** (development/testing):
-   - `Invoke-BootUpdateCycle.ps1` - Main orchestrator with full ShouldProcess support
-   - `Register-BootUpdateTask.ps1` - Creates scheduled task pointing to the above
-   - `Unregister-BootUpdateTask.ps1` - Cleanup utility
+## Verification
 
-2. **Single-file deployment** (`Deploy-BootUpdateCycle.ps1`):
-   - Paste-to-console approach - copy entire script into elevated pwsh
-   - Embeds `Invoke-BootUpdateCycle.ps1` as a here-string
-   - **Direct-first-run**: Executes first iteration in user context (not via scheduled task)
-   - Only registers scheduled task IF reboots are needed
+- Run `./tools/Invoke-TestGates.ps1` from elevated PowerShell 7 for lifecycle or launcher changes.
+- If elevation or network access is unavailable, use the documented skip switches and report skipped gates as **not run**, never passed.
+- Use the immutable published-launcher and user/SYSTEM gates; a Pester count alone is not sufficient release evidence.
+- For release work, follow `docs/TESTING.md` and `tools/New-Release.ps1`; never publish merely because the working-tree tests pass.
 
-**Winget scope strategy:**
-- First run (user context): Updates BOTH user-scope AND machine-scope packages
-- Subsequent runs (SYSTEM via task): Machine-scope only
-- This is critical: user-scope packages are ONLY updated on the first interactive run
+## Claude Code notes
 
-**State persistence:** JSON file (`BootUpdateCycle.state.json`) tracks iteration count and which update phases completed. Reset on reboot to re-run all phases.
-
-**Safety:** Max iteration limit (default 5) prevents infinite reboot loops.
-
-## Key Files
-
-| File | Purpose |
-|------|---------|
-| `Deploy-BootUpdateCycle.ps1` | **Primary entry point** - paste-to-deploy single file |
-| `Invoke-BootUpdateCycle.ps1` | Full-featured orchestrator (reference implementation) |
-| `upd.cmd` | Launcher: `upd [delay_seconds \| splash]`; self-elevates, self-adds to PATH |
-| `Repair-AwsTooling.ps1` | Optional AWS CLI v2 + AWS.Tools module maintenance |
-| `tools/New-Release.ps1` | Release helper: validates tag/version/parse, publishes script assets + `.sha256` sidecars |
-
-## Common Operations
-
-```powershell
-# Deploy (paste entire Deploy-BootUpdateCycle.ps1 into elevated pwsh)
-
-# Monitor running cycle
-Get-Content "$env:ProgramData\BootUpdateCycle\BootUpdateCycle.log" -Tail 50 -Wait
-
-# View cycle history
-Get-Content "$env:ProgramData\BootUpdateCycle\BootUpdateCycle.history.json" | ConvertFrom-Json
-
-# Stop/remove
-Unregister-ScheduledTask -TaskName 'BootUpdateCycle' -Confirm:$false
-Remove-Item "$env:ProgramData\BootUpdateCycle" -Recurse -Force
-```
-
-## Update Phases (in order)
-
-1. **Pre-flight checks** (disk space, network, battery, conflicting installers, WU service)
-2. Winget (`winget upgrade --all --scope user` then `--scope machine`) — smart idle-aware timeout
-3. Chocolatey (`choco upgrade all -y`)
-4. Windows Update (PSWindowsUpdate module, excludes SQL Server)
-5. Driver/Firmware updates via PSWindowsUpdate (OFF by default — opt-in; `-IncludeDriverUpdates` / `-IncludeFirmwareUpdates`)
-6. AWS tooling repair (off by default, `-SkipAwsTooling:$false` to enable)
-7. Defender signature update (on by default, `-SkipDefender` to disable)
-8. pip global packages (on by default, `-SkipPip` to disable)
-9. npm global packages (on by default, `-SkipNpm` to disable)
-10. Office 365 Click-to-Run (on by default, `-SkipOffice365` to disable)
-11. PowerShell modules via `Update-Module` (on by default, `-SkipPowerShellModules` to disable)
-12. WSL kernel + distro updates (OFF by default — opt-in; `-UpdateWsl`; user-scoped, skipped under SYSTEM)
-13. Docker/Podman image refresh + prune (OFF by default — opt-in; `-UpdateContainers`; user-scoped, skipped under SYSTEM)
-14. Scoop packages (on by default, `-SkipScoop` to disable; user-scoped, skipped under SYSTEM)
-15. .NET global tools (OFF by default — high risk; `-SkipDotnetTools:$false` to enable)
-16. VS Code extensions (on by default, `-SkipVscode` to disable; user-scoped, skipped under SYSTEM)
-
-**Note:** Winget runs first for cleanest environment before Chocolatey potentially locks installers.
-
-**Parallelism:** Winget/Chocolatey/WindowsUpdate/DriverFirmware/AwsTooling run sequentially (they contend for the msiexec mutex or CBS/TrustedInstaller); Wsl/Containers sequential out of caution. Everything else — pip, npm, Scoop, .NET tools, VS Code, **Defender, Office 365, PowerShell modules** — runs concurrently as the ThreadJob parallel cohort after the sequential chain. In the cohort, Defender uses `MpCmdRun.exe -SignatureUpdate -MMPC` (process-based; the Defender PS module's WinPS-compat remoting is not ThreadJob-safe). Staged rollout still runs every phase one-per-boot via the original functions.
-
-## Additional Features
-
-- **Pre-flight checks**: Validates disk space (>5GB), network, battery, conflicting installers, WU service before each iteration
-- **Smart idle-aware timeouts**: Monitors process tree CPU activity; kills truly idle processes in 5 min but lets busy installs (VS, SQL) run to completion; hard timeout backstop
-- **Crash recovery**: Detects if prior run crashed mid-phase (BSOD, power loss); logs warning and restarts that phase
-- **Atomic state writes**: State file written via temp+rename to prevent corruption on power failure
-- **State schema versioning**: v1→v2 auto-migration for renamed properties and new package managers
-- **Log rotation**: 5 MB max per log, keeps 3 archives
-- **History tracking**: `BootUpdateCycle.history.json` stores last 50 cycle summaries with package counts
-- **Completion notifications**: BurntToast toast (user mode) and Windows Event Log (Application log, source: `BootUpdateCycle`)
-- **Reboot warnings**: `shutdown.exe /g /t 120` with native Windows countdown dialog; users can abort with `shutdown /a`. `/g` leverages ARSO (Automatic Restart Sign-On) to sign the user back in and restart registered apps where supported — no stored password; degrades to a plain restart otherwise
-- **Pending-reboot detail**: `Test-PendingReboot` logs WHY each signal is pending (e.g. FileRename op count + sample paths) and warns when consecutive reboots are driven by the identical signal set (stale-signal loop indicator)
-- **WU self-healing**: 2+ consecutive Windows Update failures (sidecar-file streak, survives reboots) trigger a one-per-streak component reset (SoftwareDistribution/catroot2 rename); DISM left manual
-- **WU prefetch**: Windows Update scan+download runs as a background job during Winget/Chocolatey; install stays sequential and collects the prefetch first
-- **DirectFirstRun mode** (default): First run executes in user console for user-scope winget access; task registered only if reboot needed
-- **ARSO user-context resume**: where Windows ARSO is available (checked via `Test-ArsoAvailable`: not SYSTEM, `DisableAutomaticRestartSignOn` policy unset, user not opted out), the post-reboot task is registered as the USER at logon — `shutdown /g` signs them back in, so user-scoped phases run on EVERY iteration. A `BootUpdateCycleFallback` SYSTEM task (startup +3 min, mutex-arbitrated) covers ARSO no-shows; without ARSO the classic SYSTEM-at-startup task is used. `Unregister-BootUpdateTask` and `Uninstall.ps1` remove both tasks
-- **Package filters**: `ExcludePatterns` accepts wildcards (`Mozilla.Firefox*`) or plain substrings; `IncludePatterns` flips to allowlist mode (exclude wins over include). Central matcher: `Test-PackageExcluded` (pip cohort scriptblock carries an inline copy)
-
-## Conventions
-
-- All scripts require PowerShell 7+ and elevation
-- **Deploy.ps1**: Copies Invoke.ps1 from source dir to ProgramData (no more embedded here-string duplication). Direct first run (user context), then SYSTEM scheduled task for post-reboot
-- **Invoke.ps1**: Self-contained orchestrator; can register its own scheduled task for reboot without needing Register.ps1
-- Log filters: spinner chars (`| / - \`), Unicode box-drawing/progress bars, any `Progress:` line, download progress lines, source refresh messages; consecutive duplicate lines collapse into one `(previous line repeated N more times)` summary
-- Progress suppressed at the source too: `choco upgrade ... --no-progress`, `winget ... --disable-interactivity --no-vt`
-- **Splash** (see bd memory `do-not-modify-ascii-art-splash-banner-screens`): theme 0 (neon gradient VT) is default; `BOOT_UPDATE_SPLASH_THEME=0|1|2` switches; `upd splash` / `-PreviewSplash` previews all three without running updates. Wordmark cells must stay spaces+background-color only (no Unicode glyphs). Pixel-true SVG sources live at `docs/img/splash-theme{0,1,2}.svg`; README embeds their click-safe PNG renders.
-- Update functions return `@{ Success = [bool]; Count = [int] }` — Success=$true means "don't retry" (fail-forward pattern)
-- State schema v3: all phase flags use `*Done` suffix consistently; versioned with auto-migration (v1→v2→v3)
-
-## Key Config Options
-
-| Option | Default | Purpose |
-|--------|---------|---------|
-| `DirectFirstRun` | `$true` | First run direct (user context) vs via task (SYSTEM) |
-| `PackageTimeoutMin` | `30` | Hard timeout ceiling per package manager |
-| `RebootDelaySec` | `120` | Seconds before reboot (user can abort) |
-| `SkipPip/Npm/Office365` | `$false` | Disable specific package managers |
-| `SkipPowerShellModules` | `$false` | Disable PowerShell module updates |
-| `SkipScoop` | `$false` | Disable Scoop updates (user-scoped) |
-| `SkipDotnetTools` | `$true` | .NET global tools (OFF — high risk) |
-| `SkipVscode` | `$false` | Disable VS Code extension updates (user-scoped) |
-| `SkipDefender` | `$false` | Disable Defender signature refresh |
-| `IncludeDriverUpdates` | `$false` | Opt-in: install driver updates via PSWindowsUpdate |
-| `IncludeFirmwareUpdates` | `$false` | Opt-in: install firmware updates via PSWindowsUpdate |
-| `UpdateWsl` | `$false` | Opt-in: update WSL kernel and distro packages (user-scoped) |
-| `UpdateContainers` | `$false` | Opt-in: pull updated Docker/Podman images and prune (user-scoped) |
-| `IncludePatterns` | `@()` | Allowlist mode: when non-empty, ONLY matching packages update (winget/choco/pip filtered paths) |
-| `NotificationLevel` | `Full` | Gate toast/webhook/email noise: `Full \| SuccessOnly \| ErrorsOnly \| None` (event log always written) |
-| `PreCycleScript` | `''` | Path to a .ps1 hook executed after pre-flight, before the first phase |
-| `PostCycleScript` | `''` | Path to a .ps1 hook executed after the final phase, before reboot decision |
-| `HooksConfig` | `hooks.psd1` (sidecar) | Path to PSD1 sidecar with per-phase scriptblock hooks |
-| `DisableSelfUpdate` | `$false` | Suppress GitHub self-update (lz1); also via `BOOT_UPDATE_NO_SELF_UPDATE` env var |
-| `ConfigUrl` | `''` | URL to fleet-wide JSON config overrides (jzw). Empty = disabled. |
-
-## Self-Update (lz1)
-
-`Invoke-BootUpdateCycle.ps1` can update itself from the canonical GitHub release at `https://github.com/nanoDBA/boot-upd`. On each user-context run (never under SYSTEM), it queries the GitHub Releases API, compares the latest tag to `$script:BootUpdateCycleVersion`, and — if a newer version is available — downloads the `Invoke-BootUpdateCycle.ps1` asset, validates it with `[scriptblock]::Create()`, checks SHA256 if metadata is present, then atomically replaces the live file (backing up to `.bak`) and re-execs `pwsh -NoProfile -File` with the same arguments. If anything fails the current version continues. Disable with `-DisableSelfUpdate` or the `BOOT_UPDATE_NO_SELF_UPDATE` environment variable (for test environments).
-
-**Deploy source self-update:** `Deploy-BootUpdateCycle.ps1` additionally refreshes the SOURCE copies of both `Invoke-BootUpdateCycle.ps1` and `Deploy-BootUpdateCycle.ps1` (itself) from the latest release before deploying — same validation (parse + SHA256 + atomic replace with `.bak`), same `BOOT_UPDATE_NO_SELF_UPDATE` opt-out. Without this, every deploy would re-copy the stale source and re-download the same update. `upd.cmd` is intentionally NOT auto-updated (cmd reads batch files incrementally; replacing a running one is unsafe).
-
-## Releasing
-
-Use `tools/New-Release.ps1 -Tag vX.Y.Z -Title '...' -Notes '...'` (or `-NotesPath`). It verifies the tag matches Invoke's embedded version, parse-checks both scripts, and publishes them with `.sha256` sidecar assets — the sidecars are what activate the SHA256 integrity checks in both self-update paths. Also bump `RELEASE_NOTES.md` and commit before releasing.
-
-## Remote Configuration (jzw)
-
-Pass `-ConfigUrl <https://...>` to supply a fleet-wide JSON config override URL. `Get-RemoteConfig` fetches the URL (10 s timeout) and caches the result to `$env:ProgramData\BootUpdateCycle\remote-config.cache.json`. On network failure it falls back to the cache. `Apply-RemoteConfig` then overwrites any `$script:*` variable whose matching key appears in the JSON, **except** keys the operator explicitly passed on the command line (user always wins). Supported JSON keys: `ExcludePatterns`, `IncludePatterns`, `NotificationLevel`, `MaxIterations`, `RebootDelaySec`, `PackageTimeoutMinutes`, `MaintenanceWindowStart`, `MaintenanceWindowEnd`, `SkipPip`, `SkipNpm`, `SkipScoop`, `SkipDotnetTools`, `SkipVscode`, `SkipPowerShellModules`, `SkipOffice365`, `SkipAwsTooling`, `SkipDefender`, `SkipBitLocker`, `SkipRestorePoint`, `SkipHealthCheck`, `IncludeDriverUpdates`, `IncludeFirmwareUpdates`, `UpdateWsl`, `UpdateContainers`, `AllowMetered`, `DisableSelfUpdate`, `StagedRollout`.
-
-## Extension Hooks
-
-Two complementary hook mechanisms allow you to extend the orchestrator without modifying it.
-
-### Cycle-level hooks (`-PreCycleScript` / `-PostCycleScript`)
-
-Pass the path to a `.ps1` file. The script is dot-sourced (not spawned), so it runs in the same scope as the orchestrator.
-
-- **PreCycle** fires after pre-flight checks pass and after the max-iterations safety check, immediately before the first update phase. It does NOT fire on abort paths (mutex collision, metered connection abort, pre-flight hard block).
-- **PostCycle** fires after the final phase completes, before the reboot/completion decision is made. It fires on: normal cycle completion (no pending reboots), and max-iterations exceeded termination. It does NOT fire on the reboot path (the next boot is a new cycle invocation).
-
-If the path does not exist, a Warn is logged and execution continues. Exceptions in the hook are caught and logged at Warn — they never abort the cycle.
-
-### Per-phase hooks (`hooks.psd1` sidecar)
-
-Create a file named `hooks.psd1` in the same directory as `Invoke-BootUpdateCycle.ps1` (or pass `-HooksConfig` with an alternate path). The file must evaluate to a hashtable of scriptblocks:
-
-```powershell
-@{
-    BeforeWinget            = { Write-Host 'About to run Winget' }
-    AfterWinget             = { Write-Host 'Winget done' }
-    BeforeChoco             = { ... }
-    AfterChoco              = { ... }
-    BeforeWindowsUpdate     = { ... }
-    AfterWindowsUpdate      = { ... }
-    BeforeDriverFirmware    = { ... }
-    AfterDriverFirmware     = { ... }
-    BeforeAwsTooling        = { ... }
-    AfterAwsTooling         = { ... }
-    BeforeWsl               = { ... }
-    AfterWsl                = { ... }
-    BeforeContainers        = { ... }
-    AfterContainers         = { ... }
-    # Parallel cohort — hooks fire on the parent thread (approximate order)
-    BeforePip               = { ... }; AfterPip               = { ... }
-    BeforeNpm               = { ... }; AfterNpm               = { ... }
-    BeforeScoop             = { ... }; AfterScoop             = { ... }
-    BeforeDotnetTools       = { ... }; AfterDotnetTools       = { ... }
-    BeforeVscode            = { ... }; AfterVscode            = { ... }
-    BeforeDefender          = { ... }; AfterDefender          = { ... }
-    BeforeOffice365         = { ... }; AfterOffice365         = { ... }
-    BeforePowerShellModules = { ... }; AfterPowerShellModules = { ... }
-}
-```
-
-Only keys present in the hashtable are called. Missing keys are silently skipped. Exceptions are caught and logged at Warn.
-
-**Parallel cohort note:** Pip, Npm, Scoop, DotnetTools, Vscode, Defender, Office365, and PowerShellModules run as ThreadJob workers in isolated runspaces. Their Before hooks fire on the parent thread before the job batch launches; their After hooks fire on the parent thread as each job result is collected. This is approximate — not guaranteed to interleave with the actual job execution timeline.
-
-### Scope and safety
-
-All hooks (both cycle-level and per-phase) run in the same PowerShell scope as the orchestrator. They can read `$state`, `$script:PackageTimeoutMinutes`, `$script:LogPath`, and all other `$script:*` variables. Mutations are possible but unsupported — the orchestrator's state machine is authoritative.
-
-The `hooks.psd1` file is evaluated as a scriptblock, not parsed in safe mode, so it can contain full PowerShell expressions. Treat it as local privileged code.
-
-
-<!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
-## Beads Issue Tracker
-
-This project uses **bd (beads)** for issue tracking. Run `./tools/Invoke-Beads.ps1 prime` to see full workflow context and commands.
-
-On Windows, run tracker commands through `./tools/Invoke-Beads.ps1` so the central Dolt password is retrieved directly from Windows Credential Manager and cleared after each invocation. The command tables use `bd` as shorthand.
-
-On a new Windows checkout, run `./tools/Initialize-BeadsCredential.ps1` once. It reuses an existing named credential when available; otherwise it prompts twice without echo and stores the password in Windows Credential Manager. Use `-Replace` only when intentionally rotating the credential.
-
-### Quick Reference
-
-```bash
-bd ready              # Find available work
-bd show <id>          # View issue details
-bd update <id> --claim  # Claim work
-bd close <id>         # Complete work
-```
-
-### Rules
-
-- Use `bd` for ALL task tracking — do NOT use TodoWrite, TaskCreate, or markdown TODO lists
-- Run `./tools/Invoke-Beads.ps1 prime` for detailed command reference and session close protocol
-- Use `bd remember` for persistent knowledge — do NOT use MEMORY.md files
-
-## Session Completion
-
-**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
-
-**MANDATORY WORKFLOW:**
-
-1. **File issues for remaining work** - Create issues for anything that needs follow-up
-2. **Run quality gates** (if code changed) - Tests, linters, builds
-3. **Update issue status** - Close finished work, update in-progress items
-4. **PUSH TO REMOTE** - This is MANDATORY:
-   ```bash
-   git pull --rebase
-   ./tools/Invoke-Beads.ps1 export -o .beads/issues.jsonl   # bd writes land directly on the central Dolt server (boot_upd @ 100.88.59.72:3336); do NOT run `bd dolt push` (obsolete since the 2026-07-06 cutover — see bd memory beads-central-cutover)
-   git push
-   git status  # MUST show "up to date with origin"
-   ```
-5. **Clean up** - Clear stashes, prune remote branches
-6. **Verify** - All changes committed AND pushed
-7. **Hand off** - Provide context for next session
-
-**CRITICAL RULES:**
-- Work is NOT complete until `git push` succeeds
-- NEVER stop before pushing - that leaves work stranded locally
-- NEVER say "ready to push when you are" - YOU must push
-- If push fails, resolve and retry until it succeeds
-<!-- END BEADS INTEGRATION -->
-
-
-<!-- BEGIN CROSS_PROJECT_MAP_POINTER -->
-## Cross-project map
-
-Workspace-wide knowledge file: `C:\Users\LarsR\OneDrive\!Repos\skillz\cross-project-map.md` (OneDrive-synced, surfaces across machines). Indexes all active Claude Code projects on this laptop plus the reusable skills exposed by each project's `.claude/skills/` folder.
-
-**Use for**: project-spanning facts, cross-referencing skills from other projects, recording decisions/conventions that affect multiple projects.
-
-**Do NOT use for**: project-internal task state (use `bd` here), local code conventions (use this project's other docs).
-
-Per-project `bd` remains authoritative for project-internal state. The skillz file is the shared layer above that.
-<!-- END CROSS_PROJECT_MAP_POINTER -->
+- Use project skills `/test-gates` and `/reboot-resilience-review` when applicable.
+- Store durable project knowledge with `./tools/Invoke-Beads.ps1 remember`; Claude auto-memory is supplementary, not authoritative.
+- Use `/context` to confirm this file and its `AGENTS.md` import loaded.
