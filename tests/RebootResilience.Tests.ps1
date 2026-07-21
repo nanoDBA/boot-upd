@@ -39,6 +39,9 @@ BeforeAll {
           'Get-WingetOutputSummary',
           'Get-WingetRemediationCommand',
           'Complete-WingetFailureClassification',
+          'Register-WingetAggressiveRepairAttempt',
+          'Set-BootUpdateClipboardText',
+          'Stop-BootUpdateForManualAttention',
           'Write-BootUpdateRepairPlan'
     )) {
         . ([scriptblock]::Create((Get-FunctionText $invokeAst $functionName)))
@@ -103,14 +106,38 @@ Describe 'Concise provider diagnostics' {
         (Complete-WingetFailureClassification -State $state -Failures @($changed)).TerminalFailure | Should -BeFalse
     }
 
+    It 'registers each aggressive Winget repair signature only once' {
+        $state = [pscustomobject]@{ WingetAggressiveRepairSignatures=@() }
+
+        Register-WingetAggressiveRepairAttempt -State $state -Signature 'Corsair.iCUE.5:3221226525' |
+            Should -BeTrue
+        Register-WingetAggressiveRepairAttempt -State $state -Signature 'Corsair.iCUE.5:3221226525' |
+            Should -BeFalse
+        Register-WingetAggressiveRepairAttempt -State $state -Signature 'Microsoft.WindowsPCHealthCheck:1612' |
+            Should -BeTrue
+        @($state.WingetAggressiveRepairSignatures).Count | Should -Be 2
+    }
+
+    It 'classifies Winget failures before deciding whether to run aggressive repair' {
+        $winget = Get-FunctionText $invokeAst 'Update-WingetPackages'
+        foreach ($repairIndex in [regex]::Matches($winget, 'Invoke-WingetAggressiveRepair') | ForEach-Object Index) {
+            $classificationIndex = $winget.LastIndexOf('Complete-WingetFailureClassification', $repairIndex)
+            $classificationIndex | Should -BeGreaterThan -1
+            $classificationIndex | Should -BeLessThan $repairIndex
+        }
+        $winget | Should -Match 'identical failure signature already attempted; verification only'
+    }
+
     It 'writes a durable plan with explanations outside a valid cmd copy block' {
         $script:InstallDir = $TestDrive
-        Mock Set-Clipboard { }
+        Mock Set-BootUpdateClipboardText { $true }
         $items = @(
             [pscustomobject]@{ Name='Health Check'; Id='Microsoft.WindowsPCHealthCheck'; Code=1612; Hex='0x0000064C'; Command='winget repair --id Microsoft.WindowsPCHealthCheck -e --force' },
             [pscustomobject]@{ Name='iCUE'; Id='Corsair.iCUE.5'; Code=3221226525; Hex='0xC000041D'; Command='winget install --id Corsair.iCUE.5 -e --force' }
         )
-        $path = Write-BootUpdateRepairPlan -Items $items
+        $result = Write-BootUpdateRepairPlan -Items $items
+        $path = $result.Path
+        $result.ClipboardCopied | Should -BeTrue
         Test-Path -LiteralPath $path | Should -BeTrue
         $lines = Get-Content -LiteralPath $path
         $blockStart = [array]::IndexOf($lines,'COPY/PASTE BLOCK — ELEVATED COMMAND PROMPT') + 1
@@ -118,6 +145,31 @@ Describe 'Concise provider diagnostics' {
         @($block | Where-Object { $_ -notmatch '^(?:REM(?:\s|$)|winget\s|upd$)' }).Count | Should -Be 0
         ($block -join "`n") | Should -Match 'winget repair --id Microsoft\.WindowsPCHealthCheck'
         ($block -join "`n") | Should -Match 'winget install --id Corsair\.iCUE\.5'
+    }
+
+    It 'times out a blocked clipboard helper and disposes it without losing the repair plan' {
+        $fakeInput = [pscustomobject]@{}
+        $fakeInput | Add-Member ScriptMethod WriteLine { param($value) }
+        $fakeInput | Add-Member ScriptMethod Close { }
+        $fake = [pscustomobject]@{ StandardInput=$fakeInput; ExitCode=0; Killed=$false; Disposed=$false }
+        $fake | Add-Member ScriptMethod WaitForExit { param($milliseconds) return $false }
+        $fake | Add-Member ScriptMethod Kill { param($tree) $this.Killed = $true }
+        $fake | Add-Member ScriptMethod Dispose { $this.Disposed = $true }
+
+        Set-BootUpdateClipboardText -Value 'C:\repair-plan.txt' -TimeoutMilliseconds 100 -ProcessFactory { $fake } |
+            Should -BeFalse
+        $fake.Killed | Should -BeTrue
+        $fake.Disposed | Should -BeTrue
+    }
+
+    It 'reports a durable repair plan even when clipboard delivery is unavailable' {
+        $script:InstallDir = $TestDrive
+        Mock Set-BootUpdateClipboardText { $false }
+        $item = [pscustomobject]@{ Name='iCUE'; Id='Corsair.iCUE.5'; Code=1; Hex='0x00000001'; Command='winget install --id Corsair.iCUE.5 -e' }
+        $result = Write-BootUpdateRepairPlan -Items @($item)
+
+        Test-Path -LiteralPath $result.Path | Should -BeTrue
+        $result.ClipboardCopied | Should -BeFalse
     }
 
     It 'renders signed provider HRESULTs in recognizable hexadecimal form' {
@@ -419,6 +471,47 @@ Describe 'Behavioral completion disposition' {
         $cycle | Should -Match "disposition\.Kind -eq 'Attention'[\s\S]*?Stop-BootUpdateForManualAttention"
     }
 
+    It 'still disarms and presents the durable repair path when checkpoint persistence fails' {
+        $script:UnregisterCalls = 0
+        $script:FailUnregister = $false
+        $script:StatePath = 'C:\ProgramData\BootUpdateCycle\BootUpdateCycle.state.json'
+        $script:LogPath = 'C:\ProgramData\BootUpdateCycle\BootUpdateCycle.log'
+        Mock Set-BootUpdateState { throw 'simulated checkpoint write failure' }
+        Mock Write-BootUpdateRepairPlan {
+            [pscustomobject]@{ Path='C:\ProgramData\BootUpdateCycle\BootUpdateCycle-repair-plan.txt'; ClipboardCopied=$false }
+        }
+        Mock Show-CycleBanner { }
+        $state = [pscustomobject]@{ Phase='RetryPending'; LimitReachedAt=$null; LimitReason=$null }
+        $phase = [pscustomobject]@{
+            Name='Winget'; AttentionDetails=@([pscustomobject]@{ Name='iCUE'; Id='Corsair.iCUE.5'; Code=1; Hex='0x00000001' })
+        }
+
+        { Stop-BootUpdateForManualAttention -State $state -Phases @($phase) } | Should -Not -Throw
+        $script:UnregisterCalls | Should -Be 1
+        Should -Invoke Show-CycleBanner -Times 1 -ParameterFilter {
+            ($Info -join "`n") -match 'clipboard unavailable' -and
+            ($Info -join "`n") -match 'diagnostic state could not be saved'
+        }
+    }
+
+    It 'still presents terminal attention when repair-plan generation throws' {
+        $script:UnregisterCalls = 0
+        $script:FailUnregister = $false
+        $script:StatePath = 'C:\ProgramData\BootUpdateCycle\BootUpdateCycle.state.json'
+        $script:LogPath = 'C:\ProgramData\BootUpdateCycle\BootUpdateCycle.log'
+        Mock Set-BootUpdateState { }
+        Mock Write-BootUpdateRepairPlan { throw 'simulated repair-plan failure' }
+        Mock Show-CycleBanner { }
+        $state = [pscustomobject]@{ Phase='RetryPending'; LimitReachedAt=$null; LimitReason=$null }
+        $phase = [pscustomobject]@{ Name='Winget'; AttentionDetails=@() }
+
+        { Stop-BootUpdateForManualAttention -State $state -Phases @($phase) } | Should -Not -Throw
+        $script:UnregisterCalls | Should -Be 1
+        Should -Invoke Show-CycleBanner -Times 1 -ParameterFilter {
+            ($Info -join "`n") -match 'Repair-plan creation failed'
+        }
+    }
+
     It 'retains a user-context pass when only user-scoped work remains' {
         $result = Resolve-BootUpdateCompletionDisposition -IncompletePhases @(
             [pscustomobject]@{ Name='Scoop'; UserCompletionDeferred=$true }
@@ -460,6 +553,14 @@ Describe 'Behavioral Windows Update convergence' {
         $result = Test-WindowsUpdateConvergence
         $result.Verified | Should -BeTrue
         $result.Count | Should -Be 0
+    }
+
+    It 'does not count the legacy empty applicable marker as an update' {
+        Mock Invoke-BootUpdateBackgroundOperation { [pscustomobject]@{ Output=@('BOOTUPDATE_APPLICABLE||'); Failed=$false; TimedOut=$false } }
+        $result = Test-WindowsUpdateConvergence
+        $result.Verified | Should -BeTrue
+        $result.Count | Should -Be 0
+        Assert-MockCalled Write-Log -Times 0 -ParameterFilter { $Message -like 'Final WU scan:*' }
     }
 
     It 'reports remaining applicable updates' {

@@ -1,10 +1,17 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.52
+**Current Version:** v2.5.53
 **Release Date:** 2026-07-21
 **Status:** STABLE
 
 ---
+
+## v2.5.53 (2026-07-21)
+
+- Fixes false Windows Update work remaining when an empty scan result was serialized as `BOOTUPDATE_APPLICABLE||`.
+- Records each aggressive Winget failure signature before repair and never repeats force repair/reinstall for the same package/error set; the next pass is verification-only.
+- Makes the manual-attention repair plan and terminal banner resilient to unavailable or blocked clipboard services, with a bounded clipboard helper and truthful fallback messaging.
+- Continues disarming automatic resume tasks and presenting the durable repair path even if checkpoint persistence or NTFS compression fails.
 
 ## v2.5.52 (2026-07-21)
 

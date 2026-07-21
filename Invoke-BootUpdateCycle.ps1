@@ -340,7 +340,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 4 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.52' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.53' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 Set-Variable -Name 'RebootSignalSettleSeconds' -Value 20 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 $script:ExplicitRebootRequests = [System.Collections.Generic.List[object]]::new()
 
@@ -913,7 +913,7 @@ function Complete-WingetFailureClassification {
         Set-BootUpdateState -State $State
         $repairPlan = Join-Path $script:InstallDir 'BootUpdateCycle-repair-plan.txt'
         Remove-Item -LiteralPath $repairPlan -Force -ErrorAction SilentlyContinue
-        return [pscustomobject]@{ TerminalFailure=$false; Details=@() }
+        return [pscustomobject]@{ Signature=''; TerminalFailure=$false; Details=@() }
     }
     $prior = if ($State.PSObject.Properties.Name -contains 'WingetFailureSignature') { [string]$State.WingetFailureSignature } else { '' }
     $priorCount = if ($State.PSObject.Properties.Name -contains 'WingetFailureRepeatCount') { [int]$State.WingetFailureRepeatCount } else { 0 }
@@ -923,6 +923,7 @@ function Complete-WingetFailureClassification {
     Set-BootUpdateState -State $State
     $persistent = $repeat -ge 2
     return [pscustomobject]@{
+        Signature=$signature
         TerminalFailure=$persistent
         Details=@($Failures | ForEach-Object {
             [pscustomobject]@{
@@ -931,6 +932,28 @@ function Complete-WingetFailureClassification {
             }
         })
     }
+}
+
+function Register-WingetAggressiveRepairAttempt {
+    param(
+        [Parameter(Mandatory)][pscustomobject]$State,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Signature
+    )
+    $attempted = if ($State.PSObject.Properties.Name -contains 'WingetAggressiveRepairSignatures') {
+        @($State.WingetAggressiveRepairSignatures | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+    } else { @() }
+    if ($attempted -contains $Signature) { return $false }
+
+    # Persist before invoking force/repair operations. A crash must not cause the
+    # same known-bad package set to receive another aggressive repair next pass.
+    $combined = [string[]](@($attempted) + @($Signature))
+    if ($State.PSObject.Properties.Name -contains 'WingetAggressiveRepairSignatures') {
+        $State.WingetAggressiveRepairSignatures = $combined
+    } else {
+        $State | Add-Member -NotePropertyName WingetAggressiveRepairSignatures -NotePropertyValue $combined
+    }
+    Set-BootUpdateState -State $State
+    return $true
 }
 
 function Invoke-WingetAggressiveRepair {
@@ -1071,6 +1094,7 @@ function New-BootUpdateStateV2 {
         ConsecutiveRetryCount = 0
         LastBootSessionId     = $null
         ExplicitRebootRequests = @()
+        WingetAggressiveRepairSignatures = @()
         ResumeUser            = $null
         Summary               = [pscustomobject]@{
             Winget = 0; Chocolatey = 0; WindowsUpdate = 0; Pip = 0; Npm = 0; Office365 = 0
@@ -1130,6 +1154,7 @@ function Update-BootUpdateStateSchema {
     if ($props -notcontains 'RebootCount') { $State | Add-Member -NotePropertyName 'RebootCount' -NotePropertyValue ([math]::Max(0, [int]$State.Iteration - 1)) -Force }
     if ($props -notcontains 'ConsecutiveRetryCount') { $State | Add-Member -NotePropertyName 'ConsecutiveRetryCount' -NotePropertyValue 0 -Force }
     if ($props -notcontains 'ExplicitRebootRequests') { $State | Add-Member -NotePropertyName 'ExplicitRebootRequests' -NotePropertyValue @() -Force }
+    if ($props -notcontains 'WingetAggressiveRepairSignatures') { $State | Add-Member -NotePropertyName 'WingetAggressiveRepairSignatures' -NotePropertyValue @() -Force }
     foreach ($f in @('WindowsUpdateDone','AwsToolingDone','PowerShellModulesDone','ScoopDone','DotnetToolsDone','VscodeDone','DefenderDone','DriverFirmwareDone','WslDone','ContainersDone')) {
         if ($props -notcontains $f) { $State | Add-Member -NotePropertyName $f -NotePropertyValue $false -Force }
     }
@@ -1705,26 +1730,82 @@ function Stop-BootUpdateForManualAttention {
     $State.Phase = 'AttentionRequired'
     $State.LimitReachedAt = [datetime]::UtcNow.ToString('o')
     $State.LimitReason = if ($details) { "$reason — $details" } else { $reason }
-    Set-BootUpdateState -State $State
+    $statePersisted = $true
+    try { Set-BootUpdateState -State $State } catch {
+        $statePersisted = $false
+        Write-Log "Manual-attention checkpoint could not be persisted: $_" -Level Error
+    }
     $disarmed = $true
     try { Unregister-BootUpdateTask } catch {
         $disarmed = $false
         $State.Phase = 'AttentionDisarmFailed'
         $State.LimitReason = "$($State.LimitReason) Continuation-task removal failed: $($_.Exception.Message)"
-        Set-BootUpdateState -State $State
+        try { Set-BootUpdateState -State $State } catch {
+            $statePersisted = $false
+            Write-Log "Manual-attention disarm failure could not be added to the checkpoint: $_" -Level Error
+        }
     }
     $disposition = if ($disarmed) { 'Automatic continuation tasks were removed and verified absent.' } else { 'WARNING: continuation-task removal failed; remove both BootUpdateCycle tasks manually.' }
-    $planPath = Write-BootUpdateRepairPlan -Items $repairItems
+    $plan = $null
+    try { $plan = Write-BootUpdateRepairPlan -Items $repairItems } catch {
+        Write-Log "Manual repair-plan handoff failed after retries were stopped: $_" -Level Error
+    }
     Write-Log "$($State.LimitReason) $disposition" -Level Error
     Send-CompletionNotification -Kind Error -Title 'Boot Update Cycle NEEDS ATTENTION' -Message "$($State.LimitReason). $disposition"
     Show-CycleBanner -Title 'M A N U A L   A T T E N T I O N   N E E D E D' -AnsiColor "$([char]27)[31m" -Info @(
         'Automatic retries stopped because the same non-transient failure repeated.'
         "Incomplete phase(s): $names"
         $(if ($details) { "Failures: $details" } else { 'See the diagnostic log for the exact provider failure.' })
-        $(if ($planPath) { "Repair plan (path copied to clipboard): $planPath" } else { 'Repair-plan creation failed; use upd logs for diagnostics.' })
+        $(if ($plan) {
+            if ($plan.ClipboardCopied) { "Repair plan (path copied to clipboard): $($plan.Path)" }
+            else { "Repair plan: $($plan.Path) (clipboard unavailable; copy this path manually)" }
+        } else { 'Repair-plan creation failed; use upd logs for diagnostics.' })
         $disposition
-        "Diagnostic state preserved: $($script:StatePath)"
+        $(if ($statePersisted) { "Diagnostic state preserved: $($script:StatePath)" } else { "WARNING: diagnostic state could not be saved; preserve the log at $($script:LogPath)" })
     )
+}
+
+function Set-BootUpdateClipboardText {
+    <# Clipboard APIs can block indefinitely in a SYSTEM or disconnected session.
+       Use the native helper in a bounded child process and make clipboard delivery
+       best-effort: the repair plan on disk remains the authoritative handoff. #>
+    param(
+        [Parameter(Mandatory)][string]$Value,
+        [ValidateRange(100,10000)][int]$TimeoutMilliseconds = 2000,
+        [Parameter(DontShow)][scriptblock]$ProcessFactory
+    )
+    $process = $null
+    try {
+        if ($ProcessFactory) {
+            $process = & $ProcessFactory
+        } else {
+            $startInfo = [Diagnostics.ProcessStartInfo]::new()
+            $startInfo.FileName = 'clip.exe'
+            $startInfo.UseShellExecute = $false
+            $startInfo.CreateNoWindow = $true
+            $startInfo.RedirectStandardInput = $true
+            $process = [Diagnostics.Process]::new()
+            $process.StartInfo = $startInfo
+            if (-not $process.Start()) { throw 'clip.exe did not start.' }
+        }
+        $process.StandardInput.WriteLine($Value)
+        $process.StandardInput.Close()
+        if (-not $process.WaitForExit($TimeoutMilliseconds)) {
+            try { $process.Kill($true) } catch { try { $process.Kill() } catch { } }
+            Write-Log "Clipboard copy timed out after $TimeoutMilliseconds ms; the repair plan remains on disk." -Level Warn
+            return $false
+        }
+        if ($process.ExitCode -ne 0) {
+            Write-Log "Clipboard helper exited with code $($process.ExitCode); the repair plan remains on disk." -Level Warn
+            return $false
+        }
+        return $true
+    } catch {
+        Write-Log "Clipboard copy unavailable; the repair plan remains on disk: $_" -Level Warn
+        return $false
+    } finally {
+        if ($process) { try { $process.Dispose() } catch { } }
+    }
 }
 
 function Write-BootUpdateRepairPlan {
@@ -1748,10 +1829,12 @@ function Write-BootUpdateRepairPlan {
     $lines.Add('upd')
     try {
         [IO.File]::WriteAllLines($path,$lines,[Text.UTF8Encoding]::new($true))
-        Enable-BootUpdateNtfsCompression -Path $path
-        try { Set-Clipboard -Value $path -ErrorAction Stop } catch { try { $path | clip.exe } catch { } }
+        try { Enable-BootUpdateNtfsCompression -Path $path } catch {
+            Write-Log "Manual repair plan compression was skipped: $_" -Level Warn
+        }
+        $clipboardCopied = Set-BootUpdateClipboardText -Value $path
         Write-Log "Manual repair plan written: $path" -Level Warn
-        return $path
+        return [pscustomobject]@{ Path=$path; ClipboardCopied=[bool]$clipboardCopied }
     } catch {
         Write-Log "Manual repair plan could not be written: $_" -Level Error
         return $null
@@ -2091,10 +2174,14 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
             Write-Log '  [WHATIF] Would run: winget upgrade --all --scope user (parallel)'
             Write-Log '  [WHATIF] Would run: winget upgrade --all --scope machine (parallel)'
         }
-        if ($script:AggressiveRepair -and $script:CurrentWingetFailures.Count) {
-            Invoke-WingetAggressiveRepair -WingetPath $wingetPath -Failures $script:CurrentWingetFailures.ToArray() -TimeoutMinutes $TimeoutMinutes
-        }
         $classification = Complete-WingetFailureClassification -State $script:CurrentState -Failures $script:CurrentWingetFailures.ToArray()
+        if ($script:AggressiveRepair -and $classification.Signature) {
+            if (Register-WingetAggressiveRepairAttempt -State $script:CurrentState -Signature $classification.Signature) {
+                Invoke-WingetAggressiveRepair -WingetPath $wingetPath -Failures $script:CurrentWingetFailures.ToArray() -TimeoutMinutes $TimeoutMinutes
+            } else {
+                Write-Log 'Winget aggressive repair: identical failure signature already attempted; verification only.' -Level Warn
+            }
+        }
         if ($script:CurrentWingetFailures.Count -and -not $classification.TerminalFailure) {
             Write-Log 'Winget: one automatic verification pass remains; manual commands are withheld unless the same failure repeats.' -Level Warn
         }
@@ -2223,10 +2310,14 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
             }
         }
     }
-    if ($script:AggressiveRepair -and $script:CurrentWingetFailures.Count) {
-        Invoke-WingetAggressiveRepair -WingetPath $wingetPath -Failures $script:CurrentWingetFailures.ToArray() -TimeoutMinutes $TimeoutMinutes
-    }
     $classification = Complete-WingetFailureClassification -State $script:CurrentState -Failures $script:CurrentWingetFailures.ToArray()
+    if ($script:AggressiveRepair -and $classification.Signature) {
+        if (Register-WingetAggressiveRepairAttempt -State $script:CurrentState -Signature $classification.Signature) {
+            Invoke-WingetAggressiveRepair -WingetPath $wingetPath -Failures $script:CurrentWingetFailures.ToArray() -TimeoutMinutes $TimeoutMinutes
+        } else {
+            Write-Log 'Winget aggressive repair: identical failure signature already attempted; verification only.' -Level Warn
+        }
+    }
     if ($script:CurrentWingetFailures.Count -and -not $classification.TerminalFailure) {
         Write-Log 'Winget: one automatic verification pass remains; manual commands are withheld unless the same failure repeats.' -Level Warn
     }
@@ -2470,12 +2561,16 @@ function Test-WindowsUpdateConvergence {
                 Import-Module PSWindowsUpdate -Force
                 @(Get-WindowsUpdate -NotTitle $ExcludedTitle `
                     -RootCategories @('Security Updates','Critical Updates','Definition Updates') `
-                    -IgnoreReboot -Confirm:$false -ErrorAction Stop) | ForEach-Object {
+                    -IgnoreReboot -Confirm:$false -ErrorAction Stop) |
+                    Where-Object { $null -ne $_ } | ForEach-Object {
                         "BOOTUPDATE_APPLICABLE|$($_.KB)|$($_.Title)"
                     }
             } catch { "BOOTUPDATE_ERROR|$($_.Exception.Message)" }
         } -ArgumentList @($notTitle)
-    $updates = @($result.Output | Where-Object { $_ -match '^BOOTUPDATE_APPLICABLE\|' })
+    <# @($null) contains one element in PowerShell. Older scan workers therefore
+       emitted BOOTUPDATE_APPLICABLE|| for a clean, empty result. Require a real
+       title after the second delimiter so that sentinel cannot become an update. #>
+    $updates = @($result.Output | Where-Object { $_ -match '^BOOTUPDATE_APPLICABLE\|[^|]*\|\S' })
     $errors = @($result.Output | Where-Object { $_ -match '^BOOTUPDATE_ERROR\|' })
     foreach ($line in $updates) { Write-Log "Final WU scan: $($line -replace '^BOOTUPDATE_APPLICABLE\|','')" -Level Warn }
     foreach ($line in $errors) { Write-Log "Final WU scan error: $($line -replace '^BOOTUPDATE_ERROR\|','')" -Level Error }
