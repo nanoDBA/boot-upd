@@ -343,8 +343,8 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
     }
 }
 
-Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 5 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.57' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 6 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.58' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 Set-Variable -Name 'RebootSignalSettleSeconds' -Value 20 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 $script:ExplicitRebootRequests = [System.Collections.Generic.List[object]]::new()
 
@@ -1210,7 +1210,7 @@ function New-BootUpdateStateV2 {
             Winget = 0; Chocolatey = 0; WindowsUpdate = 0; Pip = 0; Npm = 0; Office365 = 0
             PowerShellModules = 0; Scoop = 0; DotnetTools = 0; Vscode = 0
             Defender = 0; DriverFirmware = 0; Wsl = 0; Containers = 0
-            HealthFailed = 0
+            HealthFailed = 0; ActionsTriggered = 0
         }
     }
 }
@@ -1262,6 +1262,9 @@ function Update-BootUpdateStateSchema {
         if ($props -notcontains 'WindowsUpdateZeroEvidence') { $State | Add-Member -NotePropertyName 'WindowsUpdateZeroEvidence' -NotePropertyValue $null -Force }
     }
 
+    <# v5 -> v6: separate verified update counts from updater actions whose
+       providers do not report an exact changed-item count. #>
+
     $props = $State.PSObject.Properties.Name
     <# Add-if-missing: crash recovery, new phase flags, network-check cache #>
     foreach ($f in @('LastPhaseStarted','LastPhaseTimestamp','StagedNextPhase','LastPreflightNetworkOk','LastPreflightNetworkAt','LastRebootSignals','LastBootSessionId','ResumeUser','LimitReachedAt','LimitReason')) {
@@ -1284,7 +1287,7 @@ function Update-BootUpdateStateSchema {
             Winget = 0; Chocolatey = 0; WindowsUpdate = 0; Pip = 0; Npm = 0; Office365 = 0
             PowerShellModules = 0; Scoop = 0; DotnetTools = 0; Vscode = 0
             Defender = 0; DriverFirmware = 0; Wsl = 0; Containers = 0
-            HealthFailed = 0
+            HealthFailed = 0; ActionsTriggered = 0
         }
     } elseif ($State.Summary -is [hashtable]) {
         $ht = $State.Summary
@@ -1296,7 +1299,7 @@ function Update-BootUpdateStateSchema {
             DotnetTools = [int]($ht['DotnetTools'] ?? 0); Vscode = [int]($ht['Vscode'] ?? 0)
             Defender = [int]($ht['Defender'] ?? 0); DriverFirmware = [int]($ht['DriverFirmware'] ?? 0)
             Wsl = [int]($ht['Wsl'] ?? 0); Containers = [int]($ht['Containers'] ?? 0)
-            HealthFailed = [int]($ht['HealthFailed'] ?? 0)
+            HealthFailed = [int]($ht['HealthFailed'] ?? 0); ActionsTriggered = [int]($ht['ActionsTriggered'] ?? 0)
         }
     } else {
         $sp = $State.Summary.PSObject.Properties.Name
@@ -1305,6 +1308,9 @@ function Update-BootUpdateStateSchema {
         }
         if ($null -eq $State.Summary.HealthFailed) {
             $State.Summary | Add-Member -NotePropertyName 'HealthFailed' -NotePropertyValue 0 -Force
+        }
+        if ($null -eq $State.Summary.ActionsTriggered) {
+            $State.Summary | Add-Member -NotePropertyName 'ActionsTriggered' -NotePropertyValue 0 -Force
         }
     }
 
@@ -1406,6 +1412,7 @@ function Save-CycleHistory {
         Pip = $s.Pip; Npm = $s.Npm; Office365 = $s.Office365
         PowerShellModules = $s.PowerShellModules; Scoop = $s.Scoop; DotnetTools = $s.DotnetTools; Vscode = $s.Vscode
         HealthFailed = if ($null -ne $s.HealthFailed) { [int]$s.HealthFailed } else { 0 }
+        ActionsTriggered = if ($null -ne $s.ActionsTriggered) { [int]$s.ActionsTriggered } else { 0 }
         Total = $s.Winget + $s.Chocolatey + $s.WindowsUpdate + $s.Pip + $s.Npm + $s.Office365 + $s.PowerShellModules + $s.Scoop + $s.DotnetTools + $s.Vscode
     }
     $history = @()
@@ -3488,8 +3495,8 @@ function Update-Office365 {
                 Write-Log 'Office 365 update failed or timed out.' -Level Error
                 return @{ Success = $false; Count = 0 }
             }
-            Write-Log 'Office 365 update triggered (may complete in background)'
-            return @{ Success = $true; Count = 1 }
+            Write-Log 'Office 365 update triggered (provider does not report a verified changed-package count)'
+            return @{ Success = $true; Count = 0; Triggered = 1 }
         } catch { Write-Log "Office 365 error: $_" -Level Error; return @{ Success = $false; Count = 0 } }
     } else {
         Write-Log '  [WHATIF] Would run: OfficeC2RClient.exe /update user'
@@ -3773,9 +3780,9 @@ function Update-VscodeExtensions {
             if ($count -eq 0) {
                 $upToDate = $output | Where-Object { $_ -match '(?i)already installed|up.to.date' }
                 if ($upToDate) { Write-Log 'VS Code extensions: all up to date.'; $count = 0 }
-                else { Write-Log 'VS Code extensions: update ran (exact count unavailable).'; $count = 1 }
+                else { Write-Log 'VS Code extensions: update ran; verified changed-extension count unavailable.'; $count = 0 }
             } else { Write-Log "VS Code extensions: $count updated." }
-            return @{ Success = $true; Count = $count }
+            return @{ Success = $true; Count = $count; Triggered = 1 }
         } catch { Write-Log "VS Code error: $_" -Level Error; return @{ Success = $false; Count = 0 } }
     } else {
         Write-Log '  [WHATIF] Would run: code --update-extensions'
@@ -3818,80 +3825,102 @@ function Repair-AwsTooling {
 
 #region Health Check
 function Test-PostUpdateHealth {
-    <#
-    .SYNOPSIS
-        Verifies that critical Windows services are running after the update cycle.
-
-    .DESCRIPTION
-        Checks each service in CriticalServices.  If a service is stopped or
-        stop-pending, one non-blocking start attempt is made using a background
-        job with a 5-second timeout so a hung SCM call can never stall the cycle.
-        Never throws — health check failure must not abort cleanup.
-
-    .OUTPUTS
-        [PSCustomObject] with AllHealthy, FailedServices, CheckedServices.
-    #>
+    <# Read-only by design. Service repair is a separate mutation that requires
+       explicit user scope; a health check never implies that authorization. #>
     param(
-        [string[]]$CriticalServices = @('W32Time', 'WinDefend', 'Dnscache', 'Spooler', 'EventLog')
+        [string[]]$CriticalServices = @('W32Time', 'WinDefend', 'Dnscache', 'Spooler', 'EventLog'),
+        [Parameter(DontShow)][scriptblock]$ServiceProvider = {
+            param($Name) Get-Service -Name $Name -ErrorAction SilentlyContinue
+        },
+        [Parameter(DontShow)][scriptblock]$ConfigurationProvider = {
+            param($Name) Get-CimInstance Win32_Service -Filter "Name='$Name'" -ErrorAction SilentlyContinue
+        },
+        [Parameter(DontShow)][scriptblock]$DefenderStatusProvider = {
+            Get-MpComputerStatus -ErrorAction SilentlyContinue
+        }
     )
 
-    Write-Log '--- Post-Update Health Check ---'
-
-    $checked = [System.Collections.Generic.List[string]]::new()
-    $failed  = [System.Collections.Generic.List[string]]::new()
+    Write-Log '--- Post-Update Health Check (read-only) ---'
+    $checked = [Collections.Generic.List[string]]::new()
+    $failed = [Collections.Generic.List[string]]::new()
+    $expectedStopped = [Collections.Generic.List[string]]::new()
+    $policyManaged = [Collections.Generic.List[string]]::new()
 
     foreach ($svc in $CriticalServices) {
         try {
-            $serviceObj = Get-Service -Name $svc -ErrorAction SilentlyContinue
+            $serviceObj = & $ServiceProvider $svc
             if (-not $serviceObj) {
-                Write-Log "  Health check: service not found: $svc (skipped — may not exist on this SKU)" -Level Warn
+                Write-Log "  Health check: service not found: $svc (not applicable on this SKU)"
+                continue
+            }
+            $checked.Add($svc)
+            $status = [string]$serviceObj.Status
+            $config = & $ConfigurationProvider $svc
+            $startMode = if ($config -and $config.StartMode) { [string]$config.StartMode } else { 'Unknown' }
+            if ($status -eq 'Running') {
+                Write-Log "  Health check: $svc is Running (start mode: $startMode)"
                 continue
             }
 
-            $checked.Add($svc)
-
-            if ($serviceObj.Status -in @('Stopped', 'StopPending')) {
-                Write-Log "  Health check: $svc is $($serviceObj.Status) — attempting start (5 s timeout)..."
-                $startJob = Start-Job -ScriptBlock {
-                    param($n) Start-Service -Name $n -ErrorAction SilentlyContinue
-                } -ArgumentList $svc
-
-                $null = Wait-BootUpdateJobsWithProgress -Jobs @($startJob) -TimeoutSeconds 5 `
-                    -Activity 'Post-update health check' -Status "Starting service $svc"
-                if ($startJob.State -eq 'Running') {
-                    Stop-Job  -Job $startJob
-                    Write-Log "  Health check: $svc start timed out (>5 s) — service may still be starting" -Level Warn
+            switch ($svc) {
+                'W32Time' {
+                    if ($status -eq 'Stopped' -and $startMode -eq 'Manual') {
+                        $expectedStopped.Add($svc)
+                        Write-Log "  Health check: W32Time is Stopped (expected trigger/manual state; start mode: $startMode; left unchanged)"
+                    } elseif ($status -eq 'Stopped' -and $startMode -eq 'Disabled') {
+                        $policyManaged.Add($svc)
+                        Write-Log '  Health check: W32Time is Stopped (disabled by policy; left unchanged)'
+                    } else {
+                        $failed.Add($svc)
+                        Write-Log "  Health check: W32Time is $status (start mode: $startMode; observation only)" -Level Warn
+                    }
                 }
-                Remove-Job -Job $startJob -Force
-
-                <# Re-query after attempt #>
-                $refreshed = Get-Service -Name $svc -ErrorAction SilentlyContinue
-                if ($refreshed -and $refreshed.Status -eq 'Running') {
-                    Write-Log "  Health check: $svc started successfully"
-                } else {
-                    $finalStatus = if ($refreshed) { $refreshed.Status } else { 'Unknown' }
-                    Write-Log "  Health check: $svc still not running (status: $finalStatus)" -Level Warn
+                'Spooler' {
+                    if ($status -eq 'Stopped' -and $startMode -in @('Manual','Disabled')) {
+                        $policyManaged.Add($svc)
+                        Write-Log "  Health check: Spooler is Stopped (printing is manual/disabled by policy; left unchanged)"
+                    } else {
+                        $failed.Add($svc)
+                        Write-Log "  Health check: Spooler is $status (start mode: $startMode; observation only)" -Level Warn
+                    }
+                }
+                'WinDefend' {
+                    $defender = $null
+                    try { $defender = & $DefenderStatusProvider } catch { }
+                    $mode = if ($defender -and $defender.AMRunningMode) { [string]$defender.AMRunningMode } else { 'Unknown' }
+                    $antivirusEnabled = if ($defender -and $null -ne $defender.AntivirusEnabled) { [bool]$defender.AntivirusEnabled } else { $null }
+                    if ($mode -match '(?i)passive|EDR|SxS' -or $antivirusEnabled -eq $false -or $startMode -eq 'Disabled') {
+                        $policyManaged.Add($svc)
+                        Write-Log "  Health check: WinDefend is $status (mode: $mode; policy/AV-managed; left unchanged)"
+                    } else {
+                        $failed.Add($svc)
+                        Write-Log "  Health check: WinDefend is $status (mode: $mode; start mode: $startMode; observation only)" -Level Warn
+                    }
+                }
+                default {
                     $failed.Add($svc)
+                    Write-Log "  Health check: $svc is $status (start mode: $startMode; observation only)" -Level Warn
                 }
-            } else {
-                Write-Log "  Health check: $svc is $($serviceObj.Status)"
             }
         } catch {
-            Write-Log "  Health check: unexpected error checking $svc`: $_" -Level Warn
+            $failed.Add($svc)
+            Write-Log "  Health check: could not assess $svc`: $_" -Level Warn
         }
     }
 
-    $allHealthy = ($failed.Count -eq 0)
+    $allHealthy = $failed.Count -eq 0
     if ($allHealthy) {
-        Write-Log "  Health check: all $($checked.Count) service(s) healthy"
+        Write-Log "  Health check: policy-aware assessment passed for $($checked.Count) service(s); expected stopped=$($expectedStopped.Count), policy-managed=$($policyManaged.Count)"
     } else {
-        Write-Log "  Health check: $($failed.Count) service(s) not running: $($failed -join ', ')" -Level Warn
+        Write-Log "  Health check: $($failed.Count) service state(s) need attention: $($failed -join ', '); no service changes were made" -Level Warn
     }
-
     return [pscustomobject]@{
-        AllHealthy      = $allHealthy
-        FailedServices  = [string[]]$failed
+        AllHealthy = $allHealthy
+        FailedServices = [string[]]$failed
         CheckedServices = [string[]]$checked
+        ExpectedStopped = [string[]]$expectedStopped
+        PolicyManaged = [string[]]$policyManaged
+        MutationsAttempted = 0
     }
 }
 #endregion
@@ -5513,6 +5542,7 @@ function Invoke-BootUpdateCycle {
                 $targetPhase.AttentionDetails = @($r.AttentionDetails)
                 $state.($targetPhase.Flag) = $phaseSucceeded
                 $phaseCount = if ($targetPhase.Key -and $r.Count) { $state.Summary.($targetPhase.Key) += $r.Count; $r.Count } else { 0 }
+                if ($r.Triggered) { $state.Summary.ActionsTriggered += [int]$r.Triggered }
                 $elapsed = (Get-Date) - $phaseStart
 
                 Write-PhaseResult -Num $phaseNum -Total $enabledPhases.Count -Name $targetPhase.Name -Success $phaseSucceeded -Deferred:$targetPhase.UserCompletionDeferred -Minutes $elapsed.TotalMinutes -Count $phaseCount
@@ -5582,6 +5612,7 @@ function Invoke-BootUpdateCycle {
                 $phase.AttentionDetails = @($r.AttentionDetails)
                 $state.($phase.Flag) = $phaseSucceeded
                 $phaseCount = if ($phase.Key -and $r.Count) { $state.Summary.($phase.Key) += $r.Count; $r.Count } else { 0 }
+                if ($r.Triggered) { $state.Summary.ActionsTriggered += [int]$r.Triggered }
                 $elapsed = (Get-Date) - $phaseStart
 
                 <# Console: styled result #>
@@ -5779,7 +5810,7 @@ function Invoke-BootUpdateCycle {
                     if ($count -eq 0) {
                         $upToDate = $output | Where-Object { $_ -match '(?i)already installed|up.to.date' }
                         if ($upToDate) { $log.Add('VS Code extensions: all up to date.'); $count = 0 }
-                        else { $log.Add('VS Code extensions: update ran (exact count unavailable).'); $count = 1 }
+                        else { $log.Add('VS Code extensions: update ran; verified changed-extension count unavailable.'); $count = 0 }
                     } else { $log.Add("VS Code extensions: $count updated.") }
                 } catch { $success = $false; $log.Add("[Error] VS Code: $_") }
                 $providerLines = @($output | ForEach-Object { $_.ToString() })
@@ -5787,7 +5818,7 @@ function Invoke-BootUpdateCycle {
                     $_ -notmatch '\[DEP0169\].*url\.parse\(\)' -and
                     $_ -notmatch '^\(Use `Code --trace-deprecation'
                 })
-                return @{ Phase='Vscode'; Success=$success; Count=$count; LogLines=$displayLines; ProviderLines=$providerLines }
+                return @{ Phase='Vscode'; Success=$success; Count=$count; Triggered=1; LogLines=$displayLines; ProviderLines=$providerLines }
             }
 
             $defenderSb = {
@@ -5827,8 +5858,8 @@ function Invoke-BootUpdateCycle {
                 try {
                     & $c2rClient /update user updatepromptuser=false forceappshutdown=true displaylevel=false 2>&1 | ForEach-Object { $log.Add($_.ToString()) }
                     if ($LASTEXITCODE -ne 0) { $log.Add("[Error] Office 365 updater exited with code $LASTEXITCODE"); return @{ Phase='Office365'; Success=$false; Count=0; LogLines=$log.ToArray() } }
-                    $log.Add('Office 365 update triggered (may complete in background)')
-                    return @{ Phase='Office365'; Success=$true; Count=1; LogLines=$log.ToArray() }
+                    $log.Add('Office 365 update triggered (provider does not report a verified changed-package count)')
+                    return @{ Phase='Office365'; Success=$true; Count=0; Triggered=1; LogLines=$log.ToArray() }
                 } catch { $log.Add("[Error] Office 365: $_") }
                 return @{ Phase='Office365'; Success=$false; Count=0; LogLines=$log.ToArray() }
             }
@@ -6001,6 +6032,7 @@ function Invoke-BootUpdateCycle {
                 if ($phaseDefn.Key -and $jr.Count) {
                     $state.Summary.($phaseDefn.Key) += $jr.Count
                 }
+                if ($jr.Triggered) { $state.Summary.ActionsTriggered += [int]$jr.Triggered }
 
                 $phaseNum++
                 $elapsed = (Get-Date) - $cohortStart
@@ -6182,6 +6214,7 @@ function Invoke-BootUpdateCycle {
         $duration = if ($state.StartTime) { (Get-Date) - [datetime]$state.StartTime } else { [timespan]::Zero }
         $s = $state.Summary
         $total = $s.Winget + $s.Chocolatey + $s.WindowsUpdate + $s.Pip + $s.Npm + $s.Office365 + $s.PowerShellModules + $s.Scoop + $s.DotnetTools + $s.Vscode
+        $actionsTriggered = [int]($s.ActionsTriggered ?? 0)
         $reboots = [int]$state.RebootCount
         $durMin = [math]::Round($duration.TotalMinutes, 1)
         $pkgLine = "Winget=$($s.Winget) Choco=$($s.Chocolatey) WU=$($s.WindowsUpdate) Pip=$($s.Pip) Npm=$($s.Npm) O365=$($s.Office365) PSMod=$($s.PowerShellModules) Scoop=$($s.Scoop) Dotnet=$($s.DotnetTools) VSCode=$($s.Vscode)"
@@ -6201,11 +6234,11 @@ function Invoke-BootUpdateCycle {
                            elseif ($null -eq $healthCheck) { 'Configured updates are complete; health verification was skipped.' }
                            else { 'Updates landed, but one health check needs attention.' }
         $healthLine = if ($null -eq $healthCheck) { '[--] Service health check skipped by policy' }
-                      elseif ($healthCheck.AllHealthy) { "[OK] $($healthCheck.CheckedServices.Count) critical service(s) healthy" }
+                      elseif ($healthCheck.AllHealthy) { "[OK] $($healthCheck.CheckedServices.Count) service state(s) assessed read-only; expected/policy-managed=$($healthCheck.ExpectedStopped.Count + $healthCheck.PolicyManaged.Count)" }
                       else { "[!!] Service attention: $($healthCheck.FailedServices -join ', ')" }
         <# Log file: structured entries #>
         $completionDisposition = if ($hasWingetQuarantine) { 'COMPLETE WITH WINGET QUARANTINE' } else { 'COMPLETE' }
-        Write-Log "BOOT UPDATE CYCLE${whatIfTag} $completionDisposition | $durMin min | $($state.Iteration) iteration(s) | $reboots reboot(s) | $total packages"
+        Write-Log "BOOT UPDATE CYCLE${whatIfTag} $completionDisposition | $durMin min | $($state.Iteration) iteration(s) | $reboots reboot(s) | $total verified updates | $actionsTriggered updater action(s) triggered"
         Write-Log "  $pkgLine"
         if ($hasWingetQuarantine) {
             Write-Log "Winget quarantine record retained at $($script:WingetQuarantinePath)." -Level Warn
@@ -6232,6 +6265,7 @@ function Invoke-BootUpdateCycle {
                 DotnetTools      = $s.DotnetTools
                 Vscode           = $s.Vscode
                 _total           = $total
+                _actionsTriggered = $actionsTriggered
                 _iterations      = $state.Iteration
                 _durMin          = $durMin
             }
@@ -6244,9 +6278,9 @@ function Invoke-BootUpdateCycle {
             if ($hasWingetQuarantine) {
                 $quarantineIds = @($wingetQuarantines.PackageId) -join ', '
                 Send-CompletionNotification -Kind Progress -Title 'Boot Update Cycle Complete with Quarantine' `
-                    -Message "$total packages updated; reversible Winget blocking pins remain for: $quarantineIds. Record: $($script:WingetQuarantinePath)" -Data $summaryData
+                    -Message "$total updates verified; $actionsTriggered updater action(s) reported separately from verified totals; reversible Winget blocking pins remain for: $quarantineIds. Record: $($script:WingetQuarantinePath)" -Data $summaryData
             } else {
-                Send-CompletionNotification -Title 'Boot Update Cycle Complete' -Message "$total packages updated in $($state.Iteration) iteration(s), $durMin min" -Data $summaryData
+                Send-CompletionNotification -Title 'Boot Update Cycle Complete' -Message "$total updates verified; $actionsTriggered updater action(s) reported separately from verified totals; completed in $($state.Iteration) iteration(s), $durMin min" -Data $summaryData
             }
         }
         <# The congratulatory banner is the terminal commit point: hooks, notifications,
@@ -6264,7 +6298,8 @@ function Invoke-BootUpdateCycle {
             $healthLine
             if (-not $WhatIfPreference) { '[OK] Resume tasks retired; no retry is queued' }
             "$durMin min | $($state.Iteration) iteration(s) | $reboots completed reboot(s)"
-            "$total packages updated"
+            "$total verified updates"
+            if ($actionsTriggered) { "$actionsTriggered updater action(s) reported separately from verified update totals" }
             $pkgLine
         )
     }

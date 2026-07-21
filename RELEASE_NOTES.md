@@ -1,8 +1,18 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.57
+**Current Version:** v2.5.58
 **Release Date:** 2026-07-21
 **Status:** STABLE
+
+---
+
+## v2.5.58 (2026-07-21)
+
+- Makes the post-update service assessment read-only: it never starts, stops, or reconfigures a service unless a future explicit repair operation places that mutation in scope.
+- Treats stopped trigger-start Windows Time, policy/AV-managed Defender, and intentionally unavailable printing separately from stopped core resolver/event services that need attention.
+- Replaces the misleading “all critical services healthy” claim with a policy-aware assessment that reports expected, managed, and attention states.
+- Counts only verified changed packages/extensions. Office Click-to-Run and other providers without an exact changed-item result are reported separately as updater actions triggered.
+- Migrates state to schema v6 so action counts survive reboot/resume without being mixed into verified update totals.
 
 ---
 

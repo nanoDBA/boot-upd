@@ -573,7 +573,6 @@ Describe 'Progress coverage across blocking paths' {
             'Update-WingetPackages',
             'Install-WindowsUpdates',
             'Update-PowerShellModules',
-            'Test-PostUpdateHealth',
             'Send-EmailNotification'
         )) {
             (Get-FunctionText -Ast $invokeAst -Name $functionName) |

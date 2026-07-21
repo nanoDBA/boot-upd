@@ -29,6 +29,7 @@ BeforeAll {
     foreach ($functionName in @(
         'Update-BootUpdateStateForBootSession',
         'Get-BootUpdateLaunchContract',
+        'Test-PostUpdateHealth',
         'Get-BootUpdateBootSessionId',
         'Get-ActionablePendingFileRenameOperations',
         'Resolve-BootUpdateCompletionDisposition',
@@ -312,6 +313,47 @@ Describe 'Concise provider diagnostics' {
         $winget = Get-FunctionText $invokeAst 'Update-WingetPackages'
         $winget | Should -Match 'StartFailed = \$startFailed'
         $winget | Should -Match 'if \(\$jr\.StartFailed\)[\s\S]*?\$anyTimeout = \$true[\s\S]*?continue'
+    }
+}
+
+Describe 'Do-no-harm service health assessment' {
+    It 'does not mutate services and accepts expected or policy-managed stopped states' {
+        $services = @{ W32Time='Stopped'; WinDefend='Stopped'; Spooler='Stopped'; Dnscache='Running'; EventLog='Running' }
+        $startModes = @{ W32Time='Manual'; WinDefend='Manual'; Spooler='Disabled'; Dnscache='Auto'; EventLog='Auto' }
+        $result = Test-PostUpdateHealth -CriticalServices @($services.Keys) `
+            -ServiceProvider { param($name) [pscustomobject]@{ Status=$services[$name] } } `
+            -ConfigurationProvider { param($name) [pscustomobject]@{ StartMode=$startModes[$name] } } `
+            -DefenderStatusProvider { [pscustomobject]@{ AMRunningMode='Passive'; AntivirusEnabled=$false } }
+
+        $result.AllHealthy | Should -BeTrue
+        $result.ExpectedStopped | Should -Contain 'W32Time'
+        $result.PolicyManaged | Should -Contain 'WinDefend'
+        $result.PolicyManaged | Should -Contain 'Spooler'
+        $result.MutationsAttempted | Should -Be 0
+        (Get-FunctionText $invokeAst 'Test-PostUpdateHealth') | Should -Not -Match 'Start-Service|Stop-Service|Set-Service|Start-Job'
+    }
+
+    It 'reports stopped active Defender and core resolver services without changing them' {
+        $services = @{ WinDefend='Stopped'; Dnscache='Stopped'; W32Time='Stopped'; Spooler='Stopped' }
+        $result = Test-PostUpdateHealth -CriticalServices @($services.Keys) `
+            -ServiceProvider { param($name) [pscustomobject]@{ Status=$services[$name] } } `
+            -ConfigurationProvider { param($name) [pscustomobject]@{ StartMode='Auto' } } `
+            -DefenderStatusProvider { [pscustomobject]@{ AMRunningMode='Normal'; AntivirusEnabled=$true } }
+
+        $result.AllHealthy | Should -BeFalse
+        $result.FailedServices | Should -Contain 'WinDefend'
+        $result.FailedServices | Should -Contain 'Dnscache'
+        $result.FailedServices | Should -Contain 'W32Time'
+        $result.FailedServices | Should -Contain 'Spooler'
+        $result.MutationsAttempted | Should -Be 0
+    }
+
+    It 'separates provider triggers from verified update counts' {
+        (Get-FunctionText $invokeAst 'Update-Office365') | Should -Match 'Count\s*=\s*0;\s*Triggered\s*=\s*1'
+        (Get-FunctionText $invokeAst 'Update-VscodeExtensions') | Should -Match 'Count\s*=\s*\$count;\s*Triggered\s*=\s*1'
+        $cycle = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
+        $cycle | Should -Match 'verified updates'
+        $cycle | Should -Match 'updater action\(s\) triggered'
     }
 }
 
@@ -902,7 +944,7 @@ Describe 'Evidence-backed completion' {
         $text | Should -Match 'YOU DID IT.*CONFIGURED PATCH PASS IS VERIFIED.*NICE WORK'
         $text | Should -Match 'configured phases completed'
         $text | Should -Match 'Reboot state clean twice'
-        $text | Should -Match 'critical service\(s\) healthy'
+        $text | Should -Match 'service state\(s\) assessed read-only'
         $text | Should -Not -Match 'FULLY PATCHED'
     }
 
