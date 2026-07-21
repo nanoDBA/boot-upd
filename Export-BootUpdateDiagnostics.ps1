@@ -102,7 +102,7 @@ if (-not (Test-Path -LiteralPath $OutputDirectory)) {
 
 $sensitive = @(Get-BootUpdateSensitiveValues -Additional $AdditionalRedaction)
 $logs = @(Get-ChildItem -LiteralPath $SourceDirectory -File -ErrorAction Stop |
-    Where-Object { $_.Name -match '^BootUpdateCycle(?:\.(?:providers|aws))?(?:\.\d{8}-\d{6})?\.log$' } |
+    Where-Object { $_.Name -match '^BootUpdateCycle(?:\.(?:providers|aws))?(?:\.\d{8}-\d{6})?\.log$' -or $_.Name -eq 'BootUpdateCycle-repair-plan.txt' } |
     Sort-Object LastWriteTimeUtc)
 if (-not $logs.Count) { throw 'No Boot Update Cycle log files were found to export.' }
 

@@ -669,7 +669,7 @@ exit 0
 Describe 'Typed run option forwarding' {
     It 'exposes the documented deployment controls as typed parameters' {
         foreach ($parameter in @(
-            'OutputMode','MaxIterations','PackageTimeoutMinutes','StagedRollout',
+            'OutputMode','MaxIterations','PackageTimeoutMinutes','StagedRollout','AggressiveRepair',
             'IncludeDriverUpdates','IncludeFirmwareUpdates','UpdateWsl','UpdateContainers',
             'AllowMetered','EnableRestorePoint','EnableDotnetTools','EnableAwsTooling',
             'SkipDefender','SkipBitLocker','DisableSelfUpdate','ExcludePatterns','IncludePatterns'
@@ -681,10 +681,11 @@ Describe 'Typed run option forwarding' {
     It 'keeps structured pattern arrays and new switches in both direct and scheduled paths' {
         $deploySource | Should -Match 'IncludePatternsBase64'
         $deploySource | Should -Match 'ExcludePatternsBase64'
-        foreach ($name in @('SkipDefender','IncludeDriverUpdates','UpdateWsl','UpdateContainers','AllowMetered','SkipBitLocker','DisableSelfUpdate')) {
+        foreach ($name in @('SkipDefender','IncludeDriverUpdates','UpdateWsl','UpdateContainers','AllowMetered','SkipBitLocker','DisableSelfUpdate','AggressiveRepair')) {
             $deploySource | Should -Match ([regex]::Escape("Config.$name"))
         }
         $deploySource | Should -Match '-not \$Config\.DisableSelfUpdate'
         $deploySource | Should -Match '\$remoteVer -ge \$currentVer'
+        $launcherSource | Should -Match "Alias\('ar','aggressive-repair'\)"
     }
 }

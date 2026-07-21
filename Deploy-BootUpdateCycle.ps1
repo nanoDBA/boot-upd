@@ -16,6 +16,7 @@ param(
     [ValidateRange(1,50)][int]$MaxRetryPasses,
     [ValidateRange(1,1440)][int]$PackageTimeoutMinutes,
     [switch]$StagedRollout,
+    [switch]$AggressiveRepair,
     [switch]$IncludeDriverUpdates,
     [switch]$IncludeFirmwareUpdates,
     [switch]$UpdateWsl,
@@ -81,6 +82,7 @@ $Config = @{
     SkipRestorePoint      = $true   # Skip system restore point creation (opt-in: set $false to enable)
     SkipHealthCheck       = $false  # Skip post-update health check for critical services
     StagedRollout         = $false  # Run one package manager per boot instead of all at once. Slower but safer.
+    AggressiveRepair      = $false  # Explicit opt-in: attempt Winget repair/force reinstall for failures
     IncludeDriverUpdates  = $false  # Opt in to Windows driver updates
     IncludeFirmwareUpdates = $false # Opt in to firmware updates
     UpdateWsl             = $false  # Opt in to WSL kernel/distribution updates
@@ -126,7 +128,7 @@ if ($PSBoundParameters.ContainsKey('OutputMode')) { $Config.OutputMode = $Output
 if ($PSBoundParameters.ContainsKey('MaxIterations')) { $Config.MaxIterations = $MaxIterations }
 if ($PSBoundParameters.ContainsKey('MaxRetryPasses')) { $Config.MaxRetryPasses = $MaxRetryPasses }
 if ($PSBoundParameters.ContainsKey('PackageTimeoutMinutes')) { $Config.PackageTimeoutMin = $PackageTimeoutMinutes }
-foreach ($name in @('StagedRollout','IncludeDriverUpdates','IncludeFirmwareUpdates','UpdateWsl','UpdateContainers','AllowMetered','SkipPip','SkipNpm','SkipOffice365','SkipPowerShellModules','SkipScoop','SkipVscode','SkipDefender','SkipHealthCheck','SkipBitLocker','DisableSelfUpdate')) {
+foreach ($name in @('StagedRollout','AggressiveRepair','IncludeDriverUpdates','IncludeFirmwareUpdates','UpdateWsl','UpdateContainers','AllowMetered','SkipPip','SkipNpm','SkipOffice365','SkipPowerShellModules','SkipScoop','SkipVscode','SkipDefender','SkipHealthCheck','SkipBitLocker','DisableSelfUpdate')) {
     if ($PSBoundParameters.ContainsKey($name)) { $Config[$name] = $true }
 }
 if ($EnableRestorePoint) { $Config.SkipRestorePoint = $false }
@@ -517,6 +519,7 @@ $invokeArgs = @{
     AllowMetered         = $Config.AllowMetered
     DisableSelfUpdate    = $Config.DisableSelfUpdate
     StagedRollout        = $Config.StagedRollout
+    AggressiveRepair     = $Config.AggressiveRepair
     NotifyEmail             = $Config.NotifyEmail
     SmtpServer              = $Config.SmtpServer
     MaintenanceWindowStart  = $Config.MaintenanceWindowStart
@@ -708,6 +711,7 @@ function Register-ScheduledTaskNow {
         "-OutputMode $($Config.OutputMode)"
     )
     if ($Config.SkipPip)              { $taskArgs += '-SkipPip' }
+    if ($Config.AggressiveRepair)     { $taskArgs += '-AggressiveRepair' }
     if ($Config.SkipNpm)              { $taskArgs += '-SkipNpm' }
     if ($Config.SkipOffice365)        { $taskArgs += '-SkipOffice365' }
     if ($Config.SkipAwsTooling)       { $taskArgs += '-SkipAwsTooling' }

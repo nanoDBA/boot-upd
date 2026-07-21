@@ -9,6 +9,7 @@ param(
     [Alias('t','timeout','timeout-minutes','package-timeout-minutes')][ValidateRange(1,1440)][int]$PackageTimeoutMinutes = 30,
     [Alias('duration')][ValidateRange(2,60)][int]$DurationSeconds = 8,
     [Alias('s','StagedRollout')][switch]$Staged,
+    [Alias('ar','aggressive-repair')][switch]$AggressiveRepair,
     [Alias('drv','IncludeDriverUpdates')][switch]$Drivers,
     [Alias('fw','IncludeFirmwareUpdates')][switch]$Firmware,
     [Alias('w','UpdateWsl')][switch]$Wsl,
@@ -114,6 +115,7 @@ function Show-UpdHelp {
     -n, --max-iterations <n>   Reboot-loop safety limit; default 5
     -t, --timeout <minutes>    Per-provider hard timeout; default 30
     -s, --staged               Run one provider per checkpoint
+    -ar, --aggressive-repair   Attempt repair/force reinstall for failed Winget packages
     -drv, --drivers            Include Windows driver updates
     -fw, --firmware            Include firmware updates
     -w, --wsl                  Update WSL kernel and distributions
@@ -228,7 +230,7 @@ function Get-UpdDeployParameters {
         NonInteractive        = $true
     }
     $switchMap = [ordered]@{
-        Staged='StagedRollout'; Drivers='IncludeDriverUpdates'; Firmware='IncludeFirmwareUpdates'
+        Staged='StagedRollout'; AggressiveRepair='AggressiveRepair'; Drivers='IncludeDriverUpdates'; Firmware='IncludeFirmwareUpdates'
         Wsl='UpdateWsl'; Containers='UpdateContainers'; AllowMetered='AllowMetered'
         RestorePoint='EnableRestorePoint'; DotnetTools='EnableDotnetTools'; AwsTooling='EnableAwsTooling'
         SkipPip='SkipPip'; SkipNpm='SkipNpm'; SkipOffice365='SkipOffice365'

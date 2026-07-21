@@ -69,6 +69,7 @@ param(
     [switch]$SkipHealthCheck,
     [switch]$SkipBitLocker,
     [switch]$StagedRollout,           # Run one package manager per boot instead of all at once
+    [switch]$AggressiveRepair,        # Opt in to repair/force-reinstall attempts for failed Winget packages
     [switch]$Force,
     [ValidateScript({ $_ -eq '' -or $_ -match '^https://' })]
     [string]$WebhookUrl       = '',   # Teams/Slack/Discord incoming webhook URL
@@ -263,6 +264,7 @@ $script:PackageTimeoutMinutes = $PackageTimeoutMinutes
 $script:RebootDelaySec        = $RebootDelaySec
 $script:MaxIterations         = $MaxIterations
 $script:MaxRetryPasses        = $MaxRetryPasses
+$script:AggressiveRepair      = [bool]$AggressiveRepair
 $script:SkipPip               = $SkipPip
 $script:SkipNpm               = $SkipNpm
 $script:SkipOffice365         = $SkipOffice365
@@ -338,7 +340,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 4 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.51' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.52' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 Set-Variable -Name 'RebootSignalSettleSeconds' -Value 20 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 $script:ExplicitRebootRequests = [System.Collections.Generic.List[object]]::new()
 
@@ -909,6 +911,8 @@ function Complete-WingetFailureClassification {
         $State | Add-Member WingetFailureSignature '' -Force
         $State | Add-Member WingetFailureRepeatCount 0 -Force
         Set-BootUpdateState -State $State
+        $repairPlan = Join-Path $script:InstallDir 'BootUpdateCycle-repair-plan.txt'
+        Remove-Item -LiteralPath $repairPlan -Force -ErrorAction SilentlyContinue
         return [pscustomobject]@{ TerminalFailure=$false; Details=@() }
     }
     $prior = if ($State.PSObject.Properties.Name -contains 'WingetFailureSignature') { [string]$State.WingetFailureSignature } else { '' }
@@ -920,7 +924,35 @@ function Complete-WingetFailureClassification {
     $persistent = $repeat -ge 2
     return [pscustomobject]@{
         TerminalFailure=$persistent
-        Details=@($Failures | ForEach-Object { "$($_.Name) [$($_.Id)] ($($_.Code), $($_.Hex))" })
+        Details=@($Failures | ForEach-Object {
+            [pscustomobject]@{
+                Name=$_.Name; Id=$_.Id; Code=$_.Code; Hex=$_.Hex
+                Command=(Get-WingetRemediationCommand -PackageId $_.Id -Code $_.Code)
+            }
+        })
+    }
+}
+
+function Invoke-WingetAggressiveRepair {
+    param([Parameter(Mandatory)][string]$WingetPath,[object[]]$Failures = @(),[int]$TimeoutMinutes = 30)
+    foreach ($failure in @($Failures | Sort-Object Id,Code -Unique)) {
+        $command = Get-WingetRemediationCommand -PackageId $failure.Id -Code $failure.Code
+        if (-not $command) { continue }
+        $verb = if ([long]$failure.Code -eq 1612) { 'repair' } else { 'install' }
+        Write-Log "Winget aggressive repair: attempting $verb for $($failure.Name) [$($failure.Id)]." -Level Warn
+        $result = Invoke-PackageManagerWithTimeout -Name "Winget-aggressive-$($failure.Id)" -ScriptBlock {
+            param($wp,$action,$id)
+            & $wp $action --id $id -e --source winget --force --accept-source-agreements --accept-package-agreements --disable-interactivity --no-vt 2>&1
+        } -ArgumentList @($WingetPath,$verb,$failure.Id) -IdleTimeoutMinutes 5 -HardTimeoutMinutes $TimeoutMinutes
+        Write-ProviderTranscript -Provider Winget -Scope "aggressive/$($failure.Id)" -Lines $result.Output
+        if (($result.ExitCode -notin @(0,1641,3010)) -and $verb -eq 'repair') {
+            Write-Log "Winget aggressive repair: repair was unavailable or failed; attempting force reinstall for $($failure.Id)." -Level Warn
+            $fallback = Invoke-PackageManagerWithTimeout -Name "Winget-aggressive-install-$($failure.Id)" -ScriptBlock {
+                param($wp,$id)
+                & $wp install --id $id -e --source winget --force --accept-source-agreements --accept-package-agreements --disable-interactivity --no-vt 2>&1
+            } -ArgumentList @($WingetPath,$failure.Id) -IdleTimeoutMinutes 5 -HardTimeoutMinutes $TimeoutMinutes
+            Write-ProviderTranscript -Provider Winget -Scope "aggressive-install/$($failure.Id)" -Lines $fallback.Output
+        }
     }
 }
 
@@ -948,8 +980,6 @@ function Write-WingetScopeSummary {
     foreach ($failure in $summary.Failures) {
         $identity = if ($failure.Id) { "$($failure.Name) [$($failure.Id)]" } else { $failure.Name }
         Write-Log "Winget ${Scope}: $identity failed — $($failure.Summary) ($($failure.Code), $($failure.Hex))." -Level Warn
-        $command = Get-WingetRemediationCommand -PackageId $failure.Id -Code $failure.Code
-        if ($command) { Write-Log "Winget ${Scope}: suggested remediation (elevated): $command" -Level Warn }
     }
     $notes = @()
     if ($summary.Pinned) { $notes += "$($summary.Pinned) pinned" }
@@ -1669,7 +1699,8 @@ function Stop-BootUpdateAtRetryLimit {
 function Stop-BootUpdateForManualAttention {
     param([Parameter(Mandatory)][pscustomobject]$State,[Parameter(Mandatory)][object[]]$Phases)
     $names = @($Phases.Name) -join ', '
-    $details = @($Phases | ForEach-Object { @($_.AttentionDetails) }) -join '; '
+    $repairItems = @($Phases | ForEach-Object { @($_.AttentionDetails) })
+    $details = @($repairItems | ForEach-Object { "$($_.Name) [$($_.Id)] ($($_.Code), $($_.Hex))" }) -join '; '
     $reason = "Persistent non-transient failure requires manual attention: $names"
     $State.Phase = 'AttentionRequired'
     $State.LimitReachedAt = [datetime]::UtcNow.ToString('o')
@@ -1683,15 +1714,48 @@ function Stop-BootUpdateForManualAttention {
         Set-BootUpdateState -State $State
     }
     $disposition = if ($disarmed) { 'Automatic continuation tasks were removed and verified absent.' } else { 'WARNING: continuation-task removal failed; remove both BootUpdateCycle tasks manually.' }
+    $planPath = Write-BootUpdateRepairPlan -Items $repairItems
     Write-Log "$($State.LimitReason) $disposition" -Level Error
     Send-CompletionNotification -Kind Error -Title 'Boot Update Cycle NEEDS ATTENTION' -Message "$($State.LimitReason). $disposition"
     Show-CycleBanner -Title 'M A N U A L   A T T E N T I O N   N E E D E D' -AnsiColor "$([char]27)[31m" -Info @(
         'Automatic retries stopped because the same non-transient failure repeated.'
         "Incomplete phase(s): $names"
         $(if ($details) { "Failures: $details" } else { 'See the diagnostic log for the exact provider failure.' })
+        $(if ($planPath) { "Repair plan (path copied to clipboard): $planPath" } else { 'Repair-plan creation failed; use upd logs for diagnostics.' })
         $disposition
         "Diagnostic state preserved: $($script:StatePath)"
     )
+}
+
+function Write-BootUpdateRepairPlan {
+    param([object[]]$Items = @())
+    if (-not $Items.Count) { return $null }
+    $path = Join-Path $script:InstallDir 'BootUpdateCycle-repair-plan.txt'
+    $lines = [Collections.Generic.List[string]]::new()
+    $lines.Add('BOOT UPDATE CYCLE — MANUAL REPAIR PLAN')
+    $lines.Add("Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')")
+    $lines.Add('')
+    $lines.Add('Why this exists')
+    $lines.Add('The same non-transient package failure repeated. Automatic continuation was stopped.')
+    $lines.Add('Review the package names below before using the elevated Command Prompt block.')
+    $lines.Add('')
+    foreach ($item in $Items) { $lines.Add("- $($item.Name) [$($item.Id)]: $($item.Code) / $($item.Hex)") }
+    $lines.Add('')
+    $lines.Add('COPY/PASTE BLOCK — ELEVATED COMMAND PROMPT')
+    $lines.Add('REM Every line in this block is valid Command Prompt syntax.')
+    foreach ($command in @($Items.Command | Where-Object { $_ } | Select-Object -Unique)) { $lines.Add($command) }
+    $lines.Add('REM Re-run the updater after the commands finish so convergence can be verified.')
+    $lines.Add('upd')
+    try {
+        [IO.File]::WriteAllLines($path,$lines,[Text.UTF8Encoding]::new($true))
+        Enable-BootUpdateNtfsCompression -Path $path
+        try { Set-Clipboard -Value $path -ErrorAction Stop } catch { try { $path | clip.exe } catch { } }
+        Write-Log "Manual repair plan written: $path" -Level Warn
+        return $path
+    } catch {
+        Write-Log "Manual repair plan could not be written: $_" -Level Error
+        return $null
+    }
 }
 
 function Update-BootUpdateStagedRetryCount {
@@ -2027,7 +2091,13 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
             Write-Log '  [WHATIF] Would run: winget upgrade --all --scope user (parallel)'
             Write-Log '  [WHATIF] Would run: winget upgrade --all --scope machine (parallel)'
         }
+        if ($script:AggressiveRepair -and $script:CurrentWingetFailures.Count) {
+            Invoke-WingetAggressiveRepair -WingetPath $wingetPath -Failures $script:CurrentWingetFailures.ToArray() -TimeoutMinutes $TimeoutMinutes
+        }
         $classification = Complete-WingetFailureClassification -State $script:CurrentState -Failures $script:CurrentWingetFailures.ToArray()
+        if ($script:CurrentWingetFailures.Count -and -not $classification.TerminalFailure) {
+            Write-Log 'Winget: one automatic verification pass remains; manual commands are withheld unless the same failure repeats.' -Level Warn
+        }
         return @{ Success = (-not $anyTimeout); Count = $totalCount; TerminalFailure=$classification.TerminalFailure; AttentionDetails=$classification.Details }
     }
 
@@ -2153,7 +2223,13 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
             }
         }
     }
+    if ($script:AggressiveRepair -and $script:CurrentWingetFailures.Count) {
+        Invoke-WingetAggressiveRepair -WingetPath $wingetPath -Failures $script:CurrentWingetFailures.ToArray() -TimeoutMinutes $TimeoutMinutes
+    }
     $classification = Complete-WingetFailureClassification -State $script:CurrentState -Failures $script:CurrentWingetFailures.ToArray()
+    if ($script:CurrentWingetFailures.Count -and -not $classification.TerminalFailure) {
+        Write-Log 'Winget: one automatic verification pass remains; manual commands are withheld unless the same failure repeats.' -Level Warn
+    }
     return @{ Success = (-not $anyTimeout); Count = $totalCount; TerminalFailure=$classification.TerminalFailure; AttentionDetails=$classification.Details }
 }
 
@@ -3400,6 +3476,7 @@ function Register-BootUpdateTaskForReboot {
     if ($script:AllowMetered)         { $taskArgs += '-AllowMetered' }
     if ($script:DisableSelfUpdate)    { $taskArgs += '-DisableSelfUpdate' }
     if ($script:StagedRollout)        { $taskArgs += '-StagedRollout' }
+    if ($script:AggressiveRepair)     { $taskArgs += '-AggressiveRepair' }
     if ($script:NotifyEmail)          { $taskArgs += "-NotifyEmail `"$($script:NotifyEmail)`"" }
     if ($script:SmtpServer)           { $taskArgs += "-SmtpServer `"$($script:SmtpServer)`"" }
     if ($script:MaintenanceWindowStart -ge 0) { $taskArgs += "-MaintenanceWindowStart $($script:MaintenanceWindowStart)" }
@@ -4545,7 +4622,7 @@ function Apply-RemoteConfig {
         'SkipDefender', 'SkipBitLocker', 'SkipRestorePoint', 'SkipHealthCheck',
         'IncludeDriverUpdates', 'IncludeFirmwareUpdates',
         'UpdateWsl', 'UpdateContainers', 'AllowMetered', 'DisableSelfUpdate',
-        'StagedRollout', 'OutputMode'
+        'StagedRollout', 'AggressiveRepair', 'OutputMode'
     )
 
     $overridden = [System.Collections.Generic.List[string]]::new()

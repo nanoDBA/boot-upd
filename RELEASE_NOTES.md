@@ -1,8 +1,17 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.51
+**Current Version:** v2.5.52
 **Release Date:** 2026-07-21
 **Status:** STABLE
+
+---
+
+## v2.5.52 (2026-07-21)
+
+- Adds explicit `upd -ar` / `upd --aggressive-repair` opt-in for package-specific Winget repair and force-reinstall attempts, preserved across elevation and reboot continuations.
+- Keeps default runs conservative and withholds command noise during the single automatic verification pass.
+- Writes `BootUpdateCycle-repair-plan.txt` only when an identical failure becomes terminal; explanations are separate from a contiguous block containing only valid Command Prompt syntax.
+- Displays and copies the full plan path, includes the plan in sanitized `upd logs` exports, and removes it after a verified clean Winget pass.
 
 ---
 

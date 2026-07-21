@@ -38,7 +38,8 @@ BeforeAll {
           'Get-InstallerExitSummary',
           'Get-WingetOutputSummary',
           'Get-WingetRemediationCommand',
-          'Complete-WingetFailureClassification'
+          'Complete-WingetFailureClassification',
+          'Write-BootUpdateRepairPlan'
     )) {
         . ([scriptblock]::Create((Get-FunctionText $invokeAst $functionName)))
     }
@@ -46,6 +47,7 @@ BeforeAll {
     function Set-BootUpdateState { param($State) }
     function Write-EventLogEntry { param($EventId, $EntryType, $Message) }
     function Send-CompletionNotification { param($Kind, $Title, $Message) }
+    function Enable-BootUpdateNtfsCompression { param($Path) }
     function Show-CycleBanner { param($Title, $AnsiColor, $Info) }
     function Unregister-BootUpdateTask {
         $script:UnregisterCalls++
@@ -99,6 +101,23 @@ Describe 'Concise provider diagnostics' {
         (Complete-WingetFailureClassification -State $state -Failures @($failure)).TerminalFailure | Should -BeTrue
         $changed = [pscustomobject]@{ Name='iCUE'; Id='Corsair.iCUE.5'; Code=3221226525; Hex='0xC000041D' }
         (Complete-WingetFailureClassification -State $state -Failures @($changed)).TerminalFailure | Should -BeFalse
+    }
+
+    It 'writes a durable plan with explanations outside a valid cmd copy block' {
+        $script:InstallDir = $TestDrive
+        Mock Set-Clipboard { }
+        $items = @(
+            [pscustomobject]@{ Name='Health Check'; Id='Microsoft.WindowsPCHealthCheck'; Code=1612; Hex='0x0000064C'; Command='winget repair --id Microsoft.WindowsPCHealthCheck -e --force' },
+            [pscustomobject]@{ Name='iCUE'; Id='Corsair.iCUE.5'; Code=3221226525; Hex='0xC000041D'; Command='winget install --id Corsair.iCUE.5 -e --force' }
+        )
+        $path = Write-BootUpdateRepairPlan -Items $items
+        Test-Path -LiteralPath $path | Should -BeTrue
+        $lines = Get-Content -LiteralPath $path
+        $blockStart = [array]::IndexOf($lines,'COPY/PASTE BLOCK — ELEVATED COMMAND PROMPT') + 1
+        $block = @($lines | Select-Object -Skip $blockStart)
+        @($block | Where-Object { $_ -notmatch '^(?:REM(?:\s|$)|winget\s|upd$)' }).Count | Should -Be 0
+        ($block -join "`n") | Should -Match 'winget repair --id Microsoft\.WindowsPCHealthCheck'
+        ($block -join "`n") | Should -Match 'winget install --id Corsair\.iCUE\.5'
     }
 
     It 'renders signed provider HRESULTs in recognizable hexadecimal form' {
@@ -339,7 +358,7 @@ Describe 'Durable resume chain' {
         $text = Get-FunctionText $invokeAst 'Register-BootUpdateTaskForReboot'
         $text | Should -Match 'ExcludePatternsBase64'
         $text | Should -Match 'IncludePatternsBase64'
-        foreach ($switchName in @('SkipBitLocker','AllowMetered','DisableSelfUpdate','UpdateWsl','UpdateContainers')) {
+        foreach ($switchName in @('SkipBitLocker','AllowMetered','DisableSelfUpdate','UpdateWsl','UpdateContainers','AggressiveRepair')) {
             $text | Should -Match ([regex]::Escape("-$switchName"))
         }
     }
