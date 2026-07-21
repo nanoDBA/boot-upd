@@ -41,6 +41,7 @@ $assetSpecs = @(
     [pscustomobject]@{ Source='tools/Show-BootUpdateProgressDemo.ps1'; Name='Show-BootUpdateProgressDemo.ps1'; Kind='PowerShell' }
     [pscustomobject]@{ Source='tools/Install-PowerShell7.ps1';        Name='Install-PowerShell7.ps1'; Kind='PowerShell' }
     [pscustomobject]@{ Source='Repair-AwsTooling.ps1';             Name='Repair-AwsTooling.ps1';      Kind='PowerShell' }
+    [pscustomobject]@{ Source='Export-BootUpdateDiagnostics.ps1';  Name='Export-BootUpdateDiagnostics.ps1'; Kind='PowerShell' }
 )
 
 function Export-GitBlob {

@@ -36,7 +36,8 @@ BeforeAll {
         'Test-WindowsUpdateConvergence',
         'Format-NativeExitCode',
         'Get-InstallerExitSummary',
-        'Get-WingetOutputSummary'
+          'Get-WingetOutputSummary',
+          'Get-WingetRemediationCommand'
     )) {
         . ([scriptblock]::Create((Get-FunctionText $invokeAst $functionName)))
     }
@@ -78,6 +79,12 @@ Describe 'Concise provider diagnostics' {
         $summary.Pinned | Should -Be 1
         $summary.Unknown | Should -Be 4
         $summary.TechnologyBlocked | Should -Be 1
+    }
+
+    It 'creates paste-ready remediation only from safe package identifiers' {
+        Get-WingetRemediationCommand -PackageId 'JohnMacFarlane.Pandoc' |
+            Should -Be 'winget install --id JohnMacFarlane.Pandoc -e --source winget --force --accept-source-agreements --accept-package-agreements'
+        Get-WingetRemediationCommand -PackageId 'safe; Remove-Item C:\' | Should -BeNullOrEmpty
     }
 
     It 'renders signed provider HRESULTs in recognizable hexadecimal form' {

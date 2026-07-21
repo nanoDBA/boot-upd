@@ -20,6 +20,7 @@ BootUpdateCycle.log
 BootUpdateCycle.providers.log
 BootUpdateCycle.providers.*.log
 BootUpdateCycle.*.log
+BootUpdateCycle-diagnostics-*.zip
 BootUpdateCycle.history.json
 upd.cmd.next
 upd.cmd.next.sha256

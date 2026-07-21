@@ -49,7 +49,7 @@ function Test-UpdBootstrapReadOnly {
     return $command -in @(
         '/?','?','/help','help','-help','--help','-h','usage','--usage',
         '-v','-d','-f','-st',
-        'version','v','plan','p','status','st','splash','sp',
+        'version','v','plan','p','status','st','logs','l','splash','sp',
         'demo','d','--demo','/demo','fun','f','--fun','/fun','bootstrap','b'
     )
 }

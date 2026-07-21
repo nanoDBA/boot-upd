@@ -286,6 +286,7 @@ if ([string]::IsNullOrEmpty($env:BOOT_UPDATE_NO_SELF_UPDATE) -and -not $Config.D
             [pscustomobject]@{ Name='Show-BootUpdateProgressDemo.ps1'; RelativeTarget='tools\Show-BootUpdateProgressDemo.ps1'; Required=$true; PowerShell=$true; Core=$false }
             [pscustomobject]@{ Name='Install-PowerShell7.ps1';         RelativeTarget='tools\Install-PowerShell7.ps1'; Required=$true; PowerShell=$true; Core=$false }
             [pscustomobject]@{ Name='Repair-AwsTooling.ps1';         RelativeTarget='Repair-AwsTooling.ps1';      Required=$true; PowerShell=$true; Core=$false }
+            [pscustomobject]@{ Name='Export-BootUpdateDiagnostics.ps1'; RelativeTarget='Export-BootUpdateDiagnostics.ps1'; Required=$true; PowerShell=$true; Core=$false }
             [pscustomobject]@{ Name='upd.cmd';                       RelativeTarget='upd.cmd';                    Required=$true; PowerShell=$false; Core=$false }
         )
         $sourceTempRoot = Join-Path ([IO.Path]::GetTempPath()) ('boot-upd-source-bundle-{0}' -f [guid]::NewGuid().ToString('N'))
@@ -408,7 +409,7 @@ if ($copySourceToLive) {
 }
 
 <# Also copy companion scripts if present #>
-foreach ($companion in @('Repair-AwsTooling.ps1')) {
+foreach ($companion in @('Repair-AwsTooling.ps1','Export-BootUpdateDiagnostics.ps1')) {
     $src = Join-Path $PSScriptRoot $companion
     if (Test-Path $src) {
         Copy-Item $src (Join-Path $installDir $companion) -Force

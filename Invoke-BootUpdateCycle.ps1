@@ -338,7 +338,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 4 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.48' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.49' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 Set-Variable -Name 'RebootSignalSettleSeconds' -Value 20 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 $script:ExplicitRebootRequests = [System.Collections.Generic.List[object]]::new()
 
@@ -675,15 +675,48 @@ $script:LastLogRepeatCount = 0
 $script:LastLogLevel = 'Info'
 $script:LastLogVisibility = 'Verbose'
 
-function Invoke-LogRotation {
-    if (-not (Test-Path $script:LogPath)) { return }
-    $logFile = Get-Item $script:LogPath
-    if ($logFile.Length -gt ($script:MaxLogSizeMB * 1MB)) {
-        $archivePath = $script:LogPath -replace '\.log$', ".$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
-        Move-Item $script:LogPath $archivePath -Force
-        Get-ChildItem (Split-Path $script:LogPath) -Filter 'BootUpdateCycle.*.log' |
-            Sort-Object LastWriteTime -Descending | Select-Object -Skip 3 | Remove-Item -Force
+function Enable-BootUpdateNtfsCompression {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }
+    try {
+        $item = Get-Item -LiteralPath $Path -Force
+        if (($item.Attributes -band [IO.FileAttributes]::Compressed) -ne 0) { return }
+        if (Get-Command compact.exe -ErrorAction SilentlyContinue) {
+            $null = & compact.exe /C /I /Q $item.FullName 2>$null
+        }
+    } catch {
+        # Compression is a storage optimization; logging must remain available on
+        # ReFS/FAT/network filesystems or when policy disables NTFS compression.
     }
+}
+
+function Invoke-BootUpdateLogRotation {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][long]$MaximumBytes,
+        [Parameter(Mandatory)][string]$ArchiveNamePattern,
+        [ValidateRange(1,20)][int]$Keep = 3
+    )
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    $logFile = Get-Item -LiteralPath $Path
+    Enable-BootUpdateNtfsCompression -Path $Path
+    if ($logFile.Length -le $MaximumBytes) { return }
+    $archivePath = $Path -replace '\.log$', ".$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
+    Move-Item -LiteralPath $Path -Destination $archivePath -Force
+    Enable-BootUpdateNtfsCompression -Path $archivePath
+    Get-ChildItem -LiteralPath (Split-Path $Path) -File |
+        Where-Object Name -Match $ArchiveNamePattern |
+        Sort-Object LastWriteTimeUtc -Descending | Select-Object -Skip $Keep |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+}
+
+function Invoke-LogRotation {
+    Invoke-BootUpdateLogRotation -Path $script:LogPath `
+        -MaximumBytes ($script:MaxLogSizeMB * 1MB) `
+        -ArchiveNamePattern '^BootUpdateCycle\.\d{8}-\d{6}\.log$'
+    Invoke-BootUpdateLogRotation -Path $script:ProviderTranscriptPath `
+        -MaximumBytes ($script:MaxLogSizeMB * 2MB) `
+        -ArchiveNamePattern '^BootUpdateCycle\.providers\.\d{8}-\d{6}\.log$'
 }
 
 function Write-Log {
@@ -693,6 +726,9 @@ function Write-Log {
         [ValidateSet('Verbose','Debug')][string]$Visibility = 'Verbose'
     )
     if ([string]::IsNullOrWhiteSpace($Message)) { return }
+    Invoke-BootUpdateLogRotation -Path $script:LogPath `
+        -MaximumBytes ($script:MaxLogSizeMB * 1MB) `
+        -ArchiveNamePattern '^BootUpdateCycle\.\d{8}-\d{6}\.log$'
     $trimmed = $Message.Trim()
     if ($trimmed -match '^[\|/\-\\]$') { return }
     if ($trimmed.Length -le 3 -and $trimmed -match '^[\|/\-\\]+$') { return }
@@ -747,7 +783,9 @@ function Write-Log {
 
     $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $entry = "[$ts] [$Level] $Message"
+    $newLog = -not (Test-Path -LiteralPath $script:LogPath)
     Add-Content -Path $script:LogPath -Value $entry -Force
+    if ($newLog) { Enable-BootUpdateNtfsCompression -Path $script:LogPath }
     Read-BootUpdateUiKeys
     switch ($Level) {
         'Info'  {
@@ -776,13 +814,13 @@ function Write-ProviderTranscript {
         [object[]]$Lines = @()
     )
     if (-not $Lines.Count) { return }
-    if ((Test-Path $script:ProviderTranscriptPath) -and
-        (Get-Item $script:ProviderTranscriptPath).Length -gt ($script:MaxLogSizeMB * 2MB)) {
-        $archive = $script:ProviderTranscriptPath -replace '\.log$', ".$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
-        Move-Item $script:ProviderTranscriptPath $archive -Force
-    }
+    Invoke-BootUpdateLogRotation -Path $script:ProviderTranscriptPath `
+        -MaximumBytes ($script:MaxLogSizeMB * 2MB) `
+        -ArchiveNamePattern '^BootUpdateCycle\.providers\.\d{8}-\d{6}\.log$'
     $label = if ($Scope) { "$Provider/$Scope" } else { $Provider }
+    $newTranscript = -not (Test-Path -LiteralPath $script:ProviderTranscriptPath)
     Add-Content -Path $script:ProviderTranscriptPath -Value "`r`n[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] --- $label ---" -Force
+    if ($newTranscript) { Enable-BootUpdateNtfsCompression -Path $script:ProviderTranscriptPath }
     foreach ($line in $Lines) {
         if ($null -eq $line) { continue }
         Add-Content -Path $script:ProviderTranscriptPath -Value ([string]$line) -Force
@@ -856,6 +894,13 @@ function Get-WingetOutputSummary {
     }
 }
 
+function Get-WingetRemediationCommand {
+    param([Parameter(Mandatory)][string]$PackageId)
+    # Never echo arbitrary provider output into a shell command.
+    if ($PackageId -notmatch '^[A-Za-z0-9][A-Za-z0-9._+-]*$') { return $null }
+    return "winget install --id $PackageId -e --source winget --force --accept-source-agreements --accept-package-agreements"
+}
+
 function Write-WingetScopeSummary {
     param(
         [Parameter(Mandatory)][string]$Scope,
@@ -876,12 +921,18 @@ function Write-WingetScopeSummary {
     foreach ($failure in $summary.Failures) {
         $identity = if ($failure.Id) { "$($failure.Name) [$($failure.Id)]" } else { $failure.Name }
         Write-Log "Winget ${Scope}: $identity failed — $($failure.Summary) ($($failure.Code), $($failure.Hex))." -Level Warn
+        $command = Get-WingetRemediationCommand -PackageId $failure.Id
+        if ($command) { Write-Log "Winget ${Scope}: suggested remediation (elevated): $command" -Level Warn }
     }
     $notes = @()
     if ($summary.Pinned) { $notes += "$($summary.Pinned) pinned" }
     if ($summary.Unknown) { $notes += "$($summary.Unknown) unknown-version" }
     if ($summary.TechnologyBlocked) { $notes += "$($summary.TechnologyBlocked) install-technology blocked" }
     if ($notes.Count) { Write-Log "Winget ${Scope}: deferred inventory — $($notes -join ', ')." -Level Warn }
+    if ($summary.Pinned) { Write-Log 'Winget suggested inspection: winget pin list' -Level Warn }
+    if ($summary.Unknown -or $summary.TechnologyBlocked) {
+        Write-Log 'Winget suggested inventory: winget upgrade --all --include-unknown --accept-source-agreements --accept-package-agreements' -Level Warn
+    }
     if ($null -ne $ExitCode -and [long]$ExitCode -notin @(0,1641,3010)) {
         Write-Log "Winget ($Scope) returned $ExitCode ($(Format-NativeExitCode ([long]$ExitCode))); partial failure, retry required." -Level Error
     }

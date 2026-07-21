@@ -183,6 +183,8 @@ Describe 'Duplicate log compression visibility' {
     BeforeAll {
         function Clear-BootUpdateProgressLine { }
         function Read-BootUpdateUiKeys { }
+        function Invoke-BootUpdateLogRotation { param([string]$Path) }
+        function Enable-BootUpdateNtfsCompression { param([string]$Path) }
         . ([scriptblock]::Create((Get-FunctionText -Ast $invokeAst -Name 'Test-BootUpdateOutputAtLeast')))
         . ([scriptblock]::Create((Get-FunctionText -Ast $invokeAst -Name 'Write-Log')))
     }

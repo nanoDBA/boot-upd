@@ -95,6 +95,7 @@ upd demo 12                      Run the production BOOT//PULSE animation for 12
 upd fun 12                       Splash parade followed by the animation
 upd update                       Refresh the checksummed launcher bundle and exit
 upd aws                          Update/repair AWS CLI v2 and AWS.Tools
+upd logs                         Export a sanitized diagnostic ZIP to the Desktop
 upd repair                       Recover missing/corrupt launcher and core files
 upd bootstrap                    Install/verify PowerShell 7, then show help
 upd version                      Show the bundled version
@@ -110,7 +111,7 @@ upd --exclude Teams,OneDrive --skip-office365
 ```
 
 Short forms keep everyday commands light: `upd d 12`, `upd f`, `upd p -drv -r 120`,
-`upd r -s -o Verbose`, `upd a`, `upd u`, and `upd v`. Short commands do not use a
+`upd r -s -o Verbose`, `upd a`, `upd l`, `upd u`, and `upd v`. Short commands do not use a
 leading dash; ambiguous dashed forms fail before they can reach the update path. Long
 names remain available for scripts and discoverability.
 
@@ -132,7 +133,7 @@ has exited**. It verifies the installer against the hash embedded below, then th
 verifies and transactionally replaces the complete release bundle before forwarding `aws`:
 
 ```powershell
-$u='https://github.com/nanoDBA/boot-upd/releases/download/v2.5.48/Install-UpdCompat.ps1'; $f=Join-Path $env:TEMP 'Install-UpdCompat-v2.5.48.ps1'; Invoke-WebRequest $u -OutFile $f; if((Get-FileHash $f -Algorithm SHA256).Hash -ne '1B638EBF37A79FA171601E59AC7C8A63CFE874F29CCFE1FDC9E0002FFBB583D6'){throw 'Compatibility installer hash mismatch'}; & $f -CommandArguments aws
+$u='https://github.com/nanoDBA/boot-upd/releases/download/v2.5.49/Install-UpdCompat.ps1'; $f=Join-Path $env:TEMP 'Install-UpdCompat-v2.5.49.ps1'; Invoke-WebRequest $u -OutFile $f; if((Get-FileHash $f -Algorithm SHA256).Hash -ne '67662B3B02252FF6DE045FCDF28FB74D8DEB6FDA8080C46B1DAFC7BFBE54ABE3'){throw 'Compatibility installer hash mismatch'}; & $f -CommandArguments aws
 ```
 
 This is the one-time chicken-and-egg escape hatch. It resolves the first `upd.cmd` on PATH,
@@ -158,6 +159,18 @@ Interactive runs use a compact progress view by default: current phase, overall 
 phase results, warnings, and errors. The complete timestamped detail stream still goes to
 `BootUpdateCycle.log`. Raw Winget and Chocolatey output is retained separately in
 `BootUpdateCycle.providers.log` for troubleshooting without overwhelming the normal run log.
+Standalone `upd aws` output is captured in `BootUpdateCycle.aws.log`. These logs rotate
+independently (three archives, 5 MB for core/AWS and 10 MB for provider detail) and the
+active and archived files receive NTFS compression when the volume supports it.
+
+Run `upd logs` (or `upd l`) to create a compressed diagnostic ZIP on the Desktop. The
+export includes all three log streams and fails closed if its identity, network, or path
+redaction checks detect material that should not leave the machine.
+
+Because AWS maintenance is opt-in, `upd aws` fully modernizes the requested tooling by
+default: it verifies the current Amazon-signed modular modules, then removes validated
+older modular versions and legacy `AWSPowerShell*` version directories. Use
+`upd aws --keep-aws-legacy --keep-aws-old` only when compatibility requires preserving them.
 
 Press `v` at any time during an interactive run to cycle through:
 
@@ -237,6 +250,7 @@ Package managers are auto-detected. Missing ones are skipped with a warning.
 | `Register-BootUpdateTask.ps1` | Standalone task registration (alternative to Deploy) |
 | `Unregister-BootUpdateTask.ps1` | Emergency stop — removes the scheduled task |
 | `Repair-AwsTooling.ps1` | Optional AWS CLI v2 + module maintenance |
+| `Export-BootUpdateDiagnostics.ps1` | Sanitized, compressed diagnostic bundle export |
 | `tools/Initialize-BootUpdateWebhook.ps1` | Securely configures a notification webhook outside Git and task arguments |
 
 ## Monitoring
@@ -247,6 +261,9 @@ Get-Content "$env:ProgramData\BootUpdateCycle\BootUpdateCycle.log" -Tail 50 -Wai
 
 # Unabridged package-manager transcript
 Get-Content "$env:ProgramData\BootUpdateCycle\BootUpdateCycle.providers.log" -Tail 100 -Wait
+
+# Sanitized support bundle on the Desktop (short form: upd l)
+upd logs
 
 # Cycle history (last 50 runs with package counts)
 Get-Content "$env:ProgramData\BootUpdateCycle\BootUpdateCycle.history.json" | ConvertFrom-Json

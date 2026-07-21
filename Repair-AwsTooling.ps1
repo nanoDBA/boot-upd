@@ -88,7 +88,9 @@ param(
     [switch]$SkipCli,
     [switch]$SkipModules,
 
-    [switch]$UninstallCliV1
+    [switch]$UninstallCliV1,
+    [switch]$PreserveLegacyModules,
+    [switch]$PreserveOldModularVersions
 )
 
 $ErrorActionPreference = 'Stop'
@@ -130,6 +132,38 @@ function Get-AwsPowerShellModuleInventory {
             ModuleBase = [IO.Path]::GetFullPath($_.ModuleBase)
         }
     } | Sort-Object Family,Name,Version,ModuleBase -Unique)
+}
+
+function Test-AwsModuleVersionDirectory {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$ModuleName,
+        [Parameter(Mandatory)][version]$Version
+    )
+    $full = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+    if ((Split-Path $full -Leaf) -ne $Version.ToString()) { return $false }
+    if ((Split-Path (Split-Path $full -Parent) -Leaf) -ne $ModuleName) { return $false }
+    foreach ($root in @($env:PSModulePath -split ';' | Where-Object { $_ })) {
+        $moduleRoot = [IO.Path]::GetFullPath($root).TrimEnd('\') + '\'
+        if ($full.StartsWith($moduleRoot,[StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
+}
+
+function Remove-LegacyAwsPowerShellModules {
+    param([Parameter(Mandatory)][object[]]$Inventory)
+    $removed = 0; $retained = [Collections.Generic.List[string]]::new()
+    foreach ($module in @($Inventory | Where-Object Family -eq 'Legacy')) {
+        if (-not (Test-AwsModuleVersionDirectory -Path $module.ModuleBase -ModuleName $module.Name -Version $module.Version)) {
+            $retained.Add("$($module.Name) v$($module.Version) @ $($module.ModuleBase) [path validation failed]")
+            continue
+        }
+        try { Remove-Item -LiteralPath $module.ModuleBase -Recurse -Force -ErrorAction Stop; $removed++ }
+        catch { $retained.Add("$($module.Name) v$($module.Version) @ $($module.ModuleBase) [$($_.Exception.Message)]") }
+    }
+    $removedLabel = if ($removed -eq 1) { 'directory' } else { 'directories' }
+    Write-Host "Legacy AWS module cleanup: $removed exact version $removedLabel removed."
+    if ($retained.Count) { Write-Warning ("Legacy AWS module copies retained:`n  " + ($retained -join "`n  ")) }
 }
 
 # ---- CLI INSTALLATION ----
@@ -227,6 +261,7 @@ function Repair-AwsToolsModules {
         Write-Host "  Running AWS.Tools update in subprocess..."
         
         $scriptBlock = @'
+param([switch]$PreserveOldModularVersions)
 $ErrorActionPreference = 'Stop'
 
 function Test-AwsToolsSignedModuleDirectory {
@@ -369,7 +404,8 @@ function Test-AwsToolsPublisherMismatchMessage {
 function Invoke-VerifiedAwsToolsCleanup {
     param(
         [Parameter(Mandatory)][version]$ExceptVersion,
-        [Parameter(Mandatory)][string[]]$ModuleNames
+        [Parameter(Mandatory)][string[]]$ModuleNames,
+        [switch]$PreserveOldVersions
     )
     $cleanupRecords = @(Uninstall-AWSToolsModule -ExceptVersion $ExceptVersion -Force -Confirm:$false -ErrorAction Continue *>&1)
     $benignAlreadyAbsent = 0
@@ -394,8 +430,32 @@ function Invoke-VerifiedAwsToolsCleanup {
     $stale = @($ModuleNames | ForEach-Object {
         Get-Module -ListAvailable $_ | Where-Object Version -ne $ExceptVersion
     } | Sort-Object Name,Version,ModuleBase -Unique)
+    $removedDirectories = 0
+    if (-not $PreserveOldVersions) {
+        foreach ($module in $stale) {
+            $full = [IO.Path]::GetFullPath($module.ModuleBase).TrimEnd('\')
+            $valid = (Split-Path $full -Leaf) -eq $module.Version.ToString() -and
+                (Split-Path (Split-Path $full -Parent) -Leaf) -eq $module.Name
+            $underModuleRoot = $false
+            foreach ($root in @($env:PSModulePath -split ';' | Where-Object { $_ })) {
+                $normalizedRoot = [IO.Path]::GetFullPath($root).TrimEnd('\') + '\'
+                if ($full.StartsWith($normalizedRoot,[StringComparison]::OrdinalIgnoreCase)) { $underModuleRoot = $true; break }
+            }
+            if (-not $valid -or -not $underModuleRoot) { continue }
+            try { Remove-Item -LiteralPath $full -Recurse -Force -ErrorAction Stop; $removedDirectories++ }
+            catch { }
+        }
+        if ($removedDirectories) {
+            $removedLabel = if ($removedDirectories -eq 1) { 'directory' } else { 'directories' }
+            Write-Host "AWS.Tools cleanup: $removedDirectories stale exact version $removedLabel removed."
+        }
+        $stale = @($ModuleNames | ForEach-Object {
+            Get-Module -ListAvailable $_ | Where-Object Version -ne $ExceptVersion
+        } | Sort-Object Name,Version,ModuleBase -Unique)
+    }
     if ($stale.Count) {
-        Write-Warning ("Verified AWS.Tools $ExceptVersion is installed; locked or independently installed older copies were retained:`n  " +
+        $reason = if ($PreserveOldVersions) { 'preserved by request' } else { 'locked or failed safe path validation' }
+        Write-Warning ("Verified AWS.Tools $ExceptVersion is installed; older copies were retained ($reason):`n  " +
             (($stale | ForEach-Object { "$($_.Name) v$($_.Version) @ $($_.ModuleBase)" }) -join "`n  "))
     } else {
         Write-Host "AWS.Tools cleanup verified: no older managed module copies remain."
@@ -445,7 +505,7 @@ try {
             }
         }
     }
-    Invoke-VerifiedAwsToolsCleanup -ExceptVersion $targetVersion -ModuleNames $moduleNames
+    Invoke-VerifiedAwsToolsCleanup -ExceptVersion $targetVersion -ModuleNames $moduleNames -PreserveOldVersions:$PreserveOldModularVersions
     $after = @(Get-AwsToolsInventory)
     $updatedNames = @($moduleNames | Where-Object {
         $name = $_
@@ -469,9 +529,9 @@ catch {
         try {
             # UTF-8 BOM keeps Windows PowerShell 5.1 parsing deterministic.
             [IO.File]::WriteAllText($childPath, $scriptBlock, [Text.UTF8Encoding]::new($true))
-            $proc = Start-Process $engine -ArgumentList @(
-                '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', "`"$childPath`""
-            ) -Wait -PassThru -NoNewWindow
+            $childArguments = @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',"`"$childPath`"")
+            if ($PreserveOldModularVersions) { $childArguments += '-PreserveOldModularVersions' }
+            $proc = Start-Process $engine -ArgumentList $childArguments -Wait -PassThru -NoNewWindow
 
             if ($proc.ExitCode -ne 0) {
                 throw "AWS.Tools subprocess failed (exit code $($proc.ExitCode))"
@@ -528,7 +588,8 @@ if (-not $SkipModules) {
     $legacy = @($inventory | Where-Object Family -eq 'Legacy')
     $modular = @($inventory | Where-Object Family -eq 'Modular')
     if ($legacy) {
-        Write-Warning "Legacy AWSPowerShell modules are isolated from modular maintenance and retained for compatibility ($($legacy.Count) exact installation record(s)):"
+        $legacyAction = if ($PreserveLegacyModules) { 'will be preserved by request' } else { 'will be removed after modular verification' }
+        Write-Warning "Legacy AWSPowerShell modules detected ($($legacy.Count) exact installation record(s)); $legacyAction`:"
         $legacy | ForEach-Object { Write-Host "  $($_.Name) v$($_.Version) @ $($_.ModuleBase)" }
     }
 
@@ -539,6 +600,9 @@ if (-not $SkipModules) {
     }
 
     Repair-AwsToolsModules
+    if ($Mode -eq 'Remediate' -and $legacy -and -not $PreserveLegacyModules) {
+        Remove-LegacyAwsPowerShellModules -Inventory $inventory
+    }
 }
 
 Write-Host "`nDone."

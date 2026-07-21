@@ -17,6 +17,8 @@ param(
     [Alias('rp','restore-point','EnableRestorePoint')][switch]$RestorePoint,
     [Alias('dn','dotnet-tools','EnableDotnetTools')][switch]$DotnetTools,
     [Alias('aws','aws-tooling','EnableAwsTooling')][switch]$AwsTooling,
+    [Alias('keep-aws-legacy')][switch]$PreserveAwsLegacy,
+    [Alias('keep-aws-old')][switch]$PreserveAwsOldVersions,
     [Alias('no-pip','skip-pip')][switch]$SkipPip,
     [Alias('no-npm','skip-npm')][switch]$SkipNpm,
     [Alias('no-o365','skip-office365')][switch]$SkipOffice365,
@@ -47,6 +49,35 @@ $demoPath = Join-Path $PSScriptRoot 'Show-BootUpdateProgressDemo.ps1'
 $ps7BootstrapPath = Join-Path $PSScriptRoot 'Install-PowerShell7.ps1'
 $argumentBootstrapPath = Join-Path $PSScriptRoot 'Invoke-UpdBootstrap.ps1'
 $awsPath = Join-Path $repoRoot 'Repair-AwsTooling.ps1'
+$diagnosticsPath = Join-Path $repoRoot 'Export-BootUpdateDiagnostics.ps1'
+
+function Enable-UpdNtfsCompression {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }
+    try {
+        $item = Get-Item -LiteralPath $Path -Force
+        if (($item.Attributes -band [IO.FileAttributes]::Compressed) -eq 0 -and
+            (Get-Command compact.exe -ErrorAction SilentlyContinue)) {
+            $null = & compact.exe /C /I /Q $item.FullName 2>$null
+        }
+    } catch { }
+}
+
+function Invoke-UpdAwsLogMaintenance {
+    $directory = Join-Path $env:ProgramData 'BootUpdateCycle'
+    if (-not (Test-Path -LiteralPath $directory)) { $null = New-Item -ItemType Directory -Path $directory -Force }
+    $path = Join-Path $directory 'BootUpdateCycle.aws.log'
+    if ((Test-Path -LiteralPath $path) -and (Get-Item -LiteralPath $path).Length -gt 5MB) {
+        $archive = $path -replace '\.log$', ".$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
+        Move-Item -LiteralPath $path -Destination $archive -Force
+        Enable-UpdNtfsCompression -Path $archive
+    }
+    Get-ChildItem -LiteralPath $directory -File -ErrorAction SilentlyContinue |
+        Where-Object Name -Match '^BootUpdateCycle\.aws\.\d{8}-\d{6}\.log$' |
+        Sort-Object LastWriteTimeUtc -Descending | Select-Object -Skip 3 |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+    return $path
+}
 
 function Show-UpdHelp {
     @'
@@ -63,6 +94,7 @@ function Show-UpdHelp {
     upd plan [options]         Show the resolved deployment parameters only
     upd update                 Refresh the checksummed source bundle and exit
     upd aws                    Update/repair AWS CLI v2 and AWS.Tools
+    upd logs                   Export a sanitized compressed diagnostic bundle
     upd repair                 Recover launcher/core files, then refresh the bundle
     upd bootstrap              Verify that the PowerShell 7 runtime is ready
     upd status                 Show checkpoint/task status
@@ -70,7 +102,7 @@ function Show-UpdHelp {
     upd help                   Show this screen
 
   SHORT COMMANDS
-    r=run  d=demo  f=fun  sp=splash  p=plan  u=update  a=aws  b=bootstrap  st=status  v=version
+    r=run  d=demo  f=fun  sp=splash  p=plan  u=update  a=aws  l=logs  b=bootstrap  st=status  v=version
     Short commands do not take a leading dash.
 
   HELP ALIASES
@@ -90,6 +122,8 @@ function Show-UpdHelp {
     --restore-point            Opt in to a restore point
     --dotnet-tools             Opt in to .NET global-tool updates
     --aws-tooling              Opt in to AWS CLI/module repair
+    --keep-aws-legacy         Preserve legacy AWSPowerShell* during upd aws
+    --keep-aws-old            Preserve older modular AWS.Tools versions
     -x, --exclude <pattern>    Skip matching packages; repeat or comma-separate
     -i, --include <pattern>    Allow only matching packages; repeat or comma-separate
     --skip-pip                 Skip pip
@@ -251,6 +285,7 @@ function Update-UpdSourceBundle {
             [pscustomobject]@{ Name='Show-BootUpdateProgressDemo.ps1'; Target=$demoPath; PowerShell=$true; StageBatch=$false }
             [pscustomobject]@{ Name='Install-PowerShell7.ps1'; Target=$ps7BootstrapPath; PowerShell=$true; StageBatch=$false }
             [pscustomobject]@{ Name='Repair-AwsTooling.ps1'; Target=$awsPath; PowerShell=$true; StageBatch=$false }
+            [pscustomobject]@{ Name='Export-BootUpdateDiagnostics.ps1'; Target=$diagnosticsPath; PowerShell=$true; StageBatch=$false }
             [pscustomobject]@{ Name='upd.cmd'; Target=(Join-Path $repoRoot 'upd.cmd'); PowerShell=$false; StageBatch=$true }
         )
         $baselines = @{}
@@ -412,11 +447,13 @@ function Get-UpdCanonicalRunArguments {
 }
 
 function Get-UpdCanonicalAwsArguments {
-    param([switch]$DisableUpdate,[switch]$Preflighted)
+    param([switch]$DisableUpdate,[switch]$Preflighted,[switch]$KeepLegacy,[switch]$KeepOldVersions)
     $arguments = [Collections.Generic.List[string]]::new()
     $arguments.Add('aws')
     if ($DisableUpdate) { $arguments.Add('-DisableSelfUpdate') }
     if ($Preflighted) { $arguments.Add('-BundlePreflighted') }
+    if ($KeepLegacy) { $arguments.Add('-PreserveAwsLegacy') }
+    if ($KeepOldVersions) { $arguments.Add('-PreserveAwsOldVersions') }
     return $arguments.ToArray()
 }
 
@@ -449,7 +486,7 @@ if ($V -or $D -or $F -or $St) {
 
 $commandAliases = @{
     'r'='run'; 'd'='demo'; 'f'='fun'; 'sp'='splash'; 'p'='plan'
-    'u'='update'; 'a'='aws'; 'b'='bootstrap'; 'st'='status'; 'v'='version'
+    'u'='update'; 'a'='aws'; 'l'='logs'; 'b'='bootstrap'; 'st'='status'; 'v'='version'
     '--demo'='demo'; '/demo'='demo'; '--fun'='fun'; '/fun'='fun'
 }
 if ($commandAliases.ContainsKey($Command.ToLowerInvariant())) {
@@ -524,11 +561,28 @@ switch ($Command.ToLowerInvariant()) {
     'aws' {
         if (-not (Test-UpdAdministrator)) {
             Write-Host 'Requesting administrator access to update AWS tooling...' -ForegroundColor Yellow
-            exit (Invoke-UpdElevated -CanonicalArguments (Get-UpdCanonicalAwsArguments -DisableUpdate:$DisableSelfUpdate -Preflighted:$BundlePreflighted))
+            exit (Invoke-UpdElevated -CanonicalArguments (Get-UpdCanonicalAwsArguments -DisableUpdate:$DisableSelfUpdate -Preflighted:$BundlePreflighted -KeepLegacy:$PreserveAwsLegacy -KeepOldVersions:$PreserveAwsOldVersions))
         }
         if (-not $DisableSelfUpdate -and -not $BundlePreflighted) { $null = Update-UpdSourceBundle }
         if (-not (Test-Path -LiteralPath $awsPath)) { throw 'Repair-AwsTooling.ps1 is unavailable. Run upd repair.' }
-        & $awsPath -Mode Remediate
+        $awsLogPath = Invoke-UpdAwsLogMaintenance
+        $transcriptStarted = $false
+        try {
+            try { $null = Start-Transcript -LiteralPath $awsLogPath -Append -Force; $transcriptStarted = $true }
+            catch { Write-Warning "AWS transcript could not be started; maintenance will continue: $_" }
+            & $awsPath -Mode Remediate -PreserveLegacyModules:$PreserveAwsLegacy -PreserveOldModularVersions:$PreserveAwsOldVersions
+            $awsExitCode = $LASTEXITCODE
+        } finally {
+            if ($transcriptStarted) { try { $null = Stop-Transcript } catch { } }
+            Enable-UpdNtfsCompression -Path $awsLogPath
+        }
+        exit $awsExitCode
+    }
+    'logs' {
+        if (-not (Test-Path -LiteralPath $diagnosticsPath)) {
+            throw 'Diagnostics exporter is unavailable. Run upd update, then retry upd logs.'
+        }
+        & $diagnosticsPath
         exit $LASTEXITCODE
     }
     'run' {

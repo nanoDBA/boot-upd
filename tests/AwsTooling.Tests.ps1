@@ -35,6 +35,8 @@ BeforeAll {
 
     . ([scriptblock]::Create((Get-ChildFunctionText -Name 'Test-AwsToolsPublisherMismatchMessage')))
     . ([scriptblock]::Create((Get-ChildFunctionText -Name 'Test-AwsToolsAlreadyAbsentCleanupError')))
+    . ([scriptblock]::Create((Get-OuterFunctionText -Name 'Test-AwsModuleVersionDirectory')))
+    . ([scriptblock]::Create((Get-OuterFunctionText -Name 'Remove-LegacyAwsPowerShellModules')))
 }
 
 Describe 'AWS.Tools publisher certificate rollover' {
@@ -108,7 +110,7 @@ Authenticode issuer 'CN="Amazon Web Services, Inc.", OU=SDKs and Tools, O="Amazo
         $cleanup | Should -Match '\*>&1'
         $cleanup | Should -Match 'unexpectedErrors\.Count'
         $cleanup | Should -Match 'Get-Module -ListAvailable'
-        $cleanup | Should -Match 'older managed module copies remain'
+        $cleanup | Should -Match 'older copies were retained'
     }
 
     It 'accepts PowerShellGet metadata variants only for an exact absent AWS.Tools message' {
@@ -170,5 +172,34 @@ Describe 'AWS tooling inventory and host compatibility' {
         $repairSource | Should -Match '\$childPath'
         $repairSource | Should -Match 'finally\s*\{\s*Remove-Item -LiteralPath \$childPath'
         $childSource.Length | Should -BeGreaterThan 8191
+    }
+
+    It 'removes validated legacy version directories by default after modular verification' {
+        $priorModulePath = $env:PSModulePath
+        $root = Join-Path $TestDrive 'Modules'
+        $moduleBase = Join-Path $root 'AWSPowerShell\4.1.14.0'
+        New-Item -ItemType Directory -Path $moduleBase -Force | Out-Null
+        Set-Content (Join-Path $moduleBase 'AWSPowerShell.psd1') 'test'
+        try {
+            $env:PSModulePath = "$root;$priorModulePath"
+            $inventory = @([pscustomobject]@{ Family='Legacy'; Name='AWSPowerShell'; Version=[version]'4.1.14.0'; ModuleBase=$moduleBase })
+            Remove-LegacyAwsPowerShellModules -Inventory $inventory
+            Test-Path $moduleBase | Should -BeFalse
+        } finally { $env:PSModulePath = $priorModulePath }
+        $repairSource.IndexOf('Repair-AwsToolsModules') | Should -BeLessThan $repairSource.LastIndexOf('Remove-LegacyAwsPowerShellModules -Inventory')
+        $repairSource | Should -Match '\$Mode -eq ''Remediate''[\s\S]*?Remove-LegacyAwsPowerShellModules'
+    }
+
+    It 'removes stale modular versions only after target verification and supports explicit preservation' {
+        $cleanup = Get-ChildFunctionText -Name 'Invoke-VerifiedAwsToolsCleanup'
+        $cleanup | Should -Match 'if \(-not \$PreserveOldVersions\)'
+        $cleanup | Should -Match 'Remove-Item -LiteralPath \$full -Recurse -Force'
+        $cleanup | Should -Match '\$env:PSModulePath'
+        $verify = $childSource.IndexOf('Test-AwsToolsSignedModuleDirectory -ModuleRoot $installed.ModuleBase')
+        $cleanupCall = $childSource.IndexOf('Invoke-VerifiedAwsToolsCleanup -ExceptVersion $targetVersion')
+        $verify | Should -BeGreaterThan 0
+        $cleanupCall | Should -BeGreaterThan $verify
+        $repairSource | Should -Match '\[switch\]\$PreserveLegacyModules'
+        $repairSource | Should -Match '\[switch\]\$PreserveOldModularVersions'
     }
 }

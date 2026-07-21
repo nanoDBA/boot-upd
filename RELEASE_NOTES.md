@@ -1,8 +1,19 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.48
+**Current Version:** v2.5.49
 **Release Date:** 2026-07-21
 **Status:** STABLE
+
+---
+
+## v2.5.49 (2026-07-21)
+
+### Actionable diagnostics and explicit AWS modernization
+
+- Adds `upd logs` / `upd l`, which exports rotated core, provider, and AWS transcripts as a fail-closed sanitized ZIP and applies NTFS compression to runtime logs and archives.
+- Makes explicit `upd aws` fully modernize verified AWS.Tools installations by default, with preservation switches for legacy modules and old modular versions.
+- Prints validated, paste-ready Winget remediation commands for failed package IDs plus concise pinned and unknown-version inspection commands.
+- Keeps AWS audit mode non-destructive and expands privacy, rotation, launcher, AWS cleanup, and Winget command-injection regression tests.
 
 ---
 

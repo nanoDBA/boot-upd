@@ -109,7 +109,7 @@ Describe 'Safe fun and planning commands' {
 
 Describe 'Checksummed launcher self-update handoff' {
     It 'requires checksum sidecars for every executable bundle asset' {
-        foreach ($asset in @('Invoke-BootUpdateCycle.ps1','Deploy-BootUpdateCycle.ps1','Invoke-UpdLauncher.ps1','Invoke-UpdBootstrap.ps1','Show-BootUpdateProgressDemo.ps1','Install-PowerShell7.ps1','Repair-AwsTooling.ps1','upd.cmd')) {
+        foreach ($asset in @('Invoke-BootUpdateCycle.ps1','Deploy-BootUpdateCycle.ps1','Invoke-UpdLauncher.ps1','Invoke-UpdBootstrap.ps1','Show-BootUpdateProgressDemo.ps1','Install-PowerShell7.ps1','Repair-AwsTooling.ps1','Export-BootUpdateDiagnostics.ps1','upd.cmd')) {
             $launcherSource | Should -Match ([regex]::Escape("Name='$asset'"))
         }
         $launcherSource | Should -Match '\$\(\$spec\.Name\)\.sha256'
@@ -135,7 +135,7 @@ Describe 'Checksummed launcher self-update handoff' {
     }
 
     It 'publishes the complete executable bundle with sidecars' {
-        foreach ($asset in @('Deploy-BootUpdateCycle.ps1','Invoke-BootUpdateCycle.ps1','upd.cmd','tools/Invoke-UpdLauncher.ps1','tools/Invoke-UpdBootstrap.ps1','tools/Install-UpdCompat.ps1','tools/Show-BootUpdateProgressDemo.ps1','tools/Install-PowerShell7.ps1','Repair-AwsTooling.ps1')) {
+        foreach ($asset in @('Deploy-BootUpdateCycle.ps1','Invoke-BootUpdateCycle.ps1','upd.cmd','tools/Invoke-UpdLauncher.ps1','tools/Invoke-UpdBootstrap.ps1','tools/Install-UpdCompat.ps1','tools/Show-BootUpdateProgressDemo.ps1','tools/Install-PowerShell7.ps1','Repair-AwsTooling.ps1','Export-BootUpdateDiagnostics.ps1')) {
             $releaseSource | Should -Match ([regex]::Escape($asset))
         }
         $releaseSource | Should -Match '"\$name\.sha256"'
@@ -155,7 +155,7 @@ Describe 'Checksummed launcher self-update handoff' {
 
     It 'keeps stable read-only commands local and provides an explicit offline escape hatch' {
         $argumentBootstrapSource | Should -Match 'Read-only commands must remain local'
-        foreach ($command in @('help','version','plan','status','splash','demo','fun','bootstrap')) {
+        foreach ($command in @('help','version','plan','status','logs','splash','demo','fun','bootstrap')) {
             $argumentBootstrapSource | Should -Match ([regex]::Escape("'$command'"))
         }
         foreach ($switch in @('-nu','--no-update','--disable-self-update')) {
@@ -293,6 +293,15 @@ exit 29
         $cmdSource | Should -Match 'Invoke-UpdLauncher\.ps1\.sha256'
         $launcherSource | Should -Match 'Get-UpdVersion -AllowUnknown'
         $launcherSource | Should -Match "'aws'\s*\{(?s:.*?)Repair-AwsTooling\.ps1"
+    }
+
+    It 'exports sanitized logs and captures standalone AWS maintenance output' {
+        $launcherSource | Should -Match "'l'='logs'"
+        $launcherSource | Should -Match "'logs'\s*\{"
+        $launcherSource | Should -Match '\$diagnosticsPath'
+        $launcherSource | Should -Match 'BootUpdateCycle\.aws\.log'
+        $launcherSource | Should -Match 'Start-Transcript'
+        $launcherSource | Should -Match 'Invoke-UpdAwsLogMaintenance'
     }
 
     It 'behaviorally adopts only a checksum- and version-matched staged batch' {

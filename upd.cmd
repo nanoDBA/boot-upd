@@ -5,7 +5,7 @@ goto trampoline_wrapper
 
 :trampoline_active
 setlocal
-:: BootUpdateCycleVersion=2.5.48
+:: BootUpdateCycleVersion=2.5.49
 :: Friendly entry point. Argument parsing, safe demo modes, and elevation live in
 :: tools\Invoke-UpdLauncher.ps1 so quoting and validation remain testable.
 
@@ -31,6 +31,8 @@ if /i "%~1"=="plan" goto ps7_required
 if /i "%~1"=="p" goto ps7_required
 if /i "%~1"=="status" goto ps7_required
 if /i "%~1"=="st" goto ps7_required
+if /i "%~1"=="logs" goto ps7_required
+if /i "%~1"=="l" goto ps7_required
 if /i "%~1"=="splash" goto ps7_required
 if /i "%~1"=="sp" goto ps7_required
 if /i "%~1"=="demo" goto ps7_required
@@ -135,7 +137,7 @@ echo   Help is read-only. Operational commands bootstrap PowerShell 7 automatica
 exit /b 0
 
 :ps5_version
-echo Boot Update Cycle v2.5.48 ^(PowerShell 7 runtime not installed^)
+echo Boot Update Cycle v2.5.49 ^(PowerShell 7 runtime not installed^)
 exit /b 0
 
 :ps7_required
@@ -153,7 +155,7 @@ exit /b 0
 
 :classify_read_only
 set "UPD_READ_ONLY="
-for %%C in ("/?" "?" "/help" "help" "-h" "--help" "usage" "--usage" "-v" "-d" "-f" "-st" "version" "v" "plan" "p" "status" "st" "splash" "sp" "demo" "d" "--demo" "/demo" "fun" "f" "--fun" "/fun" "bootstrap" "b") do if /i "%~1"=="%%~C" set "UPD_READ_ONLY=1"
+for %%C in ("/?" "?" "/help" "help" "-h" "--help" "usage" "--usage" "-v" "-d" "-f" "-st" "version" "v" "plan" "p" "status" "st" "logs" "l" "splash" "sp" "demo" "d" "--demo" "/demo" "fun" "f" "--fun" "/fun" "bootstrap" "b") do if /i "%~1"=="%%~C" set "UPD_READ_ONLY=1"
 exit /b 0
 
 :classify_no_update
