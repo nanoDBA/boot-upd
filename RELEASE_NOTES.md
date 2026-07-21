@@ -1,10 +1,18 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.53
+**Current Version:** v2.5.54
 **Release Date:** 2026-07-21
 **Status:** STABLE
 
 ---
+
+## v2.5.54 (2026-07-21)
+
+- Makes explicit `upd -ar` quarantine an unchanged persistent Winget failure with a verified, reversible blocking pin after its bounded repair attempt is exhausted.
+- Reports quarantined packages as an amber degraded completion—not a fully-patched claim—and persists exact IDs, evidence, and `upd uq <id>` recovery commands in status and sanitized diagnostics.
+- Adds `upd uq [id|all]` to remove quarantine pins and atomically reconcile their durable records.
+- Reuses PSWindowsUpdate's explicit zero-result post-install scan only within the same boot and exact verification scope, avoiding a redundant exhaustive scan.
+- Requires an explicit, count-matched completion marker for standalone Windows Update convergence scans and fixes `Installed [0]` / `Downloaded [0]` package overcounting.
 
 ## v2.5.53 (2026-07-21)
 

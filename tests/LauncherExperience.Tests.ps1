@@ -105,6 +105,16 @@ Describe 'Safe fun and planning commands' {
         $preview | Should -BeGreaterThan 0
         $preview | Should -BeLessThan $adminGuard
     }
+
+    It 'surfaces durable Winget quarantine and its undo command in status' {
+        $launcherSource | Should -Match 'BootUpdateCycle-winget-quarantine\.json'
+        $launcherSource | Should -Match 'winget quarantine active'
+        $launcherSource | Should -Match 'UnpinCommand'
+        $launcherSource | Should -Match "'uq'='unquarantine'"
+        $launcherSource | Should -Match 'wingetPath pin remove --id \$record\.PackageId -e --disable-interactivity'
+        $launcherSource | Should -Match 'its record was retained'
+        $launcherSource | Should -Match 'Remove-Item -LiteralPath \$path -Force'
+    }
 }
 
 Describe 'Checksummed launcher self-update handoff' {

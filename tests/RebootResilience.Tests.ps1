@@ -28,11 +28,15 @@ BeforeAll {
 
     foreach ($functionName in @(
         'Update-BootUpdateStateForBootSession',
+        'Get-BootUpdateBootSessionId',
         'Resolve-BootUpdateCompletionDisposition',
         'Stop-BootUpdateAtRebootLimit',
         'Stop-BootUpdateAtRetryLimit',
         'Update-BootUpdateStagedRetryCount',
         'Get-NextMaintenanceWindowStart',
+        'Get-WindowsUpdateVerificationScope',
+        'Test-WindowsUpdateZeroEvidence',
+        'Get-WindowsUpdateInstallOutputSummary',
         'Test-WindowsUpdateConvergence',
         'Format-NativeExitCode',
           'Get-InstallerExitSummary',
@@ -40,6 +44,9 @@ BeforeAll {
           'Get-WingetRemediationCommand',
           'Complete-WingetFailureClassification',
           'Register-WingetAggressiveRepairAttempt',
+          'Invoke-WingetFailureQuarantine',
+          'Get-WingetQuarantineRecords',
+          'Set-WingetQuarantineRecords',
           'Set-BootUpdateClipboardText',
           'Stop-BootUpdateForManualAttention',
           'Write-BootUpdateRepairPlan'
@@ -48,6 +55,8 @@ BeforeAll {
     }
     function Write-Log { param([string]$Message, [string]$Level) }
     function Set-BootUpdateState { param($State) }
+    function Write-ProviderTranscript { param($Provider, $Scope, $Lines) }
+    function Invoke-PackageManagerWithTimeout { param($Name, $ScriptBlock, $ArgumentList, $IdleTimeoutMinutes, $HardTimeoutMinutes) }
     function Write-EventLogEntry { param($EventId, $EntryType, $Message) }
     function Send-CompletionNotification { param($Kind, $Title, $Message) }
     function Enable-BootUpdateNtfsCompression { param($Path) }
@@ -126,6 +135,62 @@ Describe 'Concise provider diagnostics' {
             $classificationIndex | Should -BeLessThan $repairIndex
         }
         $winget | Should -Match 'identical failure signature already attempted; verification only'
+    }
+
+    It 'quarantines every persistent Winget failure with reversible blocking pins' {
+        $script:WingetQuarantinePath = Join-Path $TestDrive 'all-pinned-quarantine.json'
+        $state = [pscustomobject]@{ WingetQuarantines=@() }
+        $failures = @(
+            [pscustomobject]@{ Name='Health Check'; Id='Microsoft.WindowsPCHealthCheck'; Code=1612 },
+            [pscustomobject]@{ Name='iCUE'; Id='Corsair.iCUE.5'; Code=3221226525 }
+        )
+        $script:pinArguments = @()
+        Mock Invoke-PackageManagerWithTimeout {
+            $script:pinArguments += ,@($ArgumentList)
+            [pscustomobject]@{ ExitCode=0; TimedOut=$false; Failed=$false; Output=@('Pin added') }
+        }
+        Mock Write-ProviderTranscript { }
+
+        $result = Invoke-WingetFailureQuarantine -WingetPath 'C:\winget.exe' -State $state `
+            -Signature 'Corsair.iCUE.5:3221226525|Microsoft.WindowsPCHealthCheck:1612' -Failures $failures
+
+        $result.AllPinned | Should -BeTrue
+        @($result.PinnedIds).Count | Should -Be 2
+        @($state.WingetQuarantines).Count | Should -Be 2
+        @((Get-WingetQuarantineRecords)).Count | Should -Be 2
+        @($script:pinArguments | ForEach-Object { $_[1] }) | Should -Contain 'Corsair.iCUE.5'
+        @($script:pinArguments | ForEach-Object { $_[1] }) | Should -Contain 'Microsoft.WindowsPCHealthCheck'
+        foreach ($record in $state.WingetQuarantines) {
+            $record.PinCommand | Should -Be "winget pin add --id $($record.PackageId) -e --blocking --force --disable-interactivity"
+            $record.UnpinCommand | Should -Be "upd uq $($record.PackageId)"
+            $record.NativeUnpinCommand | Should -Be "winget pin remove --id $($record.PackageId) -e --disable-interactivity"
+            $record.FailureSignature | Should -Not -BeNullOrEmpty
+            $record.PinnedAt | Should -Not -BeNullOrEmpty
+        }
+        Assert-MockCalled Invoke-PackageManagerWithTimeout -Times 2 -Exactly
+    }
+
+    It 'withholds Winget quarantine success if any terminal failure was not pinned' {
+        $script:WingetQuarantinePath = Join-Path $TestDrive 'partial-quarantine.json'
+        $state = [pscustomobject]@{ WingetQuarantines=@() }
+        $failures = @(
+            [pscustomobject]@{ Name='Health Check'; Id='Microsoft.WindowsPCHealthCheck'; Code=1612 },
+            [pscustomobject]@{ Name='iCUE'; Id='Corsair.iCUE.5'; Code=3221226525 }
+        )
+        Mock Invoke-PackageManagerWithTimeout {
+            if ($ArgumentList[1] -eq 'Corsair.iCUE.5') {
+                return [pscustomobject]@{ ExitCode=1; TimedOut=$false; Failed=$true; Output=@('Pin failed') }
+            }
+            [pscustomobject]@{ ExitCode=0; TimedOut=$false; Failed=$false; Output=@('Pin added') }
+        }
+        Mock Write-ProviderTranscript { }
+
+        $result = Invoke-WingetFailureQuarantine -WingetPath 'C:\winget.exe' -State $state `
+            -Signature 'repeat' -Failures $failures
+
+        $result.AllPinned | Should -BeFalse
+        @($state.WingetQuarantines).Count | Should -Be 1
+        $state.WingetQuarantines[0].PackageId | Should -Be 'Microsoft.WindowsPCHealthCheck'
     }
 
     It 'writes a durable plan with explanations outside a valid cmd copy block' {
@@ -544,19 +609,39 @@ Describe 'Behavioral Windows Update convergence' {
     BeforeEach {
         $script:ExcludePatterns = @('SQL')
         $script:PackageTimeoutMinutes = 30
+        $script:CurrentState = $null
         Mock Get-Module { [pscustomobject]@{ Name='PSWindowsUpdate' } }
+        Mock Get-BootUpdateBootSessionId { 'boot-a' }
         Mock Write-Log {}
     }
 
     It 'verifies zero applicable updates' {
-        Mock Invoke-BootUpdateBackgroundOperation { [pscustomobject]@{ Output=@(); Failed=$false; TimedOut=$false } }
+        Mock Invoke-BootUpdateBackgroundOperation { [pscustomobject]@{ Output=@('BOOTUPDATE_SCAN_COMPLETE|0'); Failed=$false; TimedOut=$false } }
         $result = Test-WindowsUpdateConvergence
         $result.Verified | Should -BeTrue
         $result.Count | Should -Be 0
     }
 
+    It 'accepts only exact post-search zero evidence and does not count zero download/install summaries' {
+        $summary = Get-WindowsUpdateInstallOutputSummary -Lines @(
+            'Downloaded [0] Updates',
+            'Installed [0] Updates',
+            'Found [0] Updates in post search criteria'
+        )
+        $summary.Installed | Should -Be 0
+        $summary.PostSearchZero | Should -BeTrue
+
+        (Get-WindowsUpdateInstallOutputSummary -Lines @('Found [0] Updates in pre search criteria')).PostSearchZero | Should -BeFalse
+        (Get-WindowsUpdateInstallOutputSummary -Lines @('Found [1] Updates in post search criteria')).PostSearchZero | Should -BeFalse
+    }
+
+    It 'counts the installed aggregate without double-counting downloaded updates' {
+        $summary = Get-WindowsUpdateInstallOutputSummary -Lines @('Downloaded [3] Updates','Installed [2] Updates')
+        $summary.Installed | Should -Be 2
+    }
+
     It 'does not count the legacy empty applicable marker as an update' {
-        Mock Invoke-BootUpdateBackgroundOperation { [pscustomobject]@{ Output=@('BOOTUPDATE_APPLICABLE||'); Failed=$false; TimedOut=$false } }
+        Mock Invoke-BootUpdateBackgroundOperation { [pscustomobject]@{ Output=@('BOOTUPDATE_APPLICABLE||','BOOTUPDATE_SCAN_COMPLETE|0'); Failed=$false; TimedOut=$false } }
         $result = Test-WindowsUpdateConvergence
         $result.Verified | Should -BeTrue
         $result.Count | Should -Be 0
@@ -564,7 +649,7 @@ Describe 'Behavioral Windows Update convergence' {
     }
 
     It 'reports remaining applicable updates' {
-        Mock Invoke-BootUpdateBackgroundOperation { [pscustomobject]@{ Output=@('BOOTUPDATE_APPLICABLE|KB1|Update'); Failed=$false; TimedOut=$false } }
+        Mock Invoke-BootUpdateBackgroundOperation { [pscustomobject]@{ Output=@('BOOTUPDATE_APPLICABLE|KB1|Update','BOOTUPDATE_SCAN_COMPLETE|1'); Failed=$false; TimedOut=$false } }
         $result = Test-WindowsUpdateConvergence
         $result.Verified | Should -BeTrue
         $result.Count | Should -Be 1
@@ -573,6 +658,56 @@ Describe 'Behavioral Windows Update convergence' {
     It 'withholds verification after a scan error' {
         Mock Invoke-BootUpdateBackgroundOperation { [pscustomobject]@{ Output=@('BOOTUPDATE_ERROR|offline'); Failed=$false; TimedOut=$false } }
         (Test-WindowsUpdateConvergence).Verified | Should -BeFalse
+    }
+
+    It 'withholds verification when the child exits without a completion marker' {
+        Mock Invoke-BootUpdateBackgroundOperation { [pscustomobject]@{ Output=@(); Failed=$false; TimedOut=$false } }
+        (Test-WindowsUpdateConvergence).Verified | Should -BeFalse
+    }
+
+    It 'withholds verification when the completion count disagrees with update records' {
+        Mock Invoke-BootUpdateBackgroundOperation { [pscustomobject]@{
+            Output=@('BOOTUPDATE_APPLICABLE|KB1|Update','BOOTUPDATE_SCAN_COMPLETE|0')
+            Failed=$false; TimedOut=$false
+        } }
+        (Test-WindowsUpdateConvergence).Verified | Should -BeFalse
+    }
+
+    It 'reuses exact post-search zero evidence only on the same boot and scope' {
+        $scope = Get-WindowsUpdateVerificationScope
+        $script:CurrentState = [pscustomobject]@{ WindowsUpdateZeroEvidence = [pscustomobject]@{
+            BootSessionId='boot-a'; ScopeSignature=$scope.Signature
+            Source='PSWindowsUpdate-post-search-zero'; ObservedAt='2026-07-21T00:00:00Z'
+        } }
+        Mock Invoke-BootUpdateBackgroundOperation { throw 'redundant scan should not run' }
+        $result = Test-WindowsUpdateConvergence
+        $result.Verified | Should -BeTrue
+        $result.Count | Should -Be 0
+        Assert-MockCalled Invoke-BootUpdateBackgroundOperation -Times 0
+    }
+
+    It 'invalidates cached zero evidence after a boot change and performs the scan' {
+        $scope = Get-WindowsUpdateVerificationScope
+        $script:CurrentState = [pscustomobject]@{ WindowsUpdateZeroEvidence = [pscustomobject]@{
+            BootSessionId='old-boot'; ScopeSignature=$scope.Signature
+            Source='PSWindowsUpdate-post-search-zero'
+        } }
+        Mock Invoke-BootUpdateBackgroundOperation { [pscustomobject]@{ Output=@('BOOTUPDATE_SCAN_COMPLETE|0'); Failed=$false; TimedOut=$false } }
+        (Test-WindowsUpdateConvergence).Verified | Should -BeTrue
+        $script:CurrentState.WindowsUpdateZeroEvidence | Should -BeNullOrEmpty
+        Assert-MockCalled Invoke-BootUpdateBackgroundOperation -Times 1
+    }
+
+    It 'invalidates cached zero evidence when exclusions change' {
+        $oldScope = Get-WindowsUpdateVerificationScope
+        $script:CurrentState = [pscustomobject]@{ WindowsUpdateZeroEvidence = [pscustomobject]@{
+            BootSessionId='boot-a'; ScopeSignature=$oldScope.Signature
+            Source='PSWindowsUpdate-post-search-zero'
+        } }
+        $script:ExcludePatterns = @('SQL','Preview')
+        Mock Invoke-BootUpdateBackgroundOperation { [pscustomobject]@{ Output=@('BOOTUPDATE_SCAN_COMPLETE|0'); Failed=$false; TimedOut=$false } }
+        (Test-WindowsUpdateConvergence).Verified | Should -BeTrue
+        Assert-MockCalled Invoke-BootUpdateBackgroundOperation -Times 1
     }
 }
 
@@ -624,6 +759,15 @@ Describe 'Evidence-backed completion' {
         $cleanup | Should -BeLessThan $verify
         $verify | Should -BeLessThan $notify
         $notify | Should -BeLessThan $banner
+    }
+
+    It 'reports durable Winget quarantine as degraded completion rather than fully patched' {
+        $text = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
+        $text | Should -Match 'COMPLETE WITH WINGET QUARANTINE'
+        $text | Should -Match 'this is not a fully-patched claim'
+        $text | Should -Match 'Boot Update Cycle Complete with Quarantine'
+        $text | Should -Match 'WingetQuarantinePath'
+        (Get-FunctionText $invokeAst 'Clear-BootUpdateState') | Should -Not -Match 'WingetQuarantine'
     }
 
     It 'requires completed thread jobs and structured success' {

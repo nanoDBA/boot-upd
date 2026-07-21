@@ -99,11 +99,12 @@ function Show-UpdHelp {
     upd repair                 Recover launcher/core files, then refresh the bundle
     upd bootstrap              Verify that the PowerShell 7 runtime is ready
     upd status                 Show checkpoint/task status
+    upd uq [id|all]            Remove recorded Winget quarantine pins; default all
     upd version                Show the bundled updater version
     upd help                   Show this screen
 
   SHORT COMMANDS
-    r=run  d=demo  f=fun  sp=splash  p=plan  u=update  a=aws  l=logs  b=bootstrap  st=status  v=version
+    r=run  d=demo  f=fun  sp=splash  p=plan  u=update  a=aws  l=logs  uq=unquarantine  b=bootstrap  st=status  v=version
     Short commands do not take a leading dash.
 
   HELP ALIASES
@@ -461,6 +462,7 @@ function Get-UpdCanonicalAwsArguments {
 
 function Show-UpdStatus {
     $statePath = Join-Path $env:ProgramData 'BootUpdateCycle\BootUpdateCycle.state.json'
+    $quarantinePath = Join-Path $env:ProgramData 'BootUpdateCycle\BootUpdateCycle-winget-quarantine.json'
     $taskNames = @('BootUpdateCycle','BootUpdateCycleFallback')
     Write-Host "Boot Update Cycle v$(Get-UpdVersion)" -ForegroundColor Cyan
     foreach ($name in $taskNames) {
@@ -471,6 +473,48 @@ function Show-UpdStatus {
         $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
         Write-Host "  state $($state.Phase)  iteration $($state.Iteration)/$($state.MaxIterations ?? '?')"
     } else { Write-Host '  state no active checkpoint' }
+    if (Test-Path -LiteralPath $quarantinePath) {
+        try {
+            $quarantines = @((Get-Content -LiteralPath $quarantinePath -Raw | ConvertFrom-Json))
+            Write-Host "  winget quarantine active ($($quarantines.Count) package(s))" -ForegroundColor Yellow
+            foreach ($record in $quarantines) { Write-Host "    $($record.PackageId)  undo: $($record.UnpinCommand)" -ForegroundColor Yellow }
+        } catch { Write-Warning "Winget quarantine record is unreadable: $quarantinePath" }
+    }
+}
+
+function Remove-UpdWingetQuarantine {
+    param([string]$Target = 'all')
+    $path = Join-Path $env:ProgramData 'BootUpdateCycle\BootUpdateCycle-winget-quarantine.json'
+    if (-not (Test-Path -LiteralPath $path)) {
+        Write-Host 'No recorded Winget quarantine is active.' -ForegroundColor Green
+        return
+    }
+    $records = @((Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json))
+    foreach ($record in $records) {
+        if ([string]$record.PackageId -notmatch '^[A-Za-z0-9][A-Za-z0-9._+-]*$') {
+            throw 'The Winget quarantine record contains an unsafe package identifier; no pins were changed.'
+        }
+    }
+    if ($Target -ne 'all' -and $Target -notmatch '^[A-Za-z0-9][A-Za-z0-9._+-]*$') {
+        throw "Invalid Winget quarantine package id '$Target'."
+    }
+    $targets = if ($Target -eq 'all') { @($records) } else { @($records | Where-Object PackageId -eq $Target) }
+    if (-not $targets.Count) { throw "No recorded Winget quarantine matches '$Target'." }
+    $wingetPath = (Get-Command winget -ErrorAction Stop).Source
+    $remaining = [Collections.Generic.List[object]]::new([object[]]$records)
+    foreach ($record in $targets) {
+        & $wingetPath pin remove --id $record.PackageId -e --disable-interactivity
+        if ($LASTEXITCODE -ne 0) { throw "Winget could not remove the quarantine pin for $($record.PackageId); its record was retained." }
+        $null = $remaining.Remove($record)
+        if ($remaining.Count) {
+            $temp = '{0}.{1}.{2}.tmp' -f $path,$PID,[guid]::NewGuid().ToString('N')
+            try {
+                [IO.File]::WriteAllText($temp, ($remaining.ToArray() | ConvertTo-Json -Depth 6), [Text.Encoding]::UTF8)
+                [IO.File]::Move($temp,$path,$true)
+            } finally { if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue } }
+        } else { Remove-Item -LiteralPath $path -Force }
+        Write-Host "Removed Winget quarantine for $($record.PackageId)." -ForegroundColor Green
+    }
 }
 
 if ($EncodedArguments) {
@@ -488,7 +532,7 @@ if ($V -or $D -or $F -or $St) {
 
 $commandAliases = @{
     'r'='run'; 'd'='demo'; 'f'='fun'; 'sp'='splash'; 'p'='plan'
-    'u'='update'; 'a'='aws'; 'l'='logs'; 'b'='bootstrap'; 'st'='status'; 'v'='version'
+    'u'='update'; 'a'='aws'; 'l'='logs'; 'uq'='unquarantine'; 'b'='bootstrap'; 'st'='status'; 'v'='version'
     '--demo'='demo'; '/demo'='demo'; '--fun'='fun'; '/fun'='fun'
 }
 if ($commandAliases.ContainsKey($Command.ToLowerInvariant())) {
@@ -509,9 +553,22 @@ if ($Command -in @('demo','fun') -and $RemainingArguments.Count -eq 1 -and $Rema
     $DurationSeconds = [int]$RemainingArguments[0]
     $RemainingArguments = @()
 }
+if ($Command -eq 'unquarantine') {
+    if ($RemainingArguments.Count -gt 1) { throw 'Use upd uq [package-id|all].' }
+    $unquarantineTarget = if ($RemainingArguments.Count) { $RemainingArguments[0] } else { 'all' }
+    $RemainingArguments = @()
+}
 if ($RemainingArguments.Count) { throw "Unexpected argument(s): $($RemainingArguments -join ' '). Run 'upd help'." }
 
 switch ($Command.ToLowerInvariant()) {
+    'unquarantine' {
+        if (-not (Test-UpdAdministrator)) {
+            Write-Host 'Requesting administrator access to remove Winget quarantine pins...' -ForegroundColor Yellow
+            exit (Invoke-UpdElevated -CanonicalArguments @('unquarantine',$unquarantineTarget))
+        }
+        Remove-UpdWingetQuarantine -Target $unquarantineTarget
+        exit 0
+    }
     'splash' {
         & $invokePath -PreviewSplash
         exit 0

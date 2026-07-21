@@ -257,6 +257,7 @@ function Get-BootUpdateWebhookSecret {
 $script:LogPath               = Join-Path $PSScriptRoot 'BootUpdateCycle.log'
 $script:ProviderTranscriptPath = Join-Path $PSScriptRoot 'BootUpdateCycle.providers.log'
 $script:StatePath             = Join-Path $PSScriptRoot 'BootUpdateCycle.state.json'
+$script:WingetQuarantinePath  = Join-Path $PSScriptRoot 'BootUpdateCycle-winget-quarantine.json'
 $script:HistoryPath           = Join-Path $PSScriptRoot 'BootUpdateCycle.history.json'
 $script:MaxLogSizeMB          = 5
 $script:MaxHistoryEntries     = 50
@@ -339,8 +340,8 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
     }
 }
 
-Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 4 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.53' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 5 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.54' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 Set-Variable -Name 'RebootSignalSettleSeconds' -Value 20 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 $script:ExplicitRebootRequests = [System.Collections.Generic.List[object]]::new()
 
@@ -979,6 +980,101 @@ function Invoke-WingetAggressiveRepair {
     }
 }
 
+function Invoke-WingetFailureQuarantine {
+    param(
+        [Parameter(Mandatory)][string]$WingetPath,
+        [Parameter(Mandatory)][pscustomobject]$State,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Signature,
+        [object[]]$Failures = @(),
+        [int]$TimeoutMinutes = 5
+    )
+    $targets = @($Failures | Sort-Object Id -Unique)
+    # Merge the durable sidecar with transient checkpoint state. The sidecar is
+    # written first, so a crash between its promotion and state persistence must
+    # not lose an already-active pin on the next pass.
+    $existingRecords = @($(if ($State.PSObject.Properties.Name -contains 'WingetQuarantines') { @($State.WingetQuarantines) }) + @(Get-WingetQuarantineRecords)) |
+        Group-Object PackageId | ForEach-Object { $_.Group | Select-Object -Last 1 }
+    $records = [Collections.Generic.List[object]]::new([object[]]@($existingRecords))
+    $pinned = [Collections.Generic.List[string]]::new()
+
+    foreach ($failure in $targets) {
+        $id = [string]$failure.Id
+        if ($id -notmatch '^[A-Za-z0-9][A-Za-z0-9._+-]*$') {
+            Write-Log "Winget quarantine refused an unsafe or missing package identifier for $($failure.Name)." -Level Error
+            continue
+        }
+        Write-Log "Winget quarantine: adding a reversible blocking pin for $($failure.Name) [$id]." -Level Warn
+        $result = Invoke-PackageManagerWithTimeout -Name "Winget-quarantine-$id" -ScriptBlock {
+            param($wp,$packageId)
+            & $wp pin add --id $packageId -e --blocking --force --disable-interactivity 2>&1
+        } -ArgumentList @($WingetPath,$id) -IdleTimeoutMinutes 2 -HardTimeoutMinutes $TimeoutMinutes
+        Write-ProviderTranscript -Provider Winget -Scope "quarantine/$id" -Lines $result.Output
+        if ($result.TimedOut -or $result.Failed -or $result.ExitCode -ne 0) {
+            Write-Log "Winget quarantine failed for $($failure.Name) [$id]; the phase remains incomplete." -Level Error
+            continue
+        }
+
+        $records = [Collections.Generic.List[object]]::new([object[]]@($records | Where-Object { $_.PackageId -ne $id }))
+        $record = [pscustomobject]@{
+            PackageId=$id
+            Name=[string]$failure.Name
+            FailureCode=[long]$failure.Code
+            FailureSignature=$Signature
+            PinnedAt=(Get-Date).ToString('o')
+            PinCommand="winget pin add --id $id -e --blocking --force --disable-interactivity"
+            UnpinCommand="upd uq $id"
+            NativeUnpinCommand="winget pin remove --id $id -e --disable-interactivity"
+        }
+        $records.Add($record)
+        try {
+            Set-WingetQuarantineRecords -Records $records.ToArray()
+        } catch {
+            $null = $records.Remove($record)
+            Write-Log "Winget quarantine record could not be persisted for $id; rolling back its pin: $_" -Level Error
+            $rollback = Invoke-PackageManagerWithTimeout -Name "Winget-quarantine-rollback-$id" -ScriptBlock {
+                param($wp,$packageId)
+                & $wp pin remove --id $packageId -e --disable-interactivity 2>&1
+            } -ArgumentList @($WingetPath,$id) -IdleTimeoutMinutes 2 -HardTimeoutMinutes $TimeoutMinutes
+            Write-ProviderTranscript -Provider Winget -Scope "quarantine-rollback/$id" -Lines $rollback.Output
+            continue
+        }
+        $persistedRecords = [object[]]$records.ToArray()
+        if ($State.PSObject.Properties.Name -contains 'WingetQuarantines') {
+            $State.WingetQuarantines = $persistedRecords
+        } else {
+            $State | Add-Member -NotePropertyName WingetQuarantines -NotePropertyValue $persistedRecords
+        }
+        Set-BootUpdateState -State $State
+        $pinned.Add($id)
+    }
+
+    $allPinned = $targets.Count -gt 0 -and $pinned.Count -eq $targets.Count
+    if ($allPinned) {
+        Write-Log "Winget quarantine complete: $($pinned.Count) persistent failure(s) have reversible blocking pins." -Level Warn
+    }
+    return [pscustomobject]@{ AllPinned=$allPinned; PinnedIds=[string[]]$pinned.ToArray() }
+}
+
+function Get-WingetQuarantineRecords {
+    if (-not (Test-Path -LiteralPath $script:WingetQuarantinePath)) { return @() }
+    try { return @((Get-Content -LiteralPath $script:WingetQuarantinePath -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json)) }
+    catch {
+        Write-Log "Winget quarantine record is unreadable: $_" -Level Error
+        return @()
+    }
+}
+
+function Set-WingetQuarantineRecords {
+    param([Parameter(Mandatory)][object[]]$Records)
+    $tempPath = '{0}.{1}.{2}.tmp' -f $script:WingetQuarantinePath,$PID,[guid]::NewGuid().ToString('N')
+    try {
+        [IO.File]::WriteAllText($tempPath, ($Records | ConvertTo-Json -Depth 6), [Text.Encoding]::UTF8)
+        [IO.File]::Move($tempPath, $script:WingetQuarantinePath, $true)
+    } finally {
+        if (Test-Path -LiteralPath $tempPath) { Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue }
+    }
+}
+
 function Write-WingetScopeSummary {
     param(
         [Parameter(Mandatory)][string]$Scope,
@@ -1043,6 +1139,7 @@ function Update-BootUpdateStateForBootSession {
         if ($State.PSObject.Properties.Name -contains 'ConsecutiveRetryCount') { $State.ConsecutiveRetryCount = 0 }
         else { $State | Add-Member -NotePropertyName 'ConsecutiveRetryCount' -NotePropertyValue 0 -Force }
         $State.ExplicitRebootRequests = @()
+        if ($State.PSObject.Properties.Name -contains 'WindowsUpdateZeroEvidence') { $State.WindowsUpdateZeroEvidence = $null }
     }
     $State.LastBootSessionId = $CurrentBootSessionId
     return $State
@@ -1093,8 +1190,10 @@ function New-BootUpdateStateV2 {
         RebootCount           = 0
         ConsecutiveRetryCount = 0
         LastBootSessionId     = $null
+        WindowsUpdateZeroEvidence = $null
         ExplicitRebootRequests = @()
         WingetAggressiveRepairSignatures = @()
+        WingetQuarantines       = @()
         ResumeUser            = $null
         Summary               = [pscustomobject]@{
             Winget = 0; Chocolatey = 0; WindowsUpdate = 0; Pip = 0; Npm = 0; Office365 = 0
@@ -1145,6 +1244,13 @@ function Update-BootUpdateStateSchema {
         if ($props -notcontains 'LimitRebootSignals') { $State | Add-Member -NotePropertyName 'LimitRebootSignals' -NotePropertyValue @() -Force }
     }
 
+    <# v4 -> v5: persist fresh post-install zero-work evidence so the final
+       convergence check can avoid repeating the identical read-only scan. #>
+    if ($ver -lt 5) {
+        $props = $State.PSObject.Properties.Name
+        if ($props -notcontains 'WindowsUpdateZeroEvidence') { $State | Add-Member -NotePropertyName 'WindowsUpdateZeroEvidence' -NotePropertyValue $null -Force }
+    }
+
     $props = $State.PSObject.Properties.Name
     <# Add-if-missing: crash recovery, new phase flags, network-check cache #>
     foreach ($f in @('LastPhaseStarted','LastPhaseTimestamp','StagedNextPhase','LastPreflightNetworkOk','LastPreflightNetworkAt','LastRebootSignals','LastBootSessionId','ResumeUser','LimitReachedAt','LimitReason')) {
@@ -1155,6 +1261,8 @@ function Update-BootUpdateStateSchema {
     if ($props -notcontains 'ConsecutiveRetryCount') { $State | Add-Member -NotePropertyName 'ConsecutiveRetryCount' -NotePropertyValue 0 -Force }
     if ($props -notcontains 'ExplicitRebootRequests') { $State | Add-Member -NotePropertyName 'ExplicitRebootRequests' -NotePropertyValue @() -Force }
     if ($props -notcontains 'WingetAggressiveRepairSignatures') { $State | Add-Member -NotePropertyName 'WingetAggressiveRepairSignatures' -NotePropertyValue @() -Force }
+    if ($props -notcontains 'WingetQuarantines') { $State | Add-Member -NotePropertyName 'WingetQuarantines' -NotePropertyValue @() -Force }
+    if ($props -notcontains 'WindowsUpdateZeroEvidence') { $State | Add-Member -NotePropertyName 'WindowsUpdateZeroEvidence' -NotePropertyValue $null -Force }
     foreach ($f in @('WindowsUpdateDone','AwsToolingDone','PowerShellModulesDone','ScoopDone','DotnetToolsDone','VscodeDone','DefenderDone','DriverFirmwareDone','WslDone','ContainersDone')) {
         if ($props -notcontains $f) { $State | Add-Member -NotePropertyName $f -NotePropertyValue $false -Force }
     }
@@ -2182,10 +2290,20 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
                 Write-Log 'Winget aggressive repair: identical failure signature already attempted; verification only.' -Level Warn
             }
         }
-        if ($script:CurrentWingetFailures.Count -and -not $classification.TerminalFailure) {
+        $quarantine = $null
+        if ($script:AggressiveRepair -and $classification.TerminalFailure) {
+            $quarantine = Invoke-WingetFailureQuarantine -WingetPath $wingetPath -State $script:CurrentState `
+                -Signature $classification.Signature -Failures $script:CurrentWingetFailures.ToArray()
+            if ($quarantine.AllPinned) {
+                $classification.TerminalFailure = $false
+                $classification.Details = @()
+            } else { $anyTimeout = $true }
+        }
+        if ($script:CurrentWingetFailures.Count -and -not $classification.TerminalFailure -and -not ($quarantine -and $quarantine.AllPinned)) {
             Write-Log 'Winget: one automatic verification pass remains; manual commands are withheld unless the same failure repeats.' -Level Warn
         }
-        return @{ Success = (-not $anyTimeout); Count = $totalCount; TerminalFailure=$classification.TerminalFailure; AttentionDetails=$classification.Details }
+        $phaseSuccess = if ($quarantine -and $quarantine.AllPinned) { $true } elseif ($script:CurrentWingetFailures.Count) { $false } else { -not $anyTimeout }
+        return @{ Success = $phaseSuccess; Count = $totalCount; TerminalFailure=$classification.TerminalFailure; AttentionDetails=$classification.Details }
     }
 
     <# ── Sequential path: single scope (SYSTEM: machine only) OR ExcludePatterns active ── #>
@@ -2318,10 +2436,20 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
             Write-Log 'Winget aggressive repair: identical failure signature already attempted; verification only.' -Level Warn
         }
     }
-    if ($script:CurrentWingetFailures.Count -and -not $classification.TerminalFailure) {
+    $quarantine = $null
+    if ($script:AggressiveRepair -and $classification.TerminalFailure) {
+        $quarantine = Invoke-WingetFailureQuarantine -WingetPath $wingetPath -State $script:CurrentState `
+            -Signature $classification.Signature -Failures $script:CurrentWingetFailures.ToArray()
+        if ($quarantine.AllPinned) {
+            $classification.TerminalFailure = $false
+            $classification.Details = @()
+        } else { $anyTimeout = $true }
+    }
+    if ($script:CurrentWingetFailures.Count -and -not $classification.TerminalFailure -and -not ($quarantine -and $quarantine.AllPinned)) {
         Write-Log 'Winget: one automatic verification pass remains; manual commands are withheld unless the same failure repeats.' -Level Warn
     }
-    return @{ Success = (-not $anyTimeout); Count = $totalCount; TerminalFailure=$classification.TerminalFailure; AttentionDetails=$classification.Details }
+    $phaseSuccess = if ($quarantine -and $quarantine.AllPinned) { $true } elseif ($script:CurrentWingetFailures.Count) { $false } else { -not $anyTimeout }
+    return @{ Success = $phaseSuccess; Count = $totalCount; TerminalFailure=$classification.TerminalFailure; AttentionDetails=$classification.Details }
 }
 
 function Update-ChocolateyPackages {
@@ -2451,6 +2579,41 @@ function Initialize-BootUpdateWindowsUpdateModule {
     return [bool](Get-Module -ListAvailable PSWindowsUpdate)
 }
 
+function Get-WindowsUpdateVerificationScope {
+    $excludedTitle = ((@('SQL') + ($script:ExcludePatterns | ForEach-Object { [regex]::Escape($_) })) -join '|')
+    $categories = @('Security Updates','Critical Updates','Definition Updates')
+    return [pscustomobject]@{
+        ExcludedTitle = $excludedTitle
+        Categories = $categories
+        Signature = "notTitle=$excludedTitle;categories=$(($categories | Sort-Object) -join ',')"
+    }
+}
+
+function Test-WindowsUpdateZeroEvidence {
+    param([AllowNull()][object]$Evidence,[Parameter(Mandatory)][string]$BootSessionId,[Parameter(Mandatory)][string]$ScopeSignature)
+    if ($null -eq $Evidence) { return $false }
+    $properties = $Evidence.PSObject.Properties.Name
+    if (@('BootSessionId','ScopeSignature','Source') | Where-Object { $properties -notcontains $_ }) { return $false }
+    return ([string]$Evidence.BootSessionId -eq $BootSessionId -and
+        [string]$Evidence.ScopeSignature -eq $ScopeSignature -and
+        [string]$Evidence.Source -eq 'PSWindowsUpdate-post-search-zero')
+}
+
+function Get-WindowsUpdateInstallOutputSummary {
+    param([object[]]$Lines = @())
+    $installed = 0
+    $postSearchZero = $false
+    foreach ($item in $Lines) {
+        if ($null -eq $item) { continue }
+        $line = $item.ToString()
+        if ($line -match '(?i)\bFound \[0\] Updates in post search criteria\s*$') { $postSearchZero = $true }
+        if ($line -match '(?i)\bInstalled \[(\d+)\] Updates\b') {
+            $installed = [math]::Max($installed, [int]$Matches[1])
+        }
+    }
+    return [pscustomobject]@{ Installed=$installed; PostSearchZero=$postSearchZero }
+}
+
 function Install-WindowsUpdates {
     [CmdletBinding(SupportsShouldProcess)]
     param()
@@ -2490,13 +2653,20 @@ function Install-WindowsUpdates {
     }
 
     Write-Log 'Checking for Windows Updates (excluding SQL Server)...'
+    $verificationScope = Get-WindowsUpdateVerificationScope
     $params = @{
-        AcceptAll = $true; Install = $true; NotTitle = ((@('SQL') + ($script:ExcludePatterns | ForEach-Object { [regex]::Escape($_) })) -join '|')
-        RootCategories = @('Security Updates','Critical Updates','Definition Updates')
+        AcceptAll = $true; Install = $true; NotTitle = $verificationScope.ExcludedTitle
+        RootCategories = $verificationScope.Categories
         AutoReboot = $false; Confirm = $false; IgnoreReboot = $true
     }
     $count = 0; $failed = $false
     if ($PSCmdlet.ShouldProcess('Windows Update', 'Install available updates')) {
+        <# The prior observation stops being authoritative as soon as a new
+           mutating Windows Update operation begins, including if it crashes. #>
+        if ($script:CurrentState -and $script:CurrentState.WindowsUpdateZeroEvidence) {
+            $script:CurrentState.WindowsUpdateZeroEvidence = $null
+            Set-BootUpdateState -State $script:CurrentState
+        }
         try {
             $result = Invoke-BootUpdateBackgroundOperation -Name 'Installing Windows Updates' `
                 -Status 'Windows Update scan and installation are running' `
@@ -2513,6 +2683,10 @@ function Install-WindowsUpdates {
                         "BOOTUPDATE_ERROR|$($_.Exception.Message)"
                     }
                 } -ArgumentList (,$params)
+            $postSearchZero = $false
+            $installSummary = Get-WindowsUpdateInstallOutputSummary -Lines $result.Output
+            $count = $installSummary.Installed
+            $postSearchZero = $installSummary.PostSearchZero
             foreach ($item in $result.Output) {
                 $line = $item.ToString()
                 if ($line -eq 'System.__ComObject') { continue }
@@ -2521,12 +2695,23 @@ function Install-WindowsUpdates {
                     Write-Log "Windows Update error: $($Matches[1])" -Level Error
                     continue
                 }
-                if ($line -match 'Installed|Downloaded') { $count++ }
                 Write-Log $line
             }
             if ($result.Failed -or $result.TimedOut) {
                 $failed = $true
                 Write-Log 'Windows Update operation failed or timed out.' -Level Error
+            }
+            if (-not $failed -and $postSearchZero -and $script:CurrentState) {
+                $script:CurrentState.WindowsUpdateZeroEvidence = [pscustomobject]@{
+                    BootSessionId = Get-BootUpdateBootSessionId
+                    ScopeSignature = $verificationScope.Signature
+                    ObservedAt = [datetime]::UtcNow.ToString('o')
+                    Source = 'PSWindowsUpdate-post-search-zero'
+                }
+                Set-BootUpdateState -State $script:CurrentState
+            } elseif ($script:CurrentState) {
+                $script:CurrentState.WindowsUpdateZeroEvidence = $null
+                Set-BootUpdateState -State $script:CurrentState
             }
         } catch { $failed = $true; Write-Log "Windows Update error: $_" -Level Error }
 
@@ -2549,32 +2734,46 @@ function Test-WindowsUpdateConvergence {
     <# A successful install call is not convergence: dependency updates can become
        applicable immediately without setting a reboot flag. Require a fresh,
        read-only scan of the same configured category scope to return zero. #>
+    $verificationScope = Get-WindowsUpdateVerificationScope
+    $bootSessionId = Get-BootUpdateBootSessionId
+    if ($script:CurrentState -and (Test-WindowsUpdateZeroEvidence -Evidence $script:CurrentState.WindowsUpdateZeroEvidence `
+            -BootSessionId $bootSessionId -ScopeSignature $verificationScope.Signature)) {
+        Write-Log 'Windows Update convergence: reusing fresh post-install zero-work evidence from this boot and verification scope.'
+        return [pscustomobject]@{ Verified=$true; Count=0; Detail='0 applicable update(s) (fresh post-install evidence)' }
+    }
+    if ($script:CurrentState -and $script:CurrentState.WindowsUpdateZeroEvidence) {
+        $script:CurrentState.WindowsUpdateZeroEvidence = $null
+        Set-BootUpdateState -State $script:CurrentState
+    }
     if (-not (Get-Module -ListAvailable PSWindowsUpdate)) {
         return [pscustomobject]@{ Verified=$false; Count=-1; Detail='PSWindowsUpdate is unavailable for the final scan' }
     }
-    $notTitle = ((@('SQL') + ($script:ExcludePatterns | ForEach-Object { [regex]::Escape($_) })) -join '|')
     $result = Invoke-BootUpdateBackgroundOperation -Name 'Verifying Windows Update convergence' `
         -Status 'Final read-only Windows Update scan is running' -TimeoutMinutes $script:PackageTimeoutMinutes `
         -ScriptBlock {
             param($ExcludedTitle)
             try {
                 Import-Module PSWindowsUpdate -Force
-                @(Get-WindowsUpdate -NotTitle $ExcludedTitle `
+                $applicable = @(Get-WindowsUpdate -NotTitle $ExcludedTitle `
                     -RootCategories @('Security Updates','Critical Updates','Definition Updates') `
-                    -IgnoreReboot -Confirm:$false -ErrorAction Stop) |
-                    Where-Object { $null -ne $_ } | ForEach-Object {
+                    -IgnoreReboot -Confirm:$false -ErrorAction Stop) | Where-Object { $null -ne $_ }
+                $applicable | ForEach-Object {
                         "BOOTUPDATE_APPLICABLE|$($_.KB)|$($_.Title)"
                     }
+                "BOOTUPDATE_SCAN_COMPLETE|$($applicable.Count)"
             } catch { "BOOTUPDATE_ERROR|$($_.Exception.Message)" }
-        } -ArgumentList @($notTitle)
+        } -ArgumentList @($verificationScope.ExcludedTitle)
     <# @($null) contains one element in PowerShell. Older scan workers therefore
        emitted BOOTUPDATE_APPLICABLE|| for a clean, empty result. Require a real
        title after the second delimiter so that sentinel cannot become an update. #>
     $updates = @($result.Output | Where-Object { $_ -match '^BOOTUPDATE_APPLICABLE\|[^|]*\|\S' })
     $errors = @($result.Output | Where-Object { $_ -match '^BOOTUPDATE_ERROR\|' })
+    $completionMarkers = @($result.Output | Where-Object { $_ -match '^BOOTUPDATE_SCAN_COMPLETE\|(\d+)$' })
     foreach ($line in $updates) { Write-Log "Final WU scan: $($line -replace '^BOOTUPDATE_APPLICABLE\|','')" -Level Warn }
     foreach ($line in $errors) { Write-Log "Final WU scan error: $($line -replace '^BOOTUPDATE_ERROR\|','')" -Level Error }
-    $verified = -not $result.Failed -and -not $result.TimedOut -and $errors.Count -eq 0
+    $declaredCount = if ($completionMarkers.Count -eq 1 -and $completionMarkers[0] -match '^BOOTUPDATE_SCAN_COMPLETE\|(\d+)$') { [int]$Matches[1] } else { -1 }
+    $verified = -not $result.Failed -and -not $result.TimedOut -and $errors.Count -eq 0 -and
+        $completionMarkers.Count -eq 1 -and $declaredCount -eq $updates.Count
     return [pscustomobject]@{ Verified=$verified; Count=$updates.Count; Detail=$(if($verified){"$($updates.Count) applicable update(s)"}else{'scan failed'}) }
 }
 
@@ -5684,14 +5883,18 @@ function Invoke-BootUpdateCycle {
         $reboots = [int]$state.RebootCount
         $durMin = [math]::Round($duration.TotalMinutes, 1)
         $pkgLine = "Winget=$($s.Winget) Choco=$($s.Chocolatey) WU=$($s.WindowsUpdate) Pip=$($s.Pip) Npm=$($s.Npm) O365=$($s.Office365) PSMod=$($s.PowerShellModules) Scoop=$($s.Scoop) Dotnet=$($s.DotnetTools) VSCode=$($s.Vscode)"
+        $wingetQuarantines = @(Get-WingetQuarantineRecords)
+        $hasWingetQuarantine = -not $WhatIfPreference -and (Test-Path -LiteralPath $script:WingetQuarantinePath)
 
         <# Console: styled completion banner #>
         $healthIsGreen = $null -ne $healthCheck -and $healthCheck.AllHealthy
         $completionTitle = if ($WhatIfPreference) { 'W H A T I F   C H E C K   C O M P L E T E' }
+                           elseif ($hasWingetQuarantine) { 'P A T C H   P A S S   C O M P L E T E   W I T H   Q U A R A N T I N E' }
                            elseif ($healthIsGreen) { 'C O N F I G U R E D   P A T C H   P A S S   V E R I F I E D' }
                            elseif ($null -eq $healthCheck) { 'C O N F I G U R E D   S C O P E   C O M P L E T E' }
                            else { 'P A T C H   P A S S   C O M P L E T E' }
         $congratulations = if ($WhatIfPreference) { 'Preview complete — no changes were made.' }
+                           elseif ($hasWingetQuarantine) { 'PATCHING CONVERGED — persistent Winget failures were safely isolated with reversible blocking pins.' }
                            elseif ($healthIsGreen) { 'YOU DID IT — THE CONFIGURED PATCH PASS IS VERIFIED. NICE WORK.' }
                            elseif ($null -eq $healthCheck) { 'Configured updates are complete; health verification was skipped.' }
                            else { 'Updates landed, but one health check needs attention.' }
@@ -5699,8 +5902,13 @@ function Invoke-BootUpdateCycle {
                       elseif ($healthCheck.AllHealthy) { "[OK] $($healthCheck.CheckedServices.Count) critical service(s) healthy" }
                       else { "[!!] Service attention: $($healthCheck.FailedServices -join ', ')" }
         <# Log file: structured entries #>
-        Write-Log "BOOT UPDATE CYCLE${whatIfTag} COMPLETE | $durMin min | $($state.Iteration) iteration(s) | $reboots reboot(s) | $total packages"
+        $completionDisposition = if ($hasWingetQuarantine) { 'COMPLETE WITH WINGET QUARANTINE' } else { 'COMPLETE' }
+        Write-Log "BOOT UPDATE CYCLE${whatIfTag} $completionDisposition | $durMin min | $($state.Iteration) iteration(s) | $reboots reboot(s) | $total packages"
         Write-Log "  $pkgLine"
+        if ($hasWingetQuarantine) {
+            Write-Log "Winget quarantine record retained at $($script:WingetQuarantinePath)." -Level Warn
+            foreach ($record in $wingetQuarantines) { Write-Log "Winget quarantine: $($record.PackageId); undo with: $($record.UnpinCommand)" -Level Warn }
+        }
         Write-Log "Info: View trends with: Show-BootUpdateHistory.ps1 -Format Graph"
 
         Save-CycleHistory -State $state -Duration $duration
@@ -5731,14 +5939,25 @@ function Invoke-BootUpdateCycle {
             if ($leftoverTasks -or (Test-Path -LiteralPath $script:StatePath)) {
                 throw "Terminal cleanup verification failed; refusing the verified completion banner. Tasks: $($leftoverTasks -join ', ')"
             }
-            Send-CompletionNotification -Title 'Boot Update Cycle Complete' -Message "$total packages updated in $($state.Iteration) iteration(s), $durMin min" -Data $summaryData
+            if ($hasWingetQuarantine) {
+                $quarantineIds = @($wingetQuarantines.PackageId) -join ', '
+                Send-CompletionNotification -Kind Progress -Title 'Boot Update Cycle Complete with Quarantine' `
+                    -Message "$total packages updated; reversible Winget blocking pins remain for: $quarantineIds. Record: $($script:WingetQuarantinePath)" -Data $summaryData
+            } else {
+                Send-CompletionNotification -Title 'Boot Update Cycle Complete' -Message "$total packages updated in $($state.Iteration) iteration(s), $durMin min" -Data $summaryData
+            }
         }
         <# The congratulatory banner is the terminal commit point: hooks, notifications,
            task retirement, state removal, and cleanup verification have all finished. #>
         Write-BootUpdateProgress -Completed
-        Show-CycleBanner -Title $completionTitle -AnsiColor "$([char]27)[32m" -Info @(
+        Show-CycleBanner -Title $completionTitle -AnsiColor $(if ($hasWingetQuarantine) { "$([char]27)[33m" } else { "$([char]27)[32m" }) -Info @(
             $congratulations
             "[OK] $($enabledPhases.Count)/$($enabledPhases.Count) configured phases completed"
+            if ($hasWingetQuarantine) {
+                "[!!] $($wingetQuarantines.Count) Winget package(s) quarantined; this is not a fully-patched claim"
+                "[log] $($script:WingetQuarantinePath)"
+                foreach ($record in $wingetQuarantines) { "[undo] $($record.UnpinCommand)" }
+            }
             if (-not $WhatIfPreference) { "[OK] Reboot state clean twice across $($script:RebootSignalSettleSeconds) seconds" }
             $healthLine
             if (-not $WhatIfPreference) { '[OK] Resume tasks retired; no retry is queued' }
