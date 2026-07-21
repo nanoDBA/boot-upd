@@ -1,7 +1,7 @@
-#requires -Version 7.0
+#requires -Version 5.1
 # ------------------------------------------------------------------------------
 # File:        Repair-AwsTooling.ps1
-# Description: 🔧 Audits and repairs AWS CLI v2 + AWS.Tools module installations
+# Description: Audits and repairs AWS CLI v2 + AWS.Tools module installations
 # Purpose:     Ensures consistent AWS tooling across fleet by:
 #              - Detecting multiple aws.exe on PATH (the "roulette" problem)
 #              - Installing/updating AWS CLI v2 from official MSI
@@ -9,7 +9,7 @@
 #              - Optionally removing legacy AWS CLI v1
 #              Built for ops teams tired of "which aws did I just run?" surprises.
 # Created:     2025-01-10
-# Modified:    2026-01-12
+# Modified:    2026-07-21
 # ------------------------------------------------------------------------------
 
 <#
@@ -46,7 +46,7 @@
 
 .PARAMETER UninstallCliV1
     Also uninstall legacy AWS CLI v1 if found in the registry.  Use with
-    caution — some older automation may depend on v1-specific behavior.
+    caution - some older automation may depend on v1-specific behavior.
 
 .EXAMPLE
     .\Repair-AwsTooling.ps1 -Mode Audit
@@ -68,7 +68,7 @@
 .NOTES
     Requires:     PowerShell 7+, elevation for Remediate mode
     Side effects: Installs software, modifies system PATH (via MSI), removes old modules
-    Idempotent:   Yes — safe to run multiple times
+    Idempotent:   Yes - safe to run multiple times
     
     The AWS.Tools.Installer module handles keeping all AWS.Tools.* modules at
     the same version and cleaning up old versions.  This is AWS's recommended
@@ -104,7 +104,7 @@ function Test-IsAdmin {
 
 function Get-AwsOnPath {
     # Returns all aws.exe locations found via PATH resolution.
-    # Multiple hits = "PATH roulette" — whichever one wins depends on PATH order.
+    # Multiple hits = "PATH roulette" - whichever one wins depends on PATH order.
     $hits = @()
     try { $hits = @(where.exe aws 2>$null) } catch {}
     $hits | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -Unique
@@ -118,11 +118,25 @@ function Get-AwsCliV2Exe {
     return $null
 }
 
+function Get-AwsPowerShellModuleInventory {
+    # Preserve exact installation identities. Name/version alone is insufficient
+    # when AllUsers and CurrentUser (often cloud-synced) roots overlap.
+    $modules = @(Get-Module -ListAvailable AWS.Tools.*, AWSPowerShell, AWSPowerShell.NetCore -ErrorAction SilentlyContinue)
+    return @($modules | ForEach-Object {
+        [pscustomobject]@{
+            Family     = if ($_.Name -like 'AWS.Tools.*') { 'Modular' } else { 'Legacy' }
+            Name       = $_.Name
+            Version    = [version]$_.Version
+            ModuleBase = [IO.Path]::GetFullPath($_.ModuleBase)
+        }
+    } | Sort-Object Family,Name,Version,ModuleBase -Unique)
+}
+
 # ---- CLI INSTALLATION ----
 
 function Install-AwsCliV2 {
     # Downloads (if needed) and installs AWS CLI v2 via MSI.
-    # Requires elevation.  Idempotent — MSI handles upgrade-in-place.
+    # Requires elevation.  Idempotent - MSI handles upgrade-in-place.
     if (-not (Test-IsAdmin)) {
         throw "CLI install/update requires elevation.  Re-run pwsh as Administrator."
     }
@@ -151,7 +165,7 @@ function Install-AwsCliV2 {
 
 function Uninstall-AwsCliV1IfPresent {
     # Removes legacy AWS CLI v1 installations found in the registry.
-    # Only runs if -UninstallCliV1 switch is set.  Best-effort — some
+    # Only runs if -UninstallCliV1 switch is set.  Best-effort - some
     # installers may not have clean uninstall strings.
     if (-not $UninstallCliV1) { return }
 
@@ -206,7 +220,7 @@ function Repair-AwsToolsModules {
     Import-Module AWS.Tools.Installer -Force
 
     if ($Mode -eq 'Remediate') {
-        # Run update in SUBPROCESS — guarantees clean module state in child process.
+        # Run update in SUBPROCESS - guarantees clean module state in child process.
         # Do not terminate other PowerShell sessions to release module locks. If an
         # old module is genuinely locked, verified installation may still succeed
         # and cleanup will fail closed while retaining that old version.
@@ -257,6 +271,17 @@ function Test-AwsToolsSignedModuleDirectory {
         } finally { $chain.Dispose() }
     }
     return $true
+}
+
+function Get-AwsToolsInventory {
+    return @(Get-Module -ListAvailable 'AWS.Tools.*' -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -ne 'AWS.Tools.Installer' } |
+        ForEach-Object {
+            [pscustomobject]@{
+                Name=$_.Name; Version=[version]$_.Version
+                ModuleBase=[IO.Path]::GetFullPath($_.ModuleBase)
+            }
+        } | Sort-Object Name,Version,ModuleBase -Unique)
 }
 
 function Get-AwsToolsDirectoryManifest {
@@ -358,13 +383,14 @@ function Invoke-VerifiedAwsToolsCleanup {
             $unexpectedErrors.Add($record)
             continue
         }
-        Write-Host $record
+        # Provider chatter is intentionally suppressed; the verified summary below
+        # is the stable user-facing contract.
     }
     if ($unexpectedErrors.Count) {
         throw "AWS.Tools cleanup reported unexpected error(s): $($unexpectedErrors -join '; ')"
     }
     if ($benignAlreadyAbsent) {
-        Write-Host "AWS.Tools cleanup skipped $benignAlreadyAbsent already-absent package record(s)."
+        Write-Host "AWS.Tools cleanup: $benignAlreadyAbsent already-absent package record(s) ignored."
     }
 
     $stale = @($ModuleNames | ForEach-Object {
@@ -380,27 +406,46 @@ function Invoke-VerifiedAwsToolsCleanup {
 
 try {
     Import-Module AWS.Tools.Installer -Force -ErrorAction Stop
+    $before = @(Get-AwsToolsInventory)
+    $moduleNames = @($before | Select-Object -ExpandProperty Name -Unique)
+    if ($moduleNames -notcontains 'AWS.Tools.Common') { $moduleNames += 'AWS.Tools.Common' }
+    $usedPublisherRollover = $false
     try {
-        Update-AWSToolsModule -CleanUp -Force -Confirm:$false -ErrorAction Stop
+        $null = @(Update-AWSToolsModule -Force -Confirm:$false -ErrorAction Stop *>&1)
     } catch {
         $publisherMismatch = Test-AwsToolsPublisherMismatchMessage -Message $_.Exception.Message
         if (-not $publisherMismatch) { throw }
-        Write-Warning 'AWS.Tools publisher certificate rollover detected; validating the current AWS.Tools.Common package before the supported bypass.'
+        Write-Warning 'AWS.Tools publisher certificate rollover detected; validating Amazon-signed packages before the narrow supported bypass.'
         $candidate = Get-VerifiedAwsToolsRolloverCandidate
-        Update-AWSToolsModule -RequiredVersion $candidate.Version -Force -SkipPublisherCheck -Confirm:$false -ErrorAction Stop
-        foreach ($moduleName in $candidate.ModuleNames) {
-            $installedCopies = @(Get-Module -ListAvailable $moduleName | Where-Object Version -eq $candidate.Version)
-            if (-not $installedCopies.Count) { throw "The target AWS module $moduleName $($candidate.Version) was not installed. Old versions were retained." }
-            foreach ($installed in $installedCopies) {
-                $signed = Test-AwsToolsSignedModuleDirectory -ModuleRoot $installed.ModuleBase -ModuleName $moduleName
+        $null = @(Update-AWSToolsModule -RequiredVersion $candidate.Version -Force -SkipPublisherCheck -Confirm:$false -ErrorAction Stop *>&1)
+        $moduleNames = @($candidate.ModuleNames)
+        $usedPublisherRollover = $true
+    }
+
+    $afterInstall = @(Get-AwsToolsInventory)
+    $common = @($afterInstall | Where-Object Name -eq 'AWS.Tools.Common' | Sort-Object Version -Descending)
+    if (-not $common.Count) { throw 'AWS.Tools.Common was not installed; old versions were retained.' }
+    $targetVersion = [version]$common[0].Version
+    foreach ($moduleName in $moduleNames) {
+        $installedCopies = @($afterInstall | Where-Object { $_.Name -eq $moduleName -and $_.Version -eq $targetVersion })
+        if (-not $installedCopies.Count) { throw "The target AWS module $moduleName $targetVersion was not installed. Old versions were retained." }
+        foreach ($installed in $installedCopies) {
+            $signed = Test-AwsToolsSignedModuleDirectory -ModuleRoot $installed.ModuleBase -ModuleName $moduleName
+            if (-not $signed) { throw "Signature verification failed for $moduleName $targetVersion at $($installed.ModuleBase)." }
+            if ($usedPublisherRollover) {
                 $byteIdentical = Test-AwsToolsDirectoryManifest -ModuleRoot $installed.ModuleBase -Expected $candidate.Manifests[$moduleName]
-                if (-not $signed -or -not $byteIdentical) {
-                    throw "Installed AWS module verification failed for $moduleName $($candidate.Version) at $($installed.ModuleBase). Old versions were retained."
-                }
+                if (-not $byteIdentical) { throw "Installed AWS module differs from the verified package: $moduleName $targetVersion at $($installed.ModuleBase)." }
             }
         }
-        Invoke-VerifiedAwsToolsCleanup -ExceptVersion $candidate.Version -ModuleNames $candidate.ModuleNames
     }
+    Invoke-VerifiedAwsToolsCleanup -ExceptVersion $targetVersion -ModuleNames $moduleNames
+    $after = @(Get-AwsToolsInventory)
+    $updatedNames = @($moduleNames | Where-Object {
+        $name = $_
+        $old = @($before | Where-Object Name -eq $name | Sort-Object Version -Descending | Select-Object -First 1)
+        -not $old.Count -or [version]$old[0].Version -lt $targetVersion
+    })
+    Write-Host "AWS.Tools verified: $($moduleNames.Count) module(s) at v$targetVersion; $($updatedNames.Count) installed/updated; $($after.Count) exact path/version record(s)."
     exit 0
 }
 catch {
@@ -410,7 +455,8 @@ catch {
 '@
         
         $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($scriptBlock))
-        $proc = Start-Process pwsh.exe -ArgumentList @(
+        $engine = if (Get-Command pwsh.exe -ErrorAction SilentlyContinue) { 'pwsh.exe' } else { 'powershell.exe' }
+        $proc = Start-Process $engine -ArgumentList @(
             '-NoProfile', '-NonInteractive', '-EncodedCommand', $encodedCommand
         ) -Wait -PassThru -NoNewWindow
         
@@ -434,7 +480,7 @@ if (-not $awsHits) { Write-Host "  aws on PATH: <none>" }
 
 # Multiple aws.exe = unpredictable behavior depending on PATH order.
 if ($awsHits.Count -gt 1) {
-    Write-Warning "Multiple aws.exe found on PATH — command resolution is non-deterministic."
+    Write-Warning "Multiple aws.exe found on PATH - command resolution is non-deterministic."
 }
 
 # Check for / install CLI v2.
@@ -460,12 +506,20 @@ if ($Mode -eq 'Remediate' -and -not $SkipCli) {
 Write-Host "`n== AWS Tools for PowerShell modules =="
 
 if (-not $SkipModules) {
-    # Warn about legacy monolithic modules — we don't auto-remove them because
+    # Warn about legacy monolithic modules - we don't auto-remove them because
     # some older scripts may still depend on them.
-    $legacy = Get-Module -ListAvailable AWSPowerShell, AWSPowerShell.NetCore -ErrorAction SilentlyContinue
+    $inventory = @(Get-AwsPowerShellModuleInventory)
+    $legacy = @($inventory | Where-Object Family -eq 'Legacy')
+    $modular = @($inventory | Where-Object Family -eq 'Modular')
     if ($legacy) {
-        Write-Warning "Legacy AWSPowerShell* modules present (consider manual removal):"
+        Write-Warning "Legacy AWSPowerShell modules are isolated from modular maintenance and retained for compatibility ($($legacy.Count) exact installation record(s)):"
         $legacy | ForEach-Object { Write-Host "  $($_.Name) v$($_.Version) @ $($_.ModuleBase)" }
+    }
+
+    if ($modular) {
+        Write-Host "  Modular inventory: $($modular.Count) exact installation record(s), $(@($modular.Name | Sort-Object -Unique).Count) module name(s)."
+    } else {
+        Write-Host '  Modular inventory: no AWS.Tools modules installed yet.'
     }
 
     Repair-AwsToolsModules

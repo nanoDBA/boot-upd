@@ -23,6 +23,16 @@ BeforeAll {
         return $function.Extent.Text
     }
 
+    function Get-OuterFunctionText {
+        param([Parameter(Mandatory)][string]$Name)
+        $function = $repairAst.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $Name
+        },$true)
+        $function | Should -Not -BeNullOrEmpty
+        return $function.Extent.Text
+    }
+
     . ([scriptblock]::Create((Get-ChildFunctionText -Name 'Test-AwsToolsPublisherMismatchMessage')))
 }
 
@@ -51,14 +61,16 @@ Authenticode issuer 'CN="Amazon Web Services, Inc.", OU=SDKs and Tools, O="Amazo
         Test-AwsToolsPublisherMismatchMessage -Message $Message | Should -BeFalse
     }
 
-    It 'tries the ordinary cleanup update before considering a rollover fallback' {
-        $normal = $childSource.IndexOf('Update-AWSToolsModule -CleanUp -Force -Confirm:$false -ErrorAction Stop')
+    It 'separates ordinary update from verified idempotent cleanup before considering a rollover fallback' {
+        $normal = $childSource.IndexOf('Update-AWSToolsModule -Force -Confirm:$false -ErrorAction Stop')
         $decision = $childSource.IndexOf('Test-AwsToolsPublisherMismatchMessage -Message', $normal)
         $fallback = $childSource.IndexOf('Update-AWSToolsModule -RequiredVersion $candidate.Version -Force -SkipPublisherCheck')
+        $cleanup = $childSource.IndexOf('Invoke-VerifiedAwsToolsCleanup -ExceptVersion $targetVersion')
         $normal | Should -BeGreaterThan 0
         $decision | Should -BeGreaterThan $normal
         $fallback | Should -BeGreaterThan $decision
-        $childSource | Should -Not -Match 'Update-AWSToolsModule[^\r\n]*-CleanUp[^\r\n]*-SkipPublisherCheck'
+        $cleanup | Should -BeGreaterThan $fallback
+        $childSource | Should -Not -Match 'Update-AWSToolsModule[^\r\n]*-CleanUp'
     }
 
     It 'fails closed unless every staged and installed module is Amazon-signed and trusted' {
@@ -81,7 +93,7 @@ Authenticode issuer 'CN="Amazon Web Services, Inc.", OU=SDKs and Tools, O="Amazo
         $fallback = $childSource.IndexOf('Update-AWSToolsModule -RequiredVersion $candidate.Version')
         $postVerify = $childSource.IndexOf('Test-AwsToolsSignedModuleDirectory -ModuleRoot $installed.ModuleBase', $fallback)
         $fullHashVerify = $childSource.IndexOf('Test-AwsToolsDirectoryManifest -ModuleRoot $installed.ModuleBase', $fallback)
-        $cleanup = $childSource.IndexOf('Invoke-VerifiedAwsToolsCleanup -ExceptVersion $candidate.Version', $fallback)
+        $cleanup = $childSource.IndexOf('Invoke-VerifiedAwsToolsCleanup -ExceptVersion $targetVersion', $fallback)
         $fallback | Should -BeGreaterThan 0
         $postVerify | Should -BeGreaterThan $fallback
         $fullHashVerify | Should -BeGreaterThan $postVerify
@@ -96,5 +108,34 @@ Authenticode issuer 'CN="Amazon Web Services, Inc.", OU=SDKs and Tools, O="Amazo
         $cleanup | Should -Match 'unexpectedErrors\.Count'
         $cleanup | Should -Match 'Get-Module -ListAvailable'
         $cleanup | Should -Match 'older managed module copies remain'
+    }
+}
+
+Describe 'AWS tooling inventory and host compatibility' {
+    It 'keeps legacy and modular module identities separate by exact path and version' {
+        $inventory = Get-OuterFunctionText -Name 'Get-AwsPowerShellModuleInventory'
+        $inventory | Should -Match 'Family\s+=\s+if \(\$_\.Name -like ''AWS\.Tools\.\*''\)'
+        $inventory | Should -Match 'ModuleBase = \[IO\.Path\]::GetFullPath'
+        $repairSource | Should -Match "Where-Object Family -eq 'Legacy'"
+        $repairSource | Should -Match "Where-Object Family -eq 'Modular'"
+        $repairSource | Should -Not -Match 'Uninstall-Module\s+(?:AWSPowerShell|AWSPowerShell\.NetCore)'
+    }
+
+    It 'supports harmless audit startup in Windows PowerShell 5.1 and PowerShell 7' -TestCases @(
+        @{ Engine='powershell.exe' }
+        @{ Engine='pwsh.exe' }
+    ) {
+        param($Engine)
+        if (-not (Get-Command $Engine -ErrorAction SilentlyContinue)) { Set-ItResult -Skipped -Because "$Engine is unavailable"; return }
+        $output = & $Engine -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $repairPath -Mode Audit -SkipCli -SkipModules 2>&1
+        $LASTEXITCODE | Should -Be 0
+        ($output -join "`n") | Should -Match 'Mode: Audit'
+        ($output -join "`n") | Should -Match 'Done\.'
+    }
+
+    It 'suppresses raw provider chatter and emits a verified concise result' {
+        $childSource | Should -Match '\$null = @\(Update-AWSToolsModule[^\r\n]+\*>&1\)'
+        $childSource | Should -Match 'AWS\.Tools verified:'
+        $childSource | Should -Not -Match 'Write-Host \$record'
     }
 }

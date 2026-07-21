@@ -1,8 +1,22 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.45
+**Current Version:** v2.5.46
 **Release Date:** 2026-07-21
 **Status:** STABLE
+
+---
+
+## v2.5.46 (2026-07-21)
+
+### Deterministic, quieter AWS tooling maintenance
+
+- Inventories every AWS PowerShell module by family, name, version, and exact installation path so user, machine, and cloud-synced module roots cannot be conflated.
+- Keeps legacy `AWSPowerShell*` installations isolated and untouched while modular `AWS.Tools.*` maintenance runs independently.
+- Separates install/update, Amazon-signature verification, and cleanup instead of using the noisy combined `Update-AWSToolsModule -CleanUp` path.
+- Treats only exact PowerShellGet already-absent cleanup records as benign; unexpected cleanup failures still fail closed, while locked older copies are retained and reported precisely.
+- Keeps the certificate-rollover bypass narrow: it is available only for an issuer-continuity mismatch between Amazon publishers after staged package signature, chain, synchronized-version, and byte-manifest verification.
+- Suppresses raw AWS provider chatter in favor of a concise verified module/version/path summary.
+- Makes `Repair-AwsTooling.ps1` compatible with Windows PowerShell 5.1 as well as PowerShell 7 and exercises harmless audit startup under both engines.
 
 ---
 
