@@ -660,3 +660,33 @@ Describe 'Progress coverage across blocking paths' {
         $invokeSource | Should -Match '(?s)try \{\s*Invoke-BootUpdateCycle\s*\} finally \{.*?Write-BootUpdateProgress -Completed'
     }
 }
+
+Describe 'Plain-language toast outcomes' {
+    It 'routes every toast through one notification-level-aware helper' {
+        $toast = Get-FunctionText -Ast $invokeAst -Name 'Send-BootUpdateToast'
+        $toast | Should -Match 'Test-NotificationAllowed'
+        $toast | Should -Match 'S-1-5-18'
+        $toast | Should -Match 'New-BurntToastNotification'
+        (Get-FunctionText -Ast $invokeAst -Name 'Send-CompletionNotification') |
+            Should -Match 'Send-BootUpdateToast'
+        (Get-FunctionText -Ast $invokeAst -Name 'Send-RebootWarning') |
+            Should -Match 'Send-BootUpdateToast'
+    }
+
+    It 'distinguishes completion, retry, user continuation, and reboot states' {
+        $cycle = Get-FunctionText -Ast $invokeAst -Name 'Invoke-BootUpdateCycle'
+        $cycle | Should -Match 'Updates complete.*no restart required'
+        $cycle | Should -Match 'Another update pass is scheduled.*no restart required'
+        $cycle | Should -Match 'User update pass pending.*no restart required'
+        (Get-FunctionText -Ast $invokeAst -Name 'Send-RebootWarning') |
+            Should -Match 'Restart required.*updates will continue automatically'
+    }
+
+    It 'keeps public toast fixtures synthetic and free of local identity data' {
+        $fixtureText = @(
+            Get-FunctionText -Ast $invokeAst -Name 'Send-BootUpdateToast'
+            Get-FunctionText -Ast $invokeAst -Name 'Send-RebootWarning'
+        ) -join "`n"
+        $fixtureText | Should -Not -Match '(?i)OneDrive|Google Drive|Dropbox|[A-Z]:\\Users\\|@example\.(com|org)'
+    }
+}

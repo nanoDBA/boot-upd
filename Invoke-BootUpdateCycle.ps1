@@ -344,7 +344,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 6 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.60' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.61' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 Set-Variable -Name 'RebootSignalSettleSeconds' -Value 20 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 $script:ExplicitRebootRequests = [System.Collections.Generic.List[object]]::new()
 $script:LastPendingFileRenameOperations = @()
@@ -879,6 +879,7 @@ function Get-InstallerExitSummary {
     switch ($Code) {
         1605 { return 'product is not currently installed' }
         1612 { return 'installation source is unavailable' }
+        2147942405 { return 'access is denied' }
         3221226525 { return 'installer terminated with a fatal exception' }
         default { return "installer exit $(Format-NativeExitCode $Code)"
         }
@@ -896,6 +897,7 @@ function Get-WingetOutputSummary {
     $currentName = 'Unknown package'
     $currentId = ''
     $failures = [Collections.Generic.List[object]]::new()
+    $successfulIds = [Collections.Generic.List[string]]::new()
     foreach ($rawLine in $Lines) {
         # Winget may indent records or leave ANSI/VT control sequences even with
         # --no-vt. Normalize before matching so failures cannot become false green.
@@ -905,10 +907,12 @@ function Get-WingetOutputSummary {
             $attempted = [math]::Max($attempted, [int]$Matches[2])
             $currentName = $Matches[3].Trim()
             $currentId = $Matches[4].Trim()
-        } elseif ($line -match '^Successfully installed\s*$') {
+        } elseif ($line -match '^Successfully installed(?:\.|\s|$)') {
             $updated++
-        } elseif ($line -match '^(?:Uninstall|Installer) failed with exit code:\s*(-?\d+)') {
-            $code = [long]$Matches[1]
+            if ($currentId -and -not $successfulIds.Contains($currentId)) { $successfulIds.Add($currentId) }
+        } elseif ($line -match '^(?:Uninstall|Installer) failed with exit code:\s*(0x[0-9A-Fa-f]+|-?\d+)') {
+            $rawCode = $Matches[1]
+            $code = if ($rawCode -match '^0x') { [long][Convert]::ToUInt32($rawCode.Substring(2), 16) } else { [long]$rawCode }
             $failures.Add([pscustomobject]@{
                 Name=$currentName; Id=$currentId; Code=$code
                 Hex=(Format-NativeExitCode $code); Summary=(Get-InstallerExitSummary $code)
@@ -926,6 +930,7 @@ function Get-WingetOutputSummary {
     return [pscustomobject]@{
         Attempted=$attempted; Updated=$updated; Pinned=$pinned; Unknown=$unknown
         TechnologyBlocked=$technologyBlocked; NoApplicable=$noApplicable; Failures=$failures.ToArray()
+        SuccessfulIds=$successfulIds.ToArray()
         Recognized=($attempted -gt 0 -or $updated -gt 0 -or $pinned -gt 0 -or $unknown -gt 0 -or
             $technologyBlocked -gt 0 -or $noApplicable -or $failures.Count -gt 0)
     }
@@ -1500,10 +1505,18 @@ function Test-PreFlightChecks {
     $errors   = [System.Collections.Generic.List[string]]::new()
     function Add-Warning { param([string]$Msg) $warnings.Add($Msg); Write-Log $Msg -Level Warn }
     function Add-Error   { param([string]$Msg) $errors.Add($Msg);   Write-Log $Msg -Level Error }
+    $preflightClock = [Diagnostics.Stopwatch]::StartNew()
+    function Show-PreflightStep {
+        param([Parameter(Mandatory)][string]$Status,[ValidateRange(0,100)][int]$Percent)
+        Write-BootUpdateProgress -Activity 'Pre-flight checks' `
+            -Status "$Status | elapsed $([math]::Round($preflightClock.Elapsed.TotalSeconds))s" `
+            -PercentComplete $Percent
+    }
 
     Write-Log 'Pre-flight checks starting...'
 
     <# Disk space #>
+    Show-PreflightStep -Status 'Checking free disk space' -Percent 10
     try {
         $drive = Get-PSDrive -Name ($env:SystemDrive.TrimEnd(':')) -ErrorAction Stop
         $freeGB = [math]::Round($drive.Free / 1GB, 1)
@@ -1516,6 +1529,7 @@ function Test-PreFlightChecks {
        Cache is cleared on reboot (LastPreflightNetworkAt reset in phase-reset block) so a fresh
        boot always re-probes. Failures are never cached — we want fast retry on transient drops. #>
     $networkCacheHit = $false
+    Show-PreflightStep -Status 'Checking network reachability' -Percent 30
     if ($null -ne $State) {
         $cachedAt  = if ($State.LastPreflightNetworkAt) { try { [datetime]$State.LastPreflightNetworkAt } catch { $null } } else { $null }
         $cachedOk  = if ($null -ne $State.LastPreflightNetworkOk) { [bool]$State.LastPreflightNetworkOk } else { $false }
@@ -1558,6 +1572,7 @@ function Test-PreFlightChecks {
        WinRT API is preferred; falls back to CIM on Server Core where WinRT may be unavailable. #>
     $meteredDetected = $false
     $meteredDetectionFailed = $false
+    Show-PreflightStep -Status 'Checking connection policy' -Percent 50
     try {
         $null = [Windows.Networking.Connectivity.NetworkInformation, Windows.Networking.Connectivity, ContentType=WindowsRuntime]
         $cp   = [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()
@@ -1594,6 +1609,7 @@ function Test-PreFlightChecks {
     }
 
     <# Conflicting installers #>
+    Show-PreflightStep -Status 'Checking installer activity' -Percent 70
     try {
         $found = [System.Collections.Generic.List[string]]::new()
         foreach ($name in @('msiexec','TrustedInstaller','TiWorker')) {
@@ -1604,17 +1620,18 @@ function Test-PreFlightChecks {
         else { Write-Log 'Installer check: no conflicts' }
     } catch { Add-Warning "Installer check failed: $_" }
 
-    <# Windows Update service #>
+    <# Windows Update service is observed here but never started globally. A broken
+       service must not hold Winget, Chocolatey, or other independent providers
+       hostage. The WU phase owns a separately bounded recovery attempt. #>
+    Show-PreflightStep -Status 'Observing Windows Update readiness' -Percent 85
     try {
         $svc = Get-Service wuauserv -ErrorAction Stop
-        if ($svc.StartType -eq 'Disabled') { Add-Error 'Windows Update service is Disabled' }
-        elseif ($svc.Status -ne 'Running') {
-            try { Start-Service wuauserv -ErrorAction Stop; Write-Log 'WU service: started' }
-            catch { Add-Warning "WU service could not start: $_" }
-        }
-    } catch { Add-Warning "WU service check failed: $_" }
+        if ($svc.Status -eq 'Running') { Write-Log 'WU service: Running' }
+        else { Write-Log "WU service: $($svc.Status); bounded recovery is deferred to the Windows Update phase." -Level Warn }
+    } catch { Write-Log "WU service observation failed; the Windows Update phase will perform bounded recovery: $_" -Level Warn }
 
     <# Battery #>
+    Show-PreflightStep -Status 'Checking power state' -Percent 95
     try {
         $bat = Get-CimInstance Win32_Battery -EA Stop
         if ($bat) {
@@ -1635,6 +1652,7 @@ function Test-PreFlightChecks {
                elseif ($warnings.Count -gt 0) { "PROCEEDING with $($warnings.Count) warning(s) (-Force)" }
                else { 'ALL CHECKS PASSED' }
     Write-Log "Pre-flight: $summary"
+    Write-BootUpdateProgress -Completed
     return [PSCustomObject]@{ CanProceed = $canProceed; Warnings = $warnings.ToArray(); Errors = $errors.ToArray() }
 }
 #endregion
@@ -2370,6 +2388,7 @@ function Update-WingetPackages {
     else { $scopes = @('user', 'machine') }
 
     $totalCount = 0; $anyTimeout = $false
+    $successfulPackageIds = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 
     <# ── Fast path (no ExcludePatterns): run user + machine scopes in parallel via ThreadJob ──
        Each job launches winget upgrade --all in a child pwsh.exe and captures output to a temp
@@ -2525,7 +2544,9 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
     foreach ($scope in $scopes) {
         if ($PSCmdlet.ShouldProcess("Winget ($scope)", "Run Winget $scope-scope upgrades")) {
 
-            if ($script:ExcludePatterns.Count -eq 0 -and $script:IncludePatterns.Count -eq 0) {
+            $useTargetedInventory = $script:ExcludePatterns.Count -gt 0 -or $script:IncludePatterns.Count -gt 0 -or
+                ($scope -eq 'machine' -and $successfulPackageIds.Count -gt 0)
+            if (-not $useTargetedInventory) {
                 <# Fast path: no package filters — use --all for best performance #>
                 $result = Invoke-PackageManagerWithTimeout -Name "Winget-$scope" -ScriptBlock {
                     param($wp, $sc)
@@ -2535,6 +2556,7 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
                 $installBlocked = @($result.Output | Where-Object { $_ -match 'install.+in progress|in progress.+install' }).Count -gt 0
                 $scopeSummary = Write-WingetScopeSummary -Scope $scope -Lines $result.Output -ExitCode $result.ExitCode
                 $count = $scopeSummary.Updated
+                foreach ($successfulId in @($scopeSummary.SuccessfulIds)) { $null = $successfulPackageIds.Add($successfulId) }
                 if ($result.TimedOut) { $anyTimeout = $true }
                 if ($null -ne $result.ExitCode -and $result.ExitCode -notin @(0,1641,3010) -and @($scopeSummary.Failures).Count -eq 0) {
                     $kind = if (@($result.Output).Count -eq 0) { 'no-output' } else { 'unclassified' }
@@ -2553,13 +2575,18 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
                     } -ArgumentList @($wingetPath, $scope) -IdleTimeoutMinutes 5 -HardTimeoutMinutes $TimeoutMinutes
                     $retrySummary = Write-WingetScopeSummary -Scope "$scope-retry" -Lines $retry.Output -ExitCode $retry.ExitCode
                     $count += $retrySummary.Updated
+                    foreach ($successfulId in @($retrySummary.SuccessfulIds)) { $null = $successfulPackageIds.Add($successfulId) }
                     if ($retry.TimedOut) { $anyTimeout = $true }
                 }
                 $totalCount += $count
 
             } else {
-                <# Filtered path: enumerate upgradeable packages, exclude by pattern, upgrade individually #>
-                Write-Log "Winget ($scope): ExcludePatterns active ($($script:ExcludePatterns -join ', ')) — enumerating packages before upgrade"
+                <# Targeted path: enumerate upgradeable packages so filters and packages
+                   already completed in user scope can be honored before machine mutation. #>
+                $inventoryReason = if ($scope -eq 'machine' -and $successfulPackageIds.Count -gt 0) {
+                    'preventing duplicate attempts for packages completed in user scope'
+                } else { 'package filters are active' }
+                Write-Log "Winget ($scope): targeted inventory — $inventoryReason."
                 $listOutput = @()
                 try {
                     $listOutput = @(& $wingetPath list --scope $scope --upgrade-available `
@@ -2578,6 +2605,12 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
                 $packageIds = @()
                 $headerLine = $listOutput | Where-Object { $_ -match '\bId\b' } | Select-Object -First 1
                 if (-not $headerLine) {
+                    if ($scope -eq 'machine' -and $successfulPackageIds.Count -gt 0) {
+                        Write-Log 'Winget machine: could not safely parse inventory after user-scope success; refusing a duplicate --all mutation and queuing verification.' -Level Error
+                        $executionFailures.Add('machine:inventory-unparseable:dedup-required')
+                        $anyTimeout = $true
+                        continue
+                    }
                     Write-Log "Winget ($scope): Could not parse package list header — falling back to --all (no exclusion)" -Level Warn
                     $fbResult = Invoke-PackageManagerWithTimeout -Name "Winget-$scope" -ScriptBlock {
                         param($wp, $sc)
@@ -2585,6 +2618,7 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
                     } -ArgumentList @($wingetPath, $scope) -IdleTimeoutMinutes 5 -HardTimeoutMinutes $TimeoutMinutes
                     $fallbackSummary = Write-WingetScopeSummary -Scope "$scope-fallback" -Lines $fbResult.Output -ExitCode $fbResult.ExitCode
                     $count = $fallbackSummary.Updated
+                    foreach ($successfulId in @($fallbackSummary.SuccessfulIds)) { $null = $successfulPackageIds.Add($successfulId) }
                     if ($fbResult.TimedOut) { $anyTimeout = $true }
                     $totalCount += $count
                     continue
@@ -2617,7 +2651,9 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
                 $toUpgrade = @()
                 foreach ($pkgId in $packageIds) {
                     $skipReason = Test-PackageExcluded -Name $pkgId
-                    if ($skipReason) {
+                    if ($successfulPackageIds.Contains($pkgId)) {
+                        Write-Log "Winget ($scope): skipping $pkgId because it already succeeded in user scope during this run."
+                    } elseif ($skipReason) {
                         Write-Log "Skipped ($skipReason): $pkgId" -Level Info
                     } else {
                         $toUpgrade += $pkgId
@@ -2634,6 +2670,7 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
                     } -ArgumentList @($wingetPath, $pkgId, $scope) -IdleTimeoutMinutes 5 -HardTimeoutMinutes $TimeoutMinutes
                     $packageSummary = Write-WingetScopeSummary -Scope "$scope/$pkgId" -Lines $pkgResult.Output -ExitCode $pkgResult.ExitCode
                     $count += $packageSummary.Updated
+                    foreach ($successfulId in @($packageSummary.SuccessfulIds)) { $null = $successfulPackageIds.Add($successfulId) }
                     if ($pkgResult.TimedOut) { $anyTimeout = $true }
                 }
                 $totalCount += $count
@@ -2767,18 +2804,60 @@ function Repair-WindowsUpdateComponents {
     param()
     Remove-WindowsUpdateAssessmentCache
     Write-Log 'WU remediation: resetting Windows Update components (SoftwareDistribution / catroot2)...' -Level Warn
-    if (-not $PSCmdlet.ShouldProcess('Windows Update components', 'Stop services, rename SoftwareDistribution/catroot2, restart')) { return }
-    $svcs = @('wuauserv', 'cryptsvc', 'bits', 'msiserver')
-    foreach ($s in $svcs) { try { Stop-Service $s -Force -ErrorAction SilentlyContinue } catch { } }
+    if (-not $PSCmdlet.ShouldProcess('Windows Update components', 'Stop services, rename SoftwareDistribution/catroot2, restart')) { return $false }
     $stamp = Get-Date -Format 'yyyyMMddHHmmss'
-    foreach ($dir in @("$env:windir\SoftwareDistribution", "$env:windir\System32\catroot2")) {
-        if (Test-Path $dir) {
-            try { Rename-Item $dir "$dir.$stamp.bak" -ErrorAction Stop; Write-Log "  renamed: $dir -> $dir.$stamp.bak" }
-            catch { Write-Log "  could not rename ${dir}: $_" -Level Warn }
+    $result = Invoke-BootUpdateBackgroundOperation -Name 'Resetting Windows Update components' `
+        -Status 'Resetting Windows Update components (30-second limit)' -TimeoutMinutes 0.5 `
+        -ScriptBlock {
+            param($WindowsRoot, $Timestamp)
+            $sc = Join-Path $WindowsRoot 'System32\sc.exe'
+            $services = @('wuauserv', 'cryptsvc', 'bits', 'msiserver')
+            foreach ($serviceName in $services) {
+                try { & $sc stop $serviceName 2>&1 | Out-Null } catch { }
+            }
+            foreach ($dir in @((Join-Path $WindowsRoot 'SoftwareDistribution'), (Join-Path $WindowsRoot 'System32\catroot2'))) {
+                if (Test-Path -LiteralPath $dir) {
+                    $backup = "$dir.$Timestamp.bak"
+                    try {
+                        Move-Item -LiteralPath $dir -Destination $backup -ErrorAction Stop
+                        "BOOTUPDATE_WU_RESET_RENAMED|$dir|$backup"
+                    } catch {
+                        "BOOTUPDATE_WU_RESET_WARN|$dir|$($_.Exception.Message)"
+                    }
+                }
+            }
+            foreach ($serviceName in $services) {
+                try { & $sc start $serviceName 2>&1 | Out-Null } catch { }
+            }
+            $deadline = [datetime]::UtcNow.AddSeconds(20)
+            do {
+                try {
+                    $wu = Get-Service wuauserv -ErrorAction Stop
+                    if ($wu.Status -eq 'Running') {
+                        'BOOTUPDATE_WU_RESET_COMPLETE|READY'
+                        exit 0
+                    }
+                } catch { }
+                Start-Sleep -Milliseconds 500
+            } while ([datetime]::UtcNow -lt $deadline)
+            'BOOTUPDATE_WU_RESET_ERROR|wuauserv did not reach Running within 20 seconds'
+            exit 5
+        } -ArgumentList @($env:windir, $stamp)
+
+    foreach ($line in @($result.Output)) {
+        if ($line -match '^BOOTUPDATE_WU_RESET_RENAMED\|([^|]+)\|(.+)$') {
+            Write-Log "  renamed: $($Matches[1]) -> $($Matches[2])"
+        } elseif ($line -match '^BOOTUPDATE_WU_RESET_WARN\|([^|]+)\|(.+)$') {
+            Write-Log "  could not rename $($Matches[1]): $($Matches[2])" -Level Warn
         }
     }
-    foreach ($s in $svcs) { try { Start-Service $s -ErrorAction SilentlyContinue } catch { } }
+    $complete = @($result.Output | Where-Object { $_ -eq 'BOOTUPDATE_WU_RESET_COMPLETE|READY' }).Count -gt 0
+    if ($result.TimedOut -or $result.Failed -or -not $complete) {
+        Write-Log 'WU remediation: bounded component reset did not restore Windows Update; only this phase will retry.' -Level Error
+        return $false
+    }
     Write-Log 'WU remediation: component reset complete. If failures persist, run DISM /Online /Cleanup-Image /RestoreHealth manually.'
+    return $true
 }
 
 function Initialize-BootUpdateWindowsUpdateModule {
@@ -2798,6 +2877,46 @@ function Initialize-BootUpdateWindowsUpdateModule {
         return $false
     }
     return [bool](Get-Module -ListAvailable PSWindowsUpdate)
+}
+
+function Test-WindowsUpdateServiceReady {
+    <# Start-Service can block indefinitely while SCM leaves wuauserv StartPending.
+       Isolate the mutation in a killable child and give this provider—not the
+       entire update run—a strict 30-second recovery budget. #>
+    if ($WhatIfPreference) { return $true }
+    $result = Invoke-BootUpdateBackgroundOperation -Name 'Preparing Windows Update service' `
+        -Status 'Starting Windows Update service (30-second limit)' -TimeoutMinutes 0.5 `
+        -ScriptBlock {
+            try {
+                $service = Get-Service wuauserv -ErrorAction Stop
+                if ($service.StartType -eq 'Disabled') {
+                    'BOOTUPDATE_WU_SERVICE|DISABLED'
+                    exit 3
+                }
+                if ($service.Status -ne 'Running') {
+                    Start-Service wuauserv -ErrorAction Stop
+                    $service.WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Running, [timespan]::FromSeconds(20))
+                    $service.Refresh()
+                }
+                if ($service.Status -eq 'Running') { 'BOOTUPDATE_WU_SERVICE|READY'; exit 0 }
+                "BOOTUPDATE_WU_SERVICE|$($service.Status.ToString().ToUpperInvariant())"
+                exit 4
+            } catch {
+                "BOOTUPDATE_WU_SERVICE_ERROR|$($_.Exception.Message)"
+                exit 5
+            }
+        }
+    $ready = @($result.Output | Where-Object { $_ -eq 'BOOTUPDATE_WU_SERVICE|READY' }).Count -gt 0
+    if ($ready -and -not $result.Failed -and -not $result.TimedOut) {
+        Write-Log 'Windows Update service: ready within the 30-second phase budget.'
+        return $true
+    }
+    $detail = @($result.Output | Where-Object { $_ -match '^BOOTUPDATE_WU_SERVICE(?:_ERROR)?\|' } | Select-Object -Last 1)
+    $reason = if ($result.TimedOut) { 'service start exceeded 30 seconds' }
+              elseif ($detail) { $detail -replace '^BOOTUPDATE_WU_SERVICE(?:_ERROR)?\|','' }
+              else { 'service did not reach Running state' }
+    Write-Log "Windows Update deferred: $reason. Other providers are unaffected; only Windows Update will retry." -Level Error
+    return $false
 }
 
 function Get-WindowsUpdateVerificationScope {
@@ -3007,6 +3126,14 @@ function Install-WindowsUpdates {
     if (-not (Initialize-BootUpdateWindowsUpdateModule)) {
         return @{ Success = $false; Count = 0 }
     }
+    if (-not (Test-WindowsUpdateServiceReady)) {
+        if ($script:WuPrefetchJob) {
+            Stop-Job $script:WuPrefetchJob -ErrorAction SilentlyContinue
+            Remove-Job $script:WuPrefetchJob -Force -ErrorAction SilentlyContinue
+            $script:WuPrefetchJob = $null
+        }
+        return @{ Success = $false; Count = 0 }
+    }
 
     <# Consecutive-failure streak persists across reboots in a sidecar file (no state
        schema change). At 2+ consecutive failures, run the component reset once per
@@ -3017,8 +3144,10 @@ function Install-WindowsUpdates {
     if (Test-Path $streakPath) { try { $streak = [int](Get-Content $streakPath -ErrorAction Stop) } catch { $streak = 0 } }
     if ($streak -ge 2 -and -not (Test-Path $remediatedMarker)) {
         Write-Log "Windows Update has failed $streak consecutive time(s) — escalating to component reset." -Level Warn
-        Repair-WindowsUpdateComponents
-        if (-not $WhatIfPreference) { New-Item -ItemType File -Path $remediatedMarker -Force | Out-Null }
+        $resetSucceeded = Repair-WindowsUpdateComponents
+        if ($resetSucceeded -and -not $WhatIfPreference) {
+            New-Item -ItemType File -Path $remediatedMarker -Force | Out-Null
+        }
     }
 
     <# Collect the background prefetch job (2uj) before installing, if one is running #>
@@ -4397,6 +4526,32 @@ function Write-EventLogEntry {
     } catch { }
 }
 
+function Send-BootUpdateToast {
+    param(
+        [Parameter(Mandatory)][string]$Title,
+        [Parameter(Mandatory)][string]$Message,
+        [ValidateSet('Success','Error','Progress')][string]$Kind = 'Progress',
+        [string]$Sound = ''
+    )
+    if (-not (Test-NotificationAllowed -Kind $Kind)) { return $false }
+    $isSystem = ([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value -eq 'S-1-5-18')
+    if ($isSystem) { return $false }
+    try {
+        if (-not (Get-Module -ListAvailable BurntToast)) {
+            Install-Module BurntToast -Force -Scope CurrentUser -AllowClobber -ErrorAction Stop
+        }
+        Import-Module BurntToast -Force
+        $toast = @{ Text=@($Title,$Message); AppLogo=$null }
+        if ($Sound) { $toast.Sound = $Sound }
+        New-BurntToastNotification @toast
+        Write-Log "Notification: toast sent ($Kind)"
+        return $true
+    } catch {
+        Write-Log "Notification: toast failed: $_" -Level Warn
+        return $false
+    }
+}
+
 function Send-WebhookNotification {
     param(
         [string]$Title,
@@ -4587,15 +4742,7 @@ function Send-CompletionNotification {
         $msgExe = Join-Path $env:SystemRoot 'System32\msg.exe'
         if (Test-Path $msgExe) { & $msgExe * /TIME:120 "$Title`n`n$Message" 2>$null; if ($LASTEXITCODE -eq 0) { Write-Log 'Notification: msg.exe sent' } }
     } catch { }
-    <# BurntToast (user context only) #>
-    $isSystem = ([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value -eq 'S-1-5-18')
-    if (-not $isSystem) {
-        try {
-            if (-not (Get-Module -ListAvailable BurntToast)) { Install-Module BurntToast -Force -Scope CurrentUser -AllowClobber }
-            Import-Module BurntToast -Force; New-BurntToastNotification -Text $Title, $Message -AppLogo $null
-            Write-Log 'Notification: BurntToast sent'
-        } catch { Write-Log "Notification: BurntToast failed: $_" -Level Warn }
-    }
+    $null = Send-BootUpdateToast -Title $Title -Message $Message -Kind $Kind
     Write-EventLogEntry -EventId 1000 -Message "$Title`n$Message"
 
     <# Build a flat hashtable from the pscustomobject summary for webhook/email functions #>
@@ -4613,10 +4760,9 @@ function Send-RebootWarning {
     Write-Log 'Sending reboot warnings...'
     <# Toast is gated as Progress noise; the native shutdown countdown dialog and the
        event log entry are NOT gated — the abort window must stay discoverable. #>
-    $isSystem = ([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value -eq 'S-1-5-18')
-    if (-not $isSystem -and (Test-NotificationAllowed -Kind Progress)) {
-        try { if (Get-Module -ListAvailable BurntToast) { Import-Module BurntToast -Force; New-BurntToastNotification -Text 'System Reboot Warning', $msgFull -AppLogo $null -Sound 'Alarm' } } catch { }
-    }
+    $null = Send-BootUpdateToast -Kind Progress -Sound Alarm `
+        -Title 'Restart required — updates will continue automatically' `
+        -Message "Windows will restart in $SecondsUntilReboot seconds. To cancel this restart, run: shutdown /a"
     Write-EventLogEntry -EventId 1001 -EntryType Warning -Message $msgFull
 }
 
@@ -5648,7 +5794,10 @@ function Invoke-BootUpdateCycle {
             Set-BootUpdateState -State $state
         }
     }
-    if (-not $script:StagedRollout -and -not $WhatIfPreference -and -not $state.WindowsUpdateDone -and (Get-Module -ListAvailable PSWindowsUpdate)) {
+    $wuServiceRunningForPrefetch = $false
+    try { $wuServiceRunningForPrefetch = (Get-Service wuauserv -ErrorAction Stop).Status -eq 'Running' } catch { }
+    if (-not $script:StagedRollout -and -not $WhatIfPreference -and -not $state.WindowsUpdateDone -and
+        (Get-Module -ListAvailable PSWindowsUpdate) -and $wuServiceRunningForPrefetch) {
         try {
             $prefetchNotTitle = ((@('SQL') + ($script:ExcludePatterns | ForEach-Object { [regex]::Escape($_) })) -join '|')
             $script:WuPrefetchJob = Start-Job -ScriptBlock {
@@ -5663,6 +5812,9 @@ function Invoke-BootUpdateCycle {
             Write-Log "Windows Update prefetch failed to start (non-fatal): $_" -Level Warn
             $script:WuPrefetchJob = $null
         }
+    } elseif (-not $script:StagedRollout -and -not $WhatIfPreference -and -not $state.WindowsUpdateDone -and
+        (Get-Module -ListAvailable PSWindowsUpdate)) {
+        Write-Log 'Windows Update prefetch: skipped because wuauserv is not running; the Windows Update phase will attempt bounded recovery.' -Level Warn
     }
 
     <# System restore point — first iteration only; skipped on SYSTEM, Server SKUs, -SkipRestorePoint, or WhatIf #>
@@ -6349,6 +6501,9 @@ function Invoke-BootUpdateCycle {
                 Write-Log "Staged rollout: $($remainingPhases.Count) phase(s) remaining. A near-term checkpoint will run [$($nextPhase.Name)]." -Level Info
                 Write-Log "  Remaining: $(($remainingPhases | ForEach-Object { $_.Name }) -join ', ')"
                 if (-not $WhatIfPreference) { $null = Register-BootUpdateTaskForReboot -RetrySoon }
+                $null = Send-BootUpdateToast -Kind Progress `
+                    -Title 'Update pass saved — no restart required' `
+                    -Message "Next phase: $($nextPhase.Name). Another pass is scheduled; no action is required."
                 Write-BootUpdateProgress -Completed
                 return  <# Cycle not complete — exit without cleanup #>
             }
@@ -6388,6 +6543,9 @@ function Invoke-BootUpdateCycle {
             Set-BootUpdateState -State $state
             Write-Log "Verification withheld: incomplete phase(s): $incompleteNames. Automatic retry queued for two minutes." -Level Warn
             $null = Register-BootUpdateTaskForReboot -RetrySoon
+            $null = Send-BootUpdateToast -Kind Progress `
+                -Title 'Another update pass is scheduled — no restart required' `
+                -Message "$incompleteNames did not verify yet. Retrying in about 2 minutes; you may close this window."
             Write-BootUpdateProgress -Completed
             Show-CycleBanner -Title 'R E C O V E R Y   P A S S   Q U E U E D' -AnsiColor "$([char]27)[33m" -Info @(
                 'Not calling this complete yet — the checkpoint is safe.'
@@ -6406,6 +6564,13 @@ function Invoke-BootUpdateCycle {
             $deferredNames = $disposition.Phases.Name -join ', '
             $retryForUnknownUser = [string]::IsNullOrWhiteSpace([string]$state.ResumeUser)
             $null = Register-BootUpdateTaskForReboot -RetrySoon:$retryForUnknownUser
+            $userToastMessage = if ($retryForUnknownUser) {
+                "Waiting to identify an interactive user for: $deferredNames. A retry is scheduled; no restart is required."
+            } else {
+                "Waiting for the saved user to sign in so these phases can run: $deferredNames. No restart is required."
+            }
+            $null = Send-BootUpdateToast -Kind Progress `
+                -Title 'User update pass pending — no restart required' -Message $userToastMessage
             Write-BootUpdateProgress -Completed
             Show-CycleBanner -Title 'U S E R   P A S S   P E N D I N G' -AnsiColor "$([char]27)[36m" -Info @(
                 'Machine-level work is safe; full verification is intentionally withheld.'
@@ -6487,11 +6652,12 @@ function Invoke-BootUpdateCycle {
                 throw "Terminal cleanup verification failed; refusing the verified completion banner. Tasks: $($leftoverTasks -join ', ')"
             }
             if ($hasWingetQuarantine) {
-                $quarantineIds = @($wingetQuarantines.PackageId) -join ', '
-                Send-CompletionNotification -Kind Progress -Title 'Boot Update Cycle Complete with Quarantine' `
-                    -Message "$total updates verified; $actionsTriggered updater action(s) reported separately from verified totals; reversible Winget blocking pins remain for: $quarantineIds. Record: $($script:WingetQuarantinePath)" -Data $summaryData
+                Send-CompletionNotification -Kind Progress `
+                    -Title 'Updates complete — no restart required' `
+                    -Message "$total updates verified. $($wingetQuarantines.Count) repeatedly failing package(s) were skipped and reversibly pinned to prevent a loop. No action is required now." -Data $summaryData
             } else {
-                Send-CompletionNotification -Title 'Boot Update Cycle Complete' -Message "$total updates verified; $actionsTriggered updater action(s) reported separately from verified totals; completed in $($state.Iteration) iteration(s), $durMin min" -Data $summaryData
+                Send-CompletionNotification -Title 'Updates complete — no restart required' `
+                    -Message "$total updates verified in $durMin minutes. Verification passed, no retry is queued, and you are all set." -Data $summaryData
             }
         }
         <# The congratulatory banner is the terminal commit point: hooks, notifications,

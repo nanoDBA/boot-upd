@@ -49,6 +49,7 @@ BeforeAll {
         'Test-WindowsUpdateAssessmentCache',
         'Test-WindowsUpdateZeroEvidence',
         'Get-WindowsUpdateInstallOutputSummary',
+        'Test-WindowsUpdateServiceReady',
         'Test-WindowsUpdateConvergence',
         'Format-NativeExitCode',
           'Get-InstallerExitSummary',
@@ -156,6 +157,31 @@ Describe 'Concise provider diagnostics' {
         $summary.Pinned | Should -Be 1
         $summary.Unknown | Should -Be 4
         $summary.TechnologyBlocked | Should -Be 1
+    }
+
+    It 'recognizes restart-application success and hexadecimal installer failures' {
+        $summary = Get-WingetOutputSummary -Lines @(
+            '(1/2) Found Example Chat [Example.Chat] Version 2.0',
+            'Successfully installed. Restart the application to complete the upgrade.',
+            '(2/2) Found Example System App [Example.System] Version 3.0',
+            'Installer failed with exit code: 0x80070005 : Access is denied.'
+        )
+
+        $summary.Attempted | Should -Be 2
+        $summary.Updated | Should -Be 1
+        $summary.SuccessfulIds | Should -Be @('Example.Chat')
+        $summary.Failures.Count | Should -Be 1
+        $summary.Failures[0].Id | Should -Be 'Example.System'
+        $summary.Failures[0].Code | Should -Be 2147942405
+        $summary.Failures[0].Summary | Should -Be 'access is denied'
+    }
+
+    It 'uses targeted machine inventory to avoid retrying a user-scope success' {
+        $winget = Get-FunctionText $invokeAst 'Update-WingetPackages'
+        $winget | Should -Match 'successfulPackageIds'
+        $winget | Should -Match "scope -eq 'machine'.*successfulPackageIds.Count -gt 0"
+        $winget | Should -Match 'already succeeded in user scope during this run'
+        $winget | Should -Match 'refusing a duplicate --all mutation'
     }
 
     It 'creates paste-ready remediation only from safe package identifiers' {
@@ -517,6 +543,71 @@ Describe 'Delayed and explicit reboot evidence' {
         $state.LastRebootSignals | Should -Be 'WUA'
         $state.LastPhaseStarted | Should -BeNullOrEmpty
         $state.LastPreflightNetworkOk | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Bounded Windows Update service readiness' {
+    BeforeEach {
+        $WhatIfPreference = $false
+        Mock Write-Log { }
+    }
+
+    It 'limits service recovery to 30 seconds and leaves only Windows Update incomplete on timeout' {
+        Mock Invoke-BootUpdateBackgroundOperation {
+            [pscustomobject]@{ Output=@(); Failed=$true; TimedOut=$true }
+        }
+
+        Test-WindowsUpdateServiceReady | Should -BeFalse
+        Should -Invoke Invoke-BootUpdateBackgroundOperation -Times 1 -ParameterFilter {
+            $Name -eq 'Preparing Windows Update service' -and $TimeoutMinutes -eq 0.5
+        }
+        Should -Invoke Write-Log -Times 1 -ParameterFilter {
+            $Message -match 'Other providers are unaffected; only Windows Update will retry'
+        }
+    }
+
+    It 'accepts only a successful ready marker' {
+        Mock Invoke-BootUpdateBackgroundOperation {
+            [pscustomobject]@{ Output=@('BOOTUPDATE_WU_SERVICE|READY'); Failed=$false; TimedOut=$false }
+        }
+
+        Test-WindowsUpdateServiceReady | Should -BeTrue
+    }
+
+    It 'treats an indefinitely StartPending service as a Windows Update-only retry' {
+        Mock Invoke-BootUpdateBackgroundOperation {
+            [pscustomobject]@{
+                Output=@('BOOTUPDATE_WU_SERVICE|STARTPENDING')
+                Failed=$true
+                TimedOut=$true
+            }
+        }
+
+        Test-WindowsUpdateServiceReady | Should -BeFalse
+        Should -Invoke Invoke-BootUpdateBackgroundOperation -Times 1 -ParameterFilter {
+            $TimeoutMinutes -eq 0.5
+        }
+        Should -Invoke Write-Log -Times 1 -ParameterFilter {
+            $Message -match 'Other providers are unaffected; only Windows Update will retry'
+        }
+    }
+
+    It 'keeps global preflight read-only and shows elapsed progress' {
+        $preflight = Get-FunctionText $invokeAst 'Test-PreFlightChecks'
+        $preflight | Should -Not -Match 'Start-Service'
+        $preflight | Should -Match 'bounded recovery is deferred to the Windows Update phase'
+        $preflight | Should -Match 'elapsed.*TotalSeconds'
+        $preflight | Should -Match 'Write-BootUpdateProgress'
+    }
+
+    It 'bounds escalated component recovery and records remediation only after verified recovery' {
+        $repair = Get-FunctionText $invokeAst 'Repair-WindowsUpdateComponents'
+        $install = Get-FunctionText $invokeAst 'Install-WindowsUpdates'
+        $repair | Should -Match "Invoke-BootUpdateBackgroundOperation -Name 'Resetting Windows Update components'"
+        $repair | Should -Match '-TimeoutMinutes 0\.5'
+        $repair | Should -Not -Match '\b(?:Start|Stop)-Service\b'
+        $repair | Should -Match 'BOOTUPDATE_WU_RESET_COMPLETE\|READY'
+        $install | Should -Match '(?s)\$resetSucceeded = Repair-WindowsUpdateComponents.*?if \(\$resetSucceeded -and -not \$WhatIfPreference\).*?New-Item'
     }
 }
 
@@ -1046,7 +1137,7 @@ Describe 'Evidence-backed completion' {
         $text = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
         $cleanup = $text.LastIndexOf('Unregister-BootUpdateTask')
         $verify = $text.LastIndexOf('Terminal cleanup verification failed')
-        $notify = $text.LastIndexOf("Send-CompletionNotification -Title 'Boot Update Cycle Complete'")
+        $notify = $text.LastIndexOf("Send-CompletionNotification -Title 'Updates complete")
         $banner = $text.LastIndexOf('Show-CycleBanner -Title $completionTitle')
         $cleanup | Should -BeLessThan $verify
         $verify | Should -BeLessThan $notify
@@ -1056,7 +1147,7 @@ Describe 'Evidence-backed completion' {
     It 'reports durable Winget quarantine as degraded completion rather than fully patched' {
         $text = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
         $text | Should -Match 'COMPLETE WITH WINGET QUARANTINE'
-        $text | Should -Match 'Boot Update Cycle Complete with Quarantine'
+        $text | Should -Match 'Updates complete.*no restart required'
         $text | Should -Match 'WingetQuarantinePath'
         $text | Should -Match 'Repeatedly failing packages were skipped to prevent another loop'
         $text | Should -Match 'were not updated'

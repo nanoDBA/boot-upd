@@ -191,7 +191,7 @@ has exited**. It verifies the installer against the hash embedded below, then th
 verifies and transactionally replaces the complete release bundle before forwarding `aws`:
 
 ```powershell
-$u='https://github.com/nanoDBA/boot-upd/releases/download/v2.5.60/Install-UpdCompat.ps1'; $f=Join-Path $env:TEMP 'Install-UpdCompat-v2.5.60.ps1'; Invoke-WebRequest $u -OutFile $f; if((Get-FileHash $f -Algorithm SHA256).Hash -ne '67662B3B02252FF6DE045FCDF28FB74D8DEB6FDA8080C46B1DAFC7BFBE54ABE3'){throw 'Compatibility installer hash mismatch'}; & $f -CommandArguments aws
+$u='https://github.com/nanoDBA/boot-upd/releases/download/v2.5.61/Install-UpdCompat.ps1'; $f=Join-Path $env:TEMP 'Install-UpdCompat-v2.5.61.ps1'; Invoke-WebRequest $u -OutFile $f; if((Get-FileHash $f -Algorithm SHA256).Hash -ne '67662B3B02252FF6DE045FCDF28FB74D8DEB6FDA8080C46B1DAFC7BFBE54ABE3'){throw 'Compatibility installer hash mismatch'}; & $f -CommandArguments aws
 ```
 
 This is the one-time chicken-and-egg escape hatch. It resolves the first `upd.cmd` on PATH,
@@ -271,16 +271,21 @@ console feedback because isolating it would change how hook variables and side e
 
 ### What happens
 
-1. Pre-flight checks validate disk space, network, battery, and conflicting installers
+1. Pre-flight checks visibly report their current check and elapsed time while validating disk space, network, battery, and conflicting installers. They observe—but never start—the Windows Update service
 2. First iteration runs in **your** console (user context) — the only chance for user-scoped winget/Scoop/VS Code
 3. Before mutation, two reboot-signal probes span a 20-second servicing-settle window. CBS, Windows Update Agent, real file replacements, protected Windows-file deletes, and provider-native reboot results are hard barriers; delete-only application/cloud/temp housekeeping is reported as an advisory
 4. Native `3010`/`1641`, Chocolatey `350`/`1604`, and `Microsoft.Update.SystemInfo.RebootRequired` results are persisted immediately instead of waiting for registry flags to appear
 5. Verified resume tasks are armed before updates start: user-at-logon plus a delayed SYSTEM fallback, with dated watchdogs for canceled shutdowns and deferred retries
 6. `shutdown /g` restarts Windows; the checkpoint resumes automatically, preserves successful provider phases, preserves user-only work for user context, and retries only incomplete or interrupted work
-7. A successful online Windows Update assessment is reusable for six hours—even across reboots—only after an offline WUA catalog check confirms zero applicable work and the update source, scope, and recent servicing history fingerprints still match
-8. Completion requires every enabled phase, a zero-applicable Windows Update assessment, and two probes with no blocking reboot evidence (max 5 completed reboot safety valve). Optional third-party cleanup remains visible but cannot create a reboot loop
-9. Hooks run, resume tasks and transient state are removed and verified absent, and only then does the final screen congratulate the user and send the success notification
-10. If explicit aggressive mode quarantined a persistent Winget failure, its durable record survives cleanup and the final screen reports degraded completion with an `upd uq` reversal command
+7. Windows Update owns its service recovery: start and component-reset attempts are isolated behind a 30-second boundary. A stuck or indefinitely `StartPending` service makes only that phase retryable while safe independent providers continue
+8. A successful online Windows Update assessment is reusable for six hours—even across reboots—only after an offline WUA catalog check confirms zero applicable work and the update source, scope, and recent servicing history fingerprints still match
+9. Completion requires every enabled phase, a zero-applicable Windows Update assessment, and two probes with no blocking reboot evidence (max 5 completed reboot safety valve). Optional third-party cleanup remains visible but cannot create a reboot loop
+10. Hooks run, resume tasks and transient state are removed and verified absent, and only then does the final screen congratulate the user and send a result-specific notification
+11. If explicit aggressive mode quarantined a persistent Winget failure, its durable record survives cleanup and the final screen reports degraded completion with an `upd uq` reversal command
+
+Notifications distinguish four outcomes instead of using one generic toast: updates complete with no restart,
+another pass scheduled with no restart, user-context work waiting for sign-in, and restart required with automatic
+continuation. They are shown only in an interactive user session; SYSTEM resume work never attempts a desktop toast.
 
 ### Reliability lineage
 

@@ -1,8 +1,19 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.60
+**Current Version:** v2.5.61
 **Release Date:** 2026-07-22
 **Status:** STABLE
+
+---
+
+## v2.5.61 (2026-07-22)
+
+- Makes preflight visibly report its current check and elapsed time, while keeping Windows Update service recovery out of the global provider path.
+- Gives Windows Update service start and component-reset recovery a strict 30-second process boundary. A stuck or indefinitely `StartPending` service leaves only Windows Update retryable; safe independent providers continue.
+- Recognizes Winget's `Successfully installed. Restart the application...` result as success and excludes packages already completed in user scope from the machine-scope pass, preventing duplicate attempts such as per-user applications encountered in both inventories.
+- Correctly parses hexadecimal Winget installer failures such as `0x80070005` and reports their actual access-denied meaning instead of a zero exit code.
+- Gives completion, retry-without-reboot, user-context continuation, and restart-required notifications distinct plain-language titles and next steps.
+- Adds synthetic regression coverage for hung services, provider isolation, Winget success parsing and scope de-duplication, and privacy-safe notification fixtures.
 
 ---
 
