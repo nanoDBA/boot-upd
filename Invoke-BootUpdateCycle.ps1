@@ -344,9 +344,11 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 6 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.58' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.59' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 Set-Variable -Name 'RebootSignalSettleSeconds' -Value 20 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 $script:ExplicitRebootRequests = [System.Collections.Generic.List[object]]::new()
+$script:LastPendingFileRenameOperations = @()
+$script:LastPendingFileCleanupFingerprint = ''
 
 <# Force UTF-8 console I/O so box-drawing/block chars (BBS splash) render in cmd.exe regardless of system code page.
    chcp 65001 sets conhost interpretation; [Console]::OutputEncoding makes .NET write proper UTF-8 bytes. #>
@@ -658,11 +660,13 @@ function Invoke-BootUpdateBackgroundOperation {
         [Parameter(Mandatory)][scriptblock]$ScriptBlock,
         [object[]]$ArgumentList = @(),
         [ValidateRange(0.01,1440)][double]$TimeoutMinutes = 60,
-        [string]$Status = 'Background operation is running'
+        [string]$Status = 'Background operation is running',
+        [int[]]$IncompleteRebootExitCodes = @()
     )
     $result = Invoke-PackageManagerWithTimeout -Name $Name -ScriptBlock $ScriptBlock `
         -ArgumentList $ArgumentList -IdleTimeoutMinutes $TimeoutMinutes `
-        -HardTimeoutMinutes $TimeoutMinutes -Status $Status
+        -HardTimeoutMinutes $TimeoutMinutes -Status $Status `
+        -IncompleteRebootExitCodes $IncompleteRebootExitCodes
     return @{
         Output = $result.Output
         TimedOut = $result.TimedOut
@@ -1154,6 +1158,31 @@ function Update-BootUpdateStateForBootSession {
     }
     $State.LastBootSessionId = $CurrentBootSessionId
     return $State
+}
+
+function Set-BootUpdateRebootCheckpoint {
+    param(
+        [Parameter(Mandatory)][pscustomobject]$State,
+        [Parameter(Mandatory)][string]$SignalKey,
+        [switch]$ClearPhaseIntent
+    )
+    $phaseFlags = @(
+        'WingetDone','ChocolateyDone','WindowsUpdateDone','AwsToolingDone','PipDone','NpmDone',
+        'Office365Done','PowerShellModulesDone','ScoopDone','DotnetToolsDone','VscodeDone',
+        'DefenderDone','DriverFirmwareDone','WslDone','ContainersDone'
+    )
+    $completedFlags = @($phaseFlags | Where-Object { [bool]$State.$_ })
+    $State.LastRebootSignals = $SignalKey
+    if ($ClearPhaseIntent) {
+        $State.LastPhaseStarted = $null
+        $State.LastPhaseTimestamp = $null
+    }
+    $State.Phase = 'Rebooting'
+    $State.LastPreflightNetworkAt = $null
+    $State.LastPreflightNetworkOk = $null
+    Set-BootUpdateState -State $State
+    Write-Log "Reboot checkpoint: preserving $($completedFlags.Count) completed phase(s); only incomplete work will resume after boot." -Level Info
+    return $completedFlags
 }
 
 function Resolve-BootUpdateCompletionDisposition {
@@ -1693,27 +1722,110 @@ function Test-NotificationAllowed {
 #endregion
 
 #region Pending Reboot Detection
-function Get-ActionablePendingFileRenameOperations {
+function ConvertFrom-PendingFileRenamePath {
+    param([AllowNull()][string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return '' }
+
+    $clean = $Path.Trim()
+    # Current Windows builds may prefix Session Manager entries with *1/*2.
+    # Older entries use ! or * directly before the NT \??\ path prefix.
+    $clean = $clean -replace '^[!*]\d*(?=\\\?\?\\)', ''
+    $clean = $clean -replace '^[!*]*(?:\\\?\?\\|\\\\\?\\)', ''
+    return $clean
+}
+
+function Get-PendingFileRenameOperations {
     param([AllowNull()][object[]]$Entries = @())
     $operations = [System.Collections.Generic.List[object]]::new()
     $windowsSystemTemp = Join-Path $env:windir 'SystemTemp'
     for ($index = 0; $index -lt @($Entries).Count; $index += 2) {
         $source = [string]$Entries[$index]
         $destination = if (($index + 1) -lt @($Entries).Count) { [string]$Entries[$index + 1] } else { '' }
-        $cleanSource = $source -replace '^[!*]*\\\?\?\\', ''
-        $cleanDestination = $destination -replace '^[!*]*\\\?\?\\', ''
+        $cleanSource = ConvertFrom-PendingFileRenamePath -Path $source
+        $cleanDestination = ConvertFrom-PendingFileRenamePath -Path $destination
         if ([string]::IsNullOrWhiteSpace($cleanSource)) { continue }
 
-        # Chocolatey 2.8.x can leave delete-on-reboot entries for its disposable
-        # prototype extraction directory. A blank destination means deletion,
-        # not a file replacement. It is not evidence that servicing needs a boot.
-        $isDisposableChocolateyDelete = [string]::IsNullOrWhiteSpace($cleanDestination) -and
-            $cleanSource.StartsWith("$windowsSystemTemp\ChocolateyPrototype-", [StringComparison]::OrdinalIgnoreCase)
-        if ($isDisposableChocolateyDelete) { continue }
+        $isDelete = [string]::IsNullOrWhiteSpace($cleanDestination)
+        $category = if ($isDelete) { 'UnclassifiedDelete' } else { 'FileReplacement' }
+        $isBlocking = $true
 
-        $operations.Add([pscustomobject]@{ Source=$cleanSource; Destination=$cleanDestination })
+        if ($isDelete) {
+            $windowsRoot = [IO.Path]::GetFullPath($env:windir).TrimEnd('\')
+            $isWindowsPath = $cleanSource.StartsWith("$windowsRoot\", [StringComparison]::OrdinalIgnoreCase)
+            $isWindowsTemp = $cleanSource.StartsWith("$windowsRoot\Temp\", [StringComparison]::OrdinalIgnoreCase) -or
+                $cleanSource.StartsWith("$windowsRoot\SystemTemp\", [StringComparison]::OrdinalIgnoreCase)
+
+            # A delete with no destination is cleanup evidence, not a pending file
+            # replacement. Keep protected Windows/runtime paths conservative, while
+            # application, profile, cloud-sync, recovery, cache, and temp cleanup is
+            # advisory regardless of vendor. Explicit 3010/1641, CBS, and WU evidence
+            # remains independently blocking.
+            if ($cleanSource.StartsWith("$windowsSystemTemp\ChocolateyPrototype-", [StringComparison]::OrdinalIgnoreCase)) {
+                $category = 'ChocolateyPrototypeCleanup'
+                $isBlocking = $false
+            } elseif ($cleanSource -match '(?i)^[A-Z]:\\Program Files(?: \(x86\))?\\Microsoft\\EdgeUpdate\\\d+(?:\.\d+)+(?:\\|$)') {
+                $category = 'EdgeUpdateCleanup'
+                $isBlocking = $false
+            } elseif ($cleanSource -match '(?i)^[A-Z]:\\Program Files\\Dropbox\\DropboxRecovery\\scoped_dir\d+_\d+(?:\\|$)') {
+                $category = 'DropboxRecoveryCleanup'
+                $isBlocking = $false
+            } elseif ($cleanSource -match '(?i)\\(?:OneDrive|Dropbox|Google Drive|DriveFS|Box|iCloud)(?:\\|$)') {
+                $category = 'CloudStorageCleanup'
+                $isBlocking = $false
+            } elseif ($isWindowsTemp) {
+                $category = 'TemporaryCleanup'
+                $isBlocking = $false
+            } elseif ($isWindowsPath) {
+                $category = 'ProtectedWindowsDelete'
+                $isBlocking = $true
+            } elseif ($cleanSource -match '(?i)^[A-Z]:\\(?:Program Files(?: \(x86\))?|ProgramData|Users)\\') {
+                $category = 'ApplicationCleanup'
+                $isBlocking = $false
+            } elseif ($cleanSource -match '(?i)^[A-Z]:\\') {
+                $category = 'NonSystemCleanup'
+                $isBlocking = $false
+            } else {
+                $exists = $true
+                try { $exists = Test-Path -LiteralPath $cleanSource -ErrorAction Stop } catch { }
+                if (-not $exists) {
+                    $category = 'AlreadyAbsentCleanup'
+                    $isBlocking = $false
+                }
+            }
+        }
+
+        $sha = [Security.Cryptography.SHA256]::Create()
+        try {
+            $bytes = [Text.Encoding]::UTF8.GetBytes("$category|$cleanSource|$cleanDestination".ToUpperInvariant())
+            $fingerprint = ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-','').Substring(0,12)
+        } finally { $sha.Dispose() }
+
+        $operations.Add([pscustomobject]@{
+            Source=$cleanSource; Destination=$cleanDestination; IsDelete=$isDelete
+            IsBlocking=$isBlocking; Category=$category; Fingerprint=$fingerprint
+        })
     }
     return $operations.ToArray()
+}
+
+function Get-ActionablePendingFileRenameOperations {
+    param([AllowNull()][object[]]$Entries = @())
+    return @(Get-PendingFileRenameOperations -Entries $Entries | Where-Object IsBlocking)
+}
+
+function Write-PendingFileRenameAdvisory {
+    param(
+        [AllowNull()][object[]]$Operations = @(),
+        [string]$Context = 'verification'
+    )
+    $advisory = @($Operations | Where-Object { -not $_.IsBlocking })
+    if (-not $advisory.Count) { return }
+
+    $fingerprint = (($advisory.Fingerprint | Sort-Object -Unique) -join ',')
+    if ($script:LastPendingFileCleanupFingerprint -eq "$Context|$fingerprint") { return }
+    $script:LastPendingFileCleanupFingerprint = "$Context|$fingerprint"
+    $categories = @($advisory | Group-Object Category | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Count)" }) -join ', '
+    Write-Log "Pending-file cleanup advisory [$Context]: $categories; id=$fingerprint. Delete-only housekeeping does not block update convergence." -Level Warn
 }
 
 function Test-PendingReboot {
@@ -1736,9 +1848,26 @@ function Test-PendingReboot {
     if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\PostRebootReporting') {
         & $report 'WU-PostReboot' 'Windows Update: PostRebootReporting key present (WU wants a post-reboot report pass)'
     }
+    $wuaSystemInfo = $null
+    try {
+        # The Windows Update Agent API is stronger evidence than inferring its
+        # state solely from registry implementation details. Ansible's Windows
+        # updater uses this API before and after installation for the same reason.
+        $wuaSystemInfo = New-Object -ComObject Microsoft.Update.SystemInfo -ErrorAction Stop
+        if ($wuaSystemInfo.RebootRequired) {
+            & $report 'WUA' 'Windows Update Agent API reports RebootRequired'
+        }
+    } catch { } finally {
+        if ($wuaSystemInfo -and [Runtime.InteropServices.Marshal]::IsComObject($wuaSystemInfo)) {
+            try { $null = [Runtime.InteropServices.Marshal]::FinalReleaseComObject($wuaSystemInfo) } catch { }
+        }
+    }
+    $script:LastPendingFileRenameOperations = @()
     $val = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name 'PendingFileRenameOperations' -EA Ignore
     if ($val -and $val.PendingFileRenameOperations.Count -gt 0) {
-        $operations = @(Get-ActionablePendingFileRenameOperations -Entries @($val.PendingFileRenameOperations))
+        $assessedOperations = @(Get-PendingFileRenameOperations -Entries @($val.PendingFileRenameOperations))
+        $script:LastPendingFileRenameOperations = $assessedOperations
+        $operations = @($assessedOperations | Where-Object IsBlocking)
         if ($operations.Count -gt 0) {
             $sample = @($operations | Select-Object -First 3 | ForEach-Object {
                 if ($_.Destination) { "$($_.Source) -> $($_.Destination)" } else { "$($_.Source) (delete)" }
@@ -1771,11 +1900,13 @@ function Get-ConfirmedPendingReboot {
        returning. A clean result is therefore provisional: keep the live UI moving,
        allow CBS/WU/installers to settle, then require a second independent clean read.
        Explicit 3010/1641 evidence is durable for the process and bypasses the wait. #>
+    param([string]$Context = 'verification')
     if ($script:ExplicitRebootRequests.Count -gt 0) {
         return @($script:ExplicitRebootRequests)
     }
 
     $first = @(Test-PendingReboot)
+    Write-PendingFileRenameAdvisory -Operations $script:LastPendingFileRenameOperations -Context $Context
     if ($first.Count -gt 0) { return $first }
 
     Write-Log "Final verification: first reboot probe is clean; allowing $($script:RebootSignalSettleSeconds)s for delayed servicing signals." -Visibility Verbose
@@ -1783,6 +1914,7 @@ function Get-ConfirmedPendingReboot {
         -Activity 'VERIFY//SETTLE' -Status 'Watching for delayed Windows reboot signals' -PercentComplete 99
 
     $second = @(Test-PendingReboot)
+    Write-PendingFileRenameAdvisory -Operations $script:LastPendingFileRenameOperations -Context $Context
     if ($script:ExplicitRebootRequests.Count -gt 0) {
         return @($script:ExplicitRebootRequests) + $second
     }
@@ -2108,7 +2240,8 @@ function Invoke-PackageManagerWithTimeout {
         [Parameter(Mandatory)][scriptblock]$ScriptBlock,
         [object[]]$ArgumentList = @(),
         [double]$IdleTimeoutMinutes = 5, [double]$HardTimeoutMinutes = 60,
-        [string]$Status = 'Operation is running'
+        [string]$Status = 'Operation is running',
+        [int[]]$IncompleteRebootExitCodes = @()
     )
     $pwshPath = (Get-Command pwsh -EA SilentlyContinue)?.Source
     if (-not $pwshPath) { $pwshPath = Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe' }
@@ -2162,19 +2295,21 @@ try {
         $visibleOutput.Add($line)
     }
     $effectiveExitCode = if ($null -ne $nativeExitCode) { $nativeExitCode } else { $result.ExitCode }
-    $rebootRequired = $effectiveExitCode -in @(1641, 3010)
+    $successfulRebootExit = $effectiveExitCode -in @(1641, 3010)
+    $incompleteRebootExit = $effectiveExitCode -in $IncompleteRebootExitCodes
+    $rebootRequired = $successfulRebootExit -or $incompleteRebootExit
     if ($rebootRequired) {
         $rebootEvidence = [pscustomobject]@{
             Source = "$Name-exit-$effectiveExitCode"
             Status = 'Pending'
-            Detail = "$Name requested a reboot (native exit code $effectiveExitCode)"
+            Detail = if ($incompleteRebootExit) { "$Name stopped incomplete for reboot (native exit code $effectiveExitCode)" } else { "$Name requested a reboot (native exit code $effectiveExitCode)" }
         }
         $script:ExplicitRebootRequests.Add($rebootEvidence)
         if ($script:CurrentState) {
             $script:CurrentState.ExplicitRebootRequests = @($script:ExplicitRebootRequests)
             Set-BootUpdateState -State $script:CurrentState
         }
-        Write-Log "$Name requested a reboot (native exit code $effectiveExitCode)." -Level Warn
+        Write-Log $rebootEvidence.Detail -Level Warn
     }
     $timedOut = $result.Reason -in @('IdleTimeout','HardTimeout')
     $failed = $timedOut -or $result.Reason -ne 'Completed' -or $effectiveExitCode -notin @(0, 1641, 3010)
@@ -2523,7 +2658,7 @@ function Update-ChocolateyPackages {
             $result = Invoke-BootUpdateBackgroundOperation -Name 'Updating Chocolatey packages' `
                 -Status 'choco upgrade all is running' -TimeoutMinutes $script:PackageTimeoutMinutes `
                 -ScriptBlock { param($Path) & $Path upgrade all -y --no-progress 2>&1 } `
-                -ArgumentList @($chocoPath)
+                -ArgumentList @($chocoPath) -IncompleteRebootExitCodes @(350,1604)
             $result.Output | ForEach-Object {
                 if ($_ -match 'upgraded (\d+)/\d+ package') { $count = [int]$Matches[1] }
             }
@@ -2537,7 +2672,7 @@ function Update-ChocolateyPackages {
                 $listResult = Invoke-BootUpdateBackgroundOperation -Name 'Checking Chocolatey packages' `
                     -Status 'choco outdated is running' -TimeoutMinutes $script:PackageTimeoutMinutes `
                     -ScriptBlock { param($Path) & $Path outdated --limit-output 2>&1 } `
-                    -ArgumentList @($chocoPath)
+                    -ArgumentList @($chocoPath) -IncompleteRebootExitCodes @(350,1604)
                 $outdatedLines = @($listResult.Output | ForEach-Object { $_.ToString() })
                 if ($listResult.Failed -or $listResult.TimedOut) {
                     Write-Log 'Chocolatey package enumeration failed or timed out.' -Level Error
@@ -2571,7 +2706,7 @@ function Update-ChocolateyPackages {
                 $result = Invoke-BootUpdateBackgroundOperation -Name "Updating Chocolatey $pkgName" `
                     -Status "$pkgName upgrade is running" -TimeoutMinutes $script:PackageTimeoutMinutes `
                     -ScriptBlock { param($Path, $Package) & $Path upgrade $Package -y --no-progress 2>&1 } `
-                    -ArgumentList @($chocoPath, $pkgName)
+                    -ArgumentList @($chocoPath, $pkgName) -IncompleteRebootExitCodes @(350,1604)
                 $result.Output | ForEach-Object {
                     if ($_ -match 'upgraded (\d+)/\d+ package|Software installed') { $count++ }
                 }
@@ -2905,6 +3040,11 @@ function Install-WindowsUpdates {
                             $updateHashtable[$property.Name] = $property.Value
                         }
                         Get-WindowsUpdate @updateHashtable -Verbose 4>&1 | ForEach-Object { $_.ToString() }
+                        try {
+                            if ((New-Object -ComObject Microsoft.Update.SystemInfo -ErrorAction Stop).RebootRequired) {
+                                'BOOTUPDATE_WU_REBOOT|Microsoft.Update.SystemInfo'
+                            }
+                        } catch { }
                     } catch {
                         "BOOTUPDATE_ERROR|$($_.Exception.Message)"
                     }
@@ -2919,6 +3059,21 @@ function Install-WindowsUpdates {
                 if ($line -match '^BOOTUPDATE_ERROR\|(.+)$') {
                     $failed = $true
                     Write-Log "Windows Update error: $($Matches[1])" -Level Error
+                    continue
+                }
+                if ($line -eq 'BOOTUPDATE_WU_REBOOT|Microsoft.Update.SystemInfo') {
+                    if (-not @($script:ExplicitRebootRequests | Where-Object Source -eq 'WindowsUpdate-SystemInfo').Count) {
+                        $rebootEvidence = [pscustomobject]@{
+                            Source='WindowsUpdate-SystemInfo'; Status='Pending'
+                            Detail='Windows Update Agent API requested a reboot after installation'
+                        }
+                        $script:ExplicitRebootRequests.Add($rebootEvidence)
+                        if ($script:CurrentState) {
+                            $script:CurrentState.ExplicitRebootRequests = @($script:ExplicitRebootRequests)
+                            Set-BootUpdateState -State $script:CurrentState
+                        }
+                        Write-Log $rebootEvidence.Detail -Level Warn
+                    }
                     continue
                 }
                 Write-Log $line
@@ -5381,7 +5536,7 @@ function Invoke-BootUpdateCycle {
        machine which already needs to finish servicing from an earlier transaction. #>
     <# Use the same settle-and-recheck detector as final verification. Servicing flags
        can appear shortly after boot, so a single clean probe is not a safe mutation gate. #>
-    $pending = @(Get-ConfirmedPendingReboot)
+    $pending = @(Get-ConfirmedPendingReboot -Context 'before mutation')
     if ($pending.Count -gt 0) {
         $pending | ForEach-Object { Write-Log "Pending reboot before mutation: $($_.Source) — $($_.Detail)" -Level Warn }
         if (Stop-BootUpdateAtRebootLimit -State $state -PendingSignals $pending -Context 'before update phases') {
@@ -5397,11 +5552,8 @@ function Invoke-BootUpdateCycle {
             }
         }
         if (-not $WhatIfPreference) {
-            $state.LastRebootSignals = (($pending.Source | Sort-Object) -join ',')
-            foreach ($flag in @('WingetDone','ChocolateyDone','WindowsUpdateDone','AwsToolingDone','PipDone','NpmDone','Office365Done','PowerShellModulesDone','ScoopDone','DotnetToolsDone','VscodeDone','DefenderDone','DriverFirmwareDone','WslDone','ContainersDone')) { $state.$flag = $false }
-            $state.Phase = 'Rebooting'
-            $state.LastPreflightNetworkAt = $null; $state.LastPreflightNetworkOk = $null
-            Set-BootUpdateState -State $state
+            $signalKey = (($pending.Source | Sort-Object) -join ',')
+            $null = Set-BootUpdateRebootCheckpoint -State $state -SignalKey $signalKey
             Start-BootUpdateRestart -State $state -Reason 'A reboot was already pending before update phases began.'
         }
     } else { Write-Log 'No pending reboots at start of iteration' }
@@ -6065,7 +6217,7 @@ function Invoke-BootUpdateCycle {
 
     <# ---- Post-update reboot decision ---- #>
     <# In WhatIf mode, always report clean — no reboot or task registration ever happens #>
-    $pending = if ($WhatIfPreference) { @() } else { Get-ConfirmedPendingReboot }
+    $pending = if ($WhatIfPreference) { @() } else { Get-ConfirmedPendingReboot -Context 'after updates' }
     if ($pending) {
         Write-Log 'Pending reboot after updates: YES' -Level Warn
         $pending | ForEach-Object { Write-Log "  - $($_.Source): $($_.Detail)" -Level Warn }
@@ -6090,26 +6242,11 @@ function Invoke-BootUpdateCycle {
         if ($state.LastRebootSignals -and $signalKey -eq $state.LastRebootSignals) {
             Write-Log "Same reboot-signal set as the previous reboot ($signalKey). If this repeats to the max-iterations limit, one of these signals is likely stale or perpetually repopulated — see the per-signal detail above." -Level Warn
         }
-        $state.LastRebootSignals = $signalKey
-
-        <# Reset phase Done flags for next iteration.
-           Staged mode: reset ONLY the current phase's flag — completed phases are not re-run
-           after the reboot (the current phase re-runs because the reboot may have been triggered
-           by updates it installed).
-           Non-staged mode: reset ALL flags — all phases re-run after each reboot (v2.0 behaviour). #>
-        if ($script:StagedRollout -and $targetPhase) {
-            $state.($targetPhase.Flag) = $false
-            Write-Log "Staged rollout: reset only [$($targetPhase.Name)] flag for post-reboot re-run." -Level Info
-        } else {
-            $state.WingetDone = $false; $state.ChocolateyDone = $false; $state.WindowsUpdateDone = $false
-            $state.AwsToolingDone = $false; $state.PipDone = $false; $state.NpmDone = $false; $state.Office365Done = $false
-            $state.PowerShellModulesDone = $false; $state.ScoopDone = $false; $state.DotnetToolsDone = $false; $state.VscodeDone = $false
-            $state.DefenderDone = $false; $state.DriverFirmwareDone = $false; $state.WslDone = $false; $state.ContainersDone = $false
-        }
-        $state.LastPhaseStarted = $null; $state.LastPhaseTimestamp = $null; $state.Phase = 'Rebooting'
-        <# Clear network cache so the post-reboot iteration always re-probes from a clean boot state #>
-        $state.LastPreflightNetworkAt = $null; $state.LastPreflightNetworkOk = $null
-        Set-BootUpdateState -State $state
+        <# Successful provider results are durable checkpoints. Rebooting does not
+           invalidate a completed package transaction; after boot, only incomplete
+           or interrupted phases resume. Windows Update has its own identity-aware
+           post-boot convergence scan and reopens only when applicable work remains. #>
+        $null = Set-BootUpdateRebootCheckpoint -State $state -SignalKey $signalKey -ClearPhaseIntent
 
         <# Guard task registration and reboot — neither must fire in WhatIf mode #>
         if (-not $WhatIfPreference) {
@@ -6220,6 +6357,9 @@ function Invoke-BootUpdateCycle {
         $pkgLine = "Winget=$($s.Winget) Choco=$($s.Chocolatey) WU=$($s.WindowsUpdate) Pip=$($s.Pip) Npm=$($s.Npm) O365=$($s.Office365) PSMod=$($s.PowerShellModules) Scoop=$($s.Scoop) Dotnet=$($s.DotnetTools) VSCode=$($s.Vscode)"
         $wingetQuarantines = @(Get-WingetQuarantineRecords)
         $hasWingetQuarantine = -not $WhatIfPreference -and (Test-Path -LiteralPath $script:WingetQuarantinePath)
+        $cleanupAdvisories = @($script:LastPendingFileRenameOperations | Where-Object { -not $_.IsBlocking })
+        $hasCleanupAdvisory = -not $WhatIfPreference -and $cleanupAdvisories.Count -gt 0
+        $cleanupCategories = @($cleanupAdvisories | Group-Object Category | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Count)" }) -join ', '
 
         <# Console: styled completion banner #>
         $healthIsGreen = $null -ne $healthCheck -and $healthCheck.AllHealthy
@@ -6237,12 +6377,18 @@ function Invoke-BootUpdateCycle {
                       elseif ($healthCheck.AllHealthy) { "[OK] $($healthCheck.CheckedServices.Count) service state(s) assessed read-only; expected/policy-managed=$($healthCheck.ExpectedStopped.Count + $healthCheck.PolicyManaged.Count)" }
                       else { "[!!] Service attention: $($healthCheck.FailedServices -join ', ')" }
         <# Log file: structured entries #>
-        $completionDisposition = if ($hasWingetQuarantine) { 'COMPLETE WITH WINGET QUARANTINE' } else { 'COMPLETE' }
+        $completionDisposition = if ($hasWingetQuarantine -and $hasCleanupAdvisory) { 'COMPLETE WITH QUARANTINE AND CLEANUP ADVISORY' }
+                                 elseif ($hasWingetQuarantine) { 'COMPLETE WITH WINGET QUARANTINE' }
+                                 elseif ($hasCleanupAdvisory) { 'COMPLETE WITH CLEANUP ADVISORY' }
+                                 else { 'COMPLETE' }
         Write-Log "BOOT UPDATE CYCLE${whatIfTag} $completionDisposition | $durMin min | $($state.Iteration) iteration(s) | $reboots reboot(s) | $total verified updates | $actionsTriggered updater action(s) triggered"
         Write-Log "  $pkgLine"
         if ($hasWingetQuarantine) {
             Write-Log "Winget quarantine record retained at $($script:WingetQuarantinePath)." -Level Warn
             foreach ($record in $wingetQuarantines) { Write-Log "Winget quarantine: $($record.PackageId); undo with: $($record.UnpinCommand)" -Level Warn }
+        }
+        if ($hasCleanupAdvisory) {
+            Write-Log "Non-blocking restart cleanup remains: $cleanupCategories. Updates converged; a restart may complete third-party housekeeping." -Level Warn
         }
         Write-Log "Info: View trends with: Show-BootUpdateHistory.ps1 -Format Graph"
 
@@ -6294,7 +6440,8 @@ function Invoke-BootUpdateCycle {
                 "[log] $($script:WingetQuarantinePath)"
                 foreach ($record in $wingetQuarantines) { "[undo] $($record.UnpinCommand)" }
             }
-            if (-not $WhatIfPreference) { "[OK] Reboot state clean twice across $($script:RebootSignalSettleSeconds) seconds" }
+            if (-not $WhatIfPreference) { "[OK] No blocking reboot evidence across two probes and $($script:RebootSignalSettleSeconds) seconds" }
+            if ($hasCleanupAdvisory) { "[~] Optional restart cleanup remains: $cleanupCategories" }
             $healthLine
             if (-not $WhatIfPreference) { '[OK] Resume tasks retired; no retry is queued' }
             "$durMin min | $($state.Iteration) iteration(s) | $reboots completed reboot(s)"

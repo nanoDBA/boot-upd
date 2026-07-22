@@ -37,6 +37,15 @@ Describe 'Sanitized diagnostic export' {
         $safe | Should -Match '<REDACTED>|<PATH>|<EMAIL>|<URL>|<IP>|<SID>|<REGISTRY_PATH>'
     }
 
+    It 'retains safe pending-cleanup provenance while redacting the underlying path' {
+        $raw = '[Warn] Pending-file cleanup advisory [after updates]: EdgeUpdateCleanup=1, DropboxRecoveryCleanup=2; id=0123456789AB. Source C:\Program Files\Dropbox\secret.exe'
+        $safe = Protect-BootUpdateDiagnosticText -Text $raw
+        $safe | Should -Match 'EdgeUpdateCleanup=1, DropboxRecoveryCleanup=2'
+        $safe | Should -Match 'id=0123456789AB'
+        $safe | Should -Match '<PATH>'
+        $safe | Should -Not -Match 'Dropbox\\secret'
+    }
+
     It 'exports active and archived core, provider, and AWS logs into one safe zip' {
         $source = Join-Path $TestDrive 'source'; $output = Join-Path $TestDrive 'output'
         New-Item -ItemType Directory -Path $source,$output | Out-Null

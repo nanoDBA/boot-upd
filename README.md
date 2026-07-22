@@ -189,7 +189,7 @@ has exited**. It verifies the installer against the hash embedded below, then th
 verifies and transactionally replaces the complete release bundle before forwarding `aws`:
 
 ```powershell
-$u='https://github.com/nanoDBA/boot-upd/releases/download/v2.5.58/Install-UpdCompat.ps1'; $f=Join-Path $env:TEMP 'Install-UpdCompat-v2.5.58.ps1'; Invoke-WebRequest $u -OutFile $f; if((Get-FileHash $f -Algorithm SHA256).Hash -ne '67662B3B02252FF6DE045FCDF28FB74D8DEB6FDA8080C46B1DAFC7BFBE54ABE3'){throw 'Compatibility installer hash mismatch'}; & $f -CommandArguments aws
+$u='https://github.com/nanoDBA/boot-upd/releases/download/v2.5.59/Install-UpdCompat.ps1'; $f=Join-Path $env:TEMP 'Install-UpdCompat-v2.5.59.ps1'; Invoke-WebRequest $u -OutFile $f; if((Get-FileHash $f -Algorithm SHA256).Hash -ne '67662B3B02252FF6DE045FCDF28FB74D8DEB6FDA8080C46B1DAFC7BFBE54ABE3'){throw 'Compatibility installer hash mismatch'}; & $f -CommandArguments aws
 ```
 
 This is the one-time chicken-and-egg escape hatch. It resolves the first `upd.cmd` on PATH,
@@ -271,14 +271,26 @@ console feedback because isolating it would change how hook variables and side e
 
 1. Pre-flight checks validate disk space, network, battery, and conflicting installers
 2. First iteration runs in **your** console (user context) — the only chance for user-scoped winget/Scoop/VS Code
-3. Before mutation, two reboot-signal probes span a 20-second servicing-settle window; an existing reboot requirement is a hard phase barrier
-4. Native `3010`/`1641` results and Windows reboot indicators are persisted as reboot evidence until a new Windows boot identity is observed
+3. Before mutation, two reboot-signal probes span a 20-second servicing-settle window. CBS, Windows Update Agent, real file replacements, protected Windows-file deletes, and provider-native reboot results are hard barriers; delete-only application/cloud/temp housekeeping is reported as an advisory
+4. Native `3010`/`1641`, Chocolatey `350`/`1604`, and `Microsoft.Update.SystemInfo.RebootRequired` results are persisted immediately instead of waiting for registry flags to appear
 5. Verified resume tasks are armed before updates start: user-at-logon plus a delayed SYSTEM fallback, with dated watchdogs for canceled shutdowns and deferred retries
-6. `shutdown /g` restarts Windows; the checkpoint resumes automatically, preserves user-only work for user context, and retries real provider failures without marking them complete
+6. `shutdown /g` restarts Windows; the checkpoint resumes automatically, preserves successful provider phases, preserves user-only work for user context, and retries only incomplete or interrupted work
 7. A successful online Windows Update assessment is reusable for six hours—even across reboots—only after an offline WUA catalog check confirms zero applicable work and the update source, scope, and recent servicing history fingerprints still match
-8. Completion requires every enabled phase, a zero-applicable Windows Update assessment, and two clean reboot probes (max 5 successful mutation iterations safety valve)
+8. Completion requires every enabled phase, a zero-applicable Windows Update assessment, and two probes with no blocking reboot evidence (max 5 completed reboot safety valve). Optional third-party cleanup remains visible but cannot create a reboot loop
 9. Hooks run, resume tasks and transient state are removed and verified absent, and only then does the final screen congratulate the user and send the success notification
 10. If explicit aggressive mode quarantined a persistent Winget failure, its durable record survives cleanup and the final screen reports degraded completion with an `upd uq` reversal command
+
+### Reliability lineage
+
+The reboot design intentionally borrows proven boundaries instead of treating every registry
+artifact as equally authoritative:
+
+- [Boxstarter](https://github.com/chocolatey-community/boxstarter) checkpoints around package work and recognizes provider-native reboot results rather than restarting an entire provisioning plan from zero.
+- [Microsoft DSC](https://learn.microsoft.com/powershell/dsc/configurations/reboot-a-node) resumes dependency-ordered resources after reboot and makes pending-file-rename checks policy-selectable.
+- [Ansible's Windows Update implementation](https://github.com/ansible-collections/ansible.windows/blob/main/plugins/modules/win_updates.ps1) uses the Windows Update Agent API and per-update results before and after installation.
+- [PendingReboot](https://github.com/bcwilhite/PendingReboot) explicitly supports excluding pending-file-renames because antivirus and other background products commonly create false positives.
+- [Microsoft's `MoveFileEx` contract](https://learn.microsoft.com/windows/win32/api/winbase/nf-winbase-movefileexa) distinguishes a blank-destination delete from a source/destination replacement; boot-upd keeps replacements blocking while treating non-system housekeeping as advisory.
+- [Chocolatey's documented exit codes](https://docs.chocolatey.org/en-us/choco/commands/install/#exit-codes) distinguish successful reboot requests (`1641`, `3010`) from reboot barriers that leave work incomplete (`350`, `1604`).
 
 ### Reboot delay
 

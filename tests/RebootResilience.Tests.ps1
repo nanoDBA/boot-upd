@@ -31,6 +31,9 @@ BeforeAll {
         'Get-BootUpdateLaunchContract',
         'Test-PostUpdateHealth',
         'Get-BootUpdateBootSessionId',
+        'Set-BootUpdateRebootCheckpoint',
+        'ConvertFrom-PendingFileRenamePath',
+        'Get-PendingFileRenameOperations',
         'Get-ActionablePendingFileRenameOperations',
         'Resolve-BootUpdateCompletionDisposition',
         'Stop-BootUpdateAtRebootLimit',
@@ -65,7 +68,7 @@ BeforeAll {
     function Write-Log { param([string]$Message, [string]$Level) }
     function Set-BootUpdateState { param($State) }
     function Write-ProviderTranscript { param($Provider, $Scope, $Lines) }
-    function Invoke-PackageManagerWithTimeout { param($Name, $ScriptBlock, $ArgumentList, $IdleTimeoutMinutes, $HardTimeoutMinutes) }
+    function Invoke-PackageManagerWithTimeout { param($Name, $ScriptBlock, $ArgumentList, $IdleTimeoutMinutes, $HardTimeoutMinutes, $Status, $IncompleteRebootExitCodes) }
     function Write-EventLogEntry { param($EventId, $EntryType, $Message) }
     function Send-CompletionNotification { param($Kind, $Title, $Message) }
     function Enable-BootUpdateNtfsCompression { param($Path) }
@@ -369,7 +372,7 @@ Describe 'BitLocker reboot targeting' {
 }
 
 Describe 'Delayed and explicit reboot evidence' {
-    It 'ignores only Chocolatey prototype delete-on-reboot entries and preserves real rename pairs' {
+    It 'ignores disposable Chocolatey prototype deletes and preserves real rename pairs' {
         $priorWindir = $env:windir
         try {
             $env:windir = 'C:\Windows'
@@ -385,6 +388,48 @@ Describe 'Delayed and explicit reboot evidence' {
             $operations[1].Source | Should -Be 'C:\Windows\System32\pending.tmp'
             $operations[1].Destination | Should -BeNullOrEmpty
         } finally { $env:windir = $priorWindir }
+    }
+
+    It 'normalizes modern numbered Session Manager prefixes' {
+        ConvertFrom-PendingFileRenamePath '*1\??\C:\Program Files (x86)\Microsoft\EdgeUpdate\1.3.249.3' |
+            Should -Be 'C:\Program Files (x86)\Microsoft\EdgeUpdate\1.3.249.3'
+        ConvertFrom-PendingFileRenamePath '*2\??\C:\Temp\pending.tmp' |
+            Should -Be 'C:\Temp\pending.tmp'
+        ConvertFrom-PendingFileRenamePath '!\??\C:\Temp\replacement.tmp' |
+            Should -Be 'C:\Temp\replacement.tmp'
+    }
+
+    It 'downgrades application cleanup across vendors but preserves protected Windows deletes' {
+        $entries = @(
+            '*1\??\C:\Program Files (x86)\Microsoft\EdgeUpdate\1.3.249.3', '',
+            '*1\??\C:\Program Files\Dropbox\DropboxRecovery\scoped_dir16816_1351404682\UpdaterSetup.exe', '',
+            '*2\??\D:\OneDrive\Company\stale.sync', '',
+            '\??\C:\Program Files\UnfamiliarVendor\Updater\old.bin', '',
+            '\??\C:\Windows\System32', ''
+        )
+        $operations = @(Get-PendingFileRenameOperations -Entries $entries)
+        $operations.Count | Should -Be 5
+        $operations[0].Category | Should -Be 'EdgeUpdateCleanup'
+        $operations[0].IsBlocking | Should -BeFalse
+        $operations[1].Category | Should -Be 'DropboxRecoveryCleanup'
+        $operations[1].IsBlocking | Should -BeFalse
+        $operations[2].Category | Should -Be 'CloudStorageCleanup'
+        $operations[2].IsBlocking | Should -BeFalse
+        $operations[3].Category | Should -Be 'ApplicationCleanup'
+        $operations[3].IsBlocking | Should -BeFalse
+        $operations[4].Category | Should -Be 'ProtectedWindowsDelete'
+        $operations[4].IsBlocking | Should -BeTrue
+        @($operations.Fingerprint | Where-Object { $_ -notmatch '^[0-9A-F]{12}$' }).Count | Should -Be 0
+    }
+
+    It 'keeps every rename or replacement blocking regardless of vendor' {
+        $operations = @(Get-PendingFileRenameOperations -Entries @(
+            '*1\??\D:\Google Drive\old.dll',
+            '*2\??\D:\Google Drive\new.dll'
+        ))
+        $operations.Count | Should -Be 1
+        $operations[0].Category | Should -Be 'FileReplacement'
+        $operations[0].IsBlocking | Should -BeTrue
     }
 
     It 'does not ignore a Chocolatey prototype rename with a real destination' {
@@ -407,6 +452,16 @@ Describe 'Delayed and explicit reboot evidence' {
         $text | Should -Match 'Watching for delayed Windows reboot signals'
     }
 
+    It 'uses the Windows Update Agent API as authoritative reboot evidence' {
+        $detector = Get-FunctionText $invokeAst 'Test-PendingReboot'
+        $installer = Get-FunctionText $invokeAst 'Install-WindowsUpdates'
+        $detector | Should -Match 'Microsoft\.Update\.SystemInfo'
+        $detector | Should -Match 'Windows Update Agent API reports RebootRequired'
+        $installer | Should -Match 'BOOTUPDATE_WU_REBOOT\|Microsoft\.Update\.SystemInfo'
+        $installer | Should -Match "Source='WindowsUpdate-SystemInfo'"
+        $installer | Should -Match 'ExplicitRebootRequests = @\(\$script:ExplicitRebootRequests\)'
+    }
+
     It 'preserves native 3010 and 1641 as successful reboot requests' {
         $text = Get-FunctionText $invokeAst 'Invoke-PackageManagerWithTimeout'
         $text | Should -Match 'BOOTUPDATE_NATIVE_EXIT'
@@ -415,16 +470,53 @@ Describe 'Delayed and explicit reboot evidence' {
         $text | Should -Match 'notin @\(0, 1641, 3010\)'
     }
 
+    It 'treats Chocolatey 350 and 1604 as incomplete reboot barriers rather than generic failures' {
+        $choco = Get-FunctionText $invokeAst 'Update-ChocolateyPackages'
+        $runner = Get-FunctionText $invokeAst 'Invoke-PackageManagerWithTimeout'
+        ([regex]::Matches($choco, 'IncompleteRebootExitCodes @\(350,1604\)')).Count | Should -Be 3
+        $runner | Should -Match 'incompleteRebootExit'
+        $runner | Should -Match 'stopped incomplete for reboot'
+        $runner | Should -Match '\$failed = .*notin @\(0, 1641, 3010\)'
+    }
+
     It 'uses confirmed reboot evidence for the final decision' {
         (Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle') |
-            Should -Match '\$pending = if \(\$WhatIfPreference\) \{ @\(\) \} else \{ Get-ConfirmedPendingReboot \}'
+            Should -Match '\$pending = if \(\$WhatIfPreference\) \{ @\(\) \} else \{ Get-ConfirmedPendingReboot -Context ''after updates'' \}'
     }
 
     It 'also requires two clean probes before the first mutating phase' {
         $text = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
-        $text | Should -Match '\$pending = @\(Get-ConfirmedPendingReboot\)'
-        $text.IndexOf('$pending = @(Get-ConfirmedPendingReboot)') |
+        $text | Should -Match '\$pending = @\(Get-ConfirmedPendingReboot -Context ''before mutation''\)'
+        $text.IndexOf("`$pending = @(Get-ConfirmedPendingReboot -Context 'before mutation')") |
             Should -BeLessThan $text.IndexOf('Update-WingetPackages')
+    }
+
+    It 'preserves successful provider checkpoints across reboot instead of rerunning everything' {
+        $text = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
+        ([regex]::Matches($text, 'Set-BootUpdateRebootCheckpoint')).Count | Should -Be 2
+        $text | Should -Not -Match '\$state\.WingetDone = \$false; \$state\.ChocolateyDone = \$false'
+        $text | Should -Not -Match 'foreach \(\$flag in .*WingetDone.*\) \{ \$state\.\$flag = \$false \}'
+        $text | Should -Match 'Windows Update has its own identity-aware'
+
+        $state = [pscustomobject]@{
+            WingetDone=$true; ChocolateyDone=$true; WindowsUpdateDone=$false; AwsToolingDone=$false
+            PipDone=$true; NpmDone=$false; Office365Done=$false; PowerShellModulesDone=$false
+            ScoopDone=$false; DotnetToolsDone=$false; VscodeDone=$false; DefenderDone=$false
+            DriverFirmwareDone=$false; WslDone=$false; ContainersDone=$false
+            LastRebootSignals='old'; LastPhaseStarted='WindowsUpdate'; LastPhaseTimestamp='now'
+            Phase='WindowsUpdate'; LastPreflightNetworkAt='now'; LastPreflightNetworkOk=$true
+        }
+        $completed = @(Set-BootUpdateRebootCheckpoint -State $state -SignalKey 'WUA' -ClearPhaseIntent)
+        $completed | Should -Contain 'WingetDone'
+        $completed | Should -Contain 'ChocolateyDone'
+        $completed | Should -Contain 'PipDone'
+        $state.WingetDone | Should -BeTrue
+        $state.ChocolateyDone | Should -BeTrue
+        $state.WindowsUpdateDone | Should -BeFalse
+        $state.Phase | Should -Be 'Rebooting'
+        $state.LastRebootSignals | Should -Be 'WUA'
+        $state.LastPhaseStarted | Should -BeNullOrEmpty
+        $state.LastPreflightNetworkOk | Should -BeNullOrEmpty
     }
 }
 
@@ -943,7 +1035,8 @@ Describe 'Evidence-backed completion' {
         $text = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
         $text | Should -Match 'YOU DID IT.*CONFIGURED PATCH PASS IS VERIFIED.*NICE WORK'
         $text | Should -Match 'configured phases completed'
-        $text | Should -Match 'Reboot state clean twice'
+        $text | Should -Match 'No blocking reboot evidence across two probes'
+        $text | Should -Match 'Optional restart cleanup remains'
         $text | Should -Match 'service state\(s\) assessed read-only'
         $text | Should -Not -Match 'FULLY PATCHED'
     }

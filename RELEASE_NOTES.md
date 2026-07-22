@@ -1,8 +1,21 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.58
-**Release Date:** 2026-07-21
+**Current Version:** v2.5.59
+**Release Date:** 2026-07-22
 **Status:** STABLE
+
+---
+
+## v2.5.59 (2026-07-22)
+
+- Normalizes the modern `*1`/`*2` prefixes used by Windows in `PendingFileRenameOperations` instead of treating the prefix as part of the path.
+- Separates delete-only housekeeping from update-critical file replacements using a vendor-independent risk boundary. Application, user-profile, cloud-storage, recovery, cache, temporary, and already-absent deletes are advisory; every replacement and delete beneath protected Windows runtime paths remains a reboot barrier.
+- Records safe cleanup categories and short fingerprints before mutation and after updates, so sanitized diagnostics retain useful provenance without exposing local paths.
+- Prevents third-party cleanup records from consuming the reboot budget or forcing every provider to run again.
+- Preserves successful provider checkpoints across reboot. Only incomplete or interrupted phases resume; Windows Update alone uses its identity-aware post-boot convergence scan to reopen when additional applicable work appears.
+- Reports optional third-party cleanup separately from blocking reboot evidence, keeping the final verification truthful without turning harmless housekeeping into another patch cycle.
+- Recognizes Chocolatey's documented `350` (pending reboot before mutation) and `1604` (install suspended/incomplete) results as durable reboot barriers while leaving the Chocolatey phase incomplete for a targeted post-boot retry.
+- Uses the Windows Update Agent `Microsoft.Update.SystemInfo.RebootRequired` API before mutation and immediately after installation, persisting that provider-native evidence instead of waiting for registry flags to appear.
 
 ---
 
