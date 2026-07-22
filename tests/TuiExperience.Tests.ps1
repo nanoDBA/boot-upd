@@ -424,6 +424,9 @@ Describe 'Animated progress behavior' {
         $demoSource | Should -Match '\$colorIndex\s*=\s*\(\$colorIndex \+ 1\) % \$palette\.Count'
         $demoSource | Should -Not -Match '\$palette\[\$index'
         $demoSource | Should -Match '\$renderedConsoleWidth -ne \$width'
+        $demoSource | Should -Match 'Get-DemoProgressText'
+        (Get-FunctionText -Ast $demoAst -Name 'Get-DemoProgressText') | Should -Match 'v:\$\(\$Mode\.ToUpperInvariant\(\)\)'
+        (Get-FunctionText -Ast $demoAst -Name 'Get-DemoProgressText') | Should -Not -Match '\$full\.Substring'
         $demoSource | Should -Not -Match '\[Console\]::Write\("`r\$escape\[2K\$escape\[1;38'
     }
 
@@ -446,7 +449,35 @@ Describe 'Animated progress behavior' {
             $code = [int]$_
             $code -lt 32 -or $code -gt 126
         }) | Should -BeNullOrEmpty
-        $text | Should -Match '\.\.\.$'
+        $text | Should -Match 'v:NORMAL$'
+    }
+
+    It 'keeps process status signal-first at common console widths' {
+        $status = 'Windows Update scan and installation are running | CPU 0s | 0 proc | idle 0.1m | elapsed 1.2m'
+        foreach ($width in @(80, 100, 120, 160)) {
+            $text = Get-BootUpdateProgressText -Frame '/' -Activity 'Installing Windows Updates' `
+                -Status $status -PercentComplete 5 -MaxWidth $width
+            $text.Length | Should -BeLessOrEqual $width
+            $text | Should -Match 'Windows Updates'
+            $text | Should -Match 'elapsed 1\.2m'
+            $text | Should -Match 'v:NORMAL$'
+            $text | Should -Not -Match 'CPU 0s|0 proc'
+            ([regex]::Matches($text, '(?i)Windows Updates?')).Count | Should -Be 1
+        }
+    }
+
+    It 'retains useful process telemetry and exposes zero values only in Debug' {
+        $status = 'Provider is running | CPU 2.5s | 3 proc | idle 0.1m | elapsed 1.2m'
+        $normal = Get-BootUpdateProgressText -Frame '|' -Activity 'Provider' -Status $status -MaxWidth 160
+        $normal | Should -Match 'CPU 2\.5s'
+        $normal | Should -Match '3 proc'
+
+        $script:OutputMode = 'Debug'
+        $debug = Get-BootUpdateProgressText -Frame '|' -Activity 'Provider' `
+            -Status 'Provider is running | CPU 0s | 0 proc | idle 0.1m | elapsed 1.2m' -MaxWidth 160
+        $debug | Should -Match 'CPU 0s'
+        $debug | Should -Match '0 proc'
+        $debug | Should -Match 'v:DEBUG$'
     }
 
     It 'pumps multiple distinct frames at a bounded cadence during a wait' {

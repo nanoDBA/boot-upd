@@ -1,8 +1,17 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.62
+**Current Version:** v2.5.63
 **Release Date:** 2026-07-22
 **Status:** STABLE
+
+---
+
+## v2.5.63 (2026-07-22)
+
+- Makes `BOOT//PULSE` signal-first and width-aware at common 80, 100, 120, and 160-column console sizes. Activity, elapsed time, and the selected view remain intact while the progress meter and verbose wording yield space first.
+- Suppresses zero-value CPU/process telemetry outside Debug, retains nonzero activity signals, and compacts duplicated provider wording such as `Installing Windows Updates :: Windows Update ...`.
+- Updates the standalone animation demo to preserve the right-edge view indicator instead of truncating the entire row.
+- Runs the published-old-launcher adoption gate in a clean PowerShell process, preventing test-runner state from producing a false missing-breadcrumb failure after a successful replacement.
 
 ---
 

@@ -43,7 +43,19 @@ try {
         $results.Add([pscustomobject]@{ Gate='user-system-security-boundary'; Result='not_run'; Reason='SkipOsBoundary was specified.' })
     }
     if (-not $SkipPublishedUpgrade) {
-        Invoke-Gate 'published-launcher-upgrade' { & ./tests/integration/Invoke-PublishedLauncherUpgradeGate.ps1 | Write-Host }
+        Invoke-Gate 'published-launcher-upgrade' {
+            # Pester deliberately exercises process, environment, and launcher
+            # state. Verify the published upgrade from a clean PowerShell host so
+            # test-runner residue cannot create a false adoption-log failure.
+            $engine = (Get-Process -Id $PID).Path
+            $gatePath = Join-Path $root 'tests\integration\Invoke-PublishedLauncherUpgradeGate.ps1'
+            $gateOutput = & $engine -NoLogo -NoProfile -NonInteractive -File $gatePath 2>&1
+            $gateExitCode = $LASTEXITCODE
+            $gateOutput | Write-Host
+            if ($gateExitCode -ne 0) {
+                throw "Published launcher upgrade gate exited $gateExitCode."
+            }
+        }
     } else {
         $results.Add([pscustomobject]@{ Gate='published-launcher-upgrade'; Result='not_run'; Reason='SkipPublishedUpgrade was specified.' })
     }

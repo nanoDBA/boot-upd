@@ -50,4 +50,11 @@ Describe 'Claude Code project compatibility' {
         $testGate | Should -Match 'Repair-LineEndings\.ps1'
         $releaseGate | Should -Match 'Repair-LineEndings\.ps1'
     }
+
+    It 'isolates the published-launcher gate from test-runner process state' {
+        $testGate = Get-Content (Join-Path $repoRoot 'tools\Invoke-TestGates.ps1') -Raw
+        $testGate | Should -Match 'Invoke-PublishedLauncherUpgradeGate\.ps1'
+        $testGate | Should -Match '(?s)\$engine\s*=.*?-NoProfile\s+-NonInteractive\s+-File\s+\$gatePath'
+        $testGate | Should -Match '\$gateExitCode\s*=\s*\$LASTEXITCODE'
+    }
 }

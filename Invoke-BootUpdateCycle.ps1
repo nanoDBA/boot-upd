@@ -344,7 +344,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 6 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.62' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.63' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 Set-Variable -Name 'RebootSignalSettleSeconds' -Value 20 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 $script:ExplicitRebootRequests = [System.Collections.Generic.List[object]]::new()
 $script:LastPendingFileRenameOperations = @()
@@ -546,11 +546,94 @@ function Get-BootUpdateProgressText {
     $safeStatus = (($Status -replace $unsafeControls, ' ') -replace '\s+', ' ').Trim()
     $safeStatus = ($safeStatus -replace '[^\x20-\x7e]', '?').Trim()
     if (-not $safeStatus) { $safeStatus = 'working' }
+    # Treat the provider message and the process telemetry as separate signals.
+    # Truncating the assembled row hid elapsed time and the selected view mode
+    # while preserving low-value "CPU 0s | 0 proc" noise.
+    $statusParts = @($safeStatus -split '\s*\|\s*')
+    $summary = $statusParts[0]
+    $telemetry = [Collections.Generic.List[string]]::new()
+    $reducedTelemetry = [Collections.Generic.List[string]]::new()
+    $isDebug = $script:OutputMode -eq 'Debug'
+    foreach ($part in @($statusParts | Select-Object -Skip 1)) {
+        if ($part -match '^CPU\s+([0-9.]+)s$') {
+            if ($isDebug -or [double]$matches[1] -gt 0) {
+                $telemetry.Add($part); $reducedTelemetry.Add($part)
+            }
+            continue
+        }
+        if ($part -match '^(\d+)\s+proc(?:esses?)?$') {
+            if ($isDebug -or [int]$matches[1] -gt 0) {
+                $telemetry.Add($part); $reducedTelemetry.Add($part)
+            }
+            continue
+        }
+        if ($part -match '^idle\s+') { $telemetry.Add($part); continue }
+        if ($part -match '^elapsed\s+') {
+            $telemetry.Add($part); $reducedTelemetry.Add($part); continue
+        }
+        $telemetry.Add($part)
+    }
+
+    $compactSummary = $summary
+    if ($safeActivity -match '(?i)Windows\s+Updates?' -and
+        $compactSummary -match '(?i)^Windows\s+Updates?\s+(.+)$') {
+        $compactSummary = $matches[1]
+        $compactSummary = $compactSummary -replace '(?i)scan and installation are running', 'scan + install running'
+        $compactSummary = $compactSummary -replace '(?i)scan and download', 'scan + download'
+    } elseif ($compactSummary -match "(?i)^$([regex]::Escape($safeActivity))\s*[:\-]?\s*(.+)$") {
+        $compactSummary = $matches[1]
+    }
+    if (-not $compactSummary) { $compactSummary = 'working' }
+    $displaySummary = if ($compactSummary -ne $summary) { $compactSummary } else { $summary }
+    $compactActivity = ($safeActivity -replace '(?i)^(Installing|Updating|Waiting for|Checking)\s+', '').Trim()
+    if (-not $compactActivity) { $compactActivity = $safeActivity }
+
     $filled = if ($PercentComplete -ge 0) { [math]::Min(10, [math]::Floor($PercentComplete / 10)) } else { 0 }
-    $meter = ('#' * $filled) + ('-' * (10 - $filled))
-    $percent = if ($PercentComplete -ge 0) { " $PercentComplete%" } else { '' }
-    $line = " BOOT//PULSE [$Frame] $safeActivity :: $safeStatus :: [$meter]$percent :: v:$($script:OutputMode.ToUpperInvariant())"
-    return Limit-BootUpdateConsoleText -Text $line -MaxLength $MaxWidth
+    $meter = if ($PercentComplete -ge 0) {
+        "[$(('#' * $filled) + ('-' * (10 - $filled)))] $PercentComplete%"
+    } else { '' }
+    $mode = "v:$($script:OutputMode.ToUpperInvariant())"
+    $prefix = if ($MaxWidth -lt 60) { " PULSE [$Frame]" } else { " BOOT//PULSE [$Frame]" }
+    $compose = {
+        param([string]$ActivityText, [string]$SummaryText, [string[]]$Signals, [string]$MeterText)
+        $result = "$prefix $ActivityText"
+        if ($SummaryText) { $result += " :: $SummaryText" }
+        if ($Signals.Count -gt 0) { $result += " | $($Signals -join ' | ')" }
+        if ($MeterText) { $result += " :: $MeterText" }
+        return "$result :: $mode"
+    }
+
+    # Prefer complete information when it fits, then shed decoration before
+    # shortening content. The final path truncates only an individual field,
+    # never the right-edge elapsed/mode signals.
+    $candidates = @(
+        (& $compose $safeActivity $displaySummary $telemetry.ToArray() $meter),
+        (& $compose $safeActivity $displaySummary $telemetry.ToArray() ''),
+        (& $compose $compactActivity $displaySummary $telemetry.ToArray() ''),
+        (& $compose $compactActivity '' $telemetry.ToArray() ''),
+        (& $compose $safeActivity $displaySummary $reducedTelemetry.ToArray() ''),
+        (& $compose $safeActivity '' $reducedTelemetry.ToArray() '')
+    )
+    foreach ($candidate in $candidates) {
+        if ($candidate.Length -le $MaxWidth) { return $candidate }
+    }
+
+    $signals = $reducedTelemetry.ToArray()
+    $activityLimit = [math]::Min(28, [math]::Max(5, $MaxWidth - $prefix.Length - $mode.Length - 8))
+    $shortActivity = Limit-BootUpdateConsoleText -Text $safeActivity -MaxLength $activityLimit
+    $base = & $compose $shortActivity '' $signals ''
+    while ($base.Length -gt $MaxWidth -and $signals.Count -gt 0) {
+        $signals = @($signals | Select-Object -Skip 1)
+        $base = & $compose $shortActivity '' $signals ''
+    }
+    $summaryBudget = $MaxWidth - $base.Length - 4
+    if ($summaryBudget -ge 7) {
+        $shortSummary = Limit-BootUpdateConsoleText -Text $compactSummary -MaxLength $summaryBudget
+        $withSummary = & $compose $shortActivity $shortSummary $signals ''
+        if ($withSummary.Length -le $MaxWidth) { return $withSummary }
+    }
+    if ($base.Length -le $MaxWidth) { return $base }
+    return Limit-BootUpdateConsoleText -Text $base -MaxLength $MaxWidth
 }
 
 function Clear-BootUpdateProgressLine {

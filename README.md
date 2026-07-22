@@ -217,7 +217,7 @@ has exited**. It verifies the installer against the hash embedded below, then th
 verifies and transactionally replaces the complete release bundle before forwarding `aws`:
 
 ```powershell
-$u='https://github.com/nanoDBA/boot-upd/releases/download/v2.5.62/Install-UpdCompat.ps1'; $f=Join-Path $env:TEMP 'Install-UpdCompat-v2.5.62.ps1'; Invoke-WebRequest $u -OutFile $f; if((Get-FileHash $f -Algorithm SHA256).Hash -ne '67662B3B02252FF6DE045FCDF28FB74D8DEB6FDA8080C46B1DAFC7BFBE54ABE3'){throw 'Compatibility installer hash mismatch'}; & $f -CommandArguments aws
+$u='https://github.com/nanoDBA/boot-upd/releases/download/v2.5.63/Install-UpdCompat.ps1'; $f=Join-Path $env:TEMP 'Install-UpdCompat-v2.5.63.ps1'; Invoke-WebRequest $u -OutFile $f; if((Get-FileHash $f -Algorithm SHA256).Hash -ne '67662B3B02252FF6DE045FCDF28FB74D8DEB6FDA8080C46B1DAFC7BFBE54ABE3'){throw 'Compatibility installer hash mismatch'}; & $f -CommandArguments aws
 ```
 
 This is the one-time chicken-and-egg escape hatch. It resolves the first `upd.cmd` on PATH,
@@ -271,6 +271,10 @@ Choose the initial view explicitly with `-OutputMode Quiet|Normal|Verbose|Debug`
 classic `| / - \` ASCII propeller with a 112-step, seven-stop theme-zero glow. Cyan, blue,
 magenta, acid green, and electric yellow-green flow through near-black violet and cyan valleys,
 making the pulse discernible at a distance without abrupt flashes. Motion and color advance independently.
+The row adapts instead of blindly chopping off its tail: at narrower widths it keeps the operation,
+elapsed time, and `v:NORMAL` mode visible, shortens repeated provider prose, and drops decorative meter
+cells first. Normal and Verbose omit `CPU 0s | 0 proc`; nonzero activity remains visible, while Debug
+shows the raw heartbeat fields for diagnosis.
 ASCII status text is kept immutable; non-ASCII glyphs are represented safely in the live row while
 remaining untouched in the log. Key polling and animation disable themselves under SYSTEM,
 redirected output, and non-console hosts; file logging is unchanged.
@@ -287,9 +291,9 @@ To visually smoke-test animation without running any package updates:
 .\tools\Show-BootUpdateProgressDemo.ps1
 ```
 
-The demo renders the same four-frame `BOOT//PULSE` propeller and interpolated neon gradient at the production
-100 ms cadence, includes the photographed Windows Update status text, accepts live `v` mode
-cycling, and restores its console row and cursor when complete.
+The demo renders the same four-frame `BOOT//PULSE` propeller, adaptive-width row, and interpolated neon
+gradient at the production 100 ms cadence, includes the photographed Windows Update status text, accepts
+live `v` mode cycling, and restores its console row and cursor when complete.
 
 Built-in operations that can block for more than a moment run behind a process-tree-aware,
 progress-pumped adapter, keeping both animation and `v` key handling responsive. Administrator-supplied

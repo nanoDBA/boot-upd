@@ -49,6 +49,31 @@ function New-DepthGradient {
     }
     return $gradient.ToArray()
 }
+function Limit-DemoText {
+    param([string]$Text, [int]$MaxLength)
+    if ($Text.Length -le $MaxLength) { return $Text }
+    return $Text.Substring(0, [math]::Max(1, $MaxLength - 3)) + '...'
+}
+function Get-DemoProgressText {
+    param(
+        [string]$Frame, [string]$Activity, [string]$Status,
+        [int]$Percent, [string]$Mode, [int]$MaxWidth
+    )
+    $filled = [math]::Min(10, [math]::Floor($Percent / 10))
+    $meter = "[$(('#' * $filled) + ('-' * (10 - $filled)))] $Percent%"
+    $suffix = " :: v:$($Mode.ToUpperInvariant())"
+    $prefix = if ($MaxWidth -lt 60) { " PULSE [$Frame]" } else { " BOOT//PULSE [$Frame]" }
+    $full = "$prefix $Activity :: $Status :: $meter$suffix"
+    if ($full.Length -le $MaxWidth) { return $full }
+    $withoutMeter = "$prefix $Activity :: $Status$suffix"
+    if ($withoutMeter.Length -le $MaxWidth) { return $withoutMeter }
+    $statusBudget = $MaxWidth - $prefix.Length - $Activity.Length - $suffix.Length - 5
+    if ($statusBudget -ge 7) {
+        return "$prefix $Activity :: $(Limit-DemoText $Status $statusBudget)$suffix"
+    }
+    $activityBudget = [math]::Max(4, $MaxWidth - $prefix.Length - $suffix.Length - 1)
+    return "$prefix $(Limit-DemoText $Activity $activityBudget)$suffix"
+}
 $palette = New-NeonGradient
 $depthPalette = New-DepthGradient
 $scenes = @(
@@ -78,13 +103,11 @@ try {
         }
         $elapsed = $DurationSeconds - [math]::Max(0, ($deadline - [datetime]::UtcNow).TotalSeconds)
         $percent = [math]::Min(99, [math]::Floor(($elapsed / $DurationSeconds) * 100))
-        $filled = [math]::Min(10, [math]::Floor($percent / 10))
-        $meter = ('#' * $filled) + ('-' * (10 - $filled))
         $scene = $scenes[[math]::Min($scenes.Count - 1, [math]::Floor(($elapsed / $DurationSeconds) * $scenes.Count))]
         $frame = $frames[$index % $frames.Count]
-        $line = " BOOT//PULSE [$frame] $($scene[0]) :: $($scene[1]) :: [$meter] $percent% :: v:$($mode.ToUpperInvariant())"
         $width = [math]::Max(20, [math]::Min(120, [Console]::WindowWidth - 1))
-        if ($line.Length -gt $width) { $line = $line.Substring(0, $width - 3) + '...' }
+        $line = Get-DemoProgressText -Frame $frame -Activity $scene[0] -Status $scene[1] `
+            -Percent $percent -Mode $mode -MaxWidth $width
         if ($mode -eq 'Quiet') {
             if ($vt) {
                 [Console]::Write("$escape[0m`r$escape[2K")
