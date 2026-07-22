@@ -53,7 +53,7 @@ Describe 'Sanitized diagnostic export' {
         Set-Content (Join-Path $source 'BootUpdateCycle.providers.20260721-010203.log') '[Winget] alice@acme.example 192.168.10.4'
         Set-Content (Join-Path $source 'BootUpdateCycle.aws.log') '[AWS] E:\OneDrive\ACME Holdings\PowerShell\Modules'
         Set-Content (Join-Path $source 'BootUpdateCycle-winget-quarantine.json') '[{"PackageId":"Corsair.iCUE.5","UnpinCommand":"winget pin remove --id Corsair.iCUE.5 -e --disable-interactivity"}]'
-        Set-Content (Join-Path $source 'BootUpdateCycle-winget-resolved-absent.json') '[{"PackageId":"Microsoft.WindowsPCHealthCheck","FailureCode":1605,"OutcomeKey":"microsoft.windowspchealthcheck|1605|verified-absent"}]'
+        Set-Content (Join-Path $source 'BootUpdateCycle-winget-resolved-absent.json') '[{"SchemaVersion":2,"PackageId":"Microsoft.WindowsPCHealthCheck","Scope":"machine","FailureCode":1605,"ObservedVersion":"4.0","OutcomeKey":"microsoft.windowspchealthcheck|machine|1605|4.0|msi-unknown-product","Evidence":"MSI_ERROR_UNKNOWN_PRODUCT"}]'
         $redactions = @('ACME','Alice','BUILD-PC','acme.example','ACME Holdings')
         $exportArguments = @{
             SourceDirectory = $source; OutputDirectory = $output; AdditionalRedaction = $redactions

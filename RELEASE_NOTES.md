@@ -1,8 +1,18 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.65
+**Current Version:** v2.5.66
 **Release Date:** 2026-07-22
 **Status:** STABLE
+
+---
+
+## v2.5.66 (2026-07-22)
+
+- Fixes a circular v2.5.65 check that asked Winget inventory to disprove the same stale record responsible for an MSI 1605 result. Microsoft documents 1605 as `ERROR_UNKNOWN_PRODUCT`: Windows Installer says that product code is not installed even when Winget continues to enumerate it.
+- Learns a fully accounted 1605 outcome by package ID, scope, observed version, and native code. The first occurrence gets one concise `[RESOLVED]` line; identical repeats stay out of Normal output without retries or false update counts.
+- Invalidates learned absence when the package later installs successfully or returns changed failure evidence. Persistence failure remains fail-safe and restores the visible recovery choices.
+- Replaces internal completion jargon such as `PackageManagementPrototypeCleanup=6` with plain language while retaining exact categories and sanitized fingerprints in Debug output and diagnostics.
+- Validated against the sanitized 2026-07-22 diagnostic: Winget listed PC Health Check, MSI returned 1605, and the follow-up `winget list` repeated the same stale entry. The six legacy PackageManagement delete requests were unchanged before and after the run.
 
 ---
 

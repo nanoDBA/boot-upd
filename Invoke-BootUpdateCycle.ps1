@@ -345,7 +345,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 6 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.65' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.66' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 Set-Variable -Name 'RebootSignalSettleSeconds' -Value 20 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 $script:ExplicitRebootRequests = [System.Collections.Generic.List[object]]::new()
 $script:LastPendingFileRenameOperations = @()
@@ -984,6 +984,7 @@ function Get-WingetOutputSummary {
     $noApplicable = $false
     $currentName = 'Unknown package'
     $currentId = ''
+    $currentVersion = ''
     $failures = [Collections.Generic.List[object]]::new()
     $staleAbsent = [Collections.Generic.List[object]]::new()
     $successfulIds = [Collections.Generic.List[string]]::new()
@@ -992,10 +993,11 @@ function Get-WingetOutputSummary {
         # --no-vt. Normalize before matching so failures cannot become false green.
         $line = ([string]$rawLine) -replace "`e\[[0-?]*[ -/]*[@-~]", ''
         $line = $line.Trim()
-        if ($line -match '^\((\d+)/(\d+)\)\s+Found\s+(.+?)\s+\[([^\]]+)\]') {
+        if ($line -match '^\((\d+)/(\d+)\)\s+Found\s+(.+?)\s+\[([^\]]+)\](?:\s+Version\s+(\S+))?') {
             $attempted = [math]::Max($attempted, [int]$Matches[2])
             $currentName = $Matches[3].Trim()
             $currentId = $Matches[4].Trim()
+            $currentVersion = if ($Matches.Count -gt 5) { $Matches[5].Trim() } else { '' }
         } elseif ($line -match '^Successfully installed(?:\.|\s|$)') {
             $updated++
             if ($currentId -and -not $successfulIds.Contains($currentId)) { $successfulIds.Add($currentId) }
@@ -1004,7 +1006,8 @@ function Get-WingetOutputSummary {
             $code = if ($rawCode -match '^0x') { [long][Convert]::ToUInt32($rawCode.Substring(2), 16) } else { [long]$rawCode }
             $record = [pscustomobject]@{
                 Name=$currentName; Id=$currentId; Code=$code
-                Hex=(Format-NativeExitCode $code); Summary=(Get-InstallerExitSummary $code)
+                ObservedVersion=$currentVersion; Hex=(Format-NativeExitCode $code)
+                Summary=(Get-InstallerExitSummary $code)
             }
             if ($code -eq 1605) { $staleAbsent.Add($record) }
             else { $failures.Add($record) }
@@ -1249,83 +1252,85 @@ function Set-WingetResolvedAbsentRecords {
     }
 }
 
-function Test-WingetPackageVerifiedAbsent {
-    param(
-        [string]$WingetPath = '',
-        [Parameter(Mandatory)][string]$PackageId,
-        [Parameter(Mandatory)][string]$Scope
-    )
-    if ($PackageId -notmatch '^[A-Za-z0-9][A-Za-z0-9._+-]*$') { return $false }
-    if (-not $WingetPath) {
-        $command = Get-Command winget -ErrorAction SilentlyContinue
-        if (-not $command) { return $false }
-        $WingetPath = $command.Source
-    }
-    $baseScope = if ($Scope -match '^user(?:\b|[-/])') { 'user' } else { 'machine' }
-    $result = Invoke-PackageManagerWithTimeout -Name "Winget-verify-absent-$PackageId" -ScriptBlock {
-        param($wp,$id,$sc)
-        & $wp list --id $id -e --scope $sc --accept-source-agreements --disable-interactivity --no-vt 2>&1
-    } -ArgumentList @($WingetPath,$PackageId,$baseScope) -IdleTimeoutMinutes 2 -HardTimeoutMinutes 2 `
-        -DeferExitCodeReporting
-    Write-ProviderTranscript -Provider Winget -Scope "verify-absent/$PackageId" -Lines $result.Output
-    return (-not $result.TimedOut -and
-        @($result.Output | Where-Object { ([string]$_) -match '^\s*No installed package found matching input criteria\.?\s*$' }).Count -gt 0)
-}
-
 function Resolve-WingetStaleAbsentPresentation {
     param(
         [Parameter(Mandatory)][string]$Scope,
         [object[]]$StaleAbsent = @(),
-        [string]$WingetPath = ''
+        [string[]]$ChangedPackageIds = @()
     )
-    if (@($StaleAbsent).Count -eq 0) {
-        return [pscustomobject]@{ Suppressed=0; NewlyResolved=0; Unresolved=0 }
-    }
     $records = [Collections.Generic.List[object]]::new([object[]]@(Get-WingetResolvedAbsentRecords))
+    $scopeKey = if ($Scope -match '^user(?:\b|[-/])') { 'user' } else { 'machine' }
     $suppressed = 0
     $newlyResolved = 0
     $unresolved = 0
+    $invalidated = 0
+
+    $changedIds = @($ChangedPackageIds | Where-Object { $_ } | Select-Object -Unique)
+    if ($changedIds.Count) {
+        $remaining = @($records | Where-Object {
+            $recordScope = if ($_.PSObject.Properties['Scope']) { [string]$_.Scope } else { '' }
+            -not ($changedIds -contains [string]$_.PackageId) -or ($recordScope -and $recordScope -ne $scopeKey)
+        })
+        $invalidated = $records.Count - $remaining.Count
+        if ($invalidated -gt 0) {
+            try {
+                Set-WingetResolvedAbsentRecords -Records $remaining
+                $records = [Collections.Generic.List[object]]::new([object[]]$remaining)
+                Write-Log "Winget ${Scope}: invalidated $invalidated resolved-absence record(s) after changed package evidence." -Visibility Debug
+            } catch {
+                Write-Log "Winget could not invalidate changed resolved-absence evidence: $_" -Level Warn
+                $invalidated = 0
+            }
+        }
+    }
+
+    if (@($StaleAbsent).Count -eq 0) {
+        return [pscustomobject]@{ Suppressed=0; NewlyResolved=0; Unresolved=0; Invalidated=$invalidated }
+    }
 
     foreach ($stale in $StaleAbsent) {
         $id = [string]$stale.Id
         $identity = if ($id) { "$($stale.Name) [$id]" } else { [string]$stale.Name }
         $safeId = $id -match '^[A-Za-z0-9][A-Za-z0-9._+-]*$'
+        $versionKey = if ($stale.ObservedVersion) { ([string]$stale.ObservedVersion).ToLowerInvariant() } else { 'unknown' }
+        $outcomeKey = if ($safeId) {
+            '{0}|{1}|1605|{2}|msi-unknown-product' -f $id.ToLowerInvariant(),$scopeKey,$versionKey
+        } else { '' }
         $existing = if ($safeId) {
-            @($records | Where-Object { $_.PackageId -eq $id -and [long]$_.FailureCode -eq 1605 }) | Select-Object -First 1
+            @($records | Where-Object { $_.OutcomeKey -eq $outcomeKey }) | Select-Object -First 1
         } else { $null }
-        $verifiedAbsent = $safeId -and (Test-WingetPackageVerifiedAbsent -WingetPath $WingetPath -PackageId $id -Scope $Scope)
 
-        if ($verifiedAbsent) {
+        if ($safeId) {
             if ($existing) {
                 $suppressed++
-                Write-Log "Winget ${Scope}: identical stale result suppressed for verified-absent package [$id]." -Visibility Debug
+                Write-Log "Winget ${Scope}: identical MSI 1605 stale-inventory result suppressed for [$id]." -Visibility Debug
                 continue
             }
+            $retained = @($records | Where-Object {
+                $recordScope = if ($_.PSObject.Properties['Scope']) { [string]$_.Scope } else { '' }
+                $_.PackageId -ne $id -or ($recordScope -and $recordScope -ne $scopeKey)
+            })
+            $records = [Collections.Generic.List[object]]::new([object[]]$retained)
             $record = [pscustomobject]@{
-                SchemaVersion=1
+                SchemaVersion=2
                 PackageId=$id
                 Name=[string]$stale.Name
+                Scope=$scopeKey
                 FailureCode=1605
-                OutcomeKey=("{0}|1605|verified-absent" -f $id.ToLowerInvariant())
+                ObservedVersion=[string]$stale.ObservedVersion
+                OutcomeKey=$outcomeKey
                 VerifiedAbsentAtUtc=[datetime]::UtcNow.ToString('o')
+                Evidence='MSI_ERROR_UNKNOWN_PRODUCT'
             }
             $records.Add($record)
             try {
                 Set-WingetResolvedAbsentRecords -Records $records.ToArray()
                 $newlyResolved++
-                Write-Log "[RESOLVED] $identity is absent. Winget's stale uninstall result was ignored and identical future reports will stay quiet." -Level Warn
+                Write-Log "[RESOLVED] $identity returned MSI 1605: Windows Installer says the product is not installed. Winget's stale inventory entry was ignored; identical repeats will stay quiet."
                 continue
             } catch {
                 $null = $records.Remove($record)
                 Write-Log "Winget could not persist the resolved-absence record for [$id]; retaining the recovery choices. $_" -Level Warn
-            }
-        } elseif ($existing) {
-            $remaining = @($records | Where-Object { $_.PackageId -ne $id -or [long]$_.FailureCode -ne 1605 })
-            try {
-                Set-WingetResolvedAbsentRecords -Records $remaining
-                $records = [Collections.Generic.List[object]]::new([object[]]$remaining)
-            } catch {
-                Write-Log "Winget could not invalidate the resolved-absence record for [$id]: $_" -Level Warn
             }
         }
 
@@ -1338,7 +1343,7 @@ function Resolve-WingetStaleAbsentPresentation {
             Write-Log "[suppress] Temporary reversible suppression: winget pin add --id $id -e --blocking --force" -Level Warn
         }
     }
-    return [pscustomobject]@{ Suppressed=$suppressed; NewlyResolved=$newlyResolved; Unresolved=$unresolved }
+    return [pscustomobject]@{ Suppressed=$suppressed; NewlyResolved=$newlyResolved; Unresolved=$unresolved; Invalidated=$invalidated }
 }
 
 function Write-WingetScopeSummary {
@@ -1356,8 +1361,9 @@ function Write-WingetScopeSummary {
     if ($collector -and $null -ne $collector.Value -and $summary.Failures.Count) {
         foreach ($failure in $summary.Failures) { $collector.Value.Add($failure) }
     }
+    $changedPackageIds = @($summary.SuccessfulIds) + @($summary.Failures | ForEach-Object { $_.Id })
     $stalePresentation = Resolve-WingetStaleAbsentPresentation -Scope $Scope `
-        -StaleAbsent $summary.StaleAbsent -WingetPath $WingetPath
+        -StaleAbsent $summary.StaleAbsent -ChangedPackageIds $changedPackageIds
     if ($summary.NoApplicable -and $summary.Attempted -eq 0) {
         $suffix = if ($summary.Pinned) { " ($($summary.Pinned) pinned)" } else { '' }
         Write-Log "Winget ${Scope}: no applicable upgrades$suffix."
@@ -2083,6 +2089,24 @@ function Get-PendingFileRenameOperations {
 function Get-ActionablePendingFileRenameOperations {
     param([AllowNull()][object[]]$Entries = @())
     return @(Get-PendingFileRenameOperations -Entries $Entries | Where-Object IsBlocking)
+}
+
+function Get-PendingFileCleanupDisplaySummary {
+    param([AllowNull()][object[]]$Operations = @())
+    $labels = @{
+        PackageManagementPrototypeCleanup = 'legacy PackageManagement provider cleanup'
+        EdgeUpdateCleanup                  = 'Microsoft Edge updater cleanup'
+        DropboxRecoveryCleanup             = 'Dropbox recovery cleanup'
+        CloudStorageCleanup                = 'cloud-storage cleanup'
+        TemporaryCleanup                   = 'temporary-file cleanup'
+        ApplicationCleanup                 = 'application cleanup'
+        NonSystemCleanup                   = 'non-system file cleanup'
+        AlreadyAbsentCleanup               = 'already-absent file cleanup'
+    }
+    return @($Operations | Group-Object Category | Sort-Object Name | ForEach-Object {
+        $label = if ($labels.ContainsKey($_.Name)) { $labels[$_.Name] } else { $_.Name }
+        "$label ($($_.Count) delete request$(if ($_.Count -eq 1) { '' } else { 's' }))"
+    }) -join ', '
 }
 
 function Write-PendingFileRenameAdvisory {
@@ -6829,6 +6853,7 @@ function Invoke-BootUpdateCycle {
         $cleanupAdvisories = @($script:LastPendingFileRenameOperations | Where-Object { -not $_.IsBlocking })
         $hasCleanupAdvisory = -not $WhatIfPreference -and $cleanupAdvisories.Count -gt 0
         $cleanupCategories = @($cleanupAdvisories | Group-Object Category | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Count)" }) -join ', '
+        $cleanupDisplaySummary = Get-PendingFileCleanupDisplaySummary -Operations $cleanupAdvisories
 
         <# Console: styled completion banner #>
         $healthIsGreen = $null -ne $healthCheck -and $healthCheck.AllHealthy
@@ -6854,7 +6879,8 @@ function Invoke-BootUpdateCycle {
             foreach ($record in $wingetQuarantines) { Write-Log "Winget quarantine: $($record.PackageId); undo with: $($record.UnpinCommand)" -Level Warn }
         }
         if ($hasCleanupAdvisory) {
-            Write-Log "Non-blocking restart cleanup remains: $cleanupCategories. Updates converged; a restart may complete third-party housekeeping." -Level Warn
+            Write-Log "Non-blocking housekeeping remains: $cleanupDisplaySummary. Updates converged and no restart is required; restarting later may finish it." -Level Warn
+            Write-Log "Pending-file cleanup categories: $cleanupCategories" -Visibility Debug
         }
         Write-Log "Info: View trends with: Show-BootUpdateHistory.ps1 -Format Graph"
 
@@ -6910,7 +6936,7 @@ function Invoke-BootUpdateCycle {
                 foreach ($record in $wingetQuarantines) { "[undo] $($record.UnpinCommand)" }
                 "[record] $($script:WingetQuarantinePath)"
             }
-            if ($hasCleanupAdvisory) { "[~] Optional restart cleanup remains: $cleanupCategories" }
+            if ($hasCleanupAdvisory) { "[~] Housekeeping remains: $cleanupDisplaySummary; restarting later is optional" }
             $healthLine
             if (-not $WhatIfPreference) { '[OK] Resume tasks retired; no retry is queued' }
             "$durMin min | $($state.Iteration) iteration(s) | $reboots completed reboot(s)"

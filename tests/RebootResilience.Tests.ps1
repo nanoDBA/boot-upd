@@ -35,6 +35,7 @@ BeforeAll {
         'ConvertFrom-PendingFileRenamePath',
         'Get-PendingFileRenameOperations',
         'Get-ActionablePendingFileRenameOperations',
+        'Get-PendingFileCleanupDisplaySummary',
         'Write-PendingFileRenameAdvisory',
         'Resolve-BootUpdateCompletionDisposition',
         'Stop-BootUpdateAtRebootLimit',
@@ -64,7 +65,6 @@ BeforeAll {
           'Set-WingetQuarantineRecords',
           'Get-WingetResolvedAbsentRecords',
           'Set-WingetResolvedAbsentRecords',
-          'Test-WingetPackageVerifiedAbsent',
           'Resolve-WingetStaleAbsentPresentation',
           'Write-WingetScopeSummary',
           'Update-WingetPackages',
@@ -160,6 +160,7 @@ Describe 'Concise provider diagnostics' {
         $summary.Failures.Count | Should -Be 2
         $summary.StaleAbsent.Count | Should -Be 1
         $summary.StaleAbsent[0].Id | Should -Be 'JohnMacFarlane.Pandoc'
+        $summary.StaleAbsent[0].ObservedVersion | Should -Be '3.10'
         $summary.StaleAbsent[0].Summary | Should -Be 'product is not currently installed'
         $summary.Failures[0].Summary | Should -Be 'installation source is unavailable'
         $summary.Failures[1].Hex | Should -Be '0xC000041D'
@@ -173,7 +174,6 @@ Describe 'Concise provider diagnostics' {
         $script:WingetResolvedAbsentPath = Join-Path $TestDrive 'resolved-absent.json'
         Mock Write-ProviderTranscript { }
         Mock Write-Log { }
-        Mock Test-WingetPackageVerifiedAbsent { $true }
         $lines = @(
             '(1/2) Found Example App [Example.App] Version 2.0',
             'Successfully installed',
@@ -189,38 +189,63 @@ Describe 'Concise provider diagnostics' {
         $summary.Failures | Should -BeNullOrEmpty
         $summary.StaleAbsent.Count | Should -Be 1
         $script:CurrentWingetFailures.Count | Should -Be 0
-        Should -Invoke Write-Log -Times 1 -Exactly -ParameterFilter { $Message -match '^\[RESOLVED\].*future reports will stay quiet' }
-        Should -Invoke Write-Log -Times 1 -Exactly -ParameterFilter { $Message -match 'identical stale result suppressed' -and $Visibility -eq 'Debug' }
+        Should -Invoke Write-Log -Times 1 -Exactly -ParameterFilter { $Message -match '^\[RESOLVED\].*MSI 1605.*identical repeats will stay quiet' }
+        Should -Invoke Write-Log -Times 1 -Exactly -ParameterFilter { $Message -match 'identical MSI 1605 stale-inventory result suppressed' -and $Visibility -eq 'Debug' }
         Should -Invoke Write-Log -Times 0 -Exactly -ParameterFilter { $Message -match '^\[(STALE|install|remove|suppress)\]' }
         Should -Invoke Write-Log -Times 0 -ParameterFilter { $Message -match 'partial failure, retry required' }
         $record = @(Get-Content $script:WingetResolvedAbsentPath -Raw | ConvertFrom-Json)
         $record.Count | Should -Be 1
         $record[0].PackageId | Should -Be 'Microsoft.WindowsPCHealthCheck'
-        $record[0].OutcomeKey | Should -Be 'microsoft.windowspchealthcheck|1605|verified-absent'
-        ($record[0].PSObject.Properties.Name -join ',') | Should -Not -Match '(?i)user|machine|domain|path'
+        $record[0].Scope | Should -Be 'machine'
+        $record[0].ObservedVersion | Should -Be '4.0'
+        $record[0].OutcomeKey | Should -Be 'microsoft.windowspchealthcheck|machine|1605|4.0|msi-unknown-product'
+        $record[0].Evidence | Should -Be 'MSI_ERROR_UNKNOWN_PRODUCT'
+        ($record[0].PSObject.Properties.Name -join ',') | Should -Not -Match '(?i)user|domain|path'
     }
 
-    It 'invalidates remembered absence and restores choices when exact inventory disagrees' {
+    It 'invalidates remembered absence when the package later succeeds' {
         $script:CurrentWingetFailures = [Collections.Generic.List[object]]::new()
         $script:WingetResolvedAbsentPath = Join-Path $TestDrive 'resolved-absent-invalidate.json'
         Set-WingetResolvedAbsentRecords -Records @([pscustomobject]@{
-            SchemaVersion=1; PackageId='Microsoft.WindowsPCHealthCheck'; Name='Windows PC Health Check'
-            FailureCode=1605; OutcomeKey='microsoft.windowspchealthcheck|1605|verified-absent'; VerifiedAbsentAtUtc='2026-07-22T00:00:00Z'
+            SchemaVersion=2; PackageId='Microsoft.WindowsPCHealthCheck'; Name='Windows PC Health Check'; Scope='machine'
+            FailureCode=1605; ObservedVersion='4.0'; OutcomeKey='microsoft.windowspchealthcheck|machine|1605|4.0|msi-unknown-product'
+            VerifiedAbsentAtUtc='2026-07-22T00:00:00Z'; Evidence='MSI_ERROR_UNKNOWN_PRODUCT'
         })
         Mock Write-ProviderTranscript { }
         Mock Write-Log { }
-        Mock Test-WingetPackageVerifiedAbsent { $false }
         $lines = @(
             '(1/1) Found Windows PC Health Check [Microsoft.WindowsPCHealthCheck] Version 4.0',
-            'Uninstall failed with exit code: 1605'
+            'Successfully installed'
         )
 
-        $summary = Write-WingetScopeSummary -Scope machine -Lines $lines -ExitCode -1978335188
+        $summary = Write-WingetScopeSummary -Scope machine -Lines $lines -ExitCode 0
+
+        $summary.Updated | Should -Be 1
+        @(Get-WingetResolvedAbsentRecords).Count | Should -Be 0
+        Should -Invoke Write-Log -ParameterFilter { $Message -match 'invalidated 1 resolved-absence record' -and $Visibility -eq 'Debug' }
+    }
+
+    It 'reports a changed MSI 1605 version once and replaces the old signature' {
+        $script:CurrentWingetFailures = [Collections.Generic.List[object]]::new()
+        $script:WingetResolvedAbsentPath = Join-Path $TestDrive 'resolved-absent-version-change.json'
+        Set-WingetResolvedAbsentRecords -Records @([pscustomobject]@{
+            SchemaVersion=2; PackageId='Microsoft.WindowsPCHealthCheck'; Name='Windows PC Health Check'; Scope='machine'
+            FailureCode=1605; ObservedVersion='4.0'; OutcomeKey='microsoft.windowspchealthcheck|machine|1605|4.0|msi-unknown-product'
+            VerifiedAbsentAtUtc='2026-07-22T00:00:00Z'; Evidence='MSI_ERROR_UNKNOWN_PRODUCT'
+        })
+        Mock Write-ProviderTranscript { }
+        Mock Write-Log { }
+
+        $summary = Write-WingetScopeSummary -Scope machine -Lines @(
+            '(1/1) Found Windows PC Health Check [Microsoft.WindowsPCHealthCheck] Version 4.1',
+            'Uninstall failed with exit code: 1605'
+        ) -ExitCode -1978335188
 
         $summary.ExitReconciled | Should -BeTrue
-        @(Get-WingetResolvedAbsentRecords).Count | Should -Be 0
-        Should -Invoke Write-Log -ParameterFilter { $Message -match '^\[STALE\].*incomplete uninstall record' }
-        Should -Invoke Write-Log -ParameterFilter { $Message -match '^\[install\].*Microsoft\.WindowsPCHealthCheck' }
+        $records = @(Get-WingetResolvedAbsentRecords)
+        $records.Count | Should -Be 1
+        $records[0].ObservedVersion | Should -Be '4.1'
+        Should -Invoke Write-Log -Times 1 -Exactly -ParameterFilter { $Message -match '^\[RESOLVED\]' }
     }
 
     It 'does not claim resolution when durable persistence fails' {
@@ -228,7 +253,6 @@ Describe 'Concise provider diagnostics' {
         $script:WingetResolvedAbsentPath = Join-Path $TestDrive 'resolved-absent-fail.json'
         Mock Write-ProviderTranscript { }
         Mock Write-Log { }
-        Mock Test-WingetPackageVerifiedAbsent { $true }
         Mock Set-WingetResolvedAbsentRecords { throw 'simulated persistence failure' }
         $lines = @(
             '(1/1) Found Windows PC Health Check [Microsoft.WindowsPCHealthCheck] Version 4.0',
@@ -243,18 +267,9 @@ Describe 'Concise provider diagnostics' {
         Should -Invoke Write-Log -ParameterFilter { $Message -match '^\[STALE\]' }
     }
 
-    It 'verifies exact Winget absence with a bounded read-only query' {
-        Mock Write-ProviderTranscript { }
-        Mock Invoke-PackageManagerWithTimeout {
-            @{ Output=@('No installed package found matching input criteria.'); TimedOut=$false; ExitCode=-1978335212 }
-        }
-
-        Test-WingetPackageVerifiedAbsent -WingetPath 'C:\winget.exe' `
-            -PackageId Microsoft.WindowsPCHealthCheck -Scope machine-retry | Should -BeTrue
-        Should -Invoke Invoke-PackageManagerWithTimeout -ParameterFilter {
-            $Name -eq 'Winget-verify-absent-Microsoft.WindowsPCHealthCheck' -and
-            $IdleTimeoutMinutes -eq 2 -and $HardTimeoutMinutes -eq 2 -and $DeferExitCodeReporting
-        }
+    It 'does not circularly ask Winget inventory to disprove its own stale record' {
+        $invokeSource | Should -Not -Match 'Winget-verify-absent'
+        $invokeSource | Should -Match 'MSI_ERROR_UNKNOWN_PRODUCT'
     }
 
     It 'does not reconcile 1605 when another attempted package is unaccounted for' {
@@ -565,6 +580,16 @@ Describe 'Delayed and explicit reboot evidence' {
             $Level -eq 'Info' -and $Visibility -eq 'Debug' -and
             $Message -match 'AAA111AAA111,BBB222BBB222'
         }
+    }
+
+    It 'translates internal pending-cleanup categories into plain completion language' {
+        $operations = @(
+            [pscustomobject]@{ Category='PackageManagementPrototypeCleanup' },
+            [pscustomobject]@{ Category='PackageManagementPrototypeCleanup' }
+        )
+
+        Get-PendingFileCleanupDisplaySummary -Operations $operations |
+            Should -Be 'legacy PackageManagement provider cleanup (2 delete requests)'
     }
 
     It 'ignores disposable PackageManagement prototype deletes and preserves real rename pairs' {
@@ -1304,7 +1329,7 @@ Describe 'Evidence-backed completion' {
         $text | Should -Match '\[RESTART\] NOT REQUIRED'
         $text | Should -Match 'configured phases completed'
         $text | Should -Match '\[RESTART\] NOT REQUIRED.*no blocking restart evidence remains'
-        $text | Should -Match 'Optional restart cleanup remains'
+        $text | Should -Match 'Housekeeping remains.*restarting later is optional'
         $text | Should -Match 'service state\(s\) assessed read-only'
         $text | Should -Not -Match 'FULLY PATCHED'
     }
