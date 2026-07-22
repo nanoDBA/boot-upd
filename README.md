@@ -1,8 +1,15 @@
 # Boot Update Cycle
 
-**Run `upd` as admin. Walk away. Come back patched—or with a clear, reversible exception report.**
+**Run `upd` as admin. Walk away. Come back patched—or with a clear, reversible explanation of which installer chose violence.**
 
-A Windows boot-time automation tool that runs every configured package manager, checkpoints its work, reboots when updates require it, and resumes until the configured scope verifies clean — then retires its resume tasks.
+A reboot-resilient Windows updater that runs the configured package managers, checkpoints real
+progress, restarts when required, and resumes only the unfinished work until the selected scope
+verifies clean. Then it removes its continuation tasks, because leaving mysterious scheduled tasks
+behind is how software becomes folklore.
+
+[![Latest release](https://img.shields.io/github/v/release/nanoDBA/boot-upd?display_name=tag&sort=semver)](https://github.com/nanoDBA/boot-upd/releases/latest)
+[![PowerShell 7+](https://img.shields.io/badge/PowerShell-7%2B-5391FE?logo=powershell&logoColor=white)](#requirements)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 <img src="docs/img/splash-theme0.png" alt="Boot Update Cycle splash — neon gradient theme" width="684">
 
@@ -10,18 +17,21 @@ A Windows boot-time automation tool that runs every configured package manager, 
 ## 🧭 Navigate
 
 - [Quick start](#quick-start)
+- [Which command do I want?](#which-command-do-i-want)
 - [See it in action](#updater-in-action)
 - [What it updates](#what-it-updates)
 - [Commands](#friendly-launcher)
 - [How reboot/resume works](#what-happens)
 - [Status and recovery](#status-and-recovery)
+- [Common questions](#common-questions)
 - [Security model](#security-model)
 - [Configuration](#configuration) · [Testing](#testing)
 
 <a id="quick-start"></a>
 ## 🚀 Quick start
 
-Open **Windows PowerShell as Administrator**, paste this command, and press Enter:
+Open **Windows PowerShell as Administrator**, paste this command, and press Enter. Yes,
+PowerShell—not Command Prompt wearing a PowerShell command as a hat:
 
 ```powershell
 [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; & ([ScriptBlock]::Create((Invoke-RestMethod -UseBasicParsing -TimeoutSec 30 'https://github.com/nanoDBA/boot-upd/releases/latest/download/Install-UpdCompat.ps1'))) -PromptForArguments
@@ -39,13 +49,26 @@ upd logs     # create a sanitized support ZIP on the Desktop
 upd help     # commands, short aliases, and every option
 ```
 
+### Which command do I want?
+
+| Goal | Run | What you are authorizing |
+|---|---|---|
+| Patch normally | `upd` | Default providers, immediate restart when required |
+| Give me a warning | `upd -r 120` | Same run, with 120 seconds to remember where you left that unsaved document |
+| Show the plan first | `upd plan -drv -r 120` | Resolve options only; no elevation, installs, tasks, or reboots |
+| Be more forceful with Winget | `upd -ar` | One bounded repair attempt, then reversible quarantine instead of an eternal loop |
+| Update AWS tooling | `upd aws` | AWS CLI v2 and modular AWS.Tools; AWS gets its own side quest because of course it does |
+| Tell me what is happening | `upd status` | Read the checkpoint, continuation tasks, and Winget quarantine records |
+| Package evidence for support | `upd logs` | Create a sanitized ZIP and copy its full path to the clipboard |
+| Just admire the pixels | `upd fun 12` | Splash parade and live animation; absolutely no useful work, proudly |
+
 > [!IMPORTANT]
 > `upd` installs software and can restart Windows immediately by default. Save your work
 > first, or use `upd -r 120` for a two-minute reboot warning. Cancel a pending restart with
 > `shutdown /a`.
 
 Want to look around without changing the machine? These commands are read-only and do not
-request elevation:
+request elevation. Suspicion is healthy; production has taught us all things.
 
 ```powershell
 upd splash
@@ -83,7 +106,7 @@ When the configured work, restart checks, service assessment, and terminal clean
 
 <img src="docs/img/updater-complete.png" alt="Boot Update Cycle configured patch pass verified completion screen" width="900">
 
-<sub>Representative v2.5.56 console captures rendered from the production UI text for deterministic, privacy-safe documentation; package counts and elapsed time are illustrative.</sub>
+<sub>Representative v2.5.62 console captures rendered from current production wording for deterministic, privacy-safe documentation; package counts and elapsed time are illustrative.</sub>
 
 ## What it updates
 
@@ -96,7 +119,7 @@ When the configured work, restart checks, service assessment, and terminal clean
 | 5 | **pip** | On | All outdated global packages |
 | 6 | **npm** | On | All global packages |
 | 7 | **Office 365** | On | Click-to-Run silent update |
-| 8 | **PowerShell Modules** | On | All user-installed modules via `Update-Module` |
+| 8 | **PowerShell Modules** | On | Installed modules via PSResourceGet when available, with compatible fallback behavior |
 | 9 | **Scoop** | On | User-scoped; skipped under SYSTEM |
 | 10 | **.NET Global Tools** | **Off** | High risk — can break SDK-dependent builds |
 | 11 | **VS Code Extensions** | On | User-scoped; skipped under SYSTEM |
@@ -107,7 +130,7 @@ When the configured work, restart checks, service assessment, and terminal clean
 ## Install details and compatibility
 
 The [quick-start command](#quick-start) is the shortest supported fresh-install,
-repair, and run path for an elevated Command Prompt, PowerShell, or Win+R.
+repair, and run path from an elevated Windows PowerShell session.
 
 If you prefer the downloaded bootstrap to remain visible in `%TEMP%` for inspection or
 troubleshooting, use the equivalent download-and-run form:
@@ -133,7 +156,9 @@ Already installed:
 upd
 ```
 
-That's it. Runs from an elevated command prompt, PowerShell, or the Run dialog (Win+R → `upd` → Ctrl+Shift+Enter).
+That's it. Once installed, `upd` runs from an elevated Command Prompt, PowerShell, or the
+Run dialog (Win+R → `upd` → Ctrl+Shift+Enter). The installer is PowerShell; the installed
+launcher is the part that works everywhere. Tiny distinction, surprisingly large number of error messages.
 
 `upd.cmd` auto-adds itself to your system PATH on first run, so it works from anywhere after that.
 
@@ -171,7 +196,8 @@ upd --exclude Teams,OneDrive --skip-office365
 Short forms keep everyday commands light: `upd d 12`, `upd f`, `upd p -drv -r 120`,
 `upd r -s -o Verbose`, `upd a`, `upd l`, `upd u`, and `upd v`. Short commands do not use a
 leading dash; ambiguous dashed forms fail before they can reach the update path. Long
-names remain available for scripts and discoverability.
+names remain available for scripts and discoverability. `upd help` knows all of them, has
+no feelings about your typing speed, and is more current than a copied command from six releases ago.
 
 A stable raw-argument bootstrap now checks the latest GitHub release before an operational
 command reaches the typed parser. Every executable
@@ -336,7 +362,8 @@ Package managers are auto-detected. Missing ones are skipped with a warning.
 ## 🛟 Status and recovery
 
 Start with the built-in commands; they keep the common support path short and preserve
-useful evidence:
+useful evidence. Copying a 4,000-line console screenshot into chat is technically evidence,
+in the same sense that a landfill is technically a filing system:
 
 ```powershell
 upd status    # checkpoint, resume tasks, and reversible Winget quarantines
@@ -345,9 +372,20 @@ upd repair    # restore checksummed launcher/core files
 upd update    # refresh the verified source bundle without starting an update cycle
 ```
 
-If explicit `-ar` mode quarantines a repeatedly failing Winget package, completion is
-reported as **complete with quarantine**, never fully patched. The durable status record
-includes the reversal command:
+### What the final result means
+
+| Result | Meaning | What you should do |
+|---|---|---|
+| **Updates complete — no restart required** | Every enabled phase and verification check passed | Enjoy the rare moment when Windows has no further requests |
+| **Updates complete** with skipped packages | Repeated Winget failures were reversibly pinned to prevent another loop | Nothing now; use the displayed `upd uq` command when you want to retry them |
+| **Recovery pass queued** | One or more phases did not verify; a near-term retry is armed | No action unless it keeps returning or reaches the safety limit |
+| **User update pass pending** | Machine work finished, but user-scoped work needs the saved user to sign in | Sign in as that user; do not "fix" it by deleting the checkpoint |
+| **Restart required** | Blocking evidence was confirmed and continuation was verified | Save work; boot-upd resumes automatically after Windows restarts |
+| **Needs attention** | A bounded safety limit or terminal failure stopped automation | Run `upd status`, then `upd logs`; the tool stopped rather than improvising on your operating system |
+
+If explicit `-ar` mode quarantines a repeatedly failing Winget package, the final screen says
+the selected update run finished **with skipped packages**—not that the machine is fully patched.
+The durable status record includes the reversal command:
 
 ```powershell
 upd uq Package.Id    # remove one blocking pin
@@ -381,12 +419,55 @@ Get-WinEvent -FilterHashtable @{LogName='Application'; ProviderName='BootUpdateC
 # Cancel a pending reboot
 shutdown /a
 
-# Remove the scheduled task (stops the cycle)
-Unregister-ScheduledTask -TaskName 'BootUpdateCycle' -Confirm:$false
+# Remove both continuation tasks (stops automatic resume without deleting logs)
+Get-ScheduledTask -TaskName 'BootUpdateCycle','BootUpdateCycleFallback' -ErrorAction SilentlyContinue |
+    Unregister-ScheduledTask -Confirm:$false
 
 # Full cleanup
 & "$env:ProgramData\BootUpdateCycle\Uninstall.ps1" -RemoveFolder
 ```
+
+Canceling `shutdown` does not mean the update checkpoint has forgotten why it wanted a reboot.
+That would be convenient, but it would also be lying.
+
+<a id="common-questions"></a>
+## 🙋 Common questions
+
+### Is `ChocolateyPrototypeCleanup` a problem?
+
+Usually, no. It means Windows has delete-only housekeeping for Chocolatey's temporary prototype
+directory. It does **not** block convergence or consume the reboot budget. Since v2.5.62 it stays
+out of Normal warnings: Verbose shows a compact category/count, while Debug and the durable log
+retain sanitized fingerprints. A real source/destination replacement is still blocking.
+
+### Why did it restart more than once?
+
+Some updates reveal more applicable work only after reboot. boot-upd preserves completed phases,
+increments the reboot count only after observing a new Windows boot session, and resumes the
+unfinished work. It is a checkpointed update cycle, not `while ($true) { reboot }` with branding.
+
+### Why is Windows Update being checked again?
+
+A clean online assessment can be reused for up to six hours across reboots only when the local
+Windows Update catalog, configured scope, update source, and servicing-history fingerprints still
+agree. If one changes, boot-upd asks Windows again. Cached confidence is useful; cached fiction is not.
+
+### Why did a package get skipped?
+
+Normal mode leaves ordinary pins and unsupported inventory visible but does not override them.
+With explicit `upd -ar`, one repeated, identical Winget failure may receive a bounded repair attempt
+and then a reversible blocking pin. Use `upd status` to see it and `upd uq Package.Id` to retry it.
+
+### Does `upd aws` run during a normal `upd`?
+
+No. AWS tooling is opt-in. `upd aws` explicitly modernizes AWS CLI v2 and modular AWS.Tools;
+`upd --aws-tooling` includes that phase in the complete update cycle. Use the preservation flags
+only when an older script genuinely depends on legacy modules, not because old versions look lonely.
+
+### Can I see everything without the console becoming a novel?
+
+Press `v` during a run to cycle Quiet → Normal → Verbose → Debug. Normal is designed for humans;
+the rotating logs preserve the exhaustive details for humans who have become debuggers.
 
 <a id="security-model"></a>
 ## 🔐 Security model

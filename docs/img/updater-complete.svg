@@ -9,17 +9,17 @@
     <text x="30" y="178" fill="#16a34a">&gt;&gt;&gt; [10/10] PowerShellModules done (0.1 min)</text>
 
     <text x="30" y="230" fill="#2f8f70">==========================================================================</text>
-    <text x="62" y="288" fill="#f4a261" font-size="25" xml:space="preserve">C O N F I G U R E D   P A T C H   P A S S   V E R I F I E D</text>
+    <text x="62" y="288" fill="#f4a261" font-size="27" xml:space="preserve">U P D A T E S   C O M P L E T E</text>
     <text x="30" y="324" fill="#2f8f70">--------------------------------------------------------------------------</text>
 
-    <text x="62" y="372" fill="#72ffb7">YOU DID IT — THE CONFIGURED PATCH PASS IS VERIFIED. NICE WORK.</text>
-    <text x="62" y="416" fill="#16c60c">[OK] 10/10 configured phases completed</text>
-    <text x="62" y="458" fill="#16c60c">[OK] Windows Update: zero applicable work verified</text>
-    <text x="62" y="500" fill="#16c60c">[OK] Reboot state clean twice across 20 seconds</text>
-    <text x="62" y="542" fill="#16c60c">[OK] Critical services healthy</text>
-    <text x="62" y="584" fill="#16c60c">[OK] Resume tasks retired; no retry is queued</text>
+    <text x="62" y="372" fill="#72ffb7">NICE WORK — the selected update run finished. Windows may now brood quietly.</text>
+    <text x="62" y="414" fill="#16c60c">[RESTART] NOT REQUIRED — no blocking restart evidence remains</text>
+    <text x="62" y="454" fill="#16c60c">[OK] 10/10 configured phases completed</text>
+    <text x="62" y="494" fill="#16c60c">[OK] Windows Update: zero applicable work verified</text>
+    <text x="62" y="534" fill="#16c60c">[OK] Policy-aware service assessment passed without mutation</text>
+    <text x="62" y="574" fill="#16c60c">[OK] Resume tasks retired; no retry is queued</text>
 
-    <text x="62" y="626" fill="#d99858">18.4 min  |  3 passes  |  2 completed reboots  |  14 packages updated</text>
+    <text x="62" y="618" fill="#d99858">18 min  |  3 iteration(s)  |  2 completed reboot(s)  |  14 verified updates</text>
     <text x="30" y="656" fill="#2f8f70">==========================================================================</text>
   </g>
 </svg>

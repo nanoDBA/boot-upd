@@ -4,24 +4,27 @@
   <text x="16" y="24" fill="#20150d" font-family="Segoe UI, sans-serif" font-size="15">Administrator: Command Prompt — upd</text>
   <g font-family="Cascadia Mono, Consolas, monospace" font-size="19">
     <text x="28" y="73" fill="#61d6d6">.:==========================================================================:.</text>
-    <text x="28" y="105" fill="#d63bad">BOOT UPDATE CYCLE</text><text x="240" y="105" fill="#767676">//</text><text x="275" y="105" fill="#f2f2f2">unattended patch board</text><text x="542" y="105" fill="#767676">//</text><text x="578" y="105" fill="#f3f315">v2.5.56</text>
+    <text x="28" y="105" fill="#d63bad">BOOT UPDATE CYCLE</text><text x="240" y="105" fill="#767676">//</text><text x="275" y="105" fill="#f2f2f2">unattended patch board</text><text x="542" y="105" fill="#767676">//</text><text x="578" y="105" fill="#f3f315">v2.5.62</text>
     <text x="28" y="137" fill="#16c60c">[RESUMED after reboot]</text><text x="275" y="137" fill="#f2f2f2">Pass 3  |  Reboots 2/5  |  user context</text>
     <text x="28" y="169" fill="#3b9eee">[view] Normal  |  press v to cycle Quiet &gt; Normal &gt; Verbose &gt; Debug</text>
 
-    <text x="28" y="224" fill="#d99858">--- [1/10] Winget</text><text x="310" y="224" fill="#216f52">-----------------------------------------------</text>
-    <text x="28" y="256" fill="#16a34a">&gt;&gt;&gt; [1/10] Winget done (0.4 min, 1 pkg)</text>
-    <text x="28" y="300" fill="#d99858">--- [2/10] Chocolatey</text><text x="365" y="300" fill="#216f52">-----------------------------------------</text>
-    <text x="28" y="332" fill="#16a34a">&gt;&gt;&gt; [2/10] Chocolatey done (0.1 min)</text>
+    <text x="28" y="207" fill="#72ffb7">[RESTART STATUS] NOT REQUIRED — no blocking signals after two checks</text>
 
-    <text x="28" y="376" fill="#d99858">--- [3/10] WindowsUpdate</text><text x="405" y="376" fill="#216f52">--------------------------------------</text>
-    <text x="28" y="408" fill="#72ffb7">Windows Update: local catalog reconciled; redundant online poll skipped.</text>
-    <text x="28" y="440" fill="#16a34a">&gt;&gt;&gt; [3/10] WindowsUpdate done (cached assessment verified)</text>
+    <text x="28" y="250" fill="#d99858">--- [1/10] Winget</text><text x="310" y="250" fill="#216f52">-----------------------------------------------</text>
+    <text x="28" y="282" fill="#16a34a">&gt;&gt;&gt; [1/10] Winget done (0.4 min, 1 pkg)</text>
+    <text x="28" y="324" fill="#d99858">--- [2/10] Chocolatey</text><text x="365" y="324" fill="#216f52">-----------------------------------------</text>
+    <text x="28" y="356" fill="#16a34a">&gt;&gt;&gt; [2/10] Chocolatey done (0.1 min)</text>
 
-    <text x="28" y="494" fill="#d99858">--- [4/10] Defender</text><text x="330" y="494" fill="#216f52">--------------------------------------------</text>
-    <text x="28" y="536" fill="#61d6d6">BOOT//PULSE  [\]</text><text x="255" y="536" fill="#72ffb7">Updating Microsoft Defender signatures</text><text x="735" y="536" fill="#767676">::</text><text x="775" y="536" fill="#53d8a5">security intelligence refresh</text>
-    <text x="28" y="570" fill="#38efc3">[===================---------------]  active</text>
+    <text x="28" y="398" fill="#d99858">--- [3/10] WindowsUpdate</text><text x="405" y="398" fill="#216f52">--------------------------------------</text>
+    <text x="28" y="430" fill="#72ffb7">Windows Update: fresh local evidence confirms no applicable work.</text>
+    <text x="28" y="462" fill="#16a34a">&gt;&gt;&gt; [3/10] WindowsUpdate done (verified zero work)</text>
 
-    <text x="28" y="622" fill="#8aa4b8">Checkpoint armed  •  offline WUA check bounded  •  reboot-safe resume enabled</text>
-    <text x="28" y="652" fill="#61d6d6">Updates you can sleep through.</text>
+    <text x="28" y="506" fill="#d99858">--- [4/10] Defender</text><text x="330" y="506" fill="#216f52">--------------------------------------------</text>
+    <rect x="20" y="520" width="1150" height="70" rx="5" fill="#000f0e"/>
+    <text x="28" y="552" fill="#ebff5a">BOOT//PULSE  [\]</text><text x="255" y="552" fill="#72ffb7">Updating Microsoft Defender signatures</text><text x="735" y="552" fill="#767676">::</text><text x="775" y="552" fill="#53d8a5">security intelligence refresh</text>
+    <text x="28" y="582" fill="#38efc3">[===================---------------]  active</text>
+
+    <text x="28" y="622" fill="#8aa4b8">Checkpoint armed  •  completed phases preserved  •  reboot-safe resume enabled</text>
+    <text x="28" y="652" fill="#61d6d6">Windows can restart. Your progress does not develop amnesia.</text>
   </g>
 </svg>

@@ -4,4 +4,5 @@
 *.cmd -text whitespace=cr-at-eol
 *.ps1 text eol=lf
 *.md text eol=lf
+*.svg text eol=lf
 *.jsonl text eol=lf
