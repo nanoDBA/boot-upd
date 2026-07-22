@@ -77,7 +77,9 @@ The default `Normal` view stays zoomed out while the animated `BOOT//PULSE` row 
 
 <img src="docs/img/updater-progress.png" alt="Boot Update Cycle resumed after reboot, reusing a verified Windows Update assessment and refreshing Defender in the compact Normal console view" width="900">
 
-When the configured work, convergence checks, reboot checks, service health, and terminal cleanup all pass, the final screen has some earned personality:
+The splash immediately marks restart status as **checking**. Before updates begin—and again after they finish—the Normal view displays a prominent **RESTART REQUIRED** or **RESTART NOT REQUIRED** result. If a restart is required, the screen also confirms that automatic continuation is armed.
+
+When the configured work, restart checks, service assessment, and terminal cleanup all pass, the final screen leads with a plain-language result: the run finished, whether a restart is needed, whether any packages were skipped, and what (if anything) the user should do next. It still has some earned personality:
 
 <img src="docs/img/updater-complete.png" alt="Boot Update Cycle configured patch pass verified completion screen" width="900">
 
@@ -189,7 +191,7 @@ has exited**. It verifies the installer against the hash embedded below, then th
 verifies and transactionally replaces the complete release bundle before forwarding `aws`:
 
 ```powershell
-$u='https://github.com/nanoDBA/boot-upd/releases/download/v2.5.59/Install-UpdCompat.ps1'; $f=Join-Path $env:TEMP 'Install-UpdCompat-v2.5.59.ps1'; Invoke-WebRequest $u -OutFile $f; if((Get-FileHash $f -Algorithm SHA256).Hash -ne '67662B3B02252FF6DE045FCDF28FB74D8DEB6FDA8080C46B1DAFC7BFBE54ABE3'){throw 'Compatibility installer hash mismatch'}; & $f -CommandArguments aws
+$u='https://github.com/nanoDBA/boot-upd/releases/download/v2.5.60/Install-UpdCompat.ps1'; $f=Join-Path $env:TEMP 'Install-UpdCompat-v2.5.60.ps1'; Invoke-WebRequest $u -OutFile $f; if((Get-FileHash $f -Algorithm SHA256).Hash -ne '67662B3B02252FF6DE045FCDF28FB74D8DEB6FDA8080C46B1DAFC7BFBE54ABE3'){throw 'Compatibility installer hash mismatch'}; & $f -CommandArguments aws
 ```
 
 This is the one-time chicken-and-egg escape hatch. It resolves the first `upd.cmd` on PATH,

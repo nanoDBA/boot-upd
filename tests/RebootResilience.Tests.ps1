@@ -1007,7 +1007,7 @@ Describe 'Evidence-backed completion' {
         $text | Should -Match '\$incompletePhases'
         $text | Should -Match 'Register-BootUpdateTaskForReboot -RetrySoon'
         $text | Should -Match 'R E C O V E R Y   P A S S   Q U E U E D'
-        $text.IndexOf('$incompletePhases') | Should -BeLessThan $text.IndexOf('C O N F I G U R E D   P A T C H   P A S S   V E R I F I E D')
+        $text.IndexOf('$incompletePhases') | Should -BeLessThan $text.IndexOf('U P D A T E S   C O M P L E T E')
     }
 
     It 'returns success after the retry checkpoint transaction is durably armed' {
@@ -1033,9 +1033,10 @@ Describe 'Evidence-backed completion' {
 
     It 'congratulates only the verified green path and reports its evidence' {
         $text = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
-        $text | Should -Match 'YOU DID IT.*CONFIGURED PATCH PASS IS VERIFIED.*NICE WORK'
+        $text | Should -Match 'NICE WORK.*selected updates finished and verification passed'
+        $text | Should -Match '\[RESTART\] NOT REQUIRED'
         $text | Should -Match 'configured phases completed'
-        $text | Should -Match 'No blocking reboot evidence across two probes'
+        $text | Should -Match '\[RESTART\] NOT REQUIRED.*no blocking restart evidence remains'
         $text | Should -Match 'Optional restart cleanup remains'
         $text | Should -Match 'service state\(s\) assessed read-only'
         $text | Should -Not -Match 'FULLY PATCHED'
@@ -1055,10 +1056,23 @@ Describe 'Evidence-backed completion' {
     It 'reports durable Winget quarantine as degraded completion rather than fully patched' {
         $text = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
         $text | Should -Match 'COMPLETE WITH WINGET QUARANTINE'
-        $text | Should -Match 'this is not a fully-patched claim'
         $text | Should -Match 'Boot Update Cycle Complete with Quarantine'
         $text | Should -Match 'WingetQuarantinePath'
+        $text | Should -Match 'Repeatedly failing packages were skipped to prevent another loop'
+        $text | Should -Match 'were not updated'
+        $text | Should -Match 'No action is required now'
         (Get-FunctionText $invokeAst 'Clear-BootUpdateState') | Should -Not -Match 'WingetQuarantine'
+    }
+
+    It 'makes confirmed restart state prominent in Normal output at both checkpoints' {
+        $status = Get-FunctionText $invokeAst 'Show-BootUpdateRestartStatus'
+        $status | Should -Match 'RESTART STATUS'
+        $status | Should -Match 'Windows must restart before this update run can continue'
+        $status | Should -Match 'continue automatically after restart'
+        $status | Should -Match 'NOT REQUIRED'
+        $cycle = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
+        ([regex]::Matches($cycle, 'Show-BootUpdateRestartStatus -State Required')).Count | Should -Be 2
+        ([regex]::Matches($cycle, 'Show-BootUpdateRestartStatus -State NotRequired')).Count | Should -Be 2
     }
 
     It 'requires completed thread jobs and structured success' {

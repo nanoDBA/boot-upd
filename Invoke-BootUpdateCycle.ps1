@@ -344,7 +344,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 6 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.59' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.60' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 Set-Variable -Name 'RebootSignalSettleSeconds' -Value 20 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 $script:ExplicitRebootRequests = [System.Collections.Generic.List[object]]::new()
 $script:LastPendingFileRenameOperations = @()
@@ -392,7 +392,33 @@ function New-BootUpdateNeonGradient {
     return $gradient.ToArray()
 }
 
+function New-BootUpdateDepthGradient {
+    param([ValidateRange(4,64)][int]$StepsPerSegment = 24)
+
+    <# Theme 0's dim phosphor reflection colors: deep cyan/teal and deep violet.
+       This background moves at the same gradual cadence as the bright foreground
+       glow, adding depth without introducing another flash or animation rate. #>
+    $anchors = @(
+        [int[]]@(0, 20, 28),
+        [int[]]@(25, 10, 41)
+    )
+    $gradient = [Collections.Generic.List[string]]::new()
+    for ($segment = 0; $segment -lt $anchors.Count; $segment++) {
+        $start = $anchors[$segment]
+        $end = $anchors[($segment + 1) % $anchors.Count]
+        for ($step = 0; $step -lt $StepsPerSegment; $step++) {
+            $amount = $step / $StepsPerSegment
+            $channels = for ($channel = 0; $channel -lt 3; $channel++) {
+                [math]::Round($start[$channel] + (($end[$channel] - $start[$channel]) * $amount))
+            }
+            $gradient.Add(($channels -join ';'))
+        }
+    }
+    return $gradient.ToArray()
+}
+
 $script:TuiNeonPalette = New-BootUpdateNeonGradient
+$script:TuiDepthPalette = New-BootUpdateDepthGradient
 $script:TuiColorIndex = 0
 $script:TuiRefreshMilliseconds = 100
 $script:TuiSupportsVirtualTerminal = $false
@@ -566,11 +592,12 @@ function Write-BootUpdateLiveText {
         if ($script:TuiSupportsVirtualTerminal) {
             $escape = [char]27
             $rgb = $script:TuiNeonPalette[[math]::Abs($PaletteIndex % $script:TuiNeonPalette.Count)]
+            $depthRgb = $script:TuiDepthPalette[[math]::Abs($PaletteIndex % $script:TuiDepthPalette.Count)]
             $erase = if ($script:TuiRenderedConsoleWidth -gt 0 -and
                 $script:TuiRenderedConsoleWidth -ne $availableWidth) { "$escape[2K" } else { '' }
             $paddingCount = [math]::Max(0, $script:TuiRenderedWidth - $Text.Length)
             $paddingCount = [math]::Min($paddingCount, [math]::Max(0, $availableWidth - $Text.Length))
-            [Console]::Write("`r$erase$escape[1;38;2;${rgb}m$Text$(' ' * $paddingCount)$escape[0m")
+            [Console]::Write("`r$erase$escape[1;38;2;${rgb};48;2;${depthRgb}m$Text$(' ' * $paddingCount)$escape[0m")
         } else {
             $paddingCount = [math]::Max(0, $script:TuiRenderedWidth - $Text.Length)
             $paddingCount = [math]::Min($paddingCount, [math]::Max(0, $availableWidth - $Text.Length))
@@ -4787,10 +4814,41 @@ function Show-StartupArt {
     Write-Host '  :: ' -NoNewline -ForegroundColor DarkGray
     Write-Host '[log]' -NoNewline -ForegroundColor Green
     Write-Host "   $($script:LogPath)" -ForegroundColor DarkCyan
+    Write-Host '  :: ' -NoNewline -ForegroundColor DarkGray
+    Write-Host '[restart]' -NoNewline -ForegroundColor Yellow
+    Write-Host ' CHECKING' -NoNewline -ForegroundColor Yellow
+    Write-Host ' - confirmed status appears before updates begin' -ForegroundColor White
     Write-Host "  '::" -NoNewline -ForegroundColor DarkGray
     Write-Host ('=' * 66) -NoNewline -ForegroundColor Cyan
     Write-Host "::'" -ForegroundColor DarkGray
     Write-Host ""
+}
+
+function Show-BootUpdateRestartStatus {
+    param(
+        [Parameter(Mandatory)][ValidateSet('Required','NotRequired')][string]$State,
+        [Parameter(Mandatory)][string]$Checkpoint,
+        [object[]]$Signals = @(),
+        [switch]$CleanupAdvisory
+    )
+    if (-not (Test-BootUpdateOutputAtLeast -Minimum Normal)) { return }
+    Clear-BootUpdateProgressLine
+    Write-Host ''
+    Write-Host '  [RESTART STATUS] ' -NoNewline -ForegroundColor DarkGray
+    if ($State -eq 'Required') {
+        $sources = @($Signals.Source | Sort-Object -Unique) -join ', '
+        Write-Host 'REQUIRED' -NoNewline -ForegroundColor Red
+        Write-Host " - Windows must restart before this update run can continue." -ForegroundColor Yellow
+        Write-Host "  [next] The resume checkpoint is armed; the updater will continue automatically after restart. Evidence: $sources" -ForegroundColor White
+    } elseif ($CleanupAdvisory) {
+        Write-Host 'NOT REQUIRED' -NoNewline -ForegroundColor Green
+        Write-Host " - no blocking restart signals after $Checkpoint." -ForegroundColor White
+        Write-Host '  [optional] A later restart may finish non-blocking application or temporary-file cleanup.' -ForegroundColor DarkYellow
+    } else {
+        Write-Host 'NOT REQUIRED' -NoNewline -ForegroundColor Green
+        Write-Host " - no blocking restart signals after $Checkpoint." -ForegroundColor White
+    }
+    Write-Host ''
 }
 
 function Show-CycleStartStatus {
@@ -5552,11 +5610,16 @@ function Invoke-BootUpdateCycle {
             }
         }
         if (-not $WhatIfPreference) {
+            Show-BootUpdateRestartStatus -State Required -Checkpoint 'the pre-update check' -Signals $pending
             $signalKey = (($pending.Source | Sort-Object) -join ',')
             $null = Set-BootUpdateRebootCheckpoint -State $state -SignalKey $signalKey
             Start-BootUpdateRestart -State $state -Reason 'A reboot was already pending before update phases began.'
         }
-    } else { Write-Log 'No pending reboots at start of iteration' }
+    } else {
+        Show-BootUpdateRestartStatus -State NotRequired -Checkpoint "two checks $($script:RebootSignalSettleSeconds) seconds apart" `
+            -CleanupAdvisory:($script:LastPendingFileRenameOperations.Count -gt 0)
+        Write-Log 'No pending reboots at start of iteration'
+    }
 
     <# Crash recovery #>
     $null = Test-CrashRecovery -State $state
@@ -6250,12 +6313,17 @@ function Invoke-BootUpdateCycle {
 
         <# Guard task registration and reboot — neither must fire in WhatIf mode #>
         if (-not $WhatIfPreference) {
+            Show-BootUpdateRestartStatus -State Required -Checkpoint 'the post-update check' -Signals $pending
             Start-BootUpdateRestart -State $state -Reason "Iteration $($state.Iteration) completed with pending reboot evidence."
         } else {
             Write-Log '  [WHATIF] Would register scheduled task and restart computer'
         }
     } else {
         <# No pending reboot. #>
+        if (-not $WhatIfPreference) {
+            Show-BootUpdateRestartStatus -State NotRequired -Checkpoint "two post-update checks $($script:RebootSignalSettleSeconds) seconds apart" `
+                -CleanupAdvisory:($script:LastPendingFileRenameOperations.Count -gt 0)
+        }
 
         if ($script:StagedRollout) {
             <# Staged mode: check whether any enabled phases remain undone.
@@ -6363,16 +6431,13 @@ function Invoke-BootUpdateCycle {
 
         <# Console: styled completion banner #>
         $healthIsGreen = $null -ne $healthCheck -and $healthCheck.AllHealthy
-        $completionTitle = if ($WhatIfPreference) { 'W H A T I F   C H E C K   C O M P L E T E' }
-                           elseif ($hasWingetQuarantine) { 'P A T C H   P A S S   C O M P L E T E   W I T H   Q U A R A N T I N E' }
-                           elseif ($healthIsGreen) { 'C O N F I G U R E D   P A T C H   P A S S   V E R I F I E D' }
-                           elseif ($null -eq $healthCheck) { 'C O N F I G U R E D   S C O P E   C O M P L E T E' }
-                           else { 'P A T C H   P A S S   C O M P L E T E' }
+        $completionTitle = if ($WhatIfPreference) { 'P R E V I E W   C O M P L E T E' }
+                           else { 'U P D A T E S   C O M P L E T E' }
         $congratulations = if ($WhatIfPreference) { 'Preview complete — no changes were made.' }
-                           elseif ($hasWingetQuarantine) { 'PATCHING CONVERGED — persistent Winget failures were safely isolated with reversible blocking pins.' }
-                           elseif ($healthIsGreen) { 'YOU DID IT — THE CONFIGURED PATCH PASS IS VERIFIED. NICE WORK.' }
-                           elseif ($null -eq $healthCheck) { 'Configured updates are complete; health verification was skipped.' }
-                           else { 'Updates landed, but one health check needs attention.' }
+                           elseif ($hasWingetQuarantine) { 'NICE WORK — the selected update run finished. Repeatedly failing packages were skipped to prevent another loop.' }
+                           elseif ($healthIsGreen) { 'NICE WORK — the selected updates finished and verification passed.' }
+                           elseif ($null -eq $healthCheck) { 'The selected updates finished. Service health verification was skipped by policy.' }
+                           else { 'The selected updates finished, but one service health check needs attention.' }
         $healthLine = if ($null -eq $healthCheck) { '[--] Service health check skipped by policy' }
                       elseif ($healthCheck.AllHealthy) { "[OK] $($healthCheck.CheckedServices.Count) service state(s) assessed read-only; expected/policy-managed=$($healthCheck.ExpectedStopped.Count + $healthCheck.PolicyManaged.Count)" }
                       else { "[!!] Service attention: $($healthCheck.FailedServices -join ', ')" }
@@ -6434,13 +6499,15 @@ function Invoke-BootUpdateCycle {
         Write-BootUpdateProgress -Completed
         Show-CycleBanner -Title $completionTitle -AnsiColor $(if ($hasWingetQuarantine) { "$([char]27)[33m" } else { "$([char]27)[32m" }) -Info @(
             $congratulations
+            if (-not $WhatIfPreference) { '[RESTART] NOT REQUIRED - no blocking restart evidence remains' }
             "[OK] $($enabledPhases.Count)/$($enabledPhases.Count) configured phases completed"
             if ($hasWingetQuarantine) {
-                "[!!] $($wingetQuarantines.Count) Winget package(s) quarantined; this is not a fully-patched claim"
-                "[log] $($script:WingetQuarantinePath)"
+                "[SKIPPED] $($wingetQuarantines.Count) repeatedly failing Winget package(s) were not updated"
+                '[WHY] They were reversibly pinned so they cannot keep restarting this update run'
+                '[NEXT] No action is required now. Use the commands below whenever you want to retry them'
                 foreach ($record in $wingetQuarantines) { "[undo] $($record.UnpinCommand)" }
+                "[record] $($script:WingetQuarantinePath)"
             }
-            if (-not $WhatIfPreference) { "[OK] No blocking reboot evidence across two probes and $($script:RebootSignalSettleSeconds) seconds" }
             if ($hasCleanupAdvisory) { "[~] Optional restart cleanup remains: $cleanupCategories" }
             $healthLine
             if (-not $WhatIfPreference) { '[OK] Resume tasks retired; no retry is queued' }

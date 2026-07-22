@@ -1,8 +1,18 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.59
+**Current Version:** v2.5.60
 **Release Date:** 2026-07-22
 **Status:** STABLE
+
+---
+
+## v2.5.60 (2026-07-22)
+
+- Makes restart state unmistakable in the default Normal view: the splash says a confirmed check is underway, and both pre-update and post-update probes report `REQUIRED` or `NOT REQUIRED` as dedicated status blocks.
+- Explains what happens next when a restart is required: the resume checkpoint is armed and the update run continues automatically after Windows restarts.
+- Rewrites successful completion around the questions a new user actually has: whether the run finished, whether a restart is needed, whether anything was skipped, and whether any action is required.
+- Replaces unexplained “converged with quarantine” console wording with plain language: repeatedly failing Winget packages were skipped and reversibly pinned to prevent another loop, were not counted as updated, and can be retried later with the displayed commands.
+- Adds a smooth, very dark cyan-to-violet theme-0 under-glow behind the existing animated `BOOT//PULSE` foreground fade, preserving the propeller cadence and bright palette while giving the status band more depth.
 
 ---
 

@@ -30,7 +30,25 @@ function New-NeonGradient {
     }
     return $gradient.ToArray()
 }
+function New-DepthGradient {
+    param([ValidateRange(4,64)][int]$StepsPerSegment = 24)
+    $anchors = @([int[]]@(0, 20, 28), [int[]]@(25, 10, 41))
+    $gradient = [Collections.Generic.List[string]]::new()
+    for ($segment = 0; $segment -lt $anchors.Count; $segment++) {
+        $start = $anchors[$segment]
+        $end = $anchors[($segment + 1) % $anchors.Count]
+        for ($step = 0; $step -lt $StepsPerSegment; $step++) {
+            $amount = $step / $StepsPerSegment
+            $channels = for ($channel = 0; $channel -lt 3; $channel++) {
+                [math]::Round($start[$channel] + (($end[$channel] - $start[$channel]) * $amount))
+            }
+            $gradient.Add(($channels -join ';'))
+        }
+    }
+    return $gradient.ToArray()
+}
 $palette = New-NeonGradient
+$depthPalette = New-DepthGradient
 $scenes = @(
     @('Windows Update prefetch', 'Finishing background downloads'),
     @('Container images', 'Pulling refreshed layers'),
@@ -76,9 +94,10 @@ try {
             $renderedConsoleWidth = 0
         } elseif ($vt) {
             $rgb = $palette[$colorIndex]
+            $depthRgb = $depthPalette[$colorIndex % $depthPalette.Count]
             $erase = if ($renderedConsoleWidth -gt 0 -and $renderedConsoleWidth -ne $width) { "$escape[2K" } else { '' }
             $padding = [math]::Min([math]::Max(0, $renderedWidth - $line.Length), [math]::Max(0, $width - $line.Length))
-            [Console]::Write("`r$erase$escape[1;38;2;${rgb}m$line$(' ' * $padding)$escape[0m")
+            [Console]::Write("`r$erase$escape[1;38;2;${rgb};48;2;${depthRgb}m$line$(' ' * $padding)$escape[0m")
             $renderedWidth = $line.Length
             $renderedConsoleWidth = $width
         } else {

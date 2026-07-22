@@ -61,7 +61,7 @@ Describe 'Concise output modes' {
         $hash = [Convert]::ToHexString(
             [Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($splash))
         ).ToLowerInvariant()
-        $hash | Should -Be 'ec928edc16039db28faf66b577e725a1223c67316e70311c69952a940e5289cf'
+        $hash | Should -Be '514ae36a2fa40dca864da70b36b8f5a4f479f7f978ffc8cc1bf81d811b5e3d69'
     }
 }
 
@@ -291,6 +291,7 @@ Describe 'Animated progress behavior' {
     BeforeAll {
         foreach ($functionName in @(
             'New-BootUpdateNeonGradient',
+            'New-BootUpdateDepthGradient',
             'Limit-BootUpdateConsoleText',
             'Get-BootUpdateProgressText',
             'Clear-BootUpdateProgressLine',
@@ -316,6 +317,7 @@ Describe 'Animated progress behavior' {
         $script:TuiSpinnerIndex = 0
         $script:TuiSpinnerFrames = @('|', '/', '-', '\')
         $script:TuiNeonPalette = New-BootUpdateNeonGradient
+        $script:TuiDepthPalette = New-BootUpdateDepthGradient
         $script:TuiColorIndex = 0
         $script:TuiRenderedConsoleWidth = 0
         $script:TuiRefreshMilliseconds = 50
@@ -379,12 +381,34 @@ Describe 'Animated progress behavior' {
         $script:TuiColorIndex | Should -Be 12
     }
 
+    It 'adds a gradual theme-zero dark cyan and violet depth layer to the glow' {
+        $script:TuiDepthPalette.Count | Should -Be 48
+        $colors = @($script:TuiDepthPalette | ForEach-Object { ,([int[]]($_ -split ';')) })
+        $colors[0] | Should -Be @(0, 20, 28)
+        $colors[24] | Should -Be @(25, 10, 41)
+        $largestStep = 0
+        for ($i = 0; $i -lt $colors.Count; $i++) {
+            $next = $colors[($i + 1) % $colors.Count]
+            for ($channel = 0; $channel -lt 3; $channel++) {
+                $largestStep = [math]::Max($largestStep, [math]::Abs($next[$channel] - $colors[$i][$channel]))
+            }
+        }
+        $largestStep | Should -BeLessOrEqual 2
+        (Get-FunctionText -Ast $invokeAst -Name 'Write-BootUpdateLiveText') |
+            Should -Match '38;2;\$\{rgb\};48;2;\$\{depthRgb\}'
+    }
+
     It 'keeps the visual demo on the production gradient and independent color counter' {
         $demoGradient = & {
             . ([scriptblock]::Create((Get-FunctionText -Ast $demoAst -Name 'New-NeonGradient')))
             New-NeonGradient
         }
         @($demoGradient) | Should -Be @($script:TuiNeonPalette)
+        $demoDepth = & {
+            . ([scriptblock]::Create((Get-FunctionText -Ast $demoAst -Name 'New-DepthGradient')))
+            New-DepthGradient
+        }
+        @($demoDepth) | Should -Be @($script:TuiDepthPalette)
         $demoFrames = '$frames = @(''|'', ''/'', ''-'', ''\'')'
         $demoSource | Should -Match ([regex]::Escape($demoFrames))
         $demoSource | Should -Match '\$colorIndex\s*=\s*\(\$colorIndex \+ 1\) % \$palette\.Count'
