@@ -12,6 +12,7 @@
 - Replaces the generic child-exit and partial-failure cascade with immediate choices: an exact-ID reinstall command when the app is wanted, Microsoft’s incomplete-uninstall cleanup path when removal was intentional, and a reversible blocking-pin command for temporary suppression.
 - Keeps real package failures, incomplete provider output, and unaccounted attempts retryable; stale records never inflate verified update totals.
 - Adds behavioral phase-level coverage proving that one successful update plus one MSI 1605 result completes Winget without entering the failure classifier.
+- Adds Claude Code discovery guardrails: concise shared `CLAUDE.md` instructions, path-scoped updater/launcher/public-privacy rules, a provider-aware review-skill trigger, and compatibility tests that preserve the conditional reconciliation boundary and its phase-level regression test.
 
 ---
 
