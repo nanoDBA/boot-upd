@@ -62,6 +62,10 @@ BeforeAll {
           'Invoke-WingetFailureQuarantine',
           'Get-WingetQuarantineRecords',
           'Set-WingetQuarantineRecords',
+          'Get-WingetResolvedAbsentRecords',
+          'Set-WingetResolvedAbsentRecords',
+          'Test-WingetPackageVerifiedAbsent',
+          'Resolve-WingetStaleAbsentPresentation',
           'Write-WingetScopeSummary',
           'Update-WingetPackages',
           'Set-BootUpdateClipboardText',
@@ -164,10 +168,12 @@ Describe 'Concise provider diagnostics' {
         $summary.TechnologyBlocked | Should -Be 1
     }
 
-    It 'reconciles a fully-accounted MSI 1605 aggregate result and offers immediate choices' {
+    It 'reconciles MSI 1605, records verified absence once, and suppresses identical repeats' {
         $script:CurrentWingetFailures = [Collections.Generic.List[object]]::new()
+        $script:WingetResolvedAbsentPath = Join-Path $TestDrive 'resolved-absent.json'
         Mock Write-ProviderTranscript { }
         Mock Write-Log { }
+        Mock Test-WingetPackageVerifiedAbsent { $true }
         $lines = @(
             '(1/2) Found Example App [Example.App] Version 2.0',
             'Successfully installed',
@@ -176,17 +182,79 @@ Describe 'Concise provider diagnostics' {
         )
 
         $summary = Write-WingetScopeSummary -Scope machine -Lines $lines -ExitCode -1978335188
+        $repeat = Write-WingetScopeSummary -Scope machine -Lines $lines -ExitCode -1978335188
 
         $summary.ExitReconciled | Should -BeTrue
+        $repeat.ExitReconciled | Should -BeTrue
         $summary.Failures | Should -BeNullOrEmpty
         $summary.StaleAbsent.Count | Should -Be 1
         $script:CurrentWingetFailures.Count | Should -Be 0
-        Should -Invoke Write-Log -ParameterFilter { $Message -match '^\[STALE\].*incomplete uninstall record' }
-        Should -Invoke Write-Log -ParameterFilter { $Message -match '^\[OK\].*will not fail.*automatic pass' }
-        Should -Invoke Write-Log -ParameterFilter { $Message -match '^\[install\].*winget install --id Microsoft\.WindowsPCHealthCheck' }
-        Should -Invoke Write-Log -ParameterFilter { $Message -match '^\[remove\].*support\.microsoft\.com' }
-        Should -Invoke Write-Log -ParameterFilter { $Message -match '^\[suppress\].*winget pin add --id Microsoft\.WindowsPCHealthCheck' }
+        Should -Invoke Write-Log -Times 1 -Exactly -ParameterFilter { $Message -match '^\[RESOLVED\].*future reports will stay quiet' }
+        Should -Invoke Write-Log -Times 1 -Exactly -ParameterFilter { $Message -match 'identical stale result suppressed' -and $Visibility -eq 'Debug' }
+        Should -Invoke Write-Log -Times 0 -Exactly -ParameterFilter { $Message -match '^\[(STALE|install|remove|suppress)\]' }
         Should -Invoke Write-Log -Times 0 -ParameterFilter { $Message -match 'partial failure, retry required' }
+        $record = @(Get-Content $script:WingetResolvedAbsentPath -Raw | ConvertFrom-Json)
+        $record.Count | Should -Be 1
+        $record[0].PackageId | Should -Be 'Microsoft.WindowsPCHealthCheck'
+        $record[0].OutcomeKey | Should -Be 'microsoft.windowspchealthcheck|1605|verified-absent'
+        ($record[0].PSObject.Properties.Name -join ',') | Should -Not -Match '(?i)user|machine|domain|path'
+    }
+
+    It 'invalidates remembered absence and restores choices when exact inventory disagrees' {
+        $script:CurrentWingetFailures = [Collections.Generic.List[object]]::new()
+        $script:WingetResolvedAbsentPath = Join-Path $TestDrive 'resolved-absent-invalidate.json'
+        Set-WingetResolvedAbsentRecords -Records @([pscustomobject]@{
+            SchemaVersion=1; PackageId='Microsoft.WindowsPCHealthCheck'; Name='Windows PC Health Check'
+            FailureCode=1605; OutcomeKey='microsoft.windowspchealthcheck|1605|verified-absent'; VerifiedAbsentAtUtc='2026-07-22T00:00:00Z'
+        })
+        Mock Write-ProviderTranscript { }
+        Mock Write-Log { }
+        Mock Test-WingetPackageVerifiedAbsent { $false }
+        $lines = @(
+            '(1/1) Found Windows PC Health Check [Microsoft.WindowsPCHealthCheck] Version 4.0',
+            'Uninstall failed with exit code: 1605'
+        )
+
+        $summary = Write-WingetScopeSummary -Scope machine -Lines $lines -ExitCode -1978335188
+
+        $summary.ExitReconciled | Should -BeTrue
+        @(Get-WingetResolvedAbsentRecords).Count | Should -Be 0
+        Should -Invoke Write-Log -ParameterFilter { $Message -match '^\[STALE\].*incomplete uninstall record' }
+        Should -Invoke Write-Log -ParameterFilter { $Message -match '^\[install\].*Microsoft\.WindowsPCHealthCheck' }
+    }
+
+    It 'does not claim resolution when durable persistence fails' {
+        $script:CurrentWingetFailures = [Collections.Generic.List[object]]::new()
+        $script:WingetResolvedAbsentPath = Join-Path $TestDrive 'resolved-absent-fail.json'
+        Mock Write-ProviderTranscript { }
+        Mock Write-Log { }
+        Mock Test-WingetPackageVerifiedAbsent { $true }
+        Mock Set-WingetResolvedAbsentRecords { throw 'simulated persistence failure' }
+        $lines = @(
+            '(1/1) Found Windows PC Health Check [Microsoft.WindowsPCHealthCheck] Version 4.0',
+            'Uninstall failed with exit code: 1605'
+        )
+
+        $summary = Write-WingetScopeSummary -Scope machine -Lines $lines -ExitCode -1978335188
+
+        $summary.ExitReconciled | Should -BeTrue
+        Should -Invoke Write-Log -Times 0 -Exactly -ParameterFilter { $Message -match '^\[RESOLVED\]' }
+        Should -Invoke Write-Log -ParameterFilter { $Message -match 'could not persist.*retaining the recovery choices' }
+        Should -Invoke Write-Log -ParameterFilter { $Message -match '^\[STALE\]' }
+    }
+
+    It 'verifies exact Winget absence with a bounded read-only query' {
+        Mock Write-ProviderTranscript { }
+        Mock Invoke-PackageManagerWithTimeout {
+            @{ Output=@('No installed package found matching input criteria.'); TimedOut=$false; ExitCode=-1978335212 }
+        }
+
+        Test-WingetPackageVerifiedAbsent -WingetPath 'C:\winget.exe' `
+            -PackageId Microsoft.WindowsPCHealthCheck -Scope machine-retry | Should -BeTrue
+        Should -Invoke Invoke-PackageManagerWithTimeout -ParameterFilter {
+            $Name -eq 'Winget-verify-absent-Microsoft.WindowsPCHealthCheck' -and
+            $IdleTimeoutMinutes -eq 2 -and $HardTimeoutMinutes -eq 2 -and $DeferExitCodeReporting
+        }
     }
 
     It 'does not reconcile 1605 when another attempted package is unaccounted for' {
@@ -481,8 +549,8 @@ Describe 'Delayed and explicit reboot evidence' {
     It 'keeps routine cleanup out of Normal warnings while retaining compact and diagnostic evidence' {
         $script:LastPendingFileCleanupFingerprint = ''
         $operations = @(
-            [pscustomobject]@{ IsBlocking=$false; Category='ChocolateyPrototypeCleanup'; Fingerprint='AAA111AAA111' },
-            [pscustomobject]@{ IsBlocking=$false; Category='ChocolateyPrototypeCleanup'; Fingerprint='BBB222BBB222' }
+            [pscustomobject]@{ IsBlocking=$false; Category='PackageManagementPrototypeCleanup'; Fingerprint='AAA111AAA111' },
+            [pscustomobject]@{ IsBlocking=$false; Category='PackageManagementPrototypeCleanup'; Fingerprint='BBB222BBB222' }
         )
         Mock Write-Log { }
 
@@ -491,7 +559,7 @@ Describe 'Delayed and explicit reboot evidence' {
         Should -Invoke Write-Log -Times 0 -ParameterFilter { $Level -eq 'Warn' }
         Should -Invoke Write-Log -Times 1 -ParameterFilter {
             $Level -eq 'Info' -and $Visibility -eq 'Verbose' -and
-            $Message -match 'ChocolateyPrototypeCleanup=2' -and $Message -notmatch 'AAA111|BBB222'
+            $Message -match 'PackageManagementPrototypeCleanup=2' -and $Message -notmatch 'AAA111|BBB222'
         }
         Should -Invoke Write-Log -Times 1 -ParameterFilter {
             $Level -eq 'Info' -and $Visibility -eq 'Debug' -and
@@ -499,7 +567,7 @@ Describe 'Delayed and explicit reboot evidence' {
         }
     }
 
-    It 'ignores disposable Chocolatey prototype deletes and preserves real rename pairs' {
+    It 'ignores disposable PackageManagement prototype deletes and preserves real rename pairs' {
         $priorWindir = $env:windir
         try {
             $env:windir = 'C:\Windows'
@@ -559,7 +627,7 @@ Describe 'Delayed and explicit reboot evidence' {
         $operations[0].IsBlocking | Should -BeTrue
     }
 
-    It 'does not ignore a Chocolatey prototype rename with a real destination' {
+    It 'does not ignore a PackageManagement prototype rename with a real destination' {
         $priorWindir = $env:windir
         try {
             $env:windir = 'C:\Windows'
@@ -569,6 +637,13 @@ Describe 'Delayed and explicit reboot evidence' {
             ))
             $operations.Count | Should -Be 1
         } finally { $env:windir = $priorWindir }
+    }
+
+    It 'does not use broad PackageManagement inventory probes that discover legacy providers' {
+        $invokeSource | Should -Not -Match '(?m)(?<![-\w])Get-Package\b'
+        $invokeSource | Should -Not -Match '(?m)(?<![-\w])Find-Package\b'
+        $invokeSource | Should -Not -Match '(?m)(?<![-\w])Get-PackageProvider\b'
+        $invokeSource | Should -Match "PackageManagement/OneGet's legacy"
     }
 
     It 'requires two clean registry probes separated by an animated settle interval' {

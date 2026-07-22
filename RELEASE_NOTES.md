@@ -1,8 +1,18 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.64
+**Current Version:** v2.5.65
 **Release Date:** 2026-07-22
 **Status:** STABLE
+
+---
+
+## v2.5.65 (2026-07-22)
+
+- Rechecks an exact Winget package after MSI 1605 and remembers only a confirmed `No installed package found` result in a sanitized, persistent resolved-absence record.
+- Shows one concise `[RESOLVED]` message the first time, then keeps identical stale results out of Normal output while retaining raw provider evidence and a Debug breadcrumb.
+- Invalidates the remembered outcome when exact inventory no longer verifies absence. Unresolved or changed evidence continues to show the reinstall, cleanup, and reversible suppression choices.
+- Includes the resolved-absence record in sanitized diagnostics and adds behavioral coverage for first observation, repeated suppression, invalidation, persistence failure, and truthful update counts.
+- Correctly attributes `ChocolateyPrototype-2.8.5.130` delete markers to Microsoft PackageManagement/OneGet's legacy provider rather than the independent Chocolatey CLI, retains them as non-blocking housekeeping, and guards against broad provider-discovery probes in the orchestrator. The updater deliberately does not rewrite Windows' shared pending-rename queue.
 
 ---
 

@@ -53,6 +53,7 @@ Describe 'Sanitized diagnostic export' {
         Set-Content (Join-Path $source 'BootUpdateCycle.providers.20260721-010203.log') '[Winget] alice@acme.example 192.168.10.4'
         Set-Content (Join-Path $source 'BootUpdateCycle.aws.log') '[AWS] E:\OneDrive\ACME Holdings\PowerShell\Modules'
         Set-Content (Join-Path $source 'BootUpdateCycle-winget-quarantine.json') '[{"PackageId":"Corsair.iCUE.5","UnpinCommand":"winget pin remove --id Corsair.iCUE.5 -e --disable-interactivity"}]'
+        Set-Content (Join-Path $source 'BootUpdateCycle-winget-resolved-absent.json') '[{"PackageId":"Microsoft.WindowsPCHealthCheck","FailureCode":1605,"OutcomeKey":"microsoft.windowspchealthcheck|1605|verified-absent"}]'
         $redactions = @('ACME','Alice','BUILD-PC','acme.example','ACME Holdings')
         $exportArguments = @{
             SourceDirectory = $source; OutputDirectory = $output; AdditionalRedaction = $redactions
@@ -69,6 +70,7 @@ Describe 'Sanitized diagnostic export' {
         $safe | Should -Match 'BootUpdateCycle\.aws\.log'
         $safe | Should -Match 'BootUpdateCycle\.providers\.20260721-010203\.log'
         $safe | Should -Match 'BootUpdateCycle-winget-quarantine\.json'
+        $safe | Should -Match 'BootUpdateCycle-winget-resolved-absent\.json'
         $safe | Should -Match 'winget pin remove --id Corsair\.iCUE\.5'
         $safe | Should -Not -Match 'ACME|Alice|BUILD-PC|acme\.example|C:\\|E:\\|192\.168\.10\.4'
         (Get-Content (Join-Path $expanded 'manifest.json') -Raw | ConvertFrom-Json).Sanitized | Should -BeTrue

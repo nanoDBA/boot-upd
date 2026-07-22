@@ -259,6 +259,7 @@ $script:InstallDir            = $PSScriptRoot
 $script:ProviderTranscriptPath = Join-Path $PSScriptRoot 'BootUpdateCycle.providers.log'
 $script:StatePath             = Join-Path $PSScriptRoot 'BootUpdateCycle.state.json'
 $script:WingetQuarantinePath  = Join-Path $PSScriptRoot 'BootUpdateCycle-winget-quarantine.json'
+$script:WingetResolvedAbsentPath = Join-Path $PSScriptRoot 'BootUpdateCycle-winget-resolved-absent.json'
 $script:WindowsUpdateAssessmentPath = Join-Path $PSScriptRoot 'BootUpdateCycle.wu-assessment.json'
 $script:WindowsUpdateOnlineAssessmentTtlHours = 6
 $script:HistoryPath           = Join-Path $PSScriptRoot 'BootUpdateCycle.history.json'
@@ -344,7 +345,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 6 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.64' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.65' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 Set-Variable -Name 'RebootSignalSettleSeconds' -Value 20 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 $script:ExplicitRebootRequests = [System.Collections.Generic.List[object]]::new()
 $script:LastPendingFileRenameOperations = @()
@@ -1225,11 +1226,127 @@ function Set-WingetQuarantineRecords {
     }
 }
 
+function Get-WingetResolvedAbsentRecords {
+    if (-not (Test-Path -LiteralPath $script:WingetResolvedAbsentPath)) { return @() }
+    try {
+        $parsed = Get-Content -LiteralPath $script:WingetResolvedAbsentPath -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json
+        return @($parsed | Where-Object { $null -ne $_ })
+    } catch {
+        Write-Log "Winget resolved-absence record is unreadable: $_" -Level Error
+        return @()
+    }
+}
+
+function Set-WingetResolvedAbsentRecords {
+    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Records)
+    $tempPath = '{0}.{1}.{2}.tmp' -f $script:WingetResolvedAbsentPath,$PID,[guid]::NewGuid().ToString('N')
+    try {
+        [IO.File]::WriteAllText($tempPath, (ConvertTo-Json -InputObject @($Records) -Depth 5), [Text.UTF8Encoding]::new($false))
+        [IO.File]::Move($tempPath, $script:WingetResolvedAbsentPath, $true)
+        Enable-BootUpdateNtfsCompression -Path $script:WingetResolvedAbsentPath
+    } finally {
+        if (Test-Path -LiteralPath $tempPath) { Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Test-WingetPackageVerifiedAbsent {
+    param(
+        [string]$WingetPath = '',
+        [Parameter(Mandatory)][string]$PackageId,
+        [Parameter(Mandatory)][string]$Scope
+    )
+    if ($PackageId -notmatch '^[A-Za-z0-9][A-Za-z0-9._+-]*$') { return $false }
+    if (-not $WingetPath) {
+        $command = Get-Command winget -ErrorAction SilentlyContinue
+        if (-not $command) { return $false }
+        $WingetPath = $command.Source
+    }
+    $baseScope = if ($Scope -match '^user(?:\b|[-/])') { 'user' } else { 'machine' }
+    $result = Invoke-PackageManagerWithTimeout -Name "Winget-verify-absent-$PackageId" -ScriptBlock {
+        param($wp,$id,$sc)
+        & $wp list --id $id -e --scope $sc --accept-source-agreements --disable-interactivity --no-vt 2>&1
+    } -ArgumentList @($WingetPath,$PackageId,$baseScope) -IdleTimeoutMinutes 2 -HardTimeoutMinutes 2 `
+        -DeferExitCodeReporting
+    Write-ProviderTranscript -Provider Winget -Scope "verify-absent/$PackageId" -Lines $result.Output
+    return (-not $result.TimedOut -and
+        @($result.Output | Where-Object { ([string]$_) -match '^\s*No installed package found matching input criteria\.?\s*$' }).Count -gt 0)
+}
+
+function Resolve-WingetStaleAbsentPresentation {
+    param(
+        [Parameter(Mandatory)][string]$Scope,
+        [object[]]$StaleAbsent = @(),
+        [string]$WingetPath = ''
+    )
+    if (@($StaleAbsent).Count -eq 0) {
+        return [pscustomobject]@{ Suppressed=0; NewlyResolved=0; Unresolved=0 }
+    }
+    $records = [Collections.Generic.List[object]]::new([object[]]@(Get-WingetResolvedAbsentRecords))
+    $suppressed = 0
+    $newlyResolved = 0
+    $unresolved = 0
+
+    foreach ($stale in $StaleAbsent) {
+        $id = [string]$stale.Id
+        $identity = if ($id) { "$($stale.Name) [$id]" } else { [string]$stale.Name }
+        $safeId = $id -match '^[A-Za-z0-9][A-Za-z0-9._+-]*$'
+        $existing = if ($safeId) {
+            @($records | Where-Object { $_.PackageId -eq $id -and [long]$_.FailureCode -eq 1605 }) | Select-Object -First 1
+        } else { $null }
+        $verifiedAbsent = $safeId -and (Test-WingetPackageVerifiedAbsent -WingetPath $WingetPath -PackageId $id -Scope $Scope)
+
+        if ($verifiedAbsent) {
+            if ($existing) {
+                $suppressed++
+                Write-Log "Winget ${Scope}: identical stale result suppressed for verified-absent package [$id]." -Visibility Debug
+                continue
+            }
+            $record = [pscustomobject]@{
+                SchemaVersion=1
+                PackageId=$id
+                Name=[string]$stale.Name
+                FailureCode=1605
+                OutcomeKey=("{0}|1605|verified-absent" -f $id.ToLowerInvariant())
+                VerifiedAbsentAtUtc=[datetime]::UtcNow.ToString('o')
+            }
+            $records.Add($record)
+            try {
+                Set-WingetResolvedAbsentRecords -Records $records.ToArray()
+                $newlyResolved++
+                Write-Log "[RESOLVED] $identity is absent. Winget's stale uninstall result was ignored and identical future reports will stay quiet." -Level Warn
+                continue
+            } catch {
+                $null = $records.Remove($record)
+                Write-Log "Winget could not persist the resolved-absence record for [$id]; retaining the recovery choices. $_" -Level Warn
+            }
+        } elseif ($existing) {
+            $remaining = @($records | Where-Object { $_.PackageId -ne $id -or [long]$_.FailureCode -ne 1605 })
+            try {
+                Set-WingetResolvedAbsentRecords -Records $remaining
+                $records = [Collections.Generic.List[object]]::new([object[]]$remaining)
+            } catch {
+                Write-Log "Winget could not invalidate the resolved-absence record for [$id]: $_" -Level Warn
+            }
+        }
+
+        $unresolved++
+        Write-Log "[STALE] $identity is already absent, but Winget retains an incomplete uninstall record." -Level Warn
+        Write-Log '[OK] This stale record will not fail the update run or trigger another automatic pass.' -Level Warn
+        if ($safeId) {
+            Write-Log "[install] If the app is wanted: winget install --id $id -e --source winget --force --accept-source-agreements --accept-package-agreements" -Level Warn
+            Write-Log '[remove] If removal was intentional, clean incomplete uninstall data: https://support.microsoft.com/en-us/windows/deployment/install-upgrade/fix-problems-that-block-programs-from-being-installed-or-removed' -Level Warn
+            Write-Log "[suppress] Temporary reversible suppression: winget pin add --id $id -e --blocking --force" -Level Warn
+        }
+    }
+    return [pscustomobject]@{ Suppressed=$suppressed; NewlyResolved=$newlyResolved; Unresolved=$unresolved }
+}
+
 function Write-WingetScopeSummary {
     param(
         [Parameter(Mandatory)][string]$Scope,
         [object[]]$Lines = @(),
-        [AllowNull()][object]$ExitCode
+        [AllowNull()][object]$ExitCode,
+        [string]$WingetPath = ''
     )
     Write-ProviderTranscript -Provider Winget -Scope $Scope -Lines $Lines
     $summary = Get-WingetOutputSummary -Lines $Lines
@@ -1239,12 +1356,14 @@ function Write-WingetScopeSummary {
     if ($collector -and $null -ne $collector.Value -and $summary.Failures.Count) {
         foreach ($failure in $summary.Failures) { $collector.Value.Add($failure) }
     }
+    $stalePresentation = Resolve-WingetStaleAbsentPresentation -Scope $Scope `
+        -StaleAbsent $summary.StaleAbsent -WingetPath $WingetPath
     if ($summary.NoApplicable -and $summary.Attempted -eq 0) {
         $suffix = if ($summary.Pinned) { " ($($summary.Pinned) pinned)" } else { '' }
         Write-Log "Winget ${Scope}: no applicable upgrades$suffix."
     } elseif ($summary.Recognized) {
         $level = if ($summary.Failures.Count -gt 0) { 'Warn' } else { 'Info' }
-        $staleSuffix = if ($summary.StaleAbsent.Count) { ", $($summary.StaleAbsent.Count) already absent" } else { '' }
+        $staleSuffix = if ($stalePresentation.Unresolved) { ", $($stalePresentation.Unresolved) stale record(s) need attention" } else { '' }
         Write-Log "Winget ${Scope}: $($summary.Attempted) attempted, $($summary.Updated) updated, $($summary.Failures.Count) failed$staleSuffix." -Level $level
     } else {
         Write-Log "Winget ${Scope}: provider finished without recognizable English summary output; raw transcript retained for verification." -Level Warn
@@ -1252,16 +1371,6 @@ function Write-WingetScopeSummary {
     foreach ($failure in $summary.Failures) {
         $identity = if ($failure.Id) { "$($failure.Name) [$($failure.Id)]" } else { $failure.Name }
         Write-Log "Winget ${Scope}: $identity failed — $($failure.Summary) ($($failure.Code), $($failure.Hex))." -Level Warn
-    }
-    foreach ($stale in $summary.StaleAbsent) {
-        $identity = if ($stale.Id) { "$($stale.Name) [$($stale.Id)]" } else { $stale.Name }
-        Write-Log "[STALE] $identity is already absent, but Winget retains an incomplete uninstall record." -Level Warn
-        Write-Log '[OK] This stale record will not fail the update run or trigger another automatic pass.' -Level Warn
-        if ($stale.Id -match '^[A-Za-z0-9][A-Za-z0-9._+-]*$') {
-            Write-Log "[install] If the app is wanted: winget install --id $($stale.Id) -e --source winget --force --accept-source-agreements --accept-package-agreements" -Level Warn
-            Write-Log '[remove] If removal was intentional, clean incomplete uninstall data: https://support.microsoft.com/en-us/windows/deployment/install-upgrade/fix-problems-that-block-programs-from-being-installed-or-removed' -Level Warn
-            Write-Log "[suppress] Temporary reversible suppression: winget pin add --id $($stale.Id) -e --blocking --force" -Level Warn
-        }
     }
     $notes = @()
     if ($summary.Pinned) { $notes += "$($summary.Pinned) pinned" }
@@ -1922,7 +2031,9 @@ function Get-PendingFileRenameOperations {
             # advisory regardless of vendor. Explicit 3010/1641, CBS, and WU evidence
             # remains independently blocking.
             if ($cleanSource.StartsWith("$windowsSystemTemp\ChocolateyPrototype-", [StringComparison]::OrdinalIgnoreCase)) {
-                $category = 'ChocolateyPrototypeCleanup'
+                # The on-disk name belongs to PackageManagement/OneGet's legacy
+                # provider, not the independently installed choco.exe CLI.
+                $category = 'PackageManagementPrototypeCleanup'
                 $isBlocking = $false
             } elseif ($cleanSource -match '(?i)^[A-Z]:\\Program Files(?: \(x86\))?\\Microsoft\\EdgeUpdate\\\d+(?:\.\d+)+(?:\\|$)') {
                 $category = 'EdgeUpdateCleanup'
