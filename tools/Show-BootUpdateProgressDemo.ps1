@@ -11,10 +11,12 @@ if ([Console]::IsOutputRedirected -or $Host.Name -ne 'ConsoleHost') {
 
 $frames = @('|', '/', '-', '\')
 function New-NeonGradient {
-    param([ValidateRange(4,64)][int]$StepsPerSegment = 12)
+    param([ValidateRange(4,64)][int]$StepsPerSegment = 16)
     $anchors = @(
         [int[]]@(80, 255, 230), [int[]]@(95, 115, 255),
-        [int[]]@(255, 90, 205), [int[]]@(75, 255, 145)
+        [int[]]@(15, 4, 22), [int[]]@(255, 90, 205),
+        [int[]]@(75, 255, 145), [int[]]@(235, 255, 90),
+        [int[]]@(0, 15, 14)
     )
     $gradient = [Collections.Generic.List[string]]::new()
     for ($segment = 0; $segment -lt $anchors.Count; $segment++) {

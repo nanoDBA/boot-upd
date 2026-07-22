@@ -1,8 +1,17 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.61
+**Current Version:** v2.5.62
 **Release Date:** 2026-07-22
 **Status:** STABLE
+
+---
+
+## v2.5.62 (2026-07-22)
+
+- Expands the animated `BOOT//PULSE` foreground from four to seven color anchors and 48 to 112 interpolated frames. Two near-black theme-zero valleys create a legible long-distance pulse while the 100 ms transitions remain gradual rather than blink-like.
+- Keeps the splash artwork untouched and updates the standalone visual demo to use the exact production palette.
+- Demotes routine non-blocking `ChocolateyPrototypeCleanup` evidence from a Normal-view warning: Verbose shows a compact category/count, while Debug and the durable log retain sanitized fingerprints.
+- Preserves real replacements, protected Windows deletes, and provider-native restart evidence as prominent reboot barriers.
 
 ---
 

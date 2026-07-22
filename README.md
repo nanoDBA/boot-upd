@@ -191,7 +191,7 @@ has exited**. It verifies the installer against the hash embedded below, then th
 verifies and transactionally replaces the complete release bundle before forwarding `aws`:
 
 ```powershell
-$u='https://github.com/nanoDBA/boot-upd/releases/download/v2.5.61/Install-UpdCompat.ps1'; $f=Join-Path $env:TEMP 'Install-UpdCompat-v2.5.61.ps1'; Invoke-WebRequest $u -OutFile $f; if((Get-FileHash $f -Algorithm SHA256).Hash -ne '67662B3B02252FF6DE045FCDF28FB74D8DEB6FDA8080C46B1DAFC7BFBE54ABE3'){throw 'Compatibility installer hash mismatch'}; & $f -CommandArguments aws
+$u='https://github.com/nanoDBA/boot-upd/releases/download/v2.5.62/Install-UpdCompat.ps1'; $f=Join-Path $env:TEMP 'Install-UpdCompat-v2.5.62.ps1'; Invoke-WebRequest $u -OutFile $f; if((Get-FileHash $f -Algorithm SHA256).Hash -ne '67662B3B02252FF6DE045FCDF28FB74D8DEB6FDA8080C46B1DAFC7BFBE54ABE3'){throw 'Compatibility installer hash mismatch'}; & $f -CommandArguments aws
 ```
 
 This is the one-time chicken-and-egg escape hatch. It resolves the first `upd.cmd` on PATH,
@@ -242,8 +242,9 @@ Press `v` at any time during an interactive run to cycle through:
 
 Choose the initial view explicitly with `-OutputMode Quiet|Normal|Verbose|Debug`, or set
 `OutputMode` in `Deploy-BootUpdateCycle.ps1`. The interactive `BOOT//PULSE` row uses a
-classic `| / - \` ASCII propeller with the existing 48-step cyan, blue, magenta, and acid-green
-glow. Motion and color advance independently, preserving the gradual fade without abrupt flashes.
+classic `| / - \` ASCII propeller with a 112-step, seven-stop theme-zero glow. Cyan, blue,
+magenta, acid green, and electric yellow-green flow through near-black violet and cyan valleys,
+making the pulse discernible at a distance without abrupt flashes. Motion and color advance independently.
 ASCII status text is kept immutable; non-ASCII glyphs are represented safely in the live row while
 remaining untouched in the log. Key polling and animation disable themselves under SYSTEM,
 redirected output, and non-console hosts; file logging is unchanged.
@@ -279,7 +280,7 @@ console feedback because isolating it would change how hook variables and side e
 6. `shutdown /g` restarts Windows; the checkpoint resumes automatically, preserves successful provider phases, preserves user-only work for user context, and retries only incomplete or interrupted work
 7. Windows Update owns its service recovery: start and component-reset attempts are isolated behind a 30-second boundary. A stuck or indefinitely `StartPending` service makes only that phase retryable while safe independent providers continue
 8. A successful online Windows Update assessment is reusable for six hours—even across reboots—only after an offline WUA catalog check confirms zero applicable work and the update source, scope, and recent servicing history fingerprints still match
-9. Completion requires every enabled phase, a zero-applicable Windows Update assessment, and two probes with no blocking reboot evidence (max 5 completed reboot safety valve). Optional third-party cleanup remains visible but cannot create a reboot loop
+9. Completion requires every enabled phase, a zero-applicable Windows Update assessment, and two probes with no blocking reboot evidence (max 5 completed reboot safety valve). Optional third-party cleanup cannot create a reboot loop; routine categories are compact in Verbose, fingerprints are reserved for Debug and the log, and Normal remains focused on actionable state
 10. Hooks run, resume tasks and transient state are removed and verified absent, and only then does the final screen congratulate the user and send a result-specific notification
 11. If explicit aggressive mode quarantined a persistent Winget failure, its durable record survives cleanup and the final screen reports degraded completion with an `upd uq` reversal command
 

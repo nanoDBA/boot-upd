@@ -360,10 +360,20 @@ Describe 'Animated progress behavior' {
     }
 
     It 'crossfades gradually around a closed splash-palette loop independent of propeller motion' {
-        $script:TuiNeonPalette.Count | Should -Be 48
+        $script:TuiNeonPalette.Count | Should -Be 112
         $colors = @($script:TuiNeonPalette | ForEach-Object {
             ,([int[]]($_ -split ';'))
         })
+        $anchors = @(0,16,32,48,64,80,96 | ForEach-Object { ,$colors[$_] })
+        $anchors[0] | Should -Be @(80,255,230)
+        $anchors[1] | Should -Be @(95,115,255)
+        $anchors[2] | Should -Be @(15,4,22)
+        $anchors[3] | Should -Be @(255,90,205)
+        $anchors[4] | Should -Be @(75,255,145)
+        $anchors[5] | Should -Be @(235,255,90)
+        $anchors[6] | Should -Be @(0,15,14)
+        @($anchors | Where-Object { ($_[0..2] | Measure-Object -Maximum).Maximum -le 22 }).Count |
+            Should -BeGreaterOrEqual 2
         $largestStep = 0
         for ($i = 0; $i -lt $colors.Count; $i++) {
             $next = $colors[($i + 1) % $colors.Count]

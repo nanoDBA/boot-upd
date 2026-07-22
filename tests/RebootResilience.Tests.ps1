@@ -35,6 +35,7 @@ BeforeAll {
         'ConvertFrom-PendingFileRenamePath',
         'Get-PendingFileRenameOperations',
         'Get-ActionablePendingFileRenameOperations',
+        'Write-PendingFileRenameAdvisory',
         'Resolve-BootUpdateCompletionDisposition',
         'Stop-BootUpdateAtRebootLimit',
         'Stop-BootUpdateAtRetryLimit',
@@ -66,7 +67,7 @@ BeforeAll {
     )) {
         . ([scriptblock]::Create((Get-FunctionText $invokeAst $functionName)))
     }
-    function Write-Log { param([string]$Message, [string]$Level) }
+    function Write-Log { param([string]$Message, [string]$Level, [string]$Visibility) }
     function Set-BootUpdateState { param($State) }
     function Write-ProviderTranscript { param($Provider, $Scope, $Lines) }
     function Invoke-PackageManagerWithTimeout { param($Name, $ScriptBlock, $ArgumentList, $IdleTimeoutMinutes, $HardTimeoutMinutes, $Status, $IncompleteRebootExitCodes) }
@@ -398,6 +399,27 @@ Describe 'BitLocker reboot targeting' {
 }
 
 Describe 'Delayed and explicit reboot evidence' {
+    It 'keeps routine cleanup out of Normal warnings while retaining compact and diagnostic evidence' {
+        $script:LastPendingFileCleanupFingerprint = ''
+        $operations = @(
+            [pscustomobject]@{ IsBlocking=$false; Category='ChocolateyPrototypeCleanup'; Fingerprint='AAA111AAA111' },
+            [pscustomobject]@{ IsBlocking=$false; Category='ChocolateyPrototypeCleanup'; Fingerprint='BBB222BBB222' }
+        )
+        Mock Write-Log { }
+
+        Write-PendingFileRenameAdvisory -Operations $operations -Context 'before mutation'
+
+        Should -Invoke Write-Log -Times 0 -ParameterFilter { $Level -eq 'Warn' }
+        Should -Invoke Write-Log -Times 1 -ParameterFilter {
+            $Level -eq 'Info' -and $Visibility -eq 'Verbose' -and
+            $Message -match 'ChocolateyPrototypeCleanup=2' -and $Message -notmatch 'AAA111|BBB222'
+        }
+        Should -Invoke Write-Log -Times 1 -ParameterFilter {
+            $Level -eq 'Info' -and $Visibility -eq 'Debug' -and
+            $Message -match 'AAA111AAA111,BBB222BBB222'
+        }
+    }
+
     It 'ignores disposable Chocolatey prototype deletes and preserves real rename pairs' {
         $priorWindir = $env:windir
         try {

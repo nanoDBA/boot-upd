@@ -344,7 +344,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 6 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.61' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.62' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 Set-Variable -Name 'RebootSignalSettleSeconds' -Value 20 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 $script:ExplicitRebootRequests = [System.Collections.Generic.List[object]]::new()
 $script:LastPendingFileRenameOperations = @()
@@ -367,15 +367,19 @@ $script:TuiSpinnerIndex = 0
 $script:TuiSpinnerFrames = @('|', '/', '-', '\')
 
 function New-BootUpdateNeonGradient {
-    param([ValidateRange(4,64)][int]$StepsPerSegment = 12)
+    param([ValidateRange(4,64)][int]$StepsPerSegment = 16)
 
-    # Closed loop through the splash palette. Interpolation keeps every 100 ms
-    # tick close to its neighbor instead of flashing between saturated anchors.
+    # Seven-stop closed loop through the splash palette. The two near-black
+    # phosphor stops create a readable long-distance pulse without blink-tag
+    # cuts; 16 interpolated frames keep every 100 ms tick close to its neighbor.
     $anchors = @(
         [int[]]@(80, 255, 230),  # cyan
         [int[]]@(95, 115, 255),  # blue
+        [int[]]@(15, 4, 22),     # near-black violet
         [int[]]@(255, 90, 205),  # magenta
-        [int[]]@(75, 255, 145)   # acid green
+        [int[]]@(75, 255, 145),  # acid green
+        [int[]]@(235, 255, 90),  # electric yellow-green
+        [int[]]@(0, 15, 14)      # near-black cyan
     )
     $gradient = [Collections.Generic.List[string]]::new()
     for ($segment = 0; $segment -lt $anchors.Count; $segment++) {
@@ -1870,7 +1874,9 @@ function Write-PendingFileRenameAdvisory {
     if ($script:LastPendingFileCleanupFingerprint -eq "$Context|$fingerprint") { return }
     $script:LastPendingFileCleanupFingerprint = "$Context|$fingerprint"
     $categories = @($advisory | Group-Object Category | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Count)" }) -join ', '
-    Write-Log "Pending-file cleanup advisory [$Context]: $categories; id=$fingerprint. Delete-only housekeeping does not block update convergence." -Level Warn
+    Write-Log "Pending-file cleanup [$Context]: $categories. Routine delete-only housekeeping; no restart is required for update convergence." `
+        -Level Info -Visibility Verbose
+    Write-Log "Pending-file cleanup detail [$Context]: id=$fingerprint" -Level Info -Visibility Debug
 }
 
 function Test-PendingReboot {
