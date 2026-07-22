@@ -1,8 +1,17 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.63
+**Current Version:** v2.5.64
 **Release Date:** 2026-07-22
 **Status:** STABLE
+
+---
+
+## v2.5.64 (2026-07-22)
+
+- Reconciles Winget/MSI error 1605 as an already-absent application with stale uninstall inventory rather than a failed update. A fully accounted aggregate result no longer fails the Winget phase or queues an otherwise pointless recovery pass.
+- Replaces the generic child-exit and partial-failure cascade with immediate choices: an exact-ID reinstall command when the app is wanted, Microsoft’s incomplete-uninstall cleanup path when removal was intentional, and a reversible blocking-pin command for temporary suppression.
+- Keeps real package failures, incomplete provider output, and unaccounted attempts retryable; stale records never inflate verified update totals.
+- Adds behavioral phase-level coverage proving that one successful update plus one MSI 1605 result completes Winget without entering the failure classifier.
 
 ---
 

@@ -344,7 +344,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 6 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.63' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.64' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 Set-Variable -Name 'RebootSignalSettleSeconds' -Value 20 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 $script:ExplicitRebootRequests = [System.Collections.Generic.List[object]]::new()
 $script:LastPendingFileRenameOperations = @()
@@ -984,6 +984,7 @@ function Get-WingetOutputSummary {
     $currentName = 'Unknown package'
     $currentId = ''
     $failures = [Collections.Generic.List[object]]::new()
+    $staleAbsent = [Collections.Generic.List[object]]::new()
     $successfulIds = [Collections.Generic.List[string]]::new()
     foreach ($rawLine in $Lines) {
         # Winget may indent records or leave ANSI/VT control sequences even with
@@ -1000,10 +1001,12 @@ function Get-WingetOutputSummary {
         } elseif ($line -match '^(?:Uninstall|Installer) failed with exit code:\s*(0x[0-9A-Fa-f]+|-?\d+)') {
             $rawCode = $Matches[1]
             $code = if ($rawCode -match '^0x') { [long][Convert]::ToUInt32($rawCode.Substring(2), 16) } else { [long]$rawCode }
-            $failures.Add([pscustomobject]@{
+            $record = [pscustomobject]@{
                 Name=$currentName; Id=$currentId; Code=$code
                 Hex=(Format-NativeExitCode $code); Summary=(Get-InstallerExitSummary $code)
-            })
+            }
+            if ($code -eq 1605) { $staleAbsent.Add($record) }
+            else { $failures.Add($record) }
         } elseif ($line -match '^(\d+) package\(s\) have pins') {
             $pinned = [int]$Matches[1]
         } elseif ($line -match '^(\d+) package\(s\) have version numbers that cannot be determined') {
@@ -1017,10 +1020,23 @@ function Get-WingetOutputSummary {
     return [pscustomobject]@{
         Attempted=$attempted; Updated=$updated; Pinned=$pinned; Unknown=$unknown
         TechnologyBlocked=$technologyBlocked; NoApplicable=$noApplicable; Failures=$failures.ToArray()
+        StaleAbsent=$staleAbsent.ToArray()
         SuccessfulIds=$successfulIds.ToArray()
         Recognized=($attempted -gt 0 -or $updated -gt 0 -or $pinned -gt 0 -or $unknown -gt 0 -or
-            $technologyBlocked -gt 0 -or $noApplicable -or $failures.Count -gt 0)
+            $technologyBlocked -gt 0 -or $noApplicable -or $failures.Count -gt 0 -or $staleAbsent.Count -gt 0)
     }
+}
+
+function Test-WingetExitReconciled {
+    param(
+        [Parameter(Mandatory)][pscustomobject]$Summary,
+        [AllowNull()][object]$ExitCode
+    )
+    if ($null -eq $ExitCode -or [long]$ExitCode -ne -1978335188L) { return $false }
+    $staleCount = @($Summary.StaleAbsent).Count
+    return ($staleCount -gt 0 -and @($Summary.Failures).Count -eq 0 -and
+        [int]$Summary.Attempted -gt 0 -and
+        ([int]$Summary.Updated + $staleCount) -ge [int]$Summary.Attempted)
 }
 
 function Get-WingetRemediationCommand {
@@ -1217,6 +1233,8 @@ function Write-WingetScopeSummary {
     )
     Write-ProviderTranscript -Provider Winget -Scope $Scope -Lines $Lines
     $summary = Get-WingetOutputSummary -Lines $Lines
+    $exitReconciled = Test-WingetExitReconciled -Summary $summary -ExitCode $ExitCode
+    $summary | Add-Member -NotePropertyName ExitReconciled -NotePropertyValue $exitReconciled -Force
     $collector = Get-Variable -Name CurrentWingetFailures -Scope Script -ErrorAction SilentlyContinue
     if ($collector -and $null -ne $collector.Value -and $summary.Failures.Count) {
         foreach ($failure in $summary.Failures) { $collector.Value.Add($failure) }
@@ -1226,13 +1244,24 @@ function Write-WingetScopeSummary {
         Write-Log "Winget ${Scope}: no applicable upgrades$suffix."
     } elseif ($summary.Recognized) {
         $level = if ($summary.Failures.Count -gt 0) { 'Warn' } else { 'Info' }
-        Write-Log "Winget ${Scope}: $($summary.Attempted) attempted, $($summary.Updated) updated, $($summary.Failures.Count) failed." -Level $level
+        $staleSuffix = if ($summary.StaleAbsent.Count) { ", $($summary.StaleAbsent.Count) already absent" } else { '' }
+        Write-Log "Winget ${Scope}: $($summary.Attempted) attempted, $($summary.Updated) updated, $($summary.Failures.Count) failed$staleSuffix." -Level $level
     } else {
         Write-Log "Winget ${Scope}: provider finished without recognizable English summary output; raw transcript retained for verification." -Level Warn
     }
     foreach ($failure in $summary.Failures) {
         $identity = if ($failure.Id) { "$($failure.Name) [$($failure.Id)]" } else { $failure.Name }
         Write-Log "Winget ${Scope}: $identity failed — $($failure.Summary) ($($failure.Code), $($failure.Hex))." -Level Warn
+    }
+    foreach ($stale in $summary.StaleAbsent) {
+        $identity = if ($stale.Id) { "$($stale.Name) [$($stale.Id)]" } else { $stale.Name }
+        Write-Log "[STALE] $identity is already absent, but Winget retains an incomplete uninstall record." -Level Warn
+        Write-Log '[OK] This stale record will not fail the update run or trigger another automatic pass.' -Level Warn
+        if ($stale.Id -match '^[A-Za-z0-9][A-Za-z0-9._+-]*$') {
+            Write-Log "[install] If the app is wanted: winget install --id $($stale.Id) -e --source winget --force --accept-source-agreements --accept-package-agreements" -Level Warn
+            Write-Log '[remove] If removal was intentional, clean incomplete uninstall data: https://support.microsoft.com/en-us/windows/deployment/install-upgrade/fix-problems-that-block-programs-from-being-installed-or-removed' -Level Warn
+            Write-Log "[suppress] Temporary reversible suppression: winget pin add --id $($stale.Id) -e --blocking --force" -Level Warn
+        }
     }
     $notes = @()
     if ($summary.Pinned) { $notes += "$($summary.Pinned) pinned" }
@@ -1243,7 +1272,7 @@ function Write-WingetScopeSummary {
     if ($summary.Unknown -or $summary.TechnologyBlocked) {
         Write-Log 'Winget suggested inventory: winget upgrade --all --include-unknown --accept-source-agreements --accept-package-agreements' -Level Warn
     }
-    if ($null -ne $ExitCode -and [long]$ExitCode -notin @(0,1641,3010)) {
+    if ($null -ne $ExitCode -and [long]$ExitCode -notin @(0,1641,3010) -and -not $exitReconciled) {
         Write-Log "Winget ($Scope) returned $ExitCode ($(Format-NativeExitCode ([long]$ExitCode))); partial failure, retry required." -Level Error
     }
     return $summary
@@ -2375,7 +2404,8 @@ function Invoke-PackageManagerWithTimeout {
         [object[]]$ArgumentList = @(),
         [double]$IdleTimeoutMinutes = 5, [double]$HardTimeoutMinutes = 60,
         [string]$Status = 'Operation is running',
-        [int[]]$IncompleteRebootExitCodes = @()
+        [int[]]$IncompleteRebootExitCodes = @(),
+        [switch]$DeferExitCodeReporting
     )
     $pwshPath = (Get-Command pwsh -EA SilentlyContinue)?.Source
     if (-not $pwshPath) { $pwshPath = Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe' }
@@ -2448,7 +2478,7 @@ try {
     $timedOut = $result.Reason -in @('IdleTimeout','HardTimeout')
     $failed = $timedOut -or $result.Reason -ne 'Completed' -or $effectiveExitCode -notin @(0, 1641, 3010)
     if ($timedOut) { Write-Log "${Name}: Killed ($($result.Reason)) after $([math]::Round($result.Elapsed.TotalMinutes,1))m. Will retry next boot." -Level Warn }
-    elseif ($failed) { Write-Log "${Name}: child process exited with code $effectiveExitCode." -Level Warn }
+    elseif ($failed -and -not $DeferExitCodeReporting) { Write-Log "${Name}: child process exited with code $effectiveExitCode." -Level Warn }
     else { Write-Log "${Name}: Done in $([math]::Round($result.Elapsed.TotalMinutes,1))m" }
     return @{ Output = $visibleOutput.ToArray(); TimedOut = $timedOut; Failed = $failed; Reason = $result.Reason; Elapsed = $result.Elapsed; ExitCode = $effectiveExitCode; RebootRequired = $rebootRequired }
 }
@@ -2570,7 +2600,7 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
                     continue
                 }
                 $installBlocked = @($jr.Lines | Where-Object { $_ -match 'install.+in progress|in progress.+install' }).Count -gt 0
-                $null = Write-WingetScopeSummary -Scope $sc -Lines $jr.Lines -ExitCode $jr.ExitCode
+                $scopeSummary = Write-WingetScopeSummary -Scope $sc -Lines $jr.Lines -ExitCode $jr.ExitCode
                 if ($jr.TimedOut) {
                     Write-Log "Winget ($sc): Hard timeout ($TimeoutMinutes min). Will retry next boot." -Level Warn
                     $anyTimeout = $true
@@ -2580,7 +2610,7 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
                     $script:ExplicitRebootRequests.Add($rebootEvidence)
                     if ($script:CurrentState) { $script:CurrentState.ExplicitRebootRequests = @($script:ExplicitRebootRequests); Set-BootUpdateState -State $script:CurrentState }
                     Write-Log $rebootEvidence.Detail -Level Warn
-                } elseif ($null -ne $jr.ExitCode -and $jr.ExitCode -ne 0) {
+                } elseif ($null -ne $jr.ExitCode -and $jr.ExitCode -ne 0 -and -not $scopeSummary.ExitReconciled) {
                     $anyTimeout = $true
                     $kind = if (@($jr.Lines).Count -eq 0) { 'no-output' } else { 'unclassified' }
                     $executionFailures.Add("$sc`:$($jr.ExitCode):$kind")
@@ -2593,7 +2623,8 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
                     $retryResult = Invoke-PackageManagerWithTimeout -Name "Winget-$sc-retry" -ScriptBlock {
                         param($wp, $sc2)
                         & $wp upgrade --all --scope $sc2 --accept-source-agreements --accept-package-agreements --disable-interactivity --no-vt 2>&1
-                    } -ArgumentList @($wingetPath, $sc) -IdleTimeoutMinutes 5 -HardTimeoutMinutes $TimeoutMinutes
+                    } -ArgumentList @($wingetPath, $sc) -IdleTimeoutMinutes 5 -HardTimeoutMinutes $TimeoutMinutes `
+                        -DeferExitCodeReporting
                     $retrySummary = Write-WingetScopeSummary -Scope "$sc-retry" -Lines $retryResult.Output -ExitCode $retryResult.ExitCode
                     $retryCount = $retrySummary.Updated
                     $totalCount += $retryCount
@@ -2640,14 +2671,16 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
                 $result = Invoke-PackageManagerWithTimeout -Name "Winget-$scope" -ScriptBlock {
                     param($wp, $sc)
                     & $wp upgrade --all --scope $sc --accept-source-agreements --accept-package-agreements --disable-interactivity --no-vt 2>&1
-                } -ArgumentList @($wingetPath, $scope) -IdleTimeoutMinutes 5 -HardTimeoutMinutes $TimeoutMinutes
+                } -ArgumentList @($wingetPath, $scope) -IdleTimeoutMinutes 5 -HardTimeoutMinutes $TimeoutMinutes `
+                    -DeferExitCodeReporting
 
                 $installBlocked = @($result.Output | Where-Object { $_ -match 'install.+in progress|in progress.+install' }).Count -gt 0
                 $scopeSummary = Write-WingetScopeSummary -Scope $scope -Lines $result.Output -ExitCode $result.ExitCode
                 $count = $scopeSummary.Updated
                 foreach ($successfulId in @($scopeSummary.SuccessfulIds)) { $null = $successfulPackageIds.Add($successfulId) }
                 if ($result.TimedOut) { $anyTimeout = $true }
-                if ($null -ne $result.ExitCode -and $result.ExitCode -notin @(0,1641,3010) -and @($scopeSummary.Failures).Count -eq 0) {
+                if ($null -ne $result.ExitCode -and $result.ExitCode -notin @(0,1641,3010) -and
+                    @($scopeSummary.Failures).Count -eq 0 -and -not $scopeSummary.ExitReconciled) {
                     $kind = if (@($result.Output).Count -eq 0) { 'no-output' } else { 'unclassified' }
                     $executionFailures.Add("$scope`:$($result.ExitCode):$kind")
                     $anyTimeout = $true
@@ -2661,7 +2694,8 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
                     $retry = Invoke-PackageManagerWithTimeout -Name "Winget-$scope-retry" -ScriptBlock {
                         param($wp, $sc)
                         & $wp upgrade --all --scope $sc --accept-source-agreements --accept-package-agreements --disable-interactivity --no-vt 2>&1
-                    } -ArgumentList @($wingetPath, $scope) -IdleTimeoutMinutes 5 -HardTimeoutMinutes $TimeoutMinutes
+                    } -ArgumentList @($wingetPath, $scope) -IdleTimeoutMinutes 5 -HardTimeoutMinutes $TimeoutMinutes `
+                        -DeferExitCodeReporting
                     $retrySummary = Write-WingetScopeSummary -Scope "$scope-retry" -Lines $retry.Output -ExitCode $retry.ExitCode
                     $count += $retrySummary.Updated
                     foreach ($successfulId in @($retrySummary.SuccessfulIds)) { $null = $successfulPackageIds.Add($successfulId) }
@@ -2704,7 +2738,8 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
                     $fbResult = Invoke-PackageManagerWithTimeout -Name "Winget-$scope" -ScriptBlock {
                         param($wp, $sc)
                         & $wp upgrade --all --scope $sc --accept-source-agreements --accept-package-agreements --disable-interactivity --no-vt 2>&1
-                    } -ArgumentList @($wingetPath, $scope) -IdleTimeoutMinutes 5 -HardTimeoutMinutes $TimeoutMinutes
+                    } -ArgumentList @($wingetPath, $scope) -IdleTimeoutMinutes 5 -HardTimeoutMinutes $TimeoutMinutes `
+                        -DeferExitCodeReporting
                     $fallbackSummary = Write-WingetScopeSummary -Scope "$scope-fallback" -Lines $fbResult.Output -ExitCode $fbResult.ExitCode
                     $count = $fallbackSummary.Updated
                     foreach ($successfulId in @($fallbackSummary.SuccessfulIds)) { $null = $successfulPackageIds.Add($successfulId) }
@@ -2756,7 +2791,8 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
                     $pkgResult = Invoke-PackageManagerWithTimeout -Name "Winget-$scope-$pkgId" -ScriptBlock {
                         param($wp, $id, $sc)
                         & $wp upgrade --id $id --scope $sc -e --accept-source-agreements --accept-package-agreements --disable-interactivity --no-vt 2>&1
-                    } -ArgumentList @($wingetPath, $pkgId, $scope) -IdleTimeoutMinutes 5 -HardTimeoutMinutes $TimeoutMinutes
+                    } -ArgumentList @($wingetPath, $pkgId, $scope) -IdleTimeoutMinutes 5 -HardTimeoutMinutes $TimeoutMinutes `
+                        -DeferExitCodeReporting
                     $packageSummary = Write-WingetScopeSummary -Scope "$scope/$pkgId" -Lines $pkgResult.Output -ExitCode $pkgResult.ExitCode
                     $count += $packageSummary.Updated
                     foreach ($successfulId in @($packageSummary.SuccessfulIds)) { $null = $successfulPackageIds.Add($successfulId) }

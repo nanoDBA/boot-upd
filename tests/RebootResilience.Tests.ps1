@@ -55,12 +55,15 @@ BeforeAll {
         'Format-NativeExitCode',
           'Get-InstallerExitSummary',
           'Get-WingetOutputSummary',
+          'Test-WingetExitReconciled',
           'Get-WingetRemediationCommand',
           'Complete-WingetFailureClassification',
           'Register-WingetAggressiveRepairAttempt',
           'Invoke-WingetFailureQuarantine',
           'Get-WingetQuarantineRecords',
           'Set-WingetQuarantineRecords',
+          'Write-WingetScopeSummary',
+          'Update-WingetPackages',
           'Set-BootUpdateClipboardText',
           'Stop-BootUpdateForManualAttention',
           'Write-BootUpdateRepairPlan'
@@ -70,7 +73,7 @@ BeforeAll {
     function Write-Log { param([string]$Message, [string]$Level, [string]$Visibility) }
     function Set-BootUpdateState { param($State) }
     function Write-ProviderTranscript { param($Provider, $Scope, $Lines) }
-    function Invoke-PackageManagerWithTimeout { param($Name, $ScriptBlock, $ArgumentList, $IdleTimeoutMinutes, $HardTimeoutMinutes, $Status, $IncompleteRebootExitCodes) }
+    function Invoke-PackageManagerWithTimeout { param($Name, $ScriptBlock, $ArgumentList, $IdleTimeoutMinutes, $HardTimeoutMinutes, $Status, $IncompleteRebootExitCodes, [switch]$DeferExitCodeReporting) }
     function Write-EventLogEntry { param($EventId, $EntryType, $Message) }
     function Send-CompletionNotification { param($Kind, $Title, $Message) }
     function Enable-BootUpdateNtfsCompression { param($Path) }
@@ -150,14 +153,90 @@ Describe 'Concise provider diagnostics' {
         $summary = Get-WingetOutputSummary -Lines $lines
         $summary.Attempted | Should -Be 4
         $summary.Updated | Should -Be 1
-        $summary.Failures.Count | Should -Be 3
-        $summary.Failures[0].Id | Should -Be 'JohnMacFarlane.Pandoc'
-        $summary.Failures[0].Summary | Should -Be 'product is not currently installed'
-        $summary.Failures[1].Summary | Should -Be 'installation source is unavailable'
-        $summary.Failures[2].Hex | Should -Be '0xC000041D'
+        $summary.Failures.Count | Should -Be 2
+        $summary.StaleAbsent.Count | Should -Be 1
+        $summary.StaleAbsent[0].Id | Should -Be 'JohnMacFarlane.Pandoc'
+        $summary.StaleAbsent[0].Summary | Should -Be 'product is not currently installed'
+        $summary.Failures[0].Summary | Should -Be 'installation source is unavailable'
+        $summary.Failures[1].Hex | Should -Be '0xC000041D'
         $summary.Pinned | Should -Be 1
         $summary.Unknown | Should -Be 4
         $summary.TechnologyBlocked | Should -Be 1
+    }
+
+    It 'reconciles a fully-accounted MSI 1605 aggregate result and offers immediate choices' {
+        $script:CurrentWingetFailures = [Collections.Generic.List[object]]::new()
+        Mock Write-ProviderTranscript { }
+        Mock Write-Log { }
+        $lines = @(
+            '(1/2) Found Example App [Example.App] Version 2.0',
+            'Successfully installed',
+            '(2/2) Found Windows PC Health Check [Microsoft.WindowsPCHealthCheck] Version 4.0',
+            'Uninstall failed with exit code: 1605'
+        )
+
+        $summary = Write-WingetScopeSummary -Scope machine -Lines $lines -ExitCode -1978335188
+
+        $summary.ExitReconciled | Should -BeTrue
+        $summary.Failures | Should -BeNullOrEmpty
+        $summary.StaleAbsent.Count | Should -Be 1
+        $script:CurrentWingetFailures.Count | Should -Be 0
+        Should -Invoke Write-Log -ParameterFilter { $Message -match '^\[STALE\].*incomplete uninstall record' }
+        Should -Invoke Write-Log -ParameterFilter { $Message -match '^\[OK\].*will not fail.*automatic pass' }
+        Should -Invoke Write-Log -ParameterFilter { $Message -match '^\[install\].*winget install --id Microsoft\.WindowsPCHealthCheck' }
+        Should -Invoke Write-Log -ParameterFilter { $Message -match '^\[remove\].*support\.microsoft\.com' }
+        Should -Invoke Write-Log -ParameterFilter { $Message -match '^\[suppress\].*winget pin add --id Microsoft\.WindowsPCHealthCheck' }
+        Should -Invoke Write-Log -Times 0 -ParameterFilter { $Message -match 'partial failure, retry required' }
+    }
+
+    It 'does not reconcile 1605 when another attempted package is unaccounted for' {
+        $summary = Get-WingetOutputSummary -Lines @(
+            '(1/2) Found Windows PC Health Check [Microsoft.WindowsPCHealthCheck] Version 4.0',
+            'Uninstall failed with exit code: 1605'
+        )
+        Test-WingetExitReconciled -Summary $summary -ExitCode -1978335188 | Should -BeFalse
+    }
+
+    It 'defers generic Winget exit warnings until structured output is classified' {
+        $adapter = Get-FunctionText $invokeAst 'Invoke-PackageManagerWithTimeout'
+        $winget = Get-FunctionText $invokeAst 'Update-WingetPackages'
+        $adapter | Should -Match 'DeferExitCodeReporting'
+        $adapter | Should -Match '\$failed -and -not \$DeferExitCodeReporting'
+        ([regex]::Matches($winget, '-DeferExitCodeReporting')).Count | Should -BeGreaterOrEqual 5
+    }
+
+    It 'completes the Winget phase when MSI 1605 is the only aggregate exception' {
+        $script:PackageTimeoutMinutes = 30
+        $script:ExcludePatterns = @()
+        $script:IncludePatterns = @()
+        $script:AggressiveRepair = $false
+        $script:CurrentState = [pscustomobject]@{}
+        $script:InstallDir = $TestDrive
+        Mock Get-Command { [pscustomobject]@{ Source='C:\Program Files\WindowsApps\winget.exe' } } -ParameterFilter { $Name -eq 'winget' }
+        Mock Write-ProviderTranscript { }
+        Mock Write-Log { }
+        Mock Invoke-PackageManagerWithTimeout {
+            if ($Name -match 'machine') {
+                return @{
+                    Output=@(
+                        '(1/2) Found Example App [Example.App] Version 2.0',
+                        'Successfully installed',
+                        '(2/2) Found Windows PC Health Check [Microsoft.WindowsPCHealthCheck] Version 4.0',
+                        'Uninstall failed with exit code: 1605'
+                    )
+                    TimedOut=$false; Failed=$true; ExitCode=-1978335188; RebootRequired=$false
+                }
+            }
+            return @{ Output=@('No installed package found matching input criteria'); TimedOut=$false; Failed=$false; ExitCode=0; RebootRequired=$false }
+        }
+
+        $result = Update-WingetPackages -Confirm:$false
+
+        $result.Success | Should -BeTrue
+        $result.Count | Should -Be 1
+        $result.TerminalFailure | Should -BeFalse
+        $script:CurrentWingetFailures | Should -BeNullOrEmpty
+        Should -Invoke Invoke-PackageManagerWithTimeout -Times 2 -ParameterFilter { $DeferExitCodeReporting }
     }
 
     It 'recognizes restart-application success and hexadecimal installer failures' {

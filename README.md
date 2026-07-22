@@ -217,7 +217,7 @@ has exited**. It verifies the installer against the hash embedded below, then th
 verifies and transactionally replaces the complete release bundle before forwarding `aws`:
 
 ```powershell
-$u='https://github.com/nanoDBA/boot-upd/releases/download/v2.5.63/Install-UpdCompat.ps1'; $f=Join-Path $env:TEMP 'Install-UpdCompat-v2.5.63.ps1'; Invoke-WebRequest $u -OutFile $f; if((Get-FileHash $f -Algorithm SHA256).Hash -ne '67662B3B02252FF6DE045FCDF28FB74D8DEB6FDA8080C46B1DAFC7BFBE54ABE3'){throw 'Compatibility installer hash mismatch'}; & $f -CommandArguments aws
+$u='https://github.com/nanoDBA/boot-upd/releases/download/v2.5.64/Install-UpdCompat.ps1'; $f=Join-Path $env:TEMP 'Install-UpdCompat-v2.5.64.ps1'; Invoke-WebRequest $u -OutFile $f; if((Get-FileHash $f -Algorithm SHA256).Hash -ne '67662B3B02252FF6DE045FCDF28FB74D8DEB6FDA8080C46B1DAFC7BFBE54ABE3'){throw 'Compatibility installer hash mismatch'}; & $f -CommandArguments aws
 ```
 
 This is the one-time chicken-and-egg escape hatch. It resolves the first `upd.cmd` on PATH,
@@ -397,6 +397,22 @@ upd uq               # remove all recorded blocking pins
 ```
 
 Records are removed only after Winget confirms that the corresponding pin was removed.
+
+When Winget reports MSI error `1605`, the application is already absent but Windows still has
+incomplete uninstall inventory. boot-upd does not count that as an update, fail the phase, or queue
+another pass. It immediately displays three choices:
+
+```powershell
+# The application is wanted: reconstruct its installation
+winget install --id Package.Id -e --source winget --force --accept-source-agreements --accept-package-agreements
+
+# Temporary, reversible silence while leaving the stale inventory untouched
+winget pin add --id Package.Id -e --blocking --force
+```
+
+If removal was intentional, use [Microsoft's Program Install and Uninstall troubleshooter](https://support.microsoft.com/en-us/windows/deployment/install-upgrade/fix-problems-that-block-programs-from-being-installed-or-removed)
+to clean corrupt registry keys or incomplete uninstall data. A blocking pin suppresses the symptom;
+the troubleshooter addresses the stale Windows inventory.
 
 ### More monitoring
 
