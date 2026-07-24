@@ -987,6 +987,7 @@ function Get-WingetOutputSummary {
     $currentVersion = ''
     $failures = [Collections.Generic.List[object]]::new()
     $staleAbsent = [Collections.Generic.List[object]]::new()
+    $scopeBlocked = [Collections.Generic.List[object]]::new()
     $successfulIds = [Collections.Generic.List[string]]::new()
     foreach ($rawLine in $Lines) {
         # Winget may indent records or leave ANSI/VT control sequences even with
@@ -1011,6 +1012,12 @@ function Get-WingetOutputSummary {
             }
             if ($code -eq 1605) { $staleAbsent.Add($record) }
             else { $failures.Add($record) }
+        } elseif ($line -match '^The package installed for user scope cannot be uninstalled when running with administrator privileges') {
+            <# Elevated Winget definitionally cannot replace a user-scope (portable)
+               package; retrying from the same elevated context can never succeed. #>
+            $scopeBlocked.Add([pscustomobject]@{
+                Name=$currentName; Id=$currentId; ObservedVersion=$currentVersion
+            })
         } elseif ($line -match '^(\d+) package\(s\) have pins') {
             $pinned = [int]$Matches[1]
         } elseif ($line -match '^(\d+) package\(s\) have version numbers that cannot be determined') {
@@ -1025,9 +1032,11 @@ function Get-WingetOutputSummary {
         Attempted=$attempted; Updated=$updated; Pinned=$pinned; Unknown=$unknown
         TechnologyBlocked=$technologyBlocked; NoApplicable=$noApplicable; Failures=$failures.ToArray()
         StaleAbsent=$staleAbsent.ToArray()
+        ScopeBlocked=$scopeBlocked.ToArray()
         SuccessfulIds=$successfulIds.ToArray()
         Recognized=($attempted -gt 0 -or $updated -gt 0 -or $pinned -gt 0 -or $unknown -gt 0 -or
-            $technologyBlocked -gt 0 -or $noApplicable -or $failures.Count -gt 0 -or $staleAbsent.Count -gt 0)
+            $technologyBlocked -gt 0 -or $noApplicable -or $failures.Count -gt 0 -or $staleAbsent.Count -gt 0 -or
+            $scopeBlocked.Count -gt 0)
     }
 }
 
@@ -1037,10 +1046,16 @@ function Test-WingetExitReconciled {
         [AllowNull()][object]$ExitCode
     )
     if ($null -eq $ExitCode -or [long]$ExitCode -ne -1978335188L) { return $false }
+    <# Reconcile the aggregate upgrade-had-failures code only when structured output
+       accounts for every attempted package as verified success, MSI 1605 verified
+       absence, or a user-scope package that elevated Winget definitionally cannot
+       replace. Anything unaccounted keeps the exit code as failure evidence. #>
     $staleCount = @($Summary.StaleAbsent).Count
-    return ($staleCount -gt 0 -and @($Summary.Failures).Count -eq 0 -and
+    $scopeBlockedCount = @($Summary.ScopeBlocked).Count
+    $accounted = $staleCount + $scopeBlockedCount
+    return ($accounted -gt 0 -and @($Summary.Failures).Count -eq 0 -and
         [int]$Summary.Attempted -gt 0 -and
-        ([int]$Summary.Updated + $staleCount) -ge [int]$Summary.Attempted)
+        ([int]$Summary.Updated + $accounted) -ge [int]$Summary.Attempted)
 }
 
 function Get-WingetRemediationCommand {
@@ -1370,7 +1385,8 @@ function Write-WingetScopeSummary {
     } elseif ($summary.Recognized) {
         $level = if ($summary.Failures.Count -gt 0) { 'Warn' } else { 'Info' }
         $staleSuffix = if ($stalePresentation.Unresolved) { ", $($stalePresentation.Unresolved) stale record(s) need attention" } else { '' }
-        Write-Log "Winget ${Scope}: $($summary.Attempted) attempted, $($summary.Updated) updated, $($summary.Failures.Count) failed$staleSuffix." -Level $level
+        $blockedSuffix = if ($summary.ScopeBlocked.Count) { ", $($summary.ScopeBlocked.Count) blocked by elevation scope" } else { '' }
+        Write-Log "Winget ${Scope}: $($summary.Attempted) attempted, $($summary.Updated) updated, $($summary.Failures.Count) failed$staleSuffix$blockedSuffix." -Level $level
     } else {
         Write-Log "Winget ${Scope}: provider finished without recognizable English summary output; raw transcript retained for verification." -Level Warn
     }
@@ -1378,10 +1394,19 @@ function Write-WingetScopeSummary {
         $identity = if ($failure.Id) { "$($failure.Name) [$($failure.Id)]" } else { $failure.Name }
         Write-Log "Winget ${Scope}: $identity failed — $($failure.Summary) ($($failure.Code), $($failure.Hex))." -Level Warn
     }
+    foreach ($blocked in $summary.ScopeBlocked) {
+        $identity = if ($blocked.Id) { "$($blocked.Name) [$($blocked.Id)]" } else { [string]$blocked.Name }
+        Write-Log "[BLOCKED] $identity is installed user-scope; elevated Winget cannot replace it, so this run defers it rather than retrying." -Level Warn
+        if ($blocked.Id -match '^[A-Za-z0-9][A-Za-z0-9._+-]*$') {
+            Write-Log "[user] Upgrade from a normal non-elevated session: winget upgrade --id $($blocked.Id) -e --source winget --accept-source-agreements --accept-package-agreements" -Level Warn
+            Write-Log "[machine] Or reinstall machine-scope so elevated runs can manage it: winget install --id $($blocked.Id) -e --scope machine --source winget --accept-source-agreements --accept-package-agreements" -Level Warn
+        }
+    }
     $notes = @()
     if ($summary.Pinned) { $notes += "$($summary.Pinned) pinned" }
     if ($summary.Unknown) { $notes += "$($summary.Unknown) unknown-version" }
     if ($summary.TechnologyBlocked) { $notes += "$($summary.TechnologyBlocked) install-technology blocked" }
+    if ($summary.ScopeBlocked.Count) { $notes += "$($summary.ScopeBlocked.Count) elevation-scope blocked" }
     if ($notes.Count) { Write-Log "Winget ${Scope}: deferred inventory — $($notes -join ', ')." -Level Warn }
     if ($summary.Pinned) { Write-Log 'Winget suggested inspection: winget pin list' -Level Warn }
     if ($summary.Unknown -or $summary.TechnologyBlocked) {
@@ -3980,6 +4005,22 @@ function Update-ContainerImages {
     return @{ Success = (-not $failed); Count = $successfulPulls }
 }
 
+function Test-PipFatalInterpreterEvidence {
+    <# A Python whose standard library cannot load fails identically on every
+       invocation; no same-boot retry can succeed until the installation is
+       repaired. Match only interpreter-startup fatals, not package errors. #>
+    param([object[]]$Lines = @())
+    $pattern = 'Fatal Python error|Failed to import encodings module|Could not find platform independent libraries'
+    return @($Lines | Where-Object { [string]$_ -match $pattern }).Count -gt 0
+}
+
+function Get-PipInterpreterAttentionDetail {
+    return [pscustomobject]@{
+        Name='Python interpreter'; Id='python'; Code=1; Hex='fatal-startup'
+        Command='Repair or reinstall Python itself (its standard library failed to load); pip retries cannot succeed until then.'
+    }
+}
+
 function Update-PipPackages {
     [CmdletBinding(SupportsShouldProcess)]
     param()
@@ -3996,11 +4037,19 @@ function Update-PipPackages {
             -ArgumentList @($python.Source)
         $pipSelf.Output | ForEach-Object { Write-Log $_ }
         if ($pipSelf.Failed -or $pipSelf.TimedOut) { $failed = $true; Write-Log 'pip self-update failed or timed out; retry required.' -Level Error }
+        if ($pipSelf.Failed -and (Test-PipFatalInterpreterEvidence -Lines $pipSelf.Output)) {
+            Write-Log 'Pip: the Python interpreter itself failed to start (broken standard library). Same-boot retries cannot succeed; manual repair is required.' -Level Error
+            return @{ Success = $false; Count = 0; TerminalFailure = $true; AttentionDetails = @(Get-PipInterpreterAttentionDetail) }
+        }
         $listResult = Invoke-BootUpdateBackgroundOperation -Name 'Checking pip packages' `
             -Status 'pip package inventory is running' -TimeoutMinutes 5 `
             -ScriptBlock { param($Pip) & $Pip list --outdated --format=json 2>$null } `
             -ArgumentList @($pip.Source)
         if ($listResult.Failed -or $listResult.TimedOut) {
+            if (Test-PipFatalInterpreterEvidence -Lines $listResult.Output) {
+                Write-Log 'Pip: the Python interpreter itself failed to start (broken standard library). Same-boot retries cannot succeed; manual repair is required.' -Level Error
+                return @{ Success = $false; Count = 0; TerminalFailure = $true; AttentionDetails = @(Get-PipInterpreterAttentionDetail) }
+            }
             Write-Log 'pip package inventory failed or timed out.' -Level Error
             return @{ Success = $false; Count = 0 }
         }
@@ -6328,6 +6377,21 @@ function Invoke-BootUpdateCycle {
                 try {
                     & python -m pip install --upgrade pip 2>&1 | ForEach-Object { $log.Add($_.ToString()) }
                     if ($LASTEXITCODE -ne 0) { $success = $false; $log.Add("[Error] pip self-update exited with code $LASTEXITCODE") }
+                    <# Inline copy of Test-PipFatalInterpreterEvidence semantics (isolated runspace):
+                       a Python whose standard library cannot load fails identically on every
+                       invocation, so mark the phase terminal instead of queueing retries. #>
+                    $fatalPattern = 'Fatal Python error|Failed to import encodings module|Could not find platform independent libraries'
+                    if (-not $success -and @($log | Where-Object { $_ -match $fatalPattern }).Count -gt 0) {
+                        $log.Add('[Error] Pip: the Python interpreter itself failed to start (broken standard library). Same-boot retries cannot succeed; manual repair is required.')
+                        return @{
+                            Phase='Pip'; Success=$false; Count=$count; TerminalFailure=$true
+                            AttentionDetails=@([pscustomobject]@{
+                                Name='Python interpreter'; Id='python'; Code=1; Hex='fatal-startup'
+                                Command='Repair or reinstall Python itself (its standard library failed to load); pip retries cannot succeed until then.'
+                            })
+                            LogLines=$log.ToArray()
+                        }
+                    }
                     $outdated = @(& pip list --outdated --format=json 2>$null | ConvertFrom-Json -ErrorAction SilentlyContinue)
                     if ($LASTEXITCODE -ne 0) { $success = $false; $log.Add("[Error] pip inventory exited with code $LASTEXITCODE") }
                     foreach ($pkg in $outdated) {
@@ -6655,6 +6719,10 @@ function Invoke-BootUpdateCycle {
 
                 $replayedFailure = @($jr.LogLines | Where-Object { $_ -match '^\[Error\]|^\[Warn\].*(failed|timed out|timeout|error)' }).Count -gt 0
                 $phaseSucceeded = $jobState -eq 'Completed' -and [bool]$jr.Success -and (-not $replayedFailure)
+                <# Preserve terminal-failure classification from cohort phases so the
+                   completion disposition can stop retrying an unrecoverable failure. #>
+                $phaseDefn.TerminalFailure = [bool]$jr.TerminalFailure
+                $phaseDefn.AttentionDetails = @($jr.AttentionDetails)
                 $state.($phaseDefn.Flag) = $phaseSucceeded
                 if ($phaseDefn.Key -and $jr.Count) {
                     $state.Summary.($phaseDefn.Key) += $jr.Count

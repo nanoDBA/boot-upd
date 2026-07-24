@@ -68,6 +68,9 @@ BeforeAll {
           'Resolve-WingetStaleAbsentPresentation',
           'Write-WingetScopeSummary',
           'Update-WingetPackages',
+          'Test-PipFatalInterpreterEvidence',
+          'Get-PipInterpreterAttentionDetail',
+          'Update-PipPackages',
           'Set-BootUpdateClipboardText',
           'Stop-BootUpdateForManualAttention',
           'Write-BootUpdateRepairPlan'
@@ -337,6 +340,78 @@ Describe 'Concise provider diagnostics' {
         $summary.Failures[0].Id | Should -Be 'Example.System'
         $summary.Failures[0].Code | Should -Be 2147942405
         $summary.Failures[0].Summary | Should -Be 'access is denied'
+    }
+
+    It 'classifies an elevated user-scope upgrade block as scope-blocked, not a failure' {
+        $summary = Get-WingetOutputSummary -Lines @(
+            '(1/1) Found Syncthing [Syncthing.Syncthing] Version 2.1.2',
+            'Successfully verified installer hash',
+            'Extracting archive...',
+            'Successfully extracted archive',
+            'The package installed for user scope cannot be uninstalled when running with administrator privileges.'
+        )
+
+        $summary.Attempted | Should -Be 1
+        $summary.Updated | Should -Be 0
+        $summary.Failures | Should -BeNullOrEmpty
+        $summary.ScopeBlocked.Count | Should -Be 1
+        $summary.ScopeBlocked[0].Id | Should -Be 'Syncthing.Syncthing'
+        $summary.ScopeBlocked[0].ObservedVersion | Should -Be '2.1.2'
+        $summary.Recognized | Should -BeTrue
+    }
+
+    It 'reconciles the aggregate exit when every attempted package is scope-blocked' {
+        $summary = Get-WingetOutputSummary -Lines @(
+            '(1/1) Found Syncthing [Syncthing.Syncthing] Version 2.1.2',
+            'The package installed for user scope cannot be uninstalled when running with administrator privileges.'
+        )
+        Test-WingetExitReconciled -Summary $summary -ExitCode -1978335188 | Should -BeTrue
+    }
+
+    It 'does not reconcile when a scope-blocked package coexists with an unaccounted failure' {
+        $summary = Get-WingetOutputSummary -Lines @(
+            '(1/2) Found Syncthing [Syncthing.Syncthing] Version 2.1.2',
+            'The package installed for user scope cannot be uninstalled when running with administrator privileges.',
+            '(2/2) Found Example App [Example.App] Version 2.0',
+            'Installer failed with exit code: 1603'
+        )
+        Test-WingetExitReconciled -Summary $summary -ExitCode -1978335188 | Should -BeFalse
+    }
+
+    It 'logs scope-blocked remediation without queueing a retry' {
+        $script:CurrentWingetFailures = [Collections.Generic.List[object]]::new()
+        $script:WingetResolvedAbsentPath = Join-Path $TestDrive 'resolved-absent-scope-blocked.json'
+        Mock Write-ProviderTranscript { }
+        Mock Write-Log { }
+        $lines = @(
+            '(1/1) Found Syncthing [Syncthing.Syncthing] Version 2.1.2',
+            'The package installed for user scope cannot be uninstalled when running with administrator privileges.'
+        )
+
+        $summary = Write-WingetScopeSummary -Scope user -Lines $lines -ExitCode -1978335188
+
+        $summary.ExitReconciled | Should -BeTrue
+        $script:CurrentWingetFailures.Count | Should -Be 0
+        Should -Invoke Write-Log -Times 1 -Exactly -ParameterFilter { $Message -match '^\[BLOCKED\].*user-scope.*defers it rather than retrying' }
+        Should -Invoke Write-Log -Times 1 -Exactly -ParameterFilter { $Message -match '^\[user\] Upgrade from a normal non-elevated session: winget upgrade --id Syncthing\.Syncthing' }
+        Should -Invoke Write-Log -Times 1 -Exactly -ParameterFilter { $Message -match '^\[machine\] Or reinstall machine-scope.*--scope machine' }
+        Should -Invoke Write-Log -Times 0 -ParameterFilter { $Message -match 'partial failure, retry required' }
+    }
+
+    It 'withholds remediation commands for scope-blocked packages with unsafe identifiers' {
+        $script:CurrentWingetFailures = [Collections.Generic.List[object]]::new()
+        $script:WingetResolvedAbsentPath = Join-Path $TestDrive 'resolved-absent-unsafe-id.json'
+        Mock Write-ProviderTranscript { }
+        Mock Write-Log { }
+        $lines = @(
+            '(1/1) Found Weird App [Weird&App;Id] Version 1.0',
+            'The package installed for user scope cannot be uninstalled when running with administrator privileges.'
+        )
+
+        $null = Write-WingetScopeSummary -Scope user -Lines $lines -ExitCode -1978335188
+
+        Should -Invoke Write-Log -Times 1 -Exactly -ParameterFilter { $Message -match '^\[BLOCKED\]' }
+        Should -Invoke Write-Log -Times 0 -Exactly -ParameterFilter { $Message -match '^\[(user|machine)\]' }
     }
 
     It 'uses targeted machine inventory to avoid retrying a user-scope success' {
@@ -1100,6 +1175,76 @@ Describe 'Behavioral completion disposition' {
 
     It 'completes only an empty incomplete set' {
         (Resolve-BootUpdateCompletionDisposition).Kind | Should -Be 'Complete'
+    }
+}
+
+Describe 'Terminal pip interpreter failure' {
+    It 'recognizes fatal interpreter-startup evidence and ignores ordinary pip errors' {
+        Test-PipFatalInterpreterEvidence -Lines @(
+            'Could not find platform independent libraries <prefix>'
+        ) | Should -BeTrue
+        Test-PipFatalInterpreterEvidence -Lines @(
+            'Fatal Python error: Failed to import encodings module'
+        ) | Should -BeTrue
+        Test-PipFatalInterpreterEvidence -Lines @(
+            'ERROR: Could not install packages due to an OSError: [Errno 13] Permission denied',
+            'WARNING: Retrying (Retry(total=4)) after connection broken'
+        ) | Should -BeFalse
+        Test-PipFatalInterpreterEvidence | Should -BeFalse
+    }
+
+    It 'classifies a broken interpreter as terminal instead of queueing retries' {
+        Mock Write-Log { }
+        Mock Get-Command { [pscustomobject]@{ Source='C:\Path\To\Scripts\pip.exe' } } -ParameterFilter { $Name -eq 'pip' }
+        Mock Get-Command { [pscustomobject]@{ Source='C:\Path\To\python.exe' } } -ParameterFilter { $Name -eq 'python' }
+        Mock Invoke-BootUpdateBackgroundOperation {
+            @{ Failed=$true; TimedOut=$false; Output=@(
+                'Could not find platform independent libraries <prefix>',
+                'Fatal Python error: Failed to import encodings module'
+            ) }
+        }
+        $script:PackageTimeoutMinutes = 30
+
+        $result = Update-PipPackages -Confirm:$false
+
+        $result.Success | Should -BeFalse
+        $result.TerminalFailure | Should -BeTrue
+        @($result.AttentionDetails).Count | Should -Be 1
+        $result.AttentionDetails[0].Name | Should -Be 'Python interpreter'
+        $result.AttentionDetails[0].Command | Should -Match 'Repair or reinstall Python'
+        Should -Invoke Invoke-BootUpdateBackgroundOperation -Times 1 -Exactly
+    }
+
+    It 'keeps an ordinary pip inventory failure retryable' {
+        Mock Write-Log { }
+        Mock Get-Command { [pscustomobject]@{ Source='C:\Path\To\Scripts\pip.exe' } } -ParameterFilter { $Name -eq 'pip' }
+        Mock Get-Command { [pscustomobject]@{ Source='C:\Path\To\python.exe' } } -ParameterFilter { $Name -eq 'python' }
+        Mock Invoke-BootUpdateBackgroundOperation {
+            if ($Name -eq 'Updating pip') { return @{ Failed=$false; TimedOut=$false; Output=@('Requirement already satisfied: pip') } }
+            @{ Failed=$true; TimedOut=$false; Output=@('WARNING: Retrying (Retry(total=4)) after connection broken') }
+        }
+        $script:PackageTimeoutMinutes = 30
+
+        $result = Update-PipPackages -Confirm:$false
+
+        $result.Success | Should -BeFalse
+        [bool]$result.TerminalFailure | Should -BeFalse
+    }
+
+    It 'keeps the cohort scriptblock evidence pattern aligned with the shared helper' {
+        $helper = Get-FunctionText $invokeAst 'Test-PipFatalInterpreterEvidence'
+        $helper -match "\`$pattern = '([^']+)'" | Should -BeTrue
+        $helperPattern = $Matches[1]
+        $invokeSource | Should -Match ([regex]::Escape("`$fatalPattern = '$helperPattern'"))
+    }
+
+    It 'propagates cohort terminal failures to the completion disposition' {
+        $invokeSource | Should -Match ([regex]::Escape('$phaseDefn.TerminalFailure = [bool]$jr.TerminalFailure'))
+        $invokeSource | Should -Match ([regex]::Escape('$phaseDefn.AttentionDetails = @($jr.AttentionDetails)'))
+        $result = Resolve-BootUpdateCompletionDisposition -IncompletePhases @(
+            @{ Name='Pip'; UserCompletionDeferred=$false; TerminalFailure=$true; AttentionDetails=@('Python interpreter') }
+        )
+        $result.Kind | Should -Be 'Attention'
     }
 }
 
