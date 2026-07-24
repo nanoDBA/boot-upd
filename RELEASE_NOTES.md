@@ -1,8 +1,20 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.66
-**Release Date:** 2026-07-22
+**Current Version:** v2.5.67
+**Release Date:** 2026-07-24
 **Status:** STABLE
+
+---
+
+## v2.5.67 (2026-07-24)
+
+### Permanent provider failures stop retrying instead of looping
+
+- Classifies a user-scope (portable) Winget package that elevated Winget definitionally cannot replace as scope-blocked deferred inventory. The aggregate `0x8A15002C` exit reconciles only when structured output accounts for every attempted package as verified success, MSI `1605`, or scope-blocked; anything unaccounted keeps the exit as failure evidence.
+- Logs one `[BLOCKED]` line per scope-blocked package with two remediation choices: upgrade from a normal non-elevated session, or reinstall machine-scope so elevated runs can manage it. Scope-blocked packages never count as verified updates and never queue retries.
+- Detects a Python interpreter whose standard library cannot load (`Fatal Python error`, missing `encodings` module, missing platform-independent libraries) in both pip paths and classifies the phase as a terminal failure with a repair-plan attention detail, because identical same-boot retries cannot succeed. Ordinary pip failures remain retryable.
+- Propagates terminal-failure classification from parallel-cohort phase results to the completion disposition; previously cohort classifications were dropped, so the manual-attention stop could never fire for cohort phases. A diagnosed 2026-07-20 session retried every two minutes for roughly ten hours on exactly these two permanent failures.
+- Validated against the sanitized 2026-07-24 diagnostic: a user-scope package failing under elevation every pass, and pip failing 308 times on a broken interpreter.
 
 ---
 
