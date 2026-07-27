@@ -51,6 +51,7 @@ BeforeAll {
         'Test-WindowsUpdateAssessmentRecord',
         'Test-WindowsUpdateAssessmentCache',
         'Test-WindowsUpdateZeroEvidence',
+        'Get-DefenderCommandPath',
         'Get-DefenderPlatformAttentionDetail',
         'Get-WindowsUpdateInstallOutputSummary',
         'Test-WindowsUpdateServiceReady',
@@ -1162,6 +1163,74 @@ Describe 'Jitter-tolerant boot session identity' {
         }
         Test-WindowsUpdateZeroEvidence -Evidence $evidence -BootSessionId '2026-07-27T10:23:53.9000000Z' -ScopeSignature 'scope-1' |
             Should -BeTrue
+    }
+}
+
+Describe 'Defender platform executable resolution' {
+    <# Live 2026-07-27 evidence, Windows Server 2016 (build 14393): the Program Files stub was
+       4.10.14393.4651 and failed every signature update with hr=0x8007007F, while the serviced
+       platform copy 4.18.26060.3008 returned exit 0 for the identical command. #>
+    BeforeAll {
+        <# Pester 5 runs It in a child scope that cannot see functions declared in the Describe
+           body; BeforeAll definitions are visible. #>
+        function New-FakePlatform {
+            param([string]$Name, [switch]$WithoutExecutable)
+            $dir = Join-Path $script:fakeProgramData "Microsoft\Windows Defender\Platform\$Name"
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+            if (-not $WithoutExecutable) { Set-Content -LiteralPath (Join-Path $dir 'MpCmdRun.exe') -Value 'platform' }
+            return $dir
+        }
+    }
+    BeforeEach {
+        $script:sandbox = Join-Path ([System.IO.Path]::GetTempPath()) ("defender-resolve-" + [guid]::NewGuid().ToString('N'))
+        $script:fakeProgramData = Join-Path $script:sandbox 'ProgramData'
+        $script:fakeProgramFiles = Join-Path $script:sandbox 'ProgramFiles'
+        $script:realProgramData = $env:ProgramData
+        $script:realProgramFiles = $env:ProgramFiles
+        $env:ProgramData = $script:fakeProgramData
+        $env:ProgramFiles = $script:fakeProgramFiles
+        $script:inboxPath = Join-Path $script:fakeProgramFiles 'Windows Defender\MpCmdRun.exe'
+        New-Item -ItemType Directory -Path (Split-Path $script:inboxPath -Parent) -Force | Out-Null
+        Set-Content -LiteralPath $script:inboxPath -Value 'stub'
+    }
+    AfterEach {
+        $env:ProgramData = $script:realProgramData
+        $env:ProgramFiles = $script:realProgramFiles
+        if (Test-Path -LiteralPath $script:sandbox) { Remove-Item -LiteralPath $script:sandbox -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'prefers the serviced platform copy over the frozen inbox stub' {
+        $expected = Join-Path (New-FakePlatform -Name '4.18.26060.3008-0') 'MpCmdRun.exe'
+        Get-DefenderCommandPath | Should -Be $expected
+    }
+
+    It 'orders platform directories as versions, not strings' {
+        <# A lexical sort puts 4.18.9000.1 above 4.18.26060.3008 and would reselect an old build. #>
+        $null = New-FakePlatform -Name '4.18.9000.1-0'
+        $null = New-FakePlatform -Name '4.18.26040.7-0'
+        $expected = Join-Path (New-FakePlatform -Name '4.18.26060.3008-0') 'MpCmdRun.exe'
+        Get-DefenderCommandPath | Should -Be $expected
+    }
+
+    It 'ignores a platform directory that has no executable' {
+        $null = New-FakePlatform -Name '4.18.26070.1-0' -WithoutExecutable
+        $expected = Join-Path (New-FakePlatform -Name '4.18.26060.3008-0') 'MpCmdRun.exe'
+        Get-DefenderCommandPath | Should -Be $expected
+    }
+
+    It 'ignores directory names that are not versions' {
+        $null = New-FakePlatform -Name 'backup-copy'
+        $expected = Join-Path (New-FakePlatform -Name '4.18.26060.3008-0') 'MpCmdRun.exe'
+        Get-DefenderCommandPath | Should -Be $expected
+    }
+
+    It 'falls back to the inbox stub when no serviced platform exists' {
+        Get-DefenderCommandPath | Should -Be $script:inboxPath
+    }
+
+    It 'reports nothing when Defender is absent entirely' {
+        Remove-Item -LiteralPath $script:inboxPath -Force
+        Get-DefenderCommandPath | Should -BeNullOrEmpty
     }
 }
 

@@ -348,7 +348,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 6 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.68' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.69' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 Set-Variable -Name 'RebootSignalSettleSeconds' -Value 20 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 $script:ExplicitRebootRequests = [System.Collections.Generic.List[object]]::new()
 $script:LastPendingFileRenameOperations = @()
@@ -3736,14 +3736,12 @@ function Update-DefenderSignatures {
         Write-Log 'Defender signature update: skipped (not Windows).'
         return @{ Success = $true; Count = 0 }
     }
-    <# The parallel-cohort Defender scriptblock repeats this literal: Start-ThreadJob runspaces
-       do not inherit this script's functions. Change both together. #>
-    $mpCmdRun = Join-Path $env:ProgramFiles 'Windows Defender\MpCmdRun.exe'
-    if (-not (Test-Path $mpCmdRun)) {
+    $mpCmdRun = Get-DefenderCommandPath
+    if ([string]::IsNullOrWhiteSpace($mpCmdRun)) {
         Write-Log 'Defender signature update: skipped (MpCmdRun.exe not found — Defender may be disabled or absent).' -Level Warn
         return @{ Success = $true; Count = 0 }
     }
-    Write-Log 'Updating Windows Defender signatures...'
+    Write-Log "Updating Windows Defender signatures via $mpCmdRun ..."
     if ($PSCmdlet.ShouldProcess('Windows Defender', 'MpCmdRun.exe -SignatureUpdate -MMPC')) {
         try {
             $result = Invoke-BootUpdateBackgroundOperation -Name 'Updating Defender signatures' `
@@ -4053,6 +4051,35 @@ function Test-PipFatalInterpreterEvidence {
     param([object[]]$Lines = @())
     $pattern = 'Fatal Python error|Failed to import encodings module|Could not find platform independent libraries'
     return @($Lines | Where-Object { [string]$_ -match $pattern }).Count -gt 0
+}
+
+function Get-DefenderCommandPath {
+    <# Defender ships two MpCmdRun.exe copies. The one under Program Files is the OS-inbox
+       stub and is frozen at the OS build's release version; the serviced platform under
+       ProgramData advances independently. On Windows Server 2016 / build 1607 the stub stays
+       at 4.10.14393.x while the platform reaches 4.18.26060.x, and driving that engine through
+       the stub cannot bind an export — every signature update fails with hr=0x8007007F while
+       the platform copy succeeds. Prefer the newest serviced platform, fall back to the stub.
+
+       Directory names are '<version>-<revision>' and MUST be ordered as versions, not strings:
+       '4.18.9000.1' sorts above '4.18.26060.3008' lexically and would reselect an old build. #>
+    $platformRoot = Join-Path $env:ProgramData 'Microsoft\Windows Defender\Platform'
+    if (Test-Path $platformRoot) {
+        $newest = Get-ChildItem -LiteralPath $platformRoot -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                $parsed = [version]'0.0.0.0'
+                if ([version]::TryParse((($_.Name -split '-')[0]), [ref]$parsed)) {
+                    [pscustomobject]@{ Version = $parsed; Path = (Join-Path $_.FullName 'MpCmdRun.exe') }
+                }
+            } |
+            Where-Object { $_ -and (Test-Path -LiteralPath $_.Path) } |
+            Sort-Object Version -Descending |
+            Select-Object -First 1
+        if ($newest) { return $newest.Path }
+    }
+    $inbox = Join-Path $env:ProgramFiles 'Windows Defender\MpCmdRun.exe'
+    if (Test-Path -LiteralPath $inbox) { return $inbox }
+    return $null
 }
 
 function Get-DefenderPlatformAttentionDetail {
@@ -6563,14 +6590,16 @@ function Invoke-BootUpdateCycle {
             }
 
             $defenderSb = {
-                param($IsWhatIf)
+                param($IsWhatIf, $MpCmdRunPath)
                 <# Process-based (MpCmdRun.exe) rather than Update-MpSignature: the Defender
                    PS module rides Windows PowerShell compat remoting, which is not safe to
-                   share across ThreadJob runspaces. A requested refresh failure stays pending. #>
+                   share across ThreadJob runspaces. A requested refresh failure stays pending.
+                   The executable is resolved by Get-DefenderCommandPath on the parent thread
+                   and passed in: ThreadJob runspaces do not inherit this script's functions. #>
                 $log = [System.Collections.Generic.List[string]]::new()
-                $mpCmdRun = Join-Path $env:ProgramFiles 'Windows Defender\MpCmdRun.exe'
-                if (-not (Test-Path $mpCmdRun)) { $log.Add('[Warn] Defender skipped: MpCmdRun.exe not found (Defender may be disabled or absent).'); return @{ Phase='Defender'; Success=$true; Count=0; LogLines=$log.ToArray() } }
-                $log.Add('Updating Windows Defender signatures...')
+                $mpCmdRun = $MpCmdRunPath
+                if ([string]::IsNullOrWhiteSpace($mpCmdRun) -or -not (Test-Path -LiteralPath $mpCmdRun)) { $log.Add('[Warn] Defender skipped: MpCmdRun.exe not found (Defender may be disabled or absent).'); return @{ Phase='Defender'; Success=$true; Count=0; LogLines=$log.ToArray() } }
+                $log.Add("Updating Windows Defender signatures via $mpCmdRun ...")
                 if ($IsWhatIf) {
                     $log.Add('  [WHATIF] Would run: MpCmdRun.exe -SignatureUpdate -MMPC')
                     return @{ Phase='Defender'; Success=$true; Count=0; LogLines=$log.ToArray() }
@@ -6728,7 +6757,7 @@ function Invoke-BootUpdateCycle {
                     'Scoop'             { Start-ThreadJob -ScriptBlock $scoopSb     -ArgumentList $cohortWhatIf }
                     'DotnetTools'       { Start-ThreadJob -ScriptBlock $dotnetSb    -ArgumentList $cohortWhatIf }
                     'Vscode'            { Start-ThreadJob -ScriptBlock $vscodeSb    -ArgumentList $cohortWhatIf }
-                    'Defender'          { Start-ThreadJob -ScriptBlock $defenderSb  -ArgumentList $cohortWhatIf }
+                    'Defender'          { Start-ThreadJob -ScriptBlock $defenderSb  -ArgumentList $cohortWhatIf, (Get-DefenderCommandPath) }
                     'Office365'         { Start-ThreadJob -ScriptBlock $office365Sb -ArgumentList $cohortWhatIf }
                     'PowerShellModules' { Start-ThreadJob -ScriptBlock $psModulesSb -ArgumentList $cohortWhatIf, $script:PackageTimeoutMinutes }
                 }

@@ -1,8 +1,20 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.68
+**Current Version:** v2.5.69
 **Release Date:** 2026-07-27
 **Status:** STABLE
+
+---
+
+## v2.5.69 (2026-07-27)
+
+### Defender signature updates use the serviced platform, not the frozen inbox stub
+
+- Fixes the root cause of the `0x8007007F` Defender failures that v2.5.68 correctly stopped retrying. Windows ships two copies of `MpCmdRun.exe`: the one under `Program Files\Windows Defender` is the operating-system inbox stub and stays at the version the OS build shipped with, while the serviced platform under `%ProgramData%\Microsoft\Windows Defender\Platform` updates independently. The updater always invoked the inbox copy.
+- On Windows Server 2016 that stub is 4.10.14393.x while the serviced platform had reached 4.18.26060.3008. Driving a modern engine through a stub nine years older cannot resolve an expected export, which is exactly what `ERROR_PROC_NOT_FOUND` reports. The identical command run from the platform directory succeeded on the same machine.
+- Signature updates now resolve the newest serviced platform copy and fall back to the inbox stub only when no serviced platform is installed. Platform directories are ordered as versions rather than as strings, so a build such as 4.18.9000.1 cannot sort above 4.18.26060.3008.
+- The resolved executable path is now logged with the phase, so a future mismatch is visible without reproducing it.
+- The terminal classification added in v2.5.68 is unchanged: if `0x8007007F` still occurs with the correct platform binary, the platform really is broken and the cycle stops for manual attention rather than looping.
 
 ---
 
