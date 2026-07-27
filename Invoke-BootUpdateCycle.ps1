@@ -269,6 +269,9 @@ $script:PackageTimeoutMinutes = $PackageTimeoutMinutes
 $script:RebootDelaySec        = $RebootDelaySec
 $script:MaxIterations         = $MaxIterations
 $script:MaxRetryPasses        = $MaxRetryPasses
+<# Widest observed same-boot LastBootUpTime jitter, with headroom. Far below the
+   shortest realistic boot-to-boot interval, so it cannot mask a genuine restart. #>
+$script:BootSessionToleranceSeconds = 120
 $script:AggressiveRepair      = [bool]$AggressiveRepair
 $script:SkipPip               = $SkipPip
 $script:SkipNpm               = $SkipNpm
@@ -1430,12 +1433,35 @@ function Get-BootUpdateBootSessionId {
     }
 }
 
+function Test-BootUpdateSameBootSession {
+    <# LastBootUpTime is a derived value, not a stored constant: on VMs and on hosts that
+       resync the clock it jitters by seconds between reads inside a single boot. Compared
+       as an exact 100-ns string, that jitter reads as a fresh boot — which silently zeroes
+       the same-boot retry budget and invalidates same-boot Windows Update evidence, so a
+       permanently failing phase retries forever. Real boots are minutes apart at minimum,
+       so identity is a tolerance window, never string equality. #>
+    param(
+        [AllowNull()][string]$Left,
+        [AllowNull()][string]$Right,
+        [int]$ToleranceSeconds = ($script:BootSessionToleranceSeconds ?? 120)
+    )
+    if ([string]::IsNullOrWhiteSpace($Left) -or [string]::IsNullOrWhiteSpace($Right)) { return $false }
+    if ($Left -eq $Right) { return $true }
+    $leftTime = [datetimeoffset]::MinValue
+    $rightTime = [datetimeoffset]::MinValue
+    $styles = [System.Globalization.DateTimeStyles]::RoundtripKind
+    if (-not [datetimeoffset]::TryParse($Left, [cultureinfo]::InvariantCulture, $styles, [ref]$leftTime)) { return $false }
+    if (-not [datetimeoffset]::TryParse($Right, [cultureinfo]::InvariantCulture, $styles, [ref]$rightTime)) { return $false }
+    return ([math]::Abs(($leftTime - $rightTime).TotalSeconds) -le $ToleranceSeconds)
+}
+
 function Update-BootUpdateStateForBootSession {
     param(
         [Parameter(Mandatory)][pscustomobject]$State,
         [Parameter(Mandatory)][string]$CurrentBootSessionId
     )
-    if ($State.LastBootSessionId -and $State.LastBootSessionId -ne $CurrentBootSessionId) {
+    $sameSession = Test-BootUpdateSameBootSession -Left ([string]$State.LastBootSessionId) -Right $CurrentBootSessionId
+    if ($State.LastBootSessionId -and -not $sameSession) {
         if ($State.Phase -eq 'Rebooting' -or @($State.ExplicitRebootRequests).Count -gt 0) {
             $State.RebootCount = [int]$State.RebootCount + 1
         }
@@ -1444,7 +1470,9 @@ function Update-BootUpdateStateForBootSession {
         $State.ExplicitRebootRequests = @()
         if ($State.PSObject.Properties.Name -contains 'WindowsUpdateZeroEvidence') { $State.WindowsUpdateZeroEvidence = $null }
     }
-    $State.LastBootSessionId = $CurrentBootSessionId
+    <# Anchor on the first identity observed for this boot. Rewriting it on every same-boot
+       pass would let per-read jitter ratchet past the tolerance across a long recovery chain. #>
+    if (-not $State.LastBootSessionId -or -not $sameSession) { $State.LastBootSessionId = $CurrentBootSessionId }
     return $State
 }
 
@@ -3385,7 +3413,7 @@ function Test-WindowsUpdateZeroEvidence {
     if ($null -eq $Evidence) { return $false }
     $properties = $Evidence.PSObject.Properties.Name
     if (@('BootSessionId','ScopeSignature','Source') | Where-Object { $properties -notcontains $_ }) { return $false }
-    return ([string]$Evidence.BootSessionId -eq $BootSessionId -and
+    return ((Test-BootUpdateSameBootSession -Left ([string]$Evidence.BootSessionId) -Right $BootSessionId) -and
         [string]$Evidence.ScopeSignature -eq $ScopeSignature -and
         [string]$Evidence.Source -eq 'PSWindowsUpdate-post-search-zero')
 }
@@ -3708,6 +3736,8 @@ function Update-DefenderSignatures {
         Write-Log 'Defender signature update: skipped (not Windows).'
         return @{ Success = $true; Count = 0 }
     }
+    <# The parallel-cohort Defender scriptblock repeats this literal: Start-ThreadJob runspaces
+       do not inherit this script's functions. Change both together. #>
     $mpCmdRun = Join-Path $env:ProgramFiles 'Windows Defender\MpCmdRun.exe'
     if (-not (Test-Path $mpCmdRun)) {
         Write-Log 'Defender signature update: skipped (MpCmdRun.exe not found — Defender may be disabled or absent).' -Level Warn
@@ -3724,11 +3754,22 @@ function Update-DefenderSignatures {
                     "BOOTUPDATE_EXIT|$LASTEXITCODE"
                 } -ArgumentList @($mpCmdRun)
             $exitCode = -1
+            $platformFailure = $false
             foreach ($line in $result.Output) {
                 if ($line -match '^BOOTUPDATE_EXIT\|(-?\d+)$') { $exitCode = [int]$Matches[1]; continue }
+                if ($line -match '(?i)hr\s*=\s*0?x?8007007F') { $platformFailure = $true }
                 Write-Log $line.ToString()
             }
             if ($result.Failed -or $result.TimedOut -or $exitCode -ne 0) {
+                <# See the cohort Defender scriptblock: 0x8007007F is a broken Defender
+                   platform install, identical on every same-boot invocation. #>
+                if ($platformFailure) {
+                    Write-Log 'Defender platform is broken (hr=0x8007007F, ERROR_PROC_NOT_FOUND); no same-boot retry can fix this.' -Level Error
+                    return @{
+                        Success = $false; Count = 0; TerminalFailure = $true
+                        AttentionDetails = @(Get-DefenderPlatformAttentionDetail)
+                    }
+                }
                 throw "Defender signature process failed, timed out, or exited with code $exitCode."
             }
             Write-Log 'Defender signatures updated.'
@@ -4012,6 +4053,13 @@ function Test-PipFatalInterpreterEvidence {
     param([object[]]$Lines = @())
     $pattern = 'Fatal Python error|Failed to import encodings module|Could not find platform independent libraries'
     return @($Lines | Where-Object { [string]$_ -match $pattern }).Count -gt 0
+}
+
+function Get-DefenderPlatformAttentionDetail {
+    return [pscustomobject]@{
+        Name='Windows Defender platform'; Id='defender-platform'; Code=2; Hex='0x8007007F'
+        Command='Repair the Defender platform: run "MpCmdRun.exe -RemoveDefinitions -All" then reinstall the platform update (or run "sfc /scannow" / "DISM /Online /Cleanup-Image /RestoreHealth"). Signature retries cannot succeed until then.'
+    }
 }
 
 function Get-PipInterpreterAttentionDetail {
@@ -5937,7 +5985,9 @@ function Invoke-BootUpdateCycle {
     $currentBootSessionId = Get-BootUpdateBootSessionId
     $priorBootSessionId = $state.LastBootSessionId
     $state = Update-BootUpdateStateForBootSession -State $state -CurrentBootSessionId $currentBootSessionId
-    if ($priorBootSessionId -and $priorBootSessionId -ne $currentBootSessionId) { Write-Log "Observed a new Windows boot session; completed reboot count is now $($state.RebootCount)." -Visibility Verbose }
+    if ($priorBootSessionId -and -not (Test-BootUpdateSameBootSession -Left $priorBootSessionId -Right $currentBootSessionId)) {
+        Write-Log "Observed a new Windows boot session; completed reboot count is now $($state.RebootCount)." -Visibility Verbose
+    }
     $currentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
     if ($currentIdentity.User.Value -ne 'S-1-5-18') { $state.ResumeUser = $currentIdentity.Name }
     elseif (-not $state.ResumeUser) {
@@ -6525,14 +6575,31 @@ function Invoke-BootUpdateCycle {
                     $log.Add('  [WHATIF] Would run: MpCmdRun.exe -SignatureUpdate -MMPC')
                     return @{ Phase='Defender'; Success=$true; Count=0; LogLines=$log.ToArray() }
                 }
+                $output = [System.Collections.Generic.List[string]]::new()
                 try {
-                    & $mpCmdRun -SignatureUpdate -MMPC 2>&1 | ForEach-Object { $log.Add($_.ToString()) }
+                    & $mpCmdRun -SignatureUpdate -MMPC 2>&1 | ForEach-Object { $output.Add($_.ToString()); $log.Add($_.ToString()) }
                     if ($LASTEXITCODE -eq 0) {
                         $log.Add('Defender signatures updated.')
                         return @{ Phase='Defender'; Success=$true; Count=1; LogLines=$log.ToArray() }
                     }
                     $log.Add("[Error] Defender signature update exit code $LASTEXITCODE")
                 } catch { $log.Add("[Error] Defender signature update failed: $_") }
+                <# 0x8007007F is ERROR_PROC_NOT_FOUND: MpCmdRun.exe cannot bind an export in the
+                   Defender platform it loaded, so the platform install is broken or mismatched.
+                   That is not a content or network condition — every same-boot invocation fails
+                   identically. Classify it as terminal rather than feeding the retry loop. #>
+                $platformFailure = @($output | Where-Object { $_ -match '(?i)hr\s*=\s*0?x?8007007F' })
+                if ($platformFailure.Count -gt 0) {
+                    $log.Add('[Error] Defender platform is broken (hr=0x8007007F, ERROR_PROC_NOT_FOUND); no same-boot retry can fix this.')
+                    return @{
+                        Phase='Defender'; Success=$false; Count=0; TerminalFailure=$true
+                        AttentionDetails=@([pscustomobject]@{
+                            Name='Windows Defender platform'; Id='defender-platform'; Code=2; Hex='0x8007007F'
+                            Command='Repair the Defender platform: run "MpCmdRun.exe -RemoveDefinitions -All" then reinstall the platform update (or run "sfc /scannow" / "DISM /Online /Cleanup-Image /RestoreHealth"). Signature retries cannot succeed until then.'
+                        })
+                        LogLines=$log.ToArray()
+                    }
+                }
                 return @{ Phase='Defender'; Success=$false; Count=0; LogLines=$log.ToArray() }
             }
 

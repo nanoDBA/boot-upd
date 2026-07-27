@@ -27,6 +27,7 @@ BeforeAll {
     $invokeSource = Get-Content $invokePath -Raw
 
     foreach ($functionName in @(
+        'Test-BootUpdateSameBootSession',
         'Update-BootUpdateStateForBootSession',
         'Get-BootUpdateLaunchContract',
         'Test-PostUpdateHealth',
@@ -50,6 +51,7 @@ BeforeAll {
         'Test-WindowsUpdateAssessmentRecord',
         'Test-WindowsUpdateAssessmentCache',
         'Test-WindowsUpdateZeroEvidence',
+        'Get-DefenderPlatformAttentionDetail',
         'Get-WindowsUpdateInstallOutputSummary',
         'Test-WindowsUpdateServiceReady',
         'Test-WindowsUpdateConvergence',
@@ -1103,6 +1105,98 @@ Describe 'Behavioral reboot state transitions' {
         $actual = Update-BootUpdateStateForBootSession -State $state -CurrentBootSessionId 'boot-b'
         $actual.RebootCount | Should -Be 3
         $actual.ExplicitRebootRequests | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Jitter-tolerant boot session identity' {
+    <# Diagnostics 2026-07-27: LastBootUpTime drifted between reads inside one boot, so every
+       recovery pass logged a new boot session, zeroed ConsecutiveRetryCount, and the retry
+       limit never fired — six passes on a permanently failing Defender phase in 18 minutes. #>
+    It 'treats sub-tolerance LastBootUpTime drift as the same boot' {
+        Test-BootUpdateSameBootSession -Left '2026-07-27T10:23:51.4978530Z' -Right '2026-07-27T10:23:53.1120000Z' |
+            Should -BeTrue
+    }
+
+    It 'treats a genuine later boot as a new session' {
+        Test-BootUpdateSameBootSession -Left '2026-07-27T10:23:51.4978530Z' -Right '2026-07-27T10:31:02.0000000Z' |
+            Should -BeFalse
+    }
+
+    It 'preserves the same-boot retry budget across drifting passes' {
+        $state = [pscustomobject]@{
+            LastBootSessionId='2026-07-27T10:23:51.4978530Z'; Phase='RetryPending'
+            RebootCount=0; ExplicitRebootRequests=@(); ConsecutiveRetryCount=4
+        }
+        $actual = Update-BootUpdateStateForBootSession -State $state -CurrentBootSessionId '2026-07-27T10:23:52.8000000Z'
+        $actual.ConsecutiveRetryCount | Should -Be 4
+        $actual.RebootCount | Should -Be 0
+    }
+
+    It 'anchors on the first identity so drift cannot ratchet past the tolerance' {
+        $state = [pscustomobject]@{
+            LastBootSessionId='2026-07-27T10:23:51.0000000Z'; Phase='RetryPending'
+            RebootCount=0; ExplicitRebootRequests=@(); ConsecutiveRetryCount=1
+        }
+        foreach ($drifted in @('2026-07-27T10:24:40.0000000Z','2026-07-27T10:25:20.0000000Z','2026-07-27T10:25:45.0000000Z')) {
+            $state = Update-BootUpdateStateForBootSession -State $state -CurrentBootSessionId $drifted
+        }
+        $state.LastBootSessionId | Should -Be '2026-07-27T10:23:51.0000000Z'
+        $state.ConsecutiveRetryCount | Should -Be 1
+    }
+
+    It 'still resets the retry budget when the machine actually reboots' {
+        $state = [pscustomobject]@{
+            LastBootSessionId='2026-07-27T10:23:51.4978530Z'; Phase='Rebooting'
+            RebootCount=1; ExplicitRebootRequests=@('3010'); ConsecutiveRetryCount=4
+        }
+        $actual = Update-BootUpdateStateForBootSession -State $state -CurrentBootSessionId '2026-07-27T11:40:00.0000000Z'
+        $actual.ConsecutiveRetryCount | Should -Be 0
+        $actual.RebootCount | Should -Be 2
+        $actual.LastBootSessionId | Should -Be '2026-07-27T11:40:00.0000000Z'
+    }
+
+    It 'keeps same-boot Windows Update zero evidence valid under drift' {
+        $evidence = [pscustomobject]@{
+            BootSessionId='2026-07-27T10:23:51.4978530Z'; ScopeSignature='scope-1'
+            Source='PSWindowsUpdate-post-search-zero'
+        }
+        Test-WindowsUpdateZeroEvidence -Evidence $evidence -BootSessionId '2026-07-27T10:23:53.9000000Z' -ScopeSignature 'scope-1' |
+            Should -BeTrue
+    }
+}
+
+Describe 'Terminal Defender platform failure' {
+    <# hr=0x8007007F is ERROR_PROC_NOT_FOUND from a broken Defender platform install:
+       identical on every same-boot invocation, so it must not be retry fuel. #>
+    It 'stops for attention instead of retrying a broken Defender platform' {
+        $result = Resolve-BootUpdateCompletionDisposition -IncompletePhases @(
+            [pscustomobject]@{
+                Name='Defender'; UserCompletionDeferred=$false; TerminalFailure=$true
+                AttentionDetails=@(Get-DefenderPlatformAttentionDetail)
+            }
+        )
+        $result.Kind | Should -Be 'Attention'
+        $result.Phases[0].Name | Should -Be 'Defender'
+    }
+
+    It 'names the platform repair path in the attention detail' {
+        $detail = Get-DefenderPlatformAttentionDetail
+        $detail.Hex | Should -Be '0x8007007F'
+        $detail.Command | Should -Match 'RemoveDefinitions'
+    }
+
+    It 'classifies the observed MpCmdRun platform failure as terminal' {
+        $observed = @(
+            'Signature update started . . .'
+            'ERROR: Signature Update failed with hr=8007007F'
+            'CmdTool: Failed with hr = 0x8007007F. Check C:\path\MpCmdRun.log'
+        )
+        @($observed | Where-Object { $_ -match '(?i)hr\s*=\s*0?x?8007007F' }).Count | Should -BeGreaterThan 0
+    }
+
+    It 'leaves an ordinary Defender signature failure retryable' {
+        $observed = @('Signature update started . . .', 'ERROR: Signature Update failed with hr=80072EE2')
+        @($observed | Where-Object { $_ -match '(?i)hr\s*=\s*0?x?8007007F' }).Count | Should -Be 0
     }
 }
 
