@@ -1,8 +1,19 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.67
-**Release Date:** 2026-07-24
+**Current Version:** v2.5.68
+**Release Date:** 2026-07-27
 **Status:** STABLE
+
+---
+
+## v2.5.68 (2026-07-27)
+
+### The same-boot recovery limit now actually fires
+
+- Fixes an unbounded recovery loop: the updater compared boot-session identity as an exact string built from `Win32_OperatingSystem.LastBootUpTime`. That value is derived rather than stored and drifts by seconds between reads within a single boot on virtual machines and on hosts that resync the clock, so every recovery pass looked like a fresh boot, silently reset the same-boot failure streak, and the configured retry limit could never be reached. A diagnosed 2026-07-27 session ran six passes in eighteen minutes with no restart between them and no exit condition.
+- Boot-session identity is now a tolerance window rather than string equality, and the recorded identity anchors on the first value observed for that boot so per-read drift cannot accumulate past the tolerance across a long recovery chain. A genuine restart still resets the streak and still counts as a completed reboot.
+- Restores same-boot Windows Update evidence, which the same string comparison discarded: a full convergence scan was re-running on every pass.
+- Classifies a Defender signature update that fails with `hr=0x8007007F` (`ERROR_PROC_NOT_FOUND`) as a terminal failure in both the parallel-cohort and sequential paths. That code means the loaded Defender platform is broken rather than that content or the network was unavailable, so every same-boot invocation fails identically. The cycle now stops for manual attention with a platform-repair plan instead of queueing retries. Ordinary signature-update failures remain retryable.
 
 ---
 
