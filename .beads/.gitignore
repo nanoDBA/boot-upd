@@ -72,3 +72,6 @@ bd.db
 # Config files (metadata.json, config.yaml) are tracked by git by default
 # since no pattern above ignores them.
 metadata.json.pre-cutover
+
+# machine-local bd config (host/user/db); see bd dolt show
+metadata.json
