@@ -35,7 +35,7 @@ function Get-StoredGenericCredential {
     )
 
     try {
-        return [CredentialManagement.Store]::Load($Target)
+        return [CredentialManagement.Store]::Load($Target, [CredentialManagement.CredentialType]::Generic, $false)
     }
     catch {
         if ($_.Exception.InnerException.NativeErrorCode -eq 1168) {
