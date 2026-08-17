@@ -157,14 +157,61 @@ function Copy-BootUpdateDiagnosticSnapshot {
 
 function Get-BootUpdateDiagnosticActivity {
     param([Parameter(Mandatory)][string]$Text)
-    $completed = $Text -match '(?im)(?:boot update cycle|update cycle|cycle|run).*(?:completed|complete|finished|succeeded)|\bCOMPLETE(?: WITH [A-Z ]+)?\b'
-    $started = $Text -match '(?im)(?:boot update cycle|update cycle|cycle).*(?:started|resumed|running|in progress)|\bphase\b'
+    $completed = $Text -match '(?im)^\s*(?:\[[^\]]+\]\s*)*BOOT UPDATE CYCLE COMPLETE\b'
+    $started = $Text -match '(?im)^\s*(?:\[[^\]]+\]\s*)*BOOT UPDATE CYCLE (?:STARTED|RESUMED)\b'
     $active = if ($completed) { $false } elseif ($started) { $true } else { $null }
     $phase = $null
     $iteration = $null
-    if ($Text -match '(?im)\bphase\s*[:#]?\s*([A-Za-z][A-Za-z0-9 _-]{1,40})') { $phase = $Matches[1].Trim() }
-    if ($Text -match '(?im)\biteration\s*[:=]\s*(\d+)') { $iteration = [int]$Matches[1] }
+    $phaseMatches = [regex]::Matches(
+        $Text,
+        '(?im)^\s*(?:\[[^\]]+\]\s*)*(?:Current\s+)?Phase\s*[:#=]\s*(?<value>[A-Za-z][A-Za-z0-9 _-]{1,40})\s*$'
+    )
+    if ($phaseMatches.Count -gt 0) { $phase = $phaseMatches[$phaseMatches.Count - 1].Groups['value'].Value.Trim() }
+    $iterationMatches = [regex]::Matches(
+        $Text,
+        '(?im)(?:^|\|)\s*(?:\[[^\]]+\]\s*)*(?:Pass|Iteration)\s*[:=]\s*(?<value>\d+)\b'
+    )
+    if ($iterationMatches.Count -gt 0) { $iteration = [int]$iterationMatches[$iterationMatches.Count - 1].Groups['value'].Value }
     return [pscustomobject]@{ ActiveAtCapture=$active; Phase=$phase; Iteration=$iteration }
+}
+
+function Get-BootUpdateDiagnosticCleanupSummary {
+    param([Parameter(Mandatory)][string]$Text)
+    $contexts = [ordered]@{}
+    foreach ($line in ($Text -split '\r?\n')) {
+        if ($line -match '(?i)Pending-file cleanup \[(?<context>[^\]]+)\]:\s*(?<categories>[A-Za-z][A-Za-z0-9]*(?:\s*=\s*\d+)?(?:\s*,\s*[A-Za-z][A-Za-z0-9]*\s*=\s*\d+)*)') {
+            $context = $Matches['context'].Trim()
+            if (-not $contexts.Contains($context)) {
+                $contexts[$context] = [ordered]@{ Categories=[ordered]@{}; Fingerprints=@() }
+            }
+            foreach ($category in ($Matches['categories'] -split ',')) {
+                if ($category.Trim() -match '^(?<name>[A-Za-z][A-Za-z0-9]*)\s*=\s*(?<count>\d+)$') {
+                    $contexts[$context].Categories[$Matches['name']] = [int]$Matches['count']
+                }
+            }
+        }
+        if ($line -match '(?i)Pending-file cleanup detail \[(?<context>[^\]]+)\]:\s*id=(?<ids>[A-F0-9, ]+)') {
+            $context = $Matches['context'].Trim()
+            if (-not $contexts.Contains($context)) {
+                $contexts[$context] = [ordered]@{ Categories=[ordered]@{}; Fingerprints=@() }
+            }
+            $contexts[$context].Fingerprints = @($Matches['ids'] -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        }
+    }
+    $before = if ($contexts.Contains('before mutation')) { [pscustomobject]$contexts['before mutation'] } else { $null }
+    $after = if ($contexts.Contains('after updates')) { [pscustomobject]$contexts['after updates'] } else { $null }
+    $persistent = $null
+    if ($before -and $after) {
+        $beforeCategories = ($before.Categories.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ','
+        $afterCategories = ($after.Categories.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ','
+        $persistent = $beforeCategories -eq $afterCategories -and
+            (($before.Fingerprints | Sort-Object) -join ',') -eq (($after.Fingerprints | Sort-Object) -join ',')
+    }
+    return [pscustomobject]@{
+        BeforeMutation = $before
+        AfterUpdates = $after
+        Persistent = $persistent
+    }
 }
 
 function Assert-BootUpdateDiagnosticIsSanitized {
@@ -247,6 +294,7 @@ try {
     $activity = if ($coreText) { Get-BootUpdateDiagnosticActivity -Text $coreText } else {
         [pscustomobject]@{ ActiveAtCapture=$null; Phase=$null; Iteration=$null }
     }
+    $cleanupSummary = if ($coreText) { Get-BootUpdateDiagnosticCleanupSummary -Text $coreText } else { $null }
     $snapshotComplete = @($sourceRecords | Where-Object { -not $_.Stable }).Count -eq 0
     $captureState = if (-not $snapshotComplete) { 'unstable-snapshot' } elseif ($activity.ActiveAtCapture -eq $true) { 'active-at-capture' } elseif ($activity.ActiveAtCapture -eq $false) { 'completed' } else { 'unknown' }
     $sanitizedPath = Join-Path $stage 'BootUpdateCycle.sanitized.log'
@@ -260,6 +308,7 @@ try {
         ActiveAtCapture = $activity.ActiveAtCapture
         Phase = $activity.Phase
         Iteration = $activity.Iteration
+        PendingFileCleanup = $cleanupSummary
         SnapshotComplete = $snapshotComplete
         SourceFiles = @($sourceRecords)
         Warnings = @($warnings)

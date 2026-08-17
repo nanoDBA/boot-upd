@@ -1,10 +1,28 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.70
+**Current Version:** v2.5.71
 **Release Date:** 2026-08-17
 **Status:** STABLE
 
 ---
+
+## v2.5.71 (2026-08-17)
+
+Diagnostics and cleanup follow-up release.
+
+### Fixed
+
+- Tightened activity metadata parsing so only explicit cycle headers and `Pass:`/`Iteration:` markers set completion, active state, phase, and iteration. Prose such as `phase(s)` no longer produces false values such as `s ran`.
+- Added `PendingFileCleanup` evidence to exported diagnostics manifests. The manifest records before/after category counts, redacted fingerprints, and whether the same delete-only cleanup set persisted across the run.
+
+### Follow-up scope
+
+- Persistent `PackageManagementPrototypeCleanup` entries remain advisory and non-blocking. This release improves evidence for investigation without rewriting Windows' shared pending-file rename queue or forcing a reboot.
+
+### Validation
+
+- Diagnostics export and sanitization tests pass, including manifest wiring and persistent cleanup evidence.
+- Full local gates run without rebooting the host; the latest run's updater behavior remains unchanged.
 
 ## v2.5.70 (2026-08-17)
 
