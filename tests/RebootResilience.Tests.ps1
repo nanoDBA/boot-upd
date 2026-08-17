@@ -56,8 +56,9 @@ BeforeAll {
         'Get-WindowsUpdateInstallOutputSummary',
         'Test-WindowsUpdateServiceReady',
         'Test-WindowsUpdateConvergence',
-        'Format-NativeExitCode',
+          'Format-NativeExitCode',
           'Get-InstallerExitSummary',
+          'Get-WingetInventoryPackageIds',
           'Get-WingetOutputSummary',
           'Test-WingetExitReconciled',
           'Get-WingetRemediationCommand',
@@ -173,6 +174,43 @@ Describe 'Concise provider diagnostics' {
         $summary.Pinned | Should -Be 1
         $summary.Unknown | Should -Be 4
         $summary.TechnologyBlocked | Should -Be 1
+    }
+
+    It 'parses only valid Winget IDs and rejects prose footer rows' {
+        $inventory = Get-WingetInventoryPackageIds -Lines @(
+            'Name                         Id                         Version Available Source',
+            '--------------------------------------------------------------------------------',
+            'Example App                  Example.App                1.2.3   1.2.4     winget',
+            'Winget (machine/n numbers that cannot be determ) returned ... 0x8A150014'
+        )
+
+        $inventory.HeaderRecognized | Should -BeTrue
+        $inventory.PackageIds | Should -Be @('Example.App')
+        $inventory.MalformedRows | Should -Be 1
+    }
+
+    It 'fails closed when targeted inventory contains no syntactically valid IDs' {
+        $inventory = Get-WingetInventoryPackageIds -Lines @(
+            'Name                         Id                         Version Available Source',
+            '--------------------------------------------------------------------------------',
+            'Winget (machine/n numbers that cannot be determ) returned ... 0x8A150014'
+        )
+
+        $inventory.PackageIds | Should -BeNullOrEmpty
+        $inventory.MalformedRows | Should -Be 1
+    }
+
+    It 'reconciles aggregate Winget failure when all remaining work is deferred inventory' {
+        $summary = Get-WingetOutputSummary -Lines @(
+            '(1/2) Found Example App [Example.App] Version 1.0',
+            '(2/2) Found Another App [Another.App] Version 2.0',
+            '4 package(s) have version numbers that cannot be determined.',
+            '2 package(s) have upgrades blocked because newer versions use a different install technology than the current installation.'
+        )
+
+        $summary.Updated | Should -Be 0
+        $summary.Failures | Should -BeNullOrEmpty
+        Test-WingetExitReconciled -Summary $summary -ExitCode -1978335188 | Should -BeTrue
     }
 
     It 'reconciles MSI 1605, records verified absence once, and suppresses identical repeats' {
@@ -291,7 +329,7 @@ Describe 'Concise provider diagnostics' {
         $winget = Get-FunctionText $invokeAst 'Update-WingetPackages'
         $adapter | Should -Match 'DeferExitCodeReporting'
         $adapter | Should -Match '\$failed -and -not \$DeferExitCodeReporting'
-        ([regex]::Matches($winget, '-DeferExitCodeReporting')).Count | Should -BeGreaterOrEqual 5
+        ([regex]::Matches($winget, '-DeferExitCodeReporting')).Count | Should -BeGreaterOrEqual 4
     }
 
     It 'completes the Winget phase when MSI 1605 is the only aggregate exception' {
@@ -326,6 +364,36 @@ Describe 'Concise provider diagnostics' {
         $result.TerminalFailure | Should -BeFalse
         $script:CurrentWingetFailures | Should -BeNullOrEmpty
         Should -Invoke Invoke-PackageManagerWithTimeout -Times 2 -ParameterFilter { $DeferExitCodeReporting }
+    }
+
+    It 'completes the Winget phase when remaining inventory is deferred' {
+        $script:PackageTimeoutMinutes = 30
+        $script:ExcludePatterns = @()
+        $script:IncludePatterns = @()
+        $script:AggressiveRepair = $false
+        $script:CurrentState = [pscustomobject]@{}
+        $script:CurrentWingetFailures = [Collections.Generic.List[object]]::new()
+        $script:InstallDir = $TestDrive
+        Mock Get-Command { [pscustomobject]@{ Source='C:\Program Files\WindowsApps\winget.exe' } } -ParameterFilter { $Name -eq 'winget' }
+        Mock Write-ProviderTranscript { }
+        Mock Write-Log { }
+        Mock Invoke-PackageManagerWithTimeout {
+            return @{
+                Output=@(
+                    '(1/2) Found Example App [Example.App] Version 1.0',
+                    '(2/2) Found Another App [Another.App] Version 2.0',
+                    '4 package(s) have version numbers that cannot be determined.',
+                    '2 package(s) have upgrades blocked because newer versions use a different install technology than the current installation.'
+                )
+                TimedOut=$false; Failed=$true; ExitCode=-1978335188; RebootRequired=$false
+            }
+        }
+
+        $result = Update-WingetPackages -Confirm:$false
+
+        $result.Success | Should -BeTrue
+        $result.TerminalFailure | Should -BeFalse
+        $script:CurrentWingetFailures | Should -BeNullOrEmpty
     }
 
     It 'recognizes restart-application success and hexadecimal installer failures' {

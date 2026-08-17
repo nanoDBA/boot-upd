@@ -977,6 +977,61 @@ function Get-InstallerExitSummary {
     }
 }
 
+function Get-WingetInventoryPackageIds {
+    param([object[]]$Lines = @())
+
+    $validIdPattern = '^[A-Za-z0-9][A-Za-z0-9._+-]*$'
+    $normalized = @($Lines | ForEach-Object {
+        $text = ([string]$_) -replace "`e\[[0-?]*[ -/]*[@-~]", ''
+        $text -replace '^\[[^\]]+\]\s+\[[^\]]+\]\s*', ''
+    })
+    $headerIndex = -1
+    $header = $null
+    for ($index = 0; $index -lt $normalized.Count; $index++) {
+        if ($normalized[$index] -match '^\s*Name\s{2,}Id\s{2,}Version(?:\s+Available)?(?:\s+Source)?\s*$') {
+            $headerIndex = $index
+            $header = $normalized[$index]
+            break
+        }
+    }
+    if ($headerIndex -lt 0) {
+        return [pscustomobject]@{
+            HeaderRecognized = $false
+            PackageIds = @()
+            MalformedRows = 0
+            Reason = 'Winget inventory header was not recognized.'
+        }
+    }
+
+    $idColStart = $header.IndexOf('Id')
+    $afterId = $header.Substring($idColStart + 2).TrimStart()
+    $nextColumn = ($afterId -split '\s{2,}' | Where-Object { $_ } | Select-Object -First 1)
+    $nextColOffset = if ($nextColumn) { $header.IndexOf($nextColumn, $idColStart + 2) } else { -1 }
+    $ids = [Collections.Generic.List[string]]::new()
+    $malformedRows = 0
+    foreach ($row in ($normalized | Select-Object -Skip ($headerIndex + 1))) {
+        if ([string]::IsNullOrWhiteSpace($row) -or $row -match '^\s*-{3,}\s*$') { continue }
+        if ($row.Length -le $idColStart) { continue }
+        $idField = if ($nextColOffset -gt $idColStart) {
+            $row.Substring($idColStart, [math]::Min($nextColOffset - $idColStart, $row.Length - $idColStart)).Trim()
+        } else {
+            ($row.Substring($idColStart) -split '\s+')[0].Trim()
+        }
+        if ($idField -match $validIdPattern) {
+            if (-not $ids.Contains($idField)) { $ids.Add($idField) }
+        } elseif (-not [string]::IsNullOrWhiteSpace($idField)) {
+            $malformedRows++
+        }
+    }
+
+    return [pscustomobject]@{
+        HeaderRecognized = $true
+        PackageIds = $ids.ToArray()
+        MalformedRows = $malformedRows
+        Reason = if ($malformedRows) { "$malformedRows malformed inventory row(s) were rejected." } else { '' }
+    }
+}
+
 function Get-WingetOutputSummary {
     param([object[]]$Lines = @())
     $attempted = 0
@@ -1055,7 +1110,8 @@ function Test-WingetExitReconciled {
        replace. Anything unaccounted keeps the exit code as failure evidence. #>
     $staleCount = @($Summary.StaleAbsent).Count
     $scopeBlockedCount = @($Summary.ScopeBlocked).Count
-    $accounted = $staleCount + $scopeBlockedCount
+    $deferredCount = [int]$Summary.Pinned + [int]$Summary.Unknown + [int]$Summary.TechnologyBlocked
+    $accounted = $staleCount + $scopeBlockedCount + $deferredCount
     return ($accounted -gt 0 -and @($Summary.Failures).Count -eq 0 -and
         [int]$Summary.Attempted -gt 0 -and
         ([int]$Summary.Updated + $accounted) -ge [int]$Summary.Attempted)
@@ -2908,52 +2964,31 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
                     continue
                 }
 
-                <#
-                    Parse the winget list table.  Locate the 'Id' column header by character offset,
-                    then bound it against the next column header to know the field width.
-                    Rows before and including the dashed separator are skipped.
-                #>
-                $packageIds = @()
-                $headerLine = $listOutput | Where-Object { $_ -match '\bId\b' } | Select-Object -First 1
-                if (-not $headerLine) {
+                $inventory = Get-WingetInventoryPackageIds -Lines $listOutput
+                if (-not $inventory.HeaderRecognized) {
                     if ($scope -eq 'machine' -and $successfulPackageIds.Count -gt 0) {
                         Write-Log 'Winget machine: could not safely parse inventory after user-scope success; refusing a duplicate --all mutation and queuing verification.' -Level Error
                         $executionFailures.Add('machine:inventory-unparseable:dedup-required')
                         $anyTimeout = $true
                         continue
                     }
-                    Write-Log "Winget ($scope): Could not parse package list header — falling back to --all (no exclusion)" -Level Warn
-                    $fbResult = Invoke-PackageManagerWithTimeout -Name "Winget-$scope" -ScriptBlock {
-                        param($wp, $sc)
-                        & $wp upgrade --all --scope $sc --accept-source-agreements --accept-package-agreements --disable-interactivity --no-vt 2>&1
-                    } -ArgumentList @($wingetPath, $scope) -IdleTimeoutMinutes 5 -HardTimeoutMinutes $TimeoutMinutes `
-                        -DeferExitCodeReporting
-                    $fallbackSummary = Write-WingetScopeSummary -Scope "$scope-fallback" -Lines $fbResult.Output -ExitCode $fbResult.ExitCode
-                    $count = $fallbackSummary.Updated
-                    foreach ($successfulId in @($fallbackSummary.SuccessfulIds)) { $null = $successfulPackageIds.Add($successfulId) }
-                    if ($fbResult.TimedOut) { $anyTimeout = $true }
-                    $totalCount += $count
+                    Write-Log "Winget ($scope): $($inventory.Reason) Failing closed; no package mutations will be inferred from prose." -Level Error
+                    $executionFailures.Add("${scope}:inventory-unparseable:header")
+                    $anyTimeout = $true
                     continue
                 }
-
-                $idColStart    = $headerLine.IndexOf('Id')
-                $afterIdStr    = $headerLine.Substring($idColStart + 2).TrimStart()
-                $nextColName   = ($afterIdStr -split '\s{2,}' | Where-Object { $_ -ne '' } | Select-Object -First 1)
-                $nextColOffset = if ($nextColName) { $headerLine.IndexOf($nextColName, $idColStart + 2) } else { -1 }
-                $headerIndex   = [array]::IndexOf($listOutput, $headerLine)
-
-                foreach ($row in ($listOutput | Select-Object -Skip ($headerIndex + 1))) {
-                    if ($row.Length -le $idColStart) { continue }
-                    if ($row -match '^[-\s]+$') { continue }   # dashed separator line
-                    $idField = if ($nextColOffset -gt $idColStart) {
-                        $row.Substring($idColStart, $nextColOffset - $idColStart).Trim()
-                    } else {
-                        ($row.Substring($idColStart) -split '\s+')[0].Trim()
-                    }
-                    if ($idField -and $idField -notmatch '^-+$') { $packageIds += $idField }
+                if ($inventory.MalformedRows -gt 0) {
+                    Write-Log "Winget ($scope): $($inventory.Reason)" -Level Warn
                 }
+                $packageIds = @($inventory.PackageIds)
 
                 if ($packageIds.Count -eq 0) {
+                    if ($inventory.MalformedRows -gt 0) {
+                        Write-Log "Winget ($scope): no syntactically valid package IDs remained; failing closed." -Level Error
+                        $executionFailures.Add("${scope}:inventory-unparseable:package-id")
+                        $anyTimeout = $true
+                        continue
+                    }
                     Write-Log "Winget ($scope): No upgradeable packages found."
                     continue
                 }

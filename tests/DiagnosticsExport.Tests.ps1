@@ -14,7 +14,7 @@ BeforeAll {
         $function | Should -Not -BeNullOrEmpty
         return $function.Extent.Text
     }
-    foreach ($name in @('Protect-BootUpdateDiagnosticText','Assert-BootUpdateDiagnosticIsSanitized')) {
+    foreach ($name in @('Protect-BootUpdateDiagnosticText','Assert-BootUpdateDiagnosticIsSanitized','Read-BootUpdateDiagnosticText','Copy-BootUpdateDiagnosticSnapshot','Get-BootUpdateDiagnosticActivity')) {
         . ([scriptblock]::Create((Get-FunctionText -Ast $exportAst -Name $name)))
     }
     foreach ($name in @('Enable-BootUpdateNtfsCompression','Invoke-BootUpdateLogRotation')) {
@@ -46,6 +46,50 @@ Describe 'Sanitized diagnostic export' {
         $safe | Should -Not -Match 'Dropbox\\secret'
     }
 
+    It 'preserves contextual dotted package versions while redacting real IP addresses' {
+        $raw = @'
+Name                         Id                         Version         Available       Source
+Example App                  Example.App                2026.1.2.3      2026.1.2.4      winget
+Version: 10.20.30.40; peer 10.20.30.41
+'@
+        $safe = Protect-BootUpdateDiagnosticText -Text $raw
+        $safe | Should -Match '<VERSION_[0-9A-F]{12}>'
+        $safe | Should -Not -Match '2026\.1\.2\.3|2026\.1\.2\.4|10\.20\.30\.40'
+        $safe | Should -Match 'Version: <VERSION_[0-9A-F]{12}>'
+        $safe | Should -Match 'peer <IP>'
+    }
+
+    It 'decodes UTF-8 and UTF-16 sources without mojibake and reports invalid bytes' {
+        $utf8Path = Join-Path $TestDrive 'utf8.log'
+        [IO.File]::WriteAllText($utf8Path, 'provider … café', [Text.UTF8Encoding]::new($false))
+        $utf8 = Read-BootUpdateDiagnosticText -Path $utf8Path
+        $utf8.Text | Should -Be 'provider … café'
+        $utf8.Warning | Should -BeNullOrEmpty
+
+        $utf16Path = Join-Path $TestDrive 'utf16.log'
+        [IO.File]::WriteAllText($utf16Path, 'provider … café', [Text.UnicodeEncoding]::new($false, $true))
+        (Read-BootUpdateDiagnosticText -Path $utf16Path).Text | Should -Be 'provider … café'
+
+        $invalidPath = Join-Path $TestDrive 'invalid.log'
+        [IO.File]::WriteAllBytes($invalidPath, [byte[]](0xC3, 0x28))
+        (Read-BootUpdateDiagnosticText -Path $invalidPath).Warning | Should -Match 'Invalid byte sequence'
+    }
+
+    It 'marks a captured active cycle and preserves phase and iteration metadata' {
+        $source = Join-Path $TestDrive 'active-source'; $output = Join-Path $TestDrive 'active-output'
+        New-Item -ItemType Directory -Path $source,$output | Out-Null
+        Set-Content (Join-Path $source 'BootUpdateCycle.log') "BOOT UPDATE CYCLE RESUMED`nPhase: WindowsUpdate`nIteration=3"
+        $null = & $exportPath -SourceDirectory $source -OutputDirectory $output -NoClipboard 6>&1
+        $zip = Get-ChildItem -LiteralPath $output -Filter 'BootUpdateCycle-diagnostics-*.zip' | Select-Object -First 1
+        $expanded = Join-Path $TestDrive 'active-expanded'
+        Expand-Archive -LiteralPath $zip.FullName -DestinationPath $expanded
+        $manifest = Get-Content (Join-Path $expanded 'manifest.json') -Raw | ConvertFrom-Json
+        $manifest.CaptureState | Should -Be 'active-at-capture'
+        $manifest.ActiveAtCapture | Should -BeTrue
+        $manifest.Phase | Should -Be 'WindowsUpdate'
+        $manifest.Iteration | Should -Be 3
+    }
+
     It 'exports active and archived core, provider, and AWS logs into one safe zip' {
         $source = Join-Path $TestDrive 'source'; $output = Join-Path $TestDrive 'output'
         New-Item -ItemType Directory -Path $source,$output | Out-Null
@@ -73,7 +117,12 @@ Describe 'Sanitized diagnostic export' {
         $safe | Should -Match 'BootUpdateCycle-winget-resolved-absent\.json'
         $safe | Should -Match 'winget pin remove --id Corsair\.iCUE\.5'
         $safe | Should -Not -Match 'ACME|Alice|BUILD-PC|acme\.example|C:\\|E:\\|192\.168\.10\.4'
-        (Get-Content (Join-Path $expanded 'manifest.json') -Raw | ConvertFrom-Json).Sanitized | Should -BeTrue
+        $manifest = Get-Content (Join-Path $expanded 'manifest.json') -Raw | ConvertFrom-Json
+        $manifest.Sanitized | Should -BeTrue
+        $manifest.FormatVersion | Should -Be 2
+        $manifest.SnapshotComplete | Should -BeTrue
+        $manifest.SourceFiles.Count | Should -BeGreaterThan 0
+        $manifest.SourceFiles[0].SHA256 | Should -Not -BeNullOrEmpty
     }
 
     It 'copies the one absolute ZIP path to the clipboard with a graceful fallback' {
