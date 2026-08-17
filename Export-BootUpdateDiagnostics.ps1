@@ -175,6 +175,16 @@ function Get-BootUpdateDiagnosticActivity {
     return [pscustomobject]@{ ActiveAtCapture=$active; Phase=$phase; Iteration=$iteration }
 }
 
+function Get-BootUpdateDiagnosticCurrentRunText {
+    param([Parameter(Mandatory)][string]$Text)
+    $startMatches = [regex]::Matches(
+        $Text,
+        '(?im)^\s*(?:\[[^\]]+\]\s*)*BOOT UPDATE CYCLE (?:STARTED|RESUMED)\b'
+    )
+    if ($startMatches.Count -eq 0) { return $Text }
+    return $Text.Substring($startMatches[$startMatches.Count - 1].Index)
+}
+
 function Get-BootUpdateDiagnosticCleanupSummary {
     param([Parameter(Mandatory)][string]$Text)
     $contexts = [ordered]@{}
@@ -291,10 +301,11 @@ try {
         Assert-BootUpdateDiagnosticIsSanitized -Text $safe -SensitiveValues $sensitive
         $sections.Add("===== $($log.Name) =====`r`n$safe")
     }
-    $activity = if ($coreText) { Get-BootUpdateDiagnosticActivity -Text $coreText } else {
+    $currentRunText = if ($coreText) { Get-BootUpdateDiagnosticCurrentRunText -Text $coreText } else { $null }
+    $activity = if ($currentRunText) { Get-BootUpdateDiagnosticActivity -Text $currentRunText } else {
         [pscustomobject]@{ ActiveAtCapture=$null; Phase=$null; Iteration=$null }
     }
-    $cleanupSummary = if ($coreText) { Get-BootUpdateDiagnosticCleanupSummary -Text $coreText } else { $null }
+    $cleanupSummary = if ($currentRunText) { Get-BootUpdateDiagnosticCleanupSummary -Text $currentRunText } else { $null }
     $snapshotComplete = @($sourceRecords | Where-Object { -not $_.Stable }).Count -eq 0
     $captureState = if (-not $snapshotComplete) { 'unstable-snapshot' } elseif ($activity.ActiveAtCapture -eq $true) { 'active-at-capture' } elseif ($activity.ActiveAtCapture -eq $false) { 'completed' } else { 'unknown' }
     $sanitizedPath = Join-Path $stage 'BootUpdateCycle.sanitized.log'
