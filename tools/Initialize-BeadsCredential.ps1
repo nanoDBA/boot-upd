@@ -1,14 +1,14 @@
 #requires -Version 7.0
-#requires -Modules BetterCredentials
 <#
 .SYNOPSIS
     Configure secure Windows Credential Manager access for the beads client.
 
 .DESCRIPTION
     Reuses an existing generic credential when present. For a new credential,
-    prompts twice without echo, verifies the entries match, and stores it in
-    Windows Credential Manager. Existing credentials are never overwritten
-    unless -Replace is explicitly supplied.
+    prompts for the Dolt username and twice for the password without echo,
+    verifies the password entries match, and stores both in a DPAPI-protected
+    Windows Credential Manager generic credential. Existing credentials are
+    never overwritten unless -Replace is explicitly supplied.
 
     The secret is never printed, passed in process arguments, or stored in an
     environment variable. The repository stores only the non-secret credential
@@ -21,6 +21,10 @@
 .PARAMETER Replace
     Explicitly replace an existing credential after a double no-echo prompt.
 
+.PARAMETER Username
+    Central Dolt username to store in the credential. Defaults to the local
+    beads metadata username, then root.
+
 .EXAMPLE
     ./tools/Initialize-BeadsCredential.ps1
 
@@ -31,11 +35,54 @@
 param(
     [string]$Target,
 
+    [string]$Username,
+
     [switch]$Replace
 )
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path $PSScriptRoot -Parent
+
+function Initialize-BetterCredentialsModule {
+    if (-not (Get-Module -ListAvailable -Name BetterCredentials)) {
+        $installModule = Get-Command Install-Module -ErrorAction SilentlyContinue
+        if (-not $installModule) {
+            throw 'BetterCredentials is not installed and Install-Module is unavailable. Install PowerShellGet, then rerun this command.'
+        }
+
+        Install-Module -Name BetterCredentials -Repository PSGallery -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+    }
+
+    Import-Module BetterCredentials -ErrorAction Stop
+}
+
+function Get-DefaultDoltUsername {
+    $metadataPath = Join-Path $repoRoot '.beads\metadata.json'
+    if (Test-Path -LiteralPath $metadataPath) {
+        try {
+            $metadata = Get-Content -LiteralPath $metadataPath -Raw | ConvertFrom-Json
+            if (-not [string]::IsNullOrWhiteSpace($metadata.dolt_server_user)) {
+                return [string]$metadata.dolt_server_user
+            }
+        }
+        catch {
+            Write-Verbose "Could not read Dolt username from ${metadataPath}: $($_.Exception.Message)"
+        }
+    }
+
+    return 'root'
+}
+
+function Assert-DoltUsername {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Value
+    )
+
+    if ($Value -notmatch '^[A-Za-z0-9][A-Za-z0-9_.-]*$') {
+        throw 'Dolt username must contain only letters, numbers, dot, underscore, or hyphen.'
+    }
+}
 
 function Test-SecureStringEqual {
     param(
@@ -98,17 +145,26 @@ if ([string]::IsNullOrWhiteSpace($Target)) {
     }
 }
 
-Import-Module BetterCredentials -ErrorAction Stop
+Initialize-BetterCredentialsModule
 
 $existingCredential = Get-StoredGenericCredential -Target $Target
 if ($existingCredential -and -not $Replace) {
-    Write-Output "Credential target '$Target' already exists; preserving it."
+    Write-Output "Credential target '$Target' already exists; preserving its stored username and password."
 }
 else {
     $secret = $null
     $confirmation = $null
     $credential = $null
     try {
+        if ([string]::IsNullOrWhiteSpace($Username)) {
+            $defaultUsername = Get-DefaultDoltUsername
+            $Username = Read-Host "Enter the central beads Dolt username [$defaultUsername]"
+            if ([string]::IsNullOrWhiteSpace($Username)) {
+                $Username = $defaultUsername
+            }
+        }
+        Assert-DoltUsername -Value $Username
+
         $secret = Read-Host "Enter the central beads Dolt password for '$Target'" -AsSecureString
         $confirmation = Read-Host 'Confirm the password' -AsSecureString
         if ($secret.Length -eq 0) {
@@ -118,7 +174,7 @@ else {
             throw 'Passwords do not match; no credential was stored.'
         }
 
-        $credential = [PSCredential]::new($Target, $secret)
+        $credential = [PSCredential]::new($Username, $secret)
         BetterCredentials\Set-Credential `
             -Credential $credential `
             -Target $Target `
