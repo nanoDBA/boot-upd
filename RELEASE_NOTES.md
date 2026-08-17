@@ -1,8 +1,21 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.69
-**Release Date:** 2026-07-27
+**Current Version:** v2.5.70
+**Release Date:** 2026-08-17
 **Status:** STABLE
+
+---
+
+## v2.5.70 (2026-08-17)
+
+### Truthful deferred Winget outcomes and reliable diagnostics evidence
+
+- Reconciles a Winget run when every remaining package is explicitly deferred (for example, pinned inventory or unsupported install technology). The aggregate native exit code is no longer reported as an unexplained failure or used to queue a pointless same-boot retry.
+- Makes targeted Winget inventory parsing strict: only validated package-ID rows are accepted, prose and empty rows are rejected, and malformed targeted output fails closed instead of silently broadening into an `--all` update.
+- Preserves UTF-8/UTF-16 source-log encoding during diagnostics export, with a safe fallback and warning for invalid bytes so evidence is not silently mojibaked.
+- Captures diagnostics from a stability-checked source snapshot and records whether the run was active or complete, its phase/iteration, per-file hashes, and any snapshot warnings in manifest format 2.
+- Keeps dotted package versions visible as stable redacted version placeholders while continuing to redact ordinary IPv4 addresses, preserving comparison evidence without leaking exact version data.
+- Validation: 299 unit/process tests passed; published-launcher upgrade passed; user/SYSTEM security-boundary gate not run on the development laptop; no live updater cycle or reboot performed.
 
 ---
 
