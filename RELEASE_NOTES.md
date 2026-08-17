@@ -1,10 +1,24 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.71
+**Current Version:** v2.5.72
 **Release Date:** 2026-08-17
 **Status:** STABLE
 
 ---
+
+## v2.5.72 (2026-08-17)
+
+Diagnostics follow-up release.
+
+### Fixed
+
+- Scope activity and pending-file cleanup evidence to the latest explicit cycle start in the accumulated log. Historical runs can no longer change the current run's `CaptureState`, `Iteration`, or `PendingFileCleanup.Persistent` result.
+- Re-exporting the 2026-08-17 15:08 diagnostic now reports the six current cleanup fingerprints as persistent (`6` before and `6` after), instead of being contaminated by older archived runs.
+
+### Validation
+
+- Diagnostics export regression suite passes, including a mixed historical/current log fixture and re-export of the supplied bundle.
+- No updater cycle or reboot was performed during validation.
 
 ## v2.5.71 (2026-08-17)
 

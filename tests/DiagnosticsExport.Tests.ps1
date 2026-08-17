@@ -14,7 +14,7 @@ BeforeAll {
         $function | Should -Not -BeNullOrEmpty
         return $function.Extent.Text
     }
-    foreach ($name in @('Protect-BootUpdateDiagnosticText','Assert-BootUpdateDiagnosticIsSanitized','Read-BootUpdateDiagnosticText','Copy-BootUpdateDiagnosticSnapshot','Get-BootUpdateDiagnosticActivity','Get-BootUpdateDiagnosticCleanupSummary')) {
+    foreach ($name in @('Protect-BootUpdateDiagnosticText','Assert-BootUpdateDiagnosticIsSanitized','Read-BootUpdateDiagnosticText','Copy-BootUpdateDiagnosticSnapshot','Get-BootUpdateDiagnosticActivity','Get-BootUpdateDiagnosticCurrentRunText','Get-BootUpdateDiagnosticCleanupSummary')) {
         . ([scriptblock]::Create((Get-FunctionText -Ast $exportAst -Name $name)))
     }
     foreach ($name in @('Enable-BootUpdateNtfsCompression','Invoke-BootUpdateLogRotation')) {
@@ -114,6 +114,27 @@ Version: 10.20.30.40; peer 10.20.30.41
         $summary.BeforeMutation.Categories.PackageManagementPrototypeCleanup | Should -Be 6
         @($summary.AfterUpdates.Fingerprints).Count | Should -Be 2
         ($summary | ConvertTo-Json -Depth 6) | Should -Not -Match '\\|[A-Za-z]:\\|ProgramData'
+    }
+
+    It 'scopes manifest activity and cleanup evidence to the latest run in an accumulated log' {
+        $text = @'
+[2026-08-17 07:58:42] [Info] BOOT UPDATE CYCLE STARTED | Pass: 1
+[2026-08-17 07:58:50] [Info] Pending-file cleanup [before mutation]: PackageManagementPrototypeCleanup=33
+[2026-08-17 07:59:00] [Info] Pending-file cleanup detail [before mutation]: id=OLD111
+[2026-08-17 08:00:59] [Info] Pending-file cleanup [after updates]: PackageManagementPrototypeCleanup=33
+[2026-08-17 08:01:00] [Info] Pending-file cleanup detail [after updates]: id=OLD111
+[2026-08-17 15:08:23] [Info] BOOT UPDATE CYCLE STARTED | Pass: 1
+[2026-08-17 15:08:33] [Info] Pending-file cleanup [before mutation]: PackageManagementPrototypeCleanup=6
+[2026-08-17 15:08:34] [Info] Pending-file cleanup detail [before mutation]: id=AAA111,BBB222
+[2026-08-17 15:09:58] [Info] Pending-file cleanup [after updates]: PackageManagementPrototypeCleanup=6
+[2026-08-17 15:09:59] [Info] Pending-file cleanup detail [after updates]: id=AAA111,BBB222
+[2026-08-17 15:10:21] [Info] BOOT UPDATE CYCLE COMPLETE WITH CLEANUP ADVISORY
+'@
+        $current = Get-BootUpdateDiagnosticCurrentRunText -Text $text
+        (Get-BootUpdateDiagnosticActivity -Text $current).ActiveAtCapture | Should -BeFalse
+        (Get-BootUpdateDiagnosticActivity -Text $current).Iteration | Should -Be 1
+        (Get-BootUpdateDiagnosticCleanupSummary -Text $current).Persistent | Should -BeTrue
+        (Get-BootUpdateDiagnosticCleanupSummary -Text $current).BeforeMutation.Categories.PackageManagementPrototypeCleanup | Should -Be 6
     }
 
     It 'exports active and archived core, provider, and AWS logs into one safe zip' {
