@@ -14,7 +14,7 @@ BeforeAll {
         $function | Should -Not -BeNullOrEmpty
         return $function.Extent.Text
     }
-    foreach ($name in @('Protect-BootUpdateDiagnosticText','Assert-BootUpdateDiagnosticIsSanitized','Read-BootUpdateDiagnosticText','Copy-BootUpdateDiagnosticSnapshot','Get-BootUpdateDiagnosticActivity')) {
+    foreach ($name in @('Protect-BootUpdateDiagnosticText','Assert-BootUpdateDiagnosticIsSanitized','Read-BootUpdateDiagnosticText','Copy-BootUpdateDiagnosticSnapshot','Get-BootUpdateDiagnosticActivity','Get-BootUpdateDiagnosticCleanupSummary')) {
         . ([scriptblock]::Create((Get-FunctionText -Ast $exportAst -Name $name)))
     }
     foreach ($name in @('Enable-BootUpdateNtfsCompression','Invoke-BootUpdateLogRotation')) {
@@ -90,10 +90,42 @@ Version: 10.20.30.40; peer 10.20.30.41
         $manifest.Iteration | Should -Be 3
     }
 
+    It 'uses explicit pass markers and ignores phase prose when deriving activity metadata' {
+        $text = @'
+[2026-08-17 13:05:11] [Info] BOOT UPDATE CYCLE STARTED | Pass: 1
+[2026-08-17 13:07:43] [Info] --- Parallel cohort: 7 phase(s): Pip, Npm, Scoop
+[2026-08-17 13:08:25] [Info] BOOT UPDATE CYCLE COMPLETE WITH CLEANUP ADVISORY
+'@
+        $activity = Get-BootUpdateDiagnosticActivity -Text $text
+        $activity.ActiveAtCapture | Should -BeFalse
+        $activity.Phase | Should -BeNullOrEmpty
+        $activity.Iteration | Should -Be 1
+    }
+
+    It 'records persistent before-and-after cleanup fingerprints without exposing paths' {
+        $text = @'
+[Info] Pending-file cleanup [before mutation]: PackageManagementPrototypeCleanup=6. Routine delete-only housekeeping; no restart is required.
+[Info] Pending-file cleanup detail [before mutation]: id=AAA111,BBB222
+[Info] Pending-file cleanup [after updates]: PackageManagementPrototypeCleanup=6. Routine delete-only housekeeping; no restart is required.
+[Info] Pending-file cleanup detail [after updates]: id=AAA111,BBB222
+'@
+        $summary = Get-BootUpdateDiagnosticCleanupSummary -Text $text
+        $summary.Persistent | Should -BeTrue
+        $summary.BeforeMutation.Categories.PackageManagementPrototypeCleanup | Should -Be 6
+        @($summary.AfterUpdates.Fingerprints).Count | Should -Be 2
+        ($summary | ConvertTo-Json -Depth 6) | Should -Not -Match '\\|[A-Za-z]:\\|ProgramData'
+    }
+
     It 'exports active and archived core, provider, and AWS logs into one safe zip' {
         $source = Join-Path $TestDrive 'source'; $output = Join-Path $TestDrive 'output'
         New-Item -ItemType Directory -Path $source,$output | Out-Null
-        Set-Content (Join-Path $source 'BootUpdateCycle.log') '[Info] ACME\Alice on BUILD-PC at C:\Users\Alice\work\tool.exe'
+        Set-Content (Join-Path $source 'BootUpdateCycle.log') @'
+[Info] ACME\Alice on BUILD-PC at C:\Users\Alice\work\tool.exe
+[Info] Pending-file cleanup [before mutation]: PackageManagementPrototypeCleanup=6. Routine delete-only housekeeping; no restart is required.
+[Info] Pending-file cleanup detail [before mutation]: id=AAA111,BBB222
+[Info] Pending-file cleanup [after updates]: PackageManagementPrototypeCleanup=6. Routine delete-only housekeeping; no restart is required.
+[Info] Pending-file cleanup detail [after updates]: id=AAA111,BBB222
+'@
         Set-Content (Join-Path $source 'BootUpdateCycle.providers.20260721-010203.log') '[Winget] alice@acme.example 192.168.10.4'
         Set-Content (Join-Path $source 'BootUpdateCycle.aws.log') '[AWS] E:\OneDrive\ACME Holdings\PowerShell\Modules'
         Set-Content (Join-Path $source 'BootUpdateCycle-winget-quarantine.json') '[{"PackageId":"Corsair.iCUE.5","UnpinCommand":"winget pin remove --id Corsair.iCUE.5 -e --disable-interactivity"}]'
@@ -121,6 +153,8 @@ Version: 10.20.30.40; peer 10.20.30.41
         $manifest.Sanitized | Should -BeTrue
         $manifest.FormatVersion | Should -Be 2
         $manifest.SnapshotComplete | Should -BeTrue
+        $manifest.PendingFileCleanup.Persistent | Should -BeTrue
+        $manifest.PendingFileCleanup.BeforeMutation.Categories.PackageManagementPrototypeCleanup | Should -Be 6
         $manifest.SourceFiles.Count | Should -BeGreaterThan 0
         $manifest.SourceFiles[0].SHA256 | Should -Not -BeNullOrEmpty
     }
