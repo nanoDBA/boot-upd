@@ -1,11 +1,36 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.74
+**Current Version:** v2.5.75
 **Release Date:** 2026-08-24
 **Status:** STABLE
 
 ---
 
+## v2.5.75 (2026-08-24)
+
+Chocolatey failure-classification release.
+
+### Fixed
+
+- A Chocolatey package whose published checksum no longer matches the artifact the vendor serves fails identically on every pass, but the phase reported only success and a count, so that failure was indistinguishable from a transient one: it consumed the entire retry budget and then stopped without saying why. Chocolatey's `Failures` block and checksum error are now parsed into per-package records, aggregated into a failure signature, and the phase is marked as a terminal failure on the second consecutive identical signature. The existing completion-disposition seam routes it to manual attention with a repair plan on pass 2 rather than exhausting five passes.
+- The signature folds in the expected checksum because Chocolatey exits `-1` for every failing install script, so package and exit code alone cannot tell a checksum mismatch apart from a disk or network failure of the same package. This also makes the signature self-healing: when the maintainer refreshes the package metadata the expected hash changes, the signature changes, and the retry budget re-arms with no human involved.
+- The repair plan reports the expected and actual hashes and offers no command. `Write-BootUpdateRepairPlan` renders commands into a copy/paste block, and no remediation for this failure is safe to run before comparing against the vendor's published hash.
+- Checksums are attributed by the package directory in Chocolatey's cache path rather than by the most recent `[Approved]` banner. A package from a source that prints no banner previously wrote its hash into the preceding package's record, corrupting that package's signature while the real offender fell back to name and exit code alone.
+- The Chocolatey-absent path reported success while leaving the repeat counter armed, sending the next genuine failure to terminal on its first sighting. It now clears the signature, and a resolved repair plan is removed from disk as the Winget path already did.
+
+### Added
+
+- `CONTEXT.md`, a domain glossary. Terminal failure, quarantine, and deferred were being used interchangeably despite being distinct states with distinct convergence meanings.
+- Two architecture decision records: `docs/adr/0001-never-bypass-package-checksum-verification.md` and `docs/adr/0002-checksum-in-chocolatey-failure-signature.md`.
+
+### Validation
+
+- Unit and process behavior: 324/324 Pester tests pass, including a new `Chocolatey terminal failure classification` group covering parsing, signature composition, repeat counting, self-healing, multi-package attribution, and the disposition seam. Chocolatey previously had one test.
+- User/SYSTEM security boundary: passed.
+- Published launcher upgrade: passed.
+- Live bootstrap and provider integration: not run.
+- Multi-reboot convergence: not run. This release changes no reboot, checkpoint, mutex, or task logic; it is scoped to Chocolatey failure classification.
+- No updater cycle or reboot was performed during validation.
 ## v2.5.74 (2026-08-24)
 
 Retry-budget correctness release.
