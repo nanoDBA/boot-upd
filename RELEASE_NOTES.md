@@ -1,10 +1,27 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.72
-**Release Date:** 2026-08-17
+**Current Version:** v2.5.73
+**Release Date:** 2026-08-24
 **Status:** STABLE
 
 ---
+
+## v2.5.73 (2026-08-24)
+
+Winget diagnostics follow-up release.
+
+### Fixed
+
+- `Get-WingetRemediationCommand`'s `-PackageId` parameter was a Mandatory `[string]`, so PowerShell rejected an empty string during parameter binding before the function's own safety check ever ran. A targeted single-package upgrade's output can produce a failure record with no package ID (no preceding `(N/M) Found ... [Id]` header), and that empty-ID record crashed the entire Winget phase with an uncaught exception in production. `-PackageId` is now `AllowEmptyString`/`AllowNull` and the empty/invalid case is handled explicitly instead of throwing.
+- `Test-WingetExitReconciled` only reconciled one hardcoded aggregate exit code, so a targeted single-package upgrade returning its own distinct exit code for a fully-accounted stale/absent record always logged a contradictory `[Error] partial failure, retry required` immediately after telling the user the same stale record would not fail the run. Reconciliation now applies to any non-success/non-reboot-pending exit code once structured output fully accounts for it.
+
+### Validation
+
+- Unit and process behavior: 307/307 Pester tests pass, including new coverage for the empty/null package-ID case and per-package exit-code reconciliation.
+- User/SYSTEM security boundary: passed.
+- Published launcher upgrade: passed.
+- Live bootstrap, provider integration, and multi-reboot convergence: not run (no reboot/checkpoint/mutex/task logic changed; fix is scoped to Winget failure-record classification and diagnostic logging).
+- No updater cycle or reboot was performed during validation.
 
 ## v2.5.72 (2026-08-17)
 
