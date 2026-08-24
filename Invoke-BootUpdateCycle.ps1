@@ -1103,11 +1103,17 @@ function Test-WingetExitReconciled {
         [Parameter(Mandatory)][pscustomobject]$Summary,
         [AllowNull()][object]$ExitCode
     )
-    if ($null -eq $ExitCode -or [long]$ExitCode -ne -1978335188L) { return $false }
-    <# Reconcile the aggregate upgrade-had-failures code only when structured output
-       accounts for every attempted package as verified success, MSI 1605 verified
-       absence, or a user-scope package that elevated Winget definitionally cannot
-       replace. Anything unaccounted keeps the exit code as failure evidence. #>
+    if ($null -eq $ExitCode -or [long]$ExitCode -in @(0L, 1641L, 3010L)) { return $false }
+    <# Reconcile a non-success Winget exit code -- whether the aggregate
+       upgrade-had-failures code from a bulk `--all` run, or a targeted single-package
+       upgrade's own distinct native code -- only when structured output accounts for
+       every attempted package as verified success, MSI 1605 verified absence, or a
+       user-scope package that elevated Winget definitionally cannot replace. Anything
+       unaccounted keeps the exit code as failure evidence, regardless of its numeric
+       value: Winget does not use one fixed code for every "nothing really failed"
+       outcome, so gating reconciliation on a single hardcoded code left per-package
+       stale-record runs contradicting their own "will not fail the update run"
+       message with an unconditional [Error] partial-failure log. #>
     $staleCount = @($Summary.StaleAbsent).Count
     $scopeBlockedCount = @($Summary.ScopeBlocked).Count
     $deferredCount = [int]$Summary.Pinned + [int]$Summary.Unknown + [int]$Summary.TechnologyBlocked
@@ -1118,9 +1124,14 @@ function Test-WingetExitReconciled {
 }
 
 function Get-WingetRemediationCommand {
-    param([Parameter(Mandatory)][string]$PackageId,[long]$Code = 0)
+    <# PackageId is deliberately not Mandatory: a Mandatory [string] parameter makes
+       PowerShell reject an empty string during binding, before this function's own
+       safety check below ever runs -- crashing every caller whenever a parsed
+       failure record has no package ID (e.g. a targeted single-package upgrade
+       whose output never printed the "(N/M) Found ... [Id]" header). #>
+    param([AllowEmptyString()][AllowNull()][string]$PackageId,[long]$Code = 0)
     # Never echo arbitrary provider output into a shell command.
-    if ($PackageId -notmatch '^[A-Za-z0-9][A-Za-z0-9._+-]*$') { return $null }
+    if ([string]::IsNullOrEmpty($PackageId) -or $PackageId -notmatch '^[A-Za-z0-9][A-Za-z0-9._+-]*$') { return $null }
     $verb = if ($Code -eq 1612) { 'repair' } else { 'install' }
     return "winget $verb --id $PackageId -e --source winget --force --accept-source-agreements --accept-package-agreements"
 }

@@ -213,6 +213,69 @@ Describe 'Concise provider diagnostics' {
         Test-WingetExitReconciled -Summary $summary -ExitCode -1978335188 | Should -BeTrue
     }
 
+    It 'does not throw when a parsed failure record has no package ID' {
+        <# A targeted single-package upgrade (`winget upgrade --id X`) does not always
+           print the "(N/M) Found Name [Id] Version V" header that bulk `--all`
+           enumeration uses, so a failure line can be parsed with Id=''. Building a
+           remediation command for that record must not crash the whole phase. #>
+        $lines = @('Installer failed with exit code: 1603')
+        $summary = Get-WingetOutputSummary -Lines $lines
+        $summary.Failures.Count | Should -Be 1
+        $summary.Failures[0].Id | Should -BeNullOrEmpty
+
+        { Get-WingetRemediationCommand -PackageId $summary.Failures[0].Id -Code $summary.Failures[0].Code } | Should -Not -Throw
+        Get-WingetRemediationCommand -PackageId $summary.Failures[0].Id -Code $summary.Failures[0].Code | Should -BeNullOrEmpty
+
+        $state = [pscustomobject]@{}
+        { Complete-WingetFailureClassification -State $state -Failures $summary.Failures } | Should -Not -Throw
+        $classification = Complete-WingetFailureClassification -State $state -Failures $summary.Failures
+        $classification.Details.Count | Should -Be 1
+        $classification.Details[0].Command | Should -BeNullOrEmpty
+    }
+
+    It 'does not throw when Get-WingetRemediationCommand receives a null PackageId' {
+        { Get-WingetRemediationCommand -PackageId $null -Code 1603 } | Should -Not -Throw
+        Get-WingetRemediationCommand -PackageId $null -Code 1603 | Should -BeNullOrEmpty
+    }
+
+    It 'reconciles a per-package exit code distinct from the aggregate code when fully accounted' {
+        <# Targeted single-package upgrades return their own native exit code rather
+           than the bulk `--all` aggregate code (-1978335188 / 0x8A15002C); reconciliation
+           must not be gated on that one hardcoded value. #>
+        $summary = Get-WingetOutputSummary -Lines @(
+            '(1/1) Found Windows PC Health Check [Microsoft.WindowsPCHealthCheck] Version 4.0',
+            'Uninstall failed with exit code: 1605'
+        )
+        Test-WingetExitReconciled -Summary $summary -ExitCode -1978335184 | Should -BeTrue
+    }
+
+    It 'never reconciles the known Winget success/reboot-pending exit codes' {
+        $summary = Get-WingetOutputSummary -Lines @(
+            '(1/1) Found Windows PC Health Check [Microsoft.WindowsPCHealthCheck] Version 4.0',
+            'Uninstall failed with exit code: 1605'
+        )
+        foreach ($code in @(0, 1641, 3010)) {
+            Test-WingetExitReconciled -Summary $summary -ExitCode $code | Should -BeFalse
+        }
+    }
+
+    It 'does not log a contradictory partial-failure error for a fully reconciled per-package stale record' {
+        $script:CurrentWingetFailures = [Collections.Generic.List[object]]::new()
+        $script:WingetResolvedAbsentPath = Join-Path $TestDrive 'resolved-absent-per-package.json'
+        Mock Write-ProviderTranscript { }
+        Mock Write-Log { }
+        $lines = @(
+            '(1/1) Found Windows PC Health Check [Microsoft.WindowsPCHealthCheck] Version 4.0',
+            'Uninstall failed with exit code: 1605'
+        )
+
+        $summary = Write-WingetScopeSummary -Scope 'machine/Microsoft.WindowsPCHealthCheck' -Lines $lines -ExitCode -1978335184
+
+        $summary.ExitReconciled | Should -BeTrue
+        Should -Invoke Write-Log -Times 0 -ParameterFilter { $Message -match 'partial failure, retry required' }
+        Should -Invoke Write-Log -Times 1 -Exactly -ParameterFilter { $Message -match '^\[RESOLVED\].*MSI 1605' }
+    }
+
     It 'reconciles MSI 1605, records verified absence once, and suppresses identical repeats' {
         $script:CurrentWingetFailures = [Collections.Generic.List[object]]::new()
         $script:WingetResolvedAbsentPath = Join-Path $TestDrive 'resolved-absent.json'
