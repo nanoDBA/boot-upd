@@ -27,6 +27,7 @@ BeforeAll {
     $invokeSource = Get-Content $invokePath -Raw
 
     foreach ($functionName in @(
+        'ConvertTo-BootUpdateTimestampString',
         'Test-BootUpdateSameBootSession',
         'Update-BootUpdateStateForBootSession',
         'Get-BootUpdateLaunchContract',
@@ -1294,6 +1295,87 @@ Describe 'Jitter-tolerant boot session identity' {
         }
         Test-WindowsUpdateZeroEvidence -Evidence $evidence -BootSessionId '2026-07-27T10:23:53.9000000Z' -ScopeSignature 'scope-1' |
             Should -BeTrue
+    }
+}
+
+Describe 'Boot session identity survives the state-file round-trip' {
+    <# Diagnostics 2026-08-24: the tolerance above was correct but never reached. State is
+       persisted as JSON, and ConvertFrom-Json rehydrates an ISO-8601 value as [datetime];
+       binding that to a [string] parameter rendered it in the current culture and dropped
+       the offset, so the comparison picked up the machine's whole UTC offset (14399.5s
+       observed against a 120s tolerance). Every pass logged a new boot session and zeroed
+       ConsecutiveRetryCount, so MaxRetryPasses was unreachable and a permanently failing
+       Chocolatey phase retried for 42 passes. The literal-string cases above all passed
+       throughout — these exercise the boundary that actually broke. #>
+
+    BeforeAll {
+        function Get-RoundTrippedState {
+            param([Parameter(Mandatory)][pscustomobject]$State)
+            return ($State | ConvertTo-Json -Depth 10 | ConvertFrom-Json)
+        }
+    }
+
+    It 'rehydrates a persisted boot session id as [datetime], not text' {
+        <# Guards the premise: if this ever stops holding, the normalisation below is dead
+           weight rather than silently-unnecessary. #>
+        $roundTripped = Get-RoundTrippedState ([pscustomobject]@{ LastBootSessionId = '2026-08-24T15:54:52.5000000Z' })
+        $roundTripped.LastBootSessionId | Should -BeOfType ([datetime])
+    }
+
+    It 'normalises a rehydrated UTC [datetime] back to round-trip form' {
+        $roundTripped = Get-RoundTrippedState ([pscustomobject]@{ LastBootSessionId = '2026-08-24T15:54:52.5000000Z' })
+        ConvertTo-BootUpdateTimestampString -Value $roundTripped.LastBootSessionId |
+            Should -Be '2026-08-24T15:54:52.5000000Z'
+    }
+
+    It 'passes through a string and a null unchanged' {
+        ConvertTo-BootUpdateTimestampString -Value '2026-08-24T15:54:52.5000000Z' |
+            Should -Be '2026-08-24T15:54:52.5000000Z'
+        ConvertTo-BootUpdateTimestampString -Value $null | Should -BeNullOrEmpty
+    }
+
+    It 'treats a rehydrated identity as the same boot as the value it was written from' {
+        $roundTripped = Get-RoundTrippedState ([pscustomobject]@{ LastBootSessionId = '2026-08-24T15:54:52.5000000Z' })
+        Test-BootUpdateSameBootSession -Left $roundTripped.LastBootSessionId -Right '2026-08-24T15:54:52.5000000Z' |
+            Should -BeTrue
+    }
+
+    It 'preserves the retry budget across passes that reload state from JSON' {
+        $state = [pscustomobject]@{
+            LastBootSessionId='2026-08-24T15:54:52.5000000Z'; Phase='RetryPending'
+            RebootCount=0; ExplicitRebootRequests=@(); ConsecutiveRetryCount=0
+            WindowsUpdateZeroEvidence=[pscustomobject]@{ BootSessionId='2026-08-24T15:54:52.5000000Z' }
+        }
+        <# Five passes with no reboot: the budget must climb to MaxRetryPasses, not reset. #>
+        foreach ($pass in 1..5) {
+            $state = Get-RoundTrippedState $state
+            $state = Update-BootUpdateStateForBootSession -State $state -CurrentBootSessionId '2026-08-24T15:54:52.5000000Z'
+            $state.ConsecutiveRetryCount = [int]$state.ConsecutiveRetryCount + 1
+        }
+        $state.ConsecutiveRetryCount | Should -Be 5
+        $state.RebootCount | Should -Be 0
+        $state.WindowsUpdateZeroEvidence | Should -Not -BeNullOrEmpty
+    }
+
+    It 'still detects a genuine reboot across the round-trip' {
+        $state = Get-RoundTrippedState ([pscustomobject]@{
+            LastBootSessionId='2026-08-24T15:54:52.5000000Z'; Phase='Rebooting'
+            RebootCount=1; ExplicitRebootRequests=@('3010'); ConsecutiveRetryCount=4
+        })
+        $actual = Update-BootUpdateStateForBootSession -State $state -CurrentBootSessionId '2026-08-24T17:12:03.0000000Z'
+        $actual.ConsecutiveRetryCount | Should -Be 0
+        $actual.RebootCount | Should -Be 2
+    }
+
+    It 'normalises every persisted timestamp field on load' {
+        <# Same defect class reaches WindowsUpdateZeroEvidence.ObservedAtUtc, which is read
+           back with [datetime]::Parse([string]$_) and would age out an offset early. #>
+        $text = Get-FunctionText $invokeAst 'Update-BootUpdateStateSchema'
+        foreach ($field in @('StartTime','LastRun','LastPhaseTimestamp','LastPreflightNetworkAt','LastBootSessionId','LimitReachedAt')) {
+            $text | Should -Match ([regex]::Escape("'$field'"))
+        }
+        $text | Should -Match 'ConvertTo-BootUpdateTimestampString'
+        $text | Should -Match 'WindowsUpdateZeroEvidence\.ObservedAtUtc'
     }
 }
 

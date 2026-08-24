@@ -1490,6 +1490,20 @@ function Write-WingetScopeSummary {
 #endregion
 
 #region State Management
+function ConvertTo-BootUpdateTimestampString {
+    <# ConvertFrom-Json rehydrates ISO-8601 state values as [datetime], so casting one
+       back to [string] renders it in the current culture and drops the offset:
+       '2026-08-24T15:54:52.5000000Z' returns as '08/24/2026 15:54:52', which then
+       re-parses at the local offset. The resulting skew is the machine's UTC offset —
+       hours, not the seconds of jitter the tolerance windows are sized for. Normalise
+       every persisted timestamp back to round-trip 'o' form before comparing it. #>
+    param([AllowNull()]$Value)
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [datetime]) { return $Value.ToString('o') }
+    if ($Value -is [datetimeoffset]) { return $Value.ToString('o') }
+    return [string]$Value
+}
+
 function Get-BootUpdateBootSessionId {
     <# A stable identifier for the current Windows boot. Unlike process time or the
        iteration counter, this changes only after Windows actually boots again. #>
@@ -1506,12 +1520,18 @@ function Test-BootUpdateSameBootSession {
        as an exact 100-ns string, that jitter reads as a fresh boot — which silently zeroes
        the same-boot retry budget and invalidates same-boot Windows Update evidence, so a
        permanently failing phase retries forever. Real boots are minutes apart at minimum,
-       so identity is a tolerance window, never string equality. #>
+       so identity is a tolerance window, never string equality.
+
+       Both sides are normalised rather than typed [string]: parameter binding would
+       otherwise culture-format a [datetime] handed back by ConvertFrom-Json and strip
+       its offset, which reads as a fresh boot on every same-boot pass. #>
     param(
-        [AllowNull()][string]$Left,
-        [AllowNull()][string]$Right,
+        [AllowNull()]$Left,
+        [AllowNull()]$Right,
         [int]$ToleranceSeconds = ($script:BootSessionToleranceSeconds ?? 120)
     )
+    $Left = ConvertTo-BootUpdateTimestampString -Value $Left
+    $Right = ConvertTo-BootUpdateTimestampString -Value $Right
     if ([string]::IsNullOrWhiteSpace($Left) -or [string]::IsNullOrWhiteSpace($Right)) { return $false }
     if ($Left -eq $Right) { return $true }
     $leftTime = [datetimeoffset]::MinValue
@@ -1527,7 +1547,8 @@ function Update-BootUpdateStateForBootSession {
         [Parameter(Mandatory)][pscustomobject]$State,
         [Parameter(Mandatory)][string]$CurrentBootSessionId
     )
-    $sameSession = Test-BootUpdateSameBootSession -Left ([string]$State.LastBootSessionId) -Right $CurrentBootSessionId
+    $priorBootSessionId = ConvertTo-BootUpdateTimestampString -Value $State.LastBootSessionId
+    $sameSession = Test-BootUpdateSameBootSession -Left $priorBootSessionId -Right $CurrentBootSessionId
     if ($State.LastBootSessionId -and -not $sameSession) {
         if ($State.Phase -eq 'Rebooting' -or @($State.ExplicitRebootRequests).Count -gt 0) {
             $State.RebootCount = [int]$State.RebootCount + 1
@@ -1691,6 +1712,16 @@ function Update-BootUpdateStateSchema {
     if ($props -notcontains 'WindowsUpdateZeroEvidence') { $State | Add-Member -NotePropertyName 'WindowsUpdateZeroEvidence' -NotePropertyValue $null -Force }
     foreach ($f in @('WindowsUpdateDone','AwsToolingDone','PowerShellModulesDone','ScoopDone','DotnetToolsDone','VscodeDone','DefenderDone','DriverFirmwareDone','WslDone','ContainersDone')) {
         if ($props -notcontains $f) { $State | Add-Member -NotePropertyName $f -NotePropertyValue $false -Force }
+    }
+
+    <# Normalise timestamps: ConvertFrom-Json returns ISO-8601 values as [datetime], and
+       every consumer here re-reads them as text. Pin them back to round-trip 'o' form at
+       the load boundary so no comparison can silently pick up the local UTC offset. #>
+    foreach ($f in @('StartTime','LastRun','LastPhaseTimestamp','LastPreflightNetworkAt','LastBootSessionId','LimitReachedAt')) {
+        $State.$f = ConvertTo-BootUpdateTimestampString -Value $State.$f
+    }
+    if ($State.WindowsUpdateZeroEvidence -and $State.WindowsUpdateZeroEvidence.PSObject.Properties.Name -contains 'ObservedAtUtc') {
+        $State.WindowsUpdateZeroEvidence.ObservedAtUtc = ConvertTo-BootUpdateTimestampString -Value $State.WindowsUpdateZeroEvidence.ObservedAtUtc
     }
 
     <# Normalise Summary #>
