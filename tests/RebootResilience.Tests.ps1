@@ -61,6 +61,8 @@ BeforeAll {
           'Get-InstallerExitSummary',
           'Get-WingetInventoryPackageIds',
           'Get-WingetOutputSummary',
+          'Get-ChocolateyOutputSummary',
+          'Complete-ChocolateyFailureClassification',
           'Test-WingetExitReconciled',
           'Get-WingetRemediationCommand',
           'Complete-WingetFailureClassification',
@@ -76,6 +78,7 @@ BeforeAll {
           'Test-PipFatalInterpreterEvidence',
           'Get-PipInterpreterAttentionDetail',
           'Update-PipPackages',
+          'Update-ChocolateyPackages',
           'Set-BootUpdateClipboardText',
           'Stop-BootUpdateForManualAttention',
           'Write-BootUpdateRepairPlan'
@@ -1892,5 +1895,138 @@ Describe 'Evidence-backed completion' {
         $text = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
         $text | Should -Match "jobState -ne 'Completed'"
         $text | Should -Match 'phaseSucceeded = \$jobState -eq ''Completed''.*jr\.Success'
+    }
+}
+
+Describe 'Chocolatey terminal failure classification' {
+    <# Diagnostics 2026-08-24: choco upgrade all failed identically on every pass because a
+       package's published checksum no longer matched the artifact the vendor was serving.
+       The phase reported only Success/Count, so the failure was indistinguishable from a
+       transient one and consumed the whole retry budget without ever saying why. #>
+
+    BeforeAll {
+        <# Real captured output, with the user profile path sanitized. Chocolatey reports
+           "exited -1" for any failing install script, so the exit code alone cannot tell
+           this apart from a disk or network failure of the same package (ADR-0002). #>
+        $script:ChocoChecksumFailure = @(
+            'Chocolatey v2.7.4'
+            'Upgrading the following packages:'
+            'all'
+            'chocolatey v2.7.4 is the latest version available based on your source(s).'
+            'Firefox v154.0.0 is the latest version available based on your source(s).'
+            ''
+            'You have GoogleChrome v152.0.7977.42 installed. Version 152.0.7977.54 is available based on your source(s).'
+            "Downloading package from source 'https://community.chocolatey.org/api/v2/'"
+            ''
+            'GoogleChrome v152.0.7977.54 [Approved]'
+            'GoogleChrome package files upgrade completed. Performing other installation steps.'
+            'File appears to be downloaded already. Verifying with package checksum to determine if it needs to be redownloaded.'
+            "Error - hashes do not match. Actual value was 'B5F03C8D228C79A4EAFB071BE89AA34AFA46EDE60E898EC1988600BBB5D7B451'."
+            'Downloading googlechrome 64 bit'
+            "  from 'https://dl.google.com/dl/chrome/install/googlechromestandaloneenterprise64.msi'"
+            ''
+            'Download of googlechromestandaloneenterprise64.msi (-1 B) completed.'
+            "Error - hashes do not match. Actual value was 'B5F03C8D228C79A4EAFB071BE89AA34AFA46EDE60E898EC1988600BBB5D7B451'."
+            "ERROR: Checksum for 'C:\Users\Example\AppData\Local\Temp\chocolatey\GoogleChrome\152.0.7977.54\googlechromestandaloneenterprise64.msi' did not meet '693e6efefec1d8d776eb221804bfafb8f86289210d687c7024bdb89ef7034d40' for checksum type 'sha256'. Consider passing the actual checksums through with --checksum --checksum64 once you validate the checksums are appropriate. A less secure option is to pass --ignore-checksums if necessary."
+            'The upgrade of GoogleChrome was NOT successful.'
+            "Error while running 'C:\ProgramData\chocolatey\lib\GoogleChrome\tools\chocolateyInstall.ps1'."
+            ' See log for details.'
+            'googledrive v129.0.1 is the latest version available based on your source(s).'
+            'powertoys v0.100.2 is the latest version available based on your source(s).'
+            ''
+            'Chocolatey upgraded 0/14 packages. 1 packages failed.'
+            ' See the log for details (C:\ProgramData\chocolatey\logs\chocolatey.log).'
+            ''
+            'Failures'
+            " - GoogleChrome (exited -1) - Error while running 'C:\ProgramData\chocolatey\lib\GoogleChrome\tools\chocolateyInstall.ps1'."
+            ' See log for details.'
+        )
+    }
+
+    It 'extracts the failing package and its exit code from the Failures block' {
+        $summary = Get-ChocolateyOutputSummary -Lines $script:ChocoChecksumFailure
+        @($summary.Failures).Count | Should -Be 1
+        $summary.Failures[0].Name | Should -Be 'GoogleChrome'
+        $summary.Failures[0].Code | Should -Be -1
+    }
+
+    It 'associates the expected and actual checksums with the failing package' {
+        $summary = Get-ChocolateyOutputSummary -Lines $script:ChocoChecksumFailure
+        $summary.Failures[0].ExpectedChecksum | Should -Be '693e6efefec1d8d776eb221804bfafb8f86289210d687c7024bdb89ef7034d40'
+        $summary.Failures[0].ActualChecksum | Should -Be 'B5F03C8D228C79A4EAFB071BE89AA34AFA46EDE60E898EC1988600BBB5D7B451'
+    }
+
+    It 'treats the same checksum failure on consecutive passes as terminal' {
+        $state = [pscustomobject]@{}
+        $summary = Get-ChocolateyOutputSummary -Lines $script:ChocoChecksumFailure
+        $first = Complete-ChocolateyFailureClassification -State $state -Failures $summary.Failures
+        $second = Complete-ChocolateyFailureClassification -State $state -Failures $summary.Failures
+        $first.TerminalFailure | Should -BeFalse -Because 'one sighting does not prove a failure is permanent'
+        $second.TerminalFailure | Should -BeTrue
+    }
+
+    It 'stops treating a failure as terminal once the package is fixed upstream' {
+        <# The maintainer refreshing stale metadata changes the expected checksum, which
+           changes the signature, which re-arms the retry budget with no human involved. #>
+        $state = [pscustomobject]@{}
+        $summary = Get-ChocolateyOutputSummary -Lines $script:ChocoChecksumFailure
+        $null = Complete-ChocolateyFailureClassification -State $state -Failures $summary.Failures
+        (Complete-ChocolateyFailureClassification -State $state -Failures $summary.Failures).TerminalFailure |
+            Should -BeTrue
+
+        $refreshed = $script:ChocoChecksumFailure -replace '693e6efefec1d8d776eb221804bfafb8f86289210d687c7024bdb89ef7034d40', '0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0'
+        $refreshedSummary = Get-ChocolateyOutputSummary -Lines $refreshed
+        $refreshedSummary.Failures[0].Name | Should -Be 'GoogleChrome' -Because 'same package and exit code as before'
+        $refreshedSummary.Failures[0].Code | Should -Be -1
+        (Complete-ChocolateyFailureClassification -State $state -Failures $refreshedSummary.Failures).TerminalFailure |
+            Should -BeFalse
+    }
+
+    It 'reports a repeated Chocolatey failure as terminal from the phase itself' {
+        Mock Write-Log { }
+        Mock Get-Command { [pscustomobject]@{ Source='C:\ProgramData\chocolatey\bin\choco.exe' } } -ParameterFilter { $Name -eq 'choco' }
+        Mock Invoke-BootUpdateBackgroundOperation { @{ Failed=$true; TimedOut=$false; Output=$script:ChocoChecksumFailure } }
+        $script:PackageTimeoutMinutes = 30
+        $script:ExcludePatterns = @()
+        $script:IncludePatterns = @()
+        $script:CurrentState = [pscustomobject]@{}
+
+        $first = Update-ChocolateyPackages -Confirm:$false
+        $second = Update-ChocolateyPackages -Confirm:$false
+
+        $first.Success | Should -BeFalse
+        [bool]$first.TerminalFailure | Should -BeFalse
+        [bool]$second.TerminalFailure | Should -BeTrue
+    }
+
+    It 'hands over both checksums and never names the bypass' {
+        <# ADR-0001: the repair plan states the mismatch so a human can compare against the
+           vendor's published hash, and offers no command, because none is safe to run blind.
+           Write-BootUpdateRepairPlan feeds Command into a copy/paste block, so a bypass
+           placed there would be the path of least resistance. #>
+        Mock Write-Log { }
+        Mock Get-Command { [pscustomobject]@{ Source='C:\ProgramData\chocolatey\bin\choco.exe' } } -ParameterFilter { $Name -eq 'choco' }
+        Mock Invoke-BootUpdateBackgroundOperation { @{ Failed=$true; TimedOut=$false; Output=$script:ChocoChecksumFailure } }
+        $script:PackageTimeoutMinutes = 30
+        $script:ExcludePatterns = @()
+        $script:IncludePatterns = @()
+        $script:CurrentState = [pscustomobject]@{}
+
+        $null = Update-ChocolateyPackages -Confirm:$false
+        $terminal = Update-ChocolateyPackages -Confirm:$false
+
+        $detail = @($terminal.AttentionDetails)[0]
+        $detail.Name | Should -Be 'GoogleChrome'
+        $detail.Hex | Should -Match '693e6efefec1d8d776eb221804bfafb8f86289210d687c7024bdb89ef7034d40'
+        $detail.Hex | Should -Match 'B5F03C8D228C79A4EAFB071BE89AA34AFA46EDE60E898EC1988600BBB5D7B451'
+        [string]$detail.Command | Should -BeNullOrEmpty
+        ($terminal.AttentionDetails | Out-String) | Should -Not -Match 'ignore-checksums'
+    }
+
+    It 'routes a terminal Chocolatey phase to manual attention' {
+        $result = Resolve-BootUpdateCompletionDisposition -IncompletePhases @(
+            @{ Name='Chocolatey'; UserCompletionDeferred=$false; TerminalFailure=$true }
+        )
+        $result.Kind | Should -Be 'Attention'
     }
 }

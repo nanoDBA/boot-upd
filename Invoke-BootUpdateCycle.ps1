@@ -3099,6 +3099,98 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
     return @{ Success = $phaseSuccess; Count = $totalCount; TerminalFailure=$classification.TerminalFailure; AttentionDetails=$classification.Details }
 }
 
+function Get-ChocolateyOutputSummary {
+    <# Chocolatey reports per-package failures only in a trailing `Failures` block; the
+       phase itself exits -1 for any failing install script, so this block is the only
+       place the failing package is named. #>
+    param([object[]]$Lines = @())
+    $failures = [Collections.Generic.List[object]]::new()
+    $checksums = @{}
+    $currentName = ''
+    $lastActual = ''
+    $inFailures = $false
+    foreach ($rawLine in $Lines) {
+        $line = ([string]$rawLine).Trim()
+        <# A package announces itself before its own output, and the checksum error that
+           follows names only a file path, so attribute it to the last announcement. #>
+        if ($line -match '^(\S+)\s+v\S+\s+\[Approved\]') { $currentName = $Matches[1]; continue }
+        if ($line -match "^Error - hashes do not match\. Actual value was '([0-9A-Fa-f]+)'\.") { $lastActual = $Matches[1]; continue }
+        if ($line -match "^ERROR: Checksum for '.+' did not meet '([0-9A-Fa-f]+)' for checksum type") {
+            if ($currentName) { $checksums[$currentName] = [pscustomobject]@{ Expected=$Matches[1]; Actual=$lastActual } }
+            continue
+        }
+        if ($line -eq 'Failures') { $inFailures = $true; continue }
+        if (-not $inFailures) { continue }
+        if ($line -match '^-\s+(\S+)\s+\(exited\s+(-?\d+)\)') {
+            $name = $Matches[1]
+            $checksum = $checksums[$name]
+            $failures.Add([pscustomobject]@{
+                Name = $name
+                Code = [int]$Matches[2]
+                ExpectedChecksum = $(if ($checksum) { $checksum.Expected } else { '' })
+                ActualChecksum = $(if ($checksum) { $checksum.Actual } else { '' })
+            })
+        }
+    }
+    return [pscustomobject]@{ Failures = $failures.ToArray() }
+}
+
+function Complete-ChocolateyFailureClassification {
+    <# Recognise the same Chocolatey failure recurring across passes so a cause that cannot
+       succeed stops consuming the retry budget. Chocolatey exits -1 for every failing
+       install script, so package and code alone cannot tell a checksum mismatch apart from
+       a disk or network failure of the same package; the expected checksum is folded in to
+       discriminate causes and to let the signature change when the package is fixed
+       upstream. See docs/adr/0002-checksum-in-chocolatey-failure-signature.md. #>
+    param(
+        [Parameter(Mandatory)][pscustomobject]$State,
+        [object[]]$Failures = @()
+    )
+    $signatureParts = @($Failures | ForEach-Object {
+        $expected = [string]$_.ExpectedChecksum
+        if ($expected) { "$($_.Name):$($_.Code):$expected" } else { "$($_.Name):$($_.Code)" }
+    }) | Sort-Object -Unique
+    $signature = ($signatureParts -join '|')
+    if (-not $signature) {
+        $State | Add-Member ChocolateyFailureSignature '' -Force
+        $State | Add-Member ChocolateyFailureRepeatCount 0 -Force
+        Set-BootUpdateState -State $State
+        return [pscustomobject]@{ Signature=''; TerminalFailure=$false; Details=@() }
+    }
+    $prior = if ($State.PSObject.Properties.Name -contains 'ChocolateyFailureSignature') { [string]$State.ChocolateyFailureSignature } else { '' }
+    $priorCount = if ($State.PSObject.Properties.Name -contains 'ChocolateyFailureRepeatCount') { [int]$State.ChocolateyFailureRepeatCount } else { 0 }
+    $repeat = if ($prior -eq $signature) { $priorCount + 1 } else { 1 }
+    $State | Add-Member ChocolateyFailureSignature $signature -Force
+    $State | Add-Member ChocolateyFailureRepeatCount $repeat -Force
+    Set-BootUpdateState -State $State
+    return [pscustomobject]@{
+        Signature=$signature
+        TerminalFailure=($repeat -ge 2)
+        Details=@($Failures | ForEach-Object {
+            $expected = [string]$_.ExpectedChecksum
+            $actual = [string]$_.ActualChecksum
+            <# Hex is the free-text detail slot the repair plan prints beside the package.
+               For a checksum mismatch it carries both hashes so a human can compare them
+               against the vendor's published value. Command is deliberately left empty:
+               the plan feeds it into a copy/paste block, and there is no remediation for
+               this failure that is safe to run without that comparison first.
+               See docs/adr/0001-never-bypass-package-checksum-verification.md. #>
+            $detail = if ($expected) {
+                "checksum mismatch - expected $expected, actual $actual"
+            } else {
+                Format-NativeExitCode ([long]$_.Code)
+            }
+            [pscustomobject]@{
+                Name=[string]$_.Name
+                Id=[string]$_.Name
+                Code=[long]$_.Code
+                Hex=$detail
+                Command=''
+            }
+        })
+    }
+}
+
 function Update-ChocolateyPackages {
     [CmdletBinding(SupportsShouldProcess)]
     param()
@@ -3106,6 +3198,9 @@ function Update-ChocolateyPackages {
     if (-not $choco) { Write-Log 'Chocolatey not found, skipping.' -Level Warn; return @{ Success = $true; Count = 0 } }
     $chocoPath = $choco.Source
     $count = 0; $failed = $false
+    <# Both branches feed one classifier: excluding a package must not disable terminal
+       classification for everything else. #>
+    $chocoFailures = [Collections.Generic.List[object]]::new()
     if ($PSCmdlet.ShouldProcess('Chocolatey', 'Run choco upgrade all')) {
         if ($script:ExcludePatterns.Count -eq 0 -and $script:IncludePatterns.Count -eq 0) {
             <# Fast path: no package filters #>
@@ -3117,6 +3212,7 @@ function Update-ChocolateyPackages {
                 if ($_ -match 'upgraded (\d+)/\d+ package') { $count = [int]$Matches[1] }
             }
             Write-ProviderTranscript -Provider Chocolatey -Lines $result.Output
+            $chocoFailures.AddRange([object[]]@((Get-ChocolateyOutputSummary -Lines $result.Output).Failures))
             if ($result.Failed -or $result.TimedOut) { $failed = $true; Write-Log 'Chocolatey upgrade failed or timed out; retry required.' -Level Error }
         } else {
             <# Filtered path: enumerate outdated packages, exclude by pattern, upgrade individually #>
@@ -3165,6 +3261,7 @@ function Update-ChocolateyPackages {
                     if ($_ -match 'upgraded (\d+)/\d+ package|Software installed') { $count++ }
                 }
                 Write-ProviderTranscript -Provider Chocolatey -Scope $pkgName -Lines $result.Output
+                $chocoFailures.AddRange([object[]]@((Get-ChocolateyOutputSummary -Lines $result.Output).Failures))
                 if ($result.Failed -or $result.TimedOut) { $failed = $true; Write-Log "Chocolatey $pkgName failed or timed out; retry required." -Level Error }
             }
         }
@@ -3177,7 +3274,8 @@ function Update-ChocolateyPackages {
         }
     }
     Write-Log "Chocolatey: $count package(s) updated$(if ($failed) { ' (partial failure)' } else { '' })." -Level $(if ($failed) { 'Warn' } else { 'Info' })
-    return @{ Success = (-not $failed); Count = $count }
+    $classification = Complete-ChocolateyFailureClassification -State $script:CurrentState -Failures $chocoFailures.ToArray()
+    return @{ Success = (-not $failed); Count = $count; TerminalFailure = $classification.TerminalFailure; AttentionDetails = $classification.Details }
 }
 
 function Repair-WindowsUpdateComponents {
