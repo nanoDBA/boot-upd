@@ -1,10 +1,28 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.73
+**Current Version:** v2.5.74
 **Release Date:** 2026-08-24
 **Status:** STABLE
 
 ---
+
+## v2.5.74 (2026-08-24)
+
+Retry-budget correctness release.
+
+### Fixed
+
+- Boot-session identity was compared across a serialization boundary that changed its type, so the same-boot retry budget reset on every recovery pass and `MaxRetryPasses` was never reachable. State is persisted as JSON, and `ConvertFrom-Json` rehydrates an ISO-8601 value as `[datetime]`; `Test-BootUpdateSameBootSession` declared its parameters as `[string]`, so parameter binding rendered that `[datetime]` in the current culture and dropped the offset. Re-parsing then assumed the local offset, skewing the comparison by the machine's full UTC offset — 14399.5s observed against a 120s tolerance. Every pass therefore reported a new boot session, zeroing `ConsecutiveRetryCount`, clearing `ExplicitRebootRequests`, and discarding `WindowsUpdateZeroEvidence`. A permanently failing phase retried indefinitely: 42 passes in one observed session with no reboot in between. The jitter tolerance added earlier was itself correct; it was simply never reached. Persisted timestamps are now normalized back to round-trip `'o'` form by `ConvertTo-BootUpdateTimestampString`, applied at the state-load boundary in `Update-BootUpdateStateSchema` and again inside the comparison, whose parameters are no longer typed `[string]`.
+- `WindowsUpdateZeroEvidence.ObservedAtUtc` shared the same defect through its `[datetime]::Parse` round-trip, aging same-boot zero evidence out by the local UTC offset and forcing redundant Windows Update rescans. It is normalized by the same helper.
+
+### Validation
+
+- Unit and process behavior: 314/314 Pester tests pass, including seven new tests under `Boot session identity survives the state-file round-trip` that exercise the `ConvertTo-Json`/`ConvertFrom-Json` boundary the previous literal-string tests never reached.
+- User/SYSTEM security boundary: passed.
+- Published launcher upgrade: passed.
+- Live bootstrap and provider integration: not run.
+- Multi-reboot convergence: **not run.** This release changes reboot-detection logic, so the disposable-VM matrix in `docs/TESTING.md` is applicable and was not exercised. Behavior is covered by the unit and process gates only.
+- No updater cycle or reboot was performed during validation.
 
 ## v2.5.73 (2026-08-24)
 
