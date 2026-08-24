@@ -2029,4 +2029,58 @@ Describe 'Chocolatey terminal failure classification' {
         )
         $result.Kind | Should -Be 'Attention'
     }
+
+    It 'attributes each checksum to its own package when one is not [Approved]' {
+        <# Packages from non-community sources print no [Approved] marker, so tracking the
+           current package by that line alone wrote the second package's hash into the
+           first package's record, corrupting both signatures. #>
+        $lines = @(
+            'PackageOne v1.0.0 [Approved]'
+            "Error - hashes do not match. Actual value was 'AAAA1111'."
+            "ERROR: Checksum for 'C:\Users\Example\AppData\Local\Temp\chocolatey\PackageOne\1.0.0\one.msi' did not meet 'EEEE1111' for checksum type 'sha256'."
+            'The upgrade of PackageOne was NOT successful.'
+            "Error - hashes do not match. Actual value was 'BBBB2222'."
+            "ERROR: Checksum for 'C:\Users\Example\AppData\Local\Temp\chocolatey\PackageTwo\2.0.0\two.msi' did not meet 'EEEE2222' for checksum type 'sha256'."
+            'The upgrade of PackageTwo was NOT successful.'
+            'Failures'
+            ' - PackageOne (exited -1) - Error while running install script.'
+            ' - PackageTwo (exited -1) - Error while running install script.'
+        )
+        $summary = Get-ChocolateyOutputSummary -Lines $lines
+        @($summary.Failures).Count | Should -Be 2
+        $one = @($summary.Failures | Where-Object { $_.Name -eq 'PackageOne' })[0]
+        $two = @($summary.Failures | Where-Object { $_.Name -eq 'PackageTwo' })[0]
+        $one.ExpectedChecksum | Should -Be 'EEEE1111'
+        $one.ActualChecksum | Should -Be 'AAAA1111'
+        $two.ExpectedChecksum | Should -Be 'EEEE2222'
+        $two.ActualChecksum | Should -Be 'BBBB2222'
+    }
+
+    It 'clears a stale repair plan when Chocolatey recovers' {
+        $script:InstallDir = $TestDrive
+        $plan = Join-Path $TestDrive 'BootUpdateCycle-repair-plan.txt'
+        Set-Content -LiteralPath $plan -Value 'stale plan from an earlier pass'
+        $state = [pscustomobject]@{ ChocolateyFailureSignature='GoogleChrome:-1:abc'; ChocolateyFailureRepeatCount=3 }
+
+        $result = Complete-ChocolateyFailureClassification -State $state -Failures @()
+
+        $result.TerminalFailure | Should -BeFalse
+        $state.ChocolateyFailureRepeatCount | Should -Be 0
+        Test-Path -LiteralPath $plan | Should -BeFalse -Because 'the failure it described is resolved'
+    }
+
+    It 'clears the failure signature when Chocolatey is no longer installed' {
+        <# The skip path reported success while leaving the counter set, so the next real
+           failure with the same signature went terminal on its first sighting. #>
+        Mock Write-Log { }
+        Mock Get-Command { $null } -ParameterFilter { $Name -eq 'choco' }
+        $script:InstallDir = $TestDrive
+        $script:CurrentState = [pscustomobject]@{ ChocolateyFailureSignature='GoogleChrome:-1:abc'; ChocolateyFailureRepeatCount=1 }
+
+        $result = Update-ChocolateyPackages -Confirm:$false
+
+        $result.Success | Should -BeTrue
+        $script:CurrentState.ChocolateyFailureRepeatCount | Should -Be 0
+        [string]$script:CurrentState.ChocolateyFailureSignature | Should -BeNullOrEmpty
+    }
 }

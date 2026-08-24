@@ -3101,7 +3101,7 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
 
 function Get-ChocolateyOutputSummary {
     <# Chocolatey reports per-package failures only in a trailing `Failures` block; the
-       phase itself exits -1 for any failing install script, so this block is the only
+       choco process exits -1 for any failing install script, so this block is the only
        place the failing package is named. #>
     param([object[]]$Lines = @())
     $failures = [Collections.Generic.List[object]]::new()
@@ -3111,12 +3111,18 @@ function Get-ChocolateyOutputSummary {
     $inFailures = $false
     foreach ($rawLine in $Lines) {
         $line = ([string]$rawLine).Trim()
-        <# A package announces itself before its own output, and the checksum error that
-           follows names only a file path, so attribute it to the last announcement. #>
-        if ($line -match '^(\S+)\s+v\S+\s+\[Approved\]') { $currentName = $Matches[1]; continue }
+        if ($line -match '^(\S+)\s+v\S+\s+\[Approved\]') { $currentName = $Matches[1]; $lastActual = ''; continue }
         if ($line -match "^Error - hashes do not match\. Actual value was '([0-9A-Fa-f]+)'\.") { $lastActual = $Matches[1]; continue }
-        if ($line -match "^ERROR: Checksum for '.+' did not meet '([0-9A-Fa-f]+)' for checksum type") {
-            if ($currentName) { $checksums[$currentName] = [pscustomobject]@{ Expected=$Matches[1]; Actual=$lastActual } }
+        if ($line -match "^ERROR: Checksum for '(.+?)' did not meet '([0-9A-Fa-f]+)' for checksum type") {
+            $checksumPath = $Matches[1]
+            $expected = $Matches[2]
+            <# Attribute by the package directory in Chocolatey's cache path, which is on this
+               same line. Tracking the most recent [Approved] banner instead misfiles the hash
+               whenever a package comes from a source that prints no banner, which corrupts
+               the previous package's signature as well as losing this one's. #>
+            $owner = if ($checksumPath -match '[\\/]chocolatey[\\/]([^\\/]+)[\\/]') { $Matches[1] } else { $currentName }
+            if ($owner) { $checksums[$owner] = [pscustomobject]@{ Expected=$expected; Actual=$lastActual } }
+            $lastActual = ''
             continue
         }
         if ($line -eq 'Failures') { $inFailures = $true; continue }
@@ -3155,6 +3161,10 @@ function Complete-ChocolateyFailureClassification {
         $State | Add-Member ChocolateyFailureSignature '' -Force
         $State | Add-Member ChocolateyFailureRepeatCount 0 -Force
         Set-BootUpdateState -State $State
+        <# The plan described a failure that is now resolved; leaving it on disk invites
+           someone to work a stale checklist. Mirrors the Winget clear path. #>
+        $repairPlan = Join-Path $script:InstallDir 'BootUpdateCycle-repair-plan.txt'
+        Remove-Item -LiteralPath $repairPlan -Force -ErrorAction SilentlyContinue
         return [pscustomobject]@{ Signature=''; TerminalFailure=$false; Details=@() }
     }
     $prior = if ($State.PSObject.Properties.Name -contains 'ChocolateyFailureSignature') { [string]$State.ChocolateyFailureSignature } else { '' }
@@ -3195,7 +3205,13 @@ function Update-ChocolateyPackages {
     [CmdletBinding(SupportsShouldProcess)]
     param()
     $choco = Get-Command choco -EA SilentlyContinue
-    if (-not $choco) { Write-Log 'Chocolatey not found, skipping.' -Level Warn; return @{ Success = $true; Count = 0 } }
+    if (-not $choco) {
+        Write-Log 'Chocolatey not found, skipping.' -Level Warn
+        <# Reporting success while leaving a signature armed would send the next real
+           failure straight to terminal on its first sighting. #>
+        $null = Complete-ChocolateyFailureClassification -State $script:CurrentState -Failures @()
+        return @{ Success = $true; Count = 0 }
+    }
     $chocoPath = $choco.Source
     $count = 0; $failed = $false
     <# Both branches feed one classifier: excluding a package must not disable terminal
