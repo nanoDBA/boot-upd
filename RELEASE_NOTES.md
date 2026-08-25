@@ -1,10 +1,41 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.75
-**Release Date:** 2026-08-24
+**Current Version:** v2.5.76
+**Release Date:** 2026-08-25
 **Status:** STABLE
 
 ---
+
+## v2.5.76 (2026-08-25)
+
+Truthful-convergence release.
+
+### Fixed
+
+- A cycle that finished carrying work it could not attempt claimed unqualified convergence and sent a **Success** notification. `CONTEXT.md` has always held that deferred work "does not make a phase fail, but it does prevent an unqualified claim of convergence"; only the first half was implemented. `$deferredCount` — pinned packages, packages whose installed version cannot be determined, and packages Winget refuses to upgrade in place — existed solely to reconcile the Winget exit code and reached nothing downstream. Observed on real hardware 2026-08-24 17:00: the run logged `Winget machine: deferred inventory - 1 install-technology blocked` for Microsoft Edge, then `BOOT UPDATE CYCLE COMPLETE` and a Success toast. Deferred inventory now persists in cycle state and qualifies the completion claim, the notification severity, the completion banner, and the manual repair plan.
+- The observation is read from the checkpoint rather than from the finishing pass's own provider results. A phase already flagged done does not run again after a reboot or a recovery pass, so a per-run value would be empty at exactly the moment the claim is made.
+- Deferred inventory is recorded only for the canonical `user` and `machine` scopes. `Write-WingetScopeSummary` is also called with `<scope>-retry` and `<scope>/<PackageId>` labels, which are sub-observations of a scope rather than scopes of their own; recording them double-reported one deferral under a scope name that does not exist and stranded a retry entry that nothing would clear for the rest of the cycle.
+
+### Changed
+
+- The completion claim is composed rather than enumerated. `Get-BootUpdateCompletionClaim` replaces a nested `if/elseif` that produced four branches for two qualifiers and would have produced eight for three. This normalises the inconsistent `COMPLETE WITH QUARANTINE AND CLEANUP ADVISORY` to `COMPLETE WITH WINGET QUARANTINE AND CLEANUP ADVISORY`; nothing parses past the `COMPLETE` prefix, which `Export-BootUpdateDiagnostics` matches and the composer guarantees stays first.
+- The exit code is deliberately unchanged and remains `0`. `upd.cmd` and both scheduled tasks read a non-zero exit as failure, and nothing failed; encoding the qualification there would assert the one thing "deferred" forbids. The qualification is carried only by surfaces a human reads.
+- A cleanup advisory still sends a Success notification, as before. It reports housekeeping that does not block convergence — "updates converged and no restart is required" — so it does not contradict a success claim the way outstanding update work does. It continues to qualify the log claim.
+- `deferred` was overloaded and is now two terms in `CONTEXT.md`. `UserCompletionDeferred` is a *scope deferral*: the machine-scope pass ran and the user-scope pass must run later in user context, which already drives the completion disposition. *Deferred inventory* is work that cannot be attempted at all. Adds *qualified convergence*.
+
+### Added
+
+- `docs/adr/0003-deferred-inventory-qualifies-convergence.md`, recording why the code was fixed to match the glossary rather than the glossary relaxed to match the code, why blocking completion was ruled out, and why the exit code was not used as the carrier.
+- Quarantine and deferred inventory are now documented as orthogonal: quarantine is the action taken against the package manager, deferred inventory is the status that action produces. `CONTEXT.md` previously called them "distinct", which read as if they were alternatives and blocked the Chocolatey quarantine design.
+
+### Validation
+
+- Unit and process behavior: 357/357 Pester tests pass, including 33 new cases across completion-claim composition, deferred-inventory durability across a `ConvertTo-Json`/`ConvertFrom-Json` round-trip, notification severity, repair-plan reporting, and canonical-scope recording.
+- User/SYSTEM security boundary: passed.
+- Published launcher upgrade: passed.
+- Live bootstrap and provider integration: not run.
+- Multi-reboot convergence: **not run.** This release adds a state-schema field and changes completion claims; it changes no reboot, checkpoint, mutex, or task logic. The gate remains owed from v2.5.74, which did change reboot detection.
+- No updater cycle or reboot was performed during validation.
 
 ## v2.5.75 (2026-08-24)
 
