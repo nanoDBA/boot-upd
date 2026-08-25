@@ -716,7 +716,11 @@ Describe 'Plain-language toast outcomes' {
 
     It 'distinguishes completion, retry, user continuation, and reboot states' {
         $cycle = Get-FunctionText -Ast $invokeAst -Name 'Invoke-BootUpdateCycle'
-        $cycle | Should -Match 'Updates complete.*no restart required'
+        <# The completion toast is composed by Get-BootUpdateCompletionNotification so that
+           deferred inventory can downgrade its severity (ADR-0003); its wording lives
+           there, while the other three states are still built inline. #>
+        (Get-FunctionText -Ast $invokeAst -Name 'Get-BootUpdateCompletionNotification') |
+            Should -Match 'Updates complete.*no restart required'
         $cycle | Should -Match 'Another update pass is scheduled.*no restart required'
         $cycle | Should -Match 'User update pass pending.*no restart required'
         (Get-FunctionText -Ast $invokeAst -Name 'Send-RebootWarning') |

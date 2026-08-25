@@ -1478,6 +1478,29 @@ function Write-WingetScopeSummary {
     if ($summary.TechnologyBlocked) { $notes += "$($summary.TechnologyBlocked) install-technology blocked" }
     if ($summary.ScopeBlocked.Count) { $notes += "$($summary.ScopeBlocked.Count) elevation-scope blocked" }
     if ($notes.Count) { Write-Log "Winget ${Scope}: deferred inventory — $($notes -join ', ')." -Level Warn }
+    <# Record the observation in cycle state so the pass that finishes the cycle can qualify
+       its completion claim (ADR-0003). This runs on every canonical scope summary, so a
+       re-run that resolves the deferral clears it here rather than leaving a stale
+       qualifier behind.
+
+       Only 'user' and 'machine' are ledger scopes. This function is also called with
+       synthetic labels — "<scope>-retry" for a retry attempt and "<scope>/<PackageId>" for
+       a targeted single-package run — which are sub-observations of a scope, not scopes of
+       their own. Recording those would double-report one deferral under a scope name that
+       does not exist, and because an entry is only replaced by a summary carrying the
+       identical label, a "-retry" entry would then be stranded with nothing to clear it for
+       the rest of the cycle. A retry that narrows the deferral is picked up by the next
+       full-scope pass instead, which errs toward reporting outstanding work rather than
+       silently dropping it. #>
+    if ($script:CurrentState -and $Scope -in @('user', 'machine')) {
+        $deferredRecords = @(
+            if ($summary.Pinned)           { [pscustomobject]@{ Kind = 'Pinned'; Count = [int]$summary.Pinned } }
+            if ($summary.Unknown)          { [pscustomobject]@{ Kind = 'UnknownVersion'; Count = [int]$summary.Unknown } }
+            if ($summary.TechnologyBlocked){ [pscustomobject]@{ Kind = 'TechnologyBlocked'; Count = [int]$summary.TechnologyBlocked } }
+            if ($summary.ScopeBlocked.Count) { [pscustomobject]@{ Kind = 'ScopeBlocked'; Count = @($summary.ScopeBlocked).Count } }
+        )
+        Add-BootUpdateDeferredInventory -State $script:CurrentState -Provider 'Winget' -Scope $Scope -Records $deferredRecords
+    }
     if ($summary.Pinned) { Write-Log 'Winget suggested inspection: winget pin list' -Level Warn }
     if ($summary.Unknown -or $summary.TechnologyBlocked) {
         Write-Log 'Winget suggested inventory: winget upgrade --all --include-unknown --accept-source-agreements --accept-package-agreements' -Level Warn
@@ -1587,6 +1610,138 @@ function Set-BootUpdateRebootCheckpoint {
     Set-BootUpdateState -State $State
     Write-Log "Reboot checkpoint: preserving $($completedFlags.Count) completed phase(s); only incomplete work will resume after boot." -Level Info
     return $completedFlags
+}
+
+function Get-BootUpdateDeferredInventory {
+    <# Deferred inventory is outstanding work a provider could not attempt. It is observed
+       while a phase runs, but the completion claim is made by whichever pass finishes the
+       cycle — and a phase already flagged done does not run again. Reading it from state
+       rather than a per-run variable is what lets a later pass qualify its claim honestly.
+
+       Always returns a collection. ConvertTo-Json renders a one-element array as a bare
+       object, so a caller reading .Count off the rehydrated value would get $null and
+       report a clean cycle while work was outstanding. #>
+    param([Parameter(Mandatory)][pscustomobject]$State)
+    if ($State.PSObject.Properties.Name -notcontains 'DeferredInventory') { return @() }
+    return @($State.DeferredInventory | Where-Object { $null -ne $_ })
+}
+
+function Add-BootUpdateDeferredInventory {
+    <# Records what one provider scope could not attempt, replacing whatever that same
+       provider and scope reported before. Replacement rather than accumulation is the
+       point: a re-run that resolves a deferral must shrink the inventory, or resolved work
+       would qualify the completion claim for the rest of the cycle. Passing no records is
+       therefore the normal way a clean re-run clears its earlier observation. #>
+    param(
+        [Parameter(Mandatory)][pscustomobject]$State,
+        [Parameter(Mandatory)][string]$Provider,
+        [Parameter(Mandatory)][string]$Scope,
+        [object[]]$Records = @()
+    )
+    $retained = @(Get-BootUpdateDeferredInventory -State $State |
+        Where-Object { -not ($_.Provider -eq $Provider -and $_.Scope -eq $Scope) })
+    foreach ($record in @($Records)) {
+        if ($null -eq $record) { continue }
+        $retained += [pscustomobject]@{
+            Provider = $Provider
+            Scope    = $Scope
+            Kind     = [string]$record.Kind
+            Count    = [int]$record.Count
+            Detail   = if ($record.PSObject.Properties.Name -contains 'Detail') { [string]$record.Detail } else { '' }
+        }
+    }
+    if ($State.PSObject.Properties.Name -notcontains 'DeferredInventory') {
+        $State | Add-Member -NotePropertyName 'DeferredInventory' -NotePropertyValue @($retained) -Force
+    } else {
+        $State.DeferredInventory = @($retained)
+    }
+    return
+}
+
+function Get-BootUpdateDeferredInventorySummary {
+    <# Renders deferred inventory for humans: which provider scope could not attempt what,
+       and how much of it. Returns nothing for an empty inventory so callers can treat the
+       result itself as the "is anything outstanding" signal. #>
+    param([object[]]$Records = @())
+    $present = @($Records | Where-Object { $null -ne $_ })
+    if ($present.Count -eq 0) { return $null }
+    $groups = $present | Group-Object { "$($_.Provider) $($_.Scope)" } | Sort-Object Name
+    $parts = foreach ($group in $groups) {
+        $kinds = @($group.Group | ForEach-Object {
+            if ([int]$_.Count -gt 0) { "$($_.Kind)=$([int]$_.Count)" } else { [string]$_.Kind }
+        }) -join ', '
+        "$($group.Name) ($kinds)"
+    }
+    return ($parts -join '; ')
+}
+
+function Get-BootUpdateCompletionNotification {
+    <# Builds the completion toast. Per ADR-0003 a cycle carrying outstanding work still
+       completed, so this is never an Error — nothing failed. But it is not an unqualified
+       success either, and the toast is the surface a human actually reads, so it is where
+       an over-optimistic claim does the most damage. Observed 2026-08-24: a run deferring
+       Microsoft.Edge sent a plain Success toast saying "you are all set". #>
+    param(
+        [int]$TotalVerified = 0,
+        [double]$DurationMinutes = 0,
+        [int]$QuarantineCount = 0,
+        [object[]]$DeferredInventory = @()
+    )
+    $deferredSummary = Get-BootUpdateDeferredInventorySummary -Records $DeferredInventory
+    $hasDeferred = -not [string]::IsNullOrWhiteSpace($deferredSummary)
+    $hasQuarantine = $QuarantineCount -gt 0
+    if (-not $hasDeferred -and -not $hasQuarantine) {
+        return [pscustomobject]@{
+            Kind    = 'Success'
+            Title   = 'Updates complete — no restart required'
+            Message = "$TotalVerified updates verified in $DurationMinutes minutes. Verification passed, no retry is queued, and you are all set."
+        }
+    }
+    $clauses = @("$TotalVerified updates verified.")
+    if ($hasQuarantine) {
+        $clauses += "$QuarantineCount repeatedly failing package(s) were skipped and reversibly pinned to prevent a loop."
+    }
+    if ($hasDeferred) {
+        $clauses += "Some packages could not be attempted and remain outstanding — $deferredSummary."
+    }
+    $clauses += 'No action is required now.'
+    return [pscustomobject]@{
+        Kind    = 'Progress'
+        Title   = 'Updates complete — no restart required'
+        Message = ($clauses -join ' ')
+    }
+}
+
+function Get-BootUpdateCompletionClaim {
+    <# Composes the log-facing completion claim. Per ADR-0003 a cycle carrying outstanding
+       work still completes, but it may not claim convergence without qualification, and
+       each kind of outstanding work names itself in the claim.
+
+       Two constraints shape this. The claim must keep COMPLETE as its first word, because
+       Export-BootUpdateDiagnostics recognises a finished cycle by matching
+       'BOOT UPDATE CYCLE COMPLETE\b' — a qualifier placed before it would make completed
+       cycles read as incomplete in every diagnostics bundle. And the order is canonical
+       rather than call-site order, so the same set of outstanding work renders identically
+       across runs and stays greppable. #>
+    param([string[]]$Qualifiers = @())
+    $canonicalOrder = @('WINGET QUARANTINE', 'CLEANUP ADVISORY', 'DEFERRED INVENTORY')
+    $seen = [Collections.Generic.List[string]]::new()
+    foreach ($qualifier in @($Qualifiers)) {
+        if ([string]::IsNullOrWhiteSpace($qualifier)) { continue }
+        $normalized = $qualifier.Trim()
+        if (-not $seen.Contains($normalized)) { $seen.Add($normalized) }
+    }
+    if ($seen.Count -eq 0) { return 'COMPLETE' }
+    <# Unknown qualifiers sort after the known ones rather than being dropped: a claim that
+       silently omits outstanding work is the exact failure this ADR exists to prevent. #>
+    $ordered = @($seen | Sort-Object -Stable {
+        $index = $canonicalOrder.IndexOf($_)
+        if ($index -lt 0) { [int]::MaxValue } else { $index }
+    })
+    $joined = if ($ordered.Count -eq 1) { $ordered[0] }
+              elseif ($ordered.Count -eq 2) { $ordered -join ' AND ' }
+              else { ($ordered[0..($ordered.Count - 2)] -join ', ') + ', AND ' + $ordered[-1] }
+    return "COMPLETE WITH $joined"
 }
 
 function Resolve-BootUpdateCompletionDisposition {
@@ -1709,6 +1864,8 @@ function Update-BootUpdateStateSchema {
     if ($props -notcontains 'ExplicitRebootRequests') { $State | Add-Member -NotePropertyName 'ExplicitRebootRequests' -NotePropertyValue @() -Force }
     if ($props -notcontains 'WingetAggressiveRepairSignatures') { $State | Add-Member -NotePropertyName 'WingetAggressiveRepairSignatures' -NotePropertyValue @() -Force }
     if ($props -notcontains 'WingetQuarantines') { $State | Add-Member -NotePropertyName 'WingetQuarantines' -NotePropertyValue @() -Force }
+    if ($props -notcontains 'DeferredInventory') { $State | Add-Member -NotePropertyName 'DeferredInventory' -NotePropertyValue @() -Force }
+    else { $State.DeferredInventory = @($State.DeferredInventory | Where-Object { $null -ne $_ }) }
     if ($props -notcontains 'WindowsUpdateZeroEvidence') { $State | Add-Member -NotePropertyName 'WindowsUpdateZeroEvidence' -NotePropertyValue $null -Force }
     foreach ($f in @('WindowsUpdateDone','AwsToolingDone','PowerShellModulesDone','ScoopDone','DotnetToolsDone','VscodeDone','DefenderDone','DriverFirmwareDone','WslDone','ContainersDone')) {
         if ($props -notcontains $f) { $State | Add-Member -NotePropertyName $f -NotePropertyValue $false -Force }
@@ -2481,7 +2638,10 @@ function Stop-BootUpdateForManualAttention {
     }
     $disposition = if ($disarmed) { 'Automatic continuation tasks were removed and verified absent.' } else { 'WARNING: continuation-task removal failed; remove both BootUpdateCycle tasks manually.' }
     $plan = $null
-    try { $plan = Write-BootUpdateRepairPlan -Items $repairItems } catch {
+    try {
+        $plan = Write-BootUpdateRepairPlan -Items $repairItems `
+            -DeferredInventory @(Get-BootUpdateDeferredInventory -State $State)
+    } catch {
         Write-Log "Manual repair-plan handoff failed after retries were stopped: $_" -Level Error
     }
     Write-Log "$($State.LimitReason) $disposition" -Level Error
@@ -2543,7 +2703,7 @@ function Set-BootUpdateClipboardText {
 }
 
 function Write-BootUpdateRepairPlan {
-    param([object[]]$Items = @())
+    param([object[]]$Items = @(), [object[]]$DeferredInventory = @())
     if (-not $Items.Count) { return $null }
     $path = Join-Path $script:InstallDir 'BootUpdateCycle-repair-plan.txt'
     $lines = [Collections.Generic.List[string]]::new()
@@ -2556,6 +2716,20 @@ function Write-BootUpdateRepairPlan {
     $lines.Add('')
     foreach ($item in $Items) { $lines.Add("- $($item.Name) [$($item.Id)]: $($item.Code) / $($item.Hex)") }
     $lines.Add('')
+    <# ADR-0003: deferred inventory is outstanding work that qualified this run's claim. It
+       is reported here as fact and deliberately carries no commands. Per ADR-0001 the plan
+       states facts and options rather than steering the reader, and the providers' own
+       advice for these cases ("uninstall each package, then install the newer version")
+       is wrong for the system components it most often names. It also stays above the
+       copy/paste block, which an elevated Command Prompt consumes verbatim. #>
+    $deferredSummary = Get-BootUpdateDeferredInventorySummary -Records $DeferredInventory
+    if (-not [string]::IsNullOrWhiteSpace($deferredSummary)) {
+        $lines.Add('Also outstanding — not failures')
+        $lines.Add('These could not be attempted, so they are not counted as updated and need no retry:')
+        $lines.Add("  $deferredSummary")
+        $lines.Add('They did not cause this stop and no command below addresses them.')
+        $lines.Add('')
+    }
     $lines.Add('COPY/PASTE BLOCK — ELEVATED COMMAND PROMPT')
     $lines.Add('REM Every line in this block is valid Command Prompt syntax.')
     foreach ($command in @($Items.Command | Where-Object { $_ } | Select-Object -Unique)) { $lines.Add($command) }
@@ -7209,6 +7383,12 @@ function Invoke-BootUpdateCycle {
         $hasCleanupAdvisory = -not $WhatIfPreference -and $cleanupAdvisories.Count -gt 0
         $cleanupCategories = @($cleanupAdvisories | Group-Object Category | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Count)" }) -join ', '
         $cleanupDisplaySummary = Get-PendingFileCleanupDisplaySummary -Operations $cleanupAdvisories
+        <# ADR-0003: outstanding work a provider could not attempt qualifies the completion
+           claim. Read from state, not from this pass's provider results: a phase already
+           flagged done did not run again here, so its deferrals are only in the checkpoint. #>
+        $deferredInventory = @(Get-BootUpdateDeferredInventory -State $state)
+        $deferredSummary = Get-BootUpdateDeferredInventorySummary -Records $deferredInventory
+        $hasDeferredInventory = -not $WhatIfPreference -and -not [string]::IsNullOrWhiteSpace($deferredSummary)
 
         <# Console: styled completion banner #>
         $healthIsGreen = $null -ne $healthCheck -and $healthCheck.AllHealthy
@@ -7216,6 +7396,7 @@ function Invoke-BootUpdateCycle {
                            else { 'U P D A T E S   C O M P L E T E' }
         $congratulations = if ($WhatIfPreference) { 'Preview complete — no changes were made.' }
                            elseif ($hasWingetQuarantine) { 'NICE WORK — the selected update run finished. Repeatedly failing packages were skipped to prevent another loop.' }
+                           elseif ($hasDeferredInventory) { 'NICE WORK — the selected update run finished. Some packages could not be attempted and are still outstanding.' }
                            elseif ($healthIsGreen) { 'NICE WORK — the selected updates finished and verification passed.' }
                            elseif ($null -eq $healthCheck) { 'The selected updates finished. Service health verification was skipped by policy.' }
                            else { 'The selected updates finished, but one service health check needs attention.' }
@@ -7223,15 +7404,19 @@ function Invoke-BootUpdateCycle {
                       elseif ($healthCheck.AllHealthy) { "[OK] $($healthCheck.CheckedServices.Count) service state(s) assessed read-only; expected/policy-managed=$($healthCheck.ExpectedStopped.Count + $healthCheck.PolicyManaged.Count)" }
                       else { "[!!] Service attention: $($healthCheck.FailedServices -join ', ')" }
         <# Log file: structured entries #>
-        $completionDisposition = if ($hasWingetQuarantine -and $hasCleanupAdvisory) { 'COMPLETE WITH QUARANTINE AND CLEANUP ADVISORY' }
-                                 elseif ($hasWingetQuarantine) { 'COMPLETE WITH WINGET QUARANTINE' }
-                                 elseif ($hasCleanupAdvisory) { 'COMPLETE WITH CLEANUP ADVISORY' }
-                                 else { 'COMPLETE' }
+        $completionDisposition = Get-BootUpdateCompletionClaim -Qualifiers @(
+            if ($hasWingetQuarantine) { 'WINGET QUARANTINE' }
+            if ($hasCleanupAdvisory)  { 'CLEANUP ADVISORY' }
+            if ($hasDeferredInventory){ 'DEFERRED INVENTORY' }
+        )
         Write-Log "BOOT UPDATE CYCLE${whatIfTag} $completionDisposition | $durMin min | $($state.Iteration) iteration(s) | $reboots reboot(s) | $total verified updates | $actionsTriggered updater action(s) triggered"
         Write-Log "  $pkgLine"
         if ($hasWingetQuarantine) {
             Write-Log "Winget quarantine record retained at $($script:WingetQuarantinePath)." -Level Warn
             foreach ($record in $wingetQuarantines) { Write-Log "Winget quarantine: $($record.PackageId); undo with: $($record.UnpinCommand)" -Level Warn }
+        }
+        if ($hasDeferredInventory) {
+            Write-Log "Deferred inventory remains: $deferredSummary. These packages were not attempted, are not counted as verified updates, and do not require a retry — the cycle completed without claiming full convergence." -Level Warn
         }
         if ($hasCleanupAdvisory) {
             Write-Log "Non-blocking housekeeping remains: $cleanupDisplaySummary. Updates converged and no restart is required; restarting later may finish it." -Level Warn
@@ -7268,19 +7453,16 @@ function Invoke-BootUpdateCycle {
             if ($leftoverTasks -or (Test-Path -LiteralPath $script:StatePath)) {
                 throw "Terminal cleanup verification failed; refusing the verified completion banner. Tasks: $($leftoverTasks -join ', ')"
             }
-            if ($hasWingetQuarantine) {
-                Send-CompletionNotification -Kind Progress `
-                    -Title 'Updates complete — no restart required' `
-                    -Message "$total updates verified. $($wingetQuarantines.Count) repeatedly failing package(s) were skipped and reversibly pinned to prevent a loop. No action is required now." -Data $summaryData
-            } else {
-                Send-CompletionNotification -Title 'Updates complete — no restart required' `
-                    -Message "$total updates verified in $durMin minutes. Verification passed, no retry is queued, and you are all set." -Data $summaryData
-            }
+            $completionToast = Get-BootUpdateCompletionNotification -TotalVerified $total -DurationMinutes $durMin `
+                -QuarantineCount $(if ($hasWingetQuarantine) { @($wingetQuarantines).Count } else { 0 }) `
+                -DeferredInventory $(if ($hasDeferredInventory) { $deferredInventory } else { @() })
+            Send-CompletionNotification -Kind $completionToast.Kind -Title $completionToast.Title `
+                -Message $completionToast.Message -Data $summaryData
         }
         <# The congratulatory banner is the terminal commit point: hooks, notifications,
            task retirement, state removal, and cleanup verification have all finished. #>
         Write-BootUpdateProgress -Completed
-        Show-CycleBanner -Title $completionTitle -AnsiColor $(if ($hasWingetQuarantine) { "$([char]27)[33m" } else { "$([char]27)[32m" }) -Info @(
+        Show-CycleBanner -Title $completionTitle -AnsiColor $(if ($hasWingetQuarantine -or $hasDeferredInventory) { "$([char]27)[33m" } else { "$([char]27)[32m" }) -Info @(
             $congratulations
             if (-not $WhatIfPreference) { '[RESTART] NOT REQUIRED - no blocking restart evidence remains' }
             "[OK] $($enabledPhases.Count)/$($enabledPhases.Count) configured phases completed"
@@ -7290,6 +7472,10 @@ function Invoke-BootUpdateCycle {
                 '[NEXT] No action is required now. Use the commands below whenever you want to retry them'
                 foreach ($record in $wingetQuarantines) { "[undo] $($record.UnpinCommand)" }
                 "[record] $($script:WingetQuarantinePath)"
+            }
+            if ($hasDeferredInventory) {
+                "[DEFERRED] Not attempted, still outstanding: $deferredSummary"
+                '[WHY] The provider could not upgrade them in place; they are not failures and no retry is queued'
             }
             if ($hasCleanupAdvisory) { "[~] Housekeeping remains: $cleanupDisplaySummary; restarting later is optional" }
             $healthLine

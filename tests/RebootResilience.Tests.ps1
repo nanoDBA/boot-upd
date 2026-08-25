@@ -81,7 +81,12 @@ BeforeAll {
           'Update-ChocolateyPackages',
           'Set-BootUpdateClipboardText',
           'Stop-BootUpdateForManualAttention',
-          'Write-BootUpdateRepairPlan'
+          'Write-BootUpdateRepairPlan',
+          'Get-BootUpdateCompletionClaim',
+          'Add-BootUpdateDeferredInventory',
+          'Get-BootUpdateDeferredInventory',
+          'Get-BootUpdateDeferredInventorySummary',
+          'Get-BootUpdateCompletionNotification'
     )) {
         . ([scriptblock]::Create((Get-FunctionText $invokeAst $functionName)))
     }
@@ -1862,7 +1867,10 @@ Describe 'Evidence-backed completion' {
         $text = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
         $cleanup = $text.LastIndexOf('Unregister-BootUpdateTask')
         $verify = $text.LastIndexOf('Terminal cleanup verification failed')
-        $notify = $text.LastIndexOf("Send-CompletionNotification -Title 'Updates complete")
+        <# Anchored on the call, not on its argument text: the message is composed by
+           Get-BootUpdateCompletionNotification, so pinning the literal here would couple
+           this ordering invariant to wording it does not care about. #>
+        $notify = $text.LastIndexOf('Send-CompletionNotification')
         $banner = $text.LastIndexOf('Show-CycleBanner -Title $completionTitle')
         $cleanup | Should -BeLessThan $verify
         $verify | Should -BeLessThan $notify
@@ -1870,13 +1878,20 @@ Describe 'Evidence-backed completion' {
     }
 
     It 'reports durable Winget quarantine as degraded completion rather than fully patched' {
+        <# The claim string and the toast wording are composed by dedicated functions and
+           asserted behaviourally in 'Completion claim composition' and 'Completion
+           notification severity'. What this guards is that the orchestrator still feeds
+           quarantine into both, and still surfaces the record so a human can undo it. #>
         $text = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
-        $text | Should -Match 'COMPLETE WITH WINGET QUARANTINE'
-        $text | Should -Match 'Updates complete.*no restart required'
+        $text | Should -Match "'WINGET QUARANTINE'"
         $text | Should -Match 'WingetQuarantinePath'
         $text | Should -Match 'Repeatedly failing packages were skipped to prevent another loop'
         $text | Should -Match 'were not updated'
-        $text | Should -Match 'No action is required now'
+        Get-BootUpdateCompletionClaim -Qualifiers @('WINGET QUARANTINE') |
+            Should -Be 'COMPLETE WITH WINGET QUARANTINE'
+        $toast = Get-BootUpdateCompletionNotification -TotalVerified 1 -DurationMinutes 1 -QuarantineCount 1
+        $toast.Title | Should -Match 'Updates complete.*no restart required'
+        $toast.Message | Should -Match 'No action is required now'
         (Get-FunctionText $invokeAst 'Clear-BootUpdateState') | Should -Not -Match 'WingetQuarantine'
     }
 
@@ -2082,5 +2097,352 @@ Describe 'Chocolatey terminal failure classification' {
         $result.Success | Should -BeTrue
         $script:CurrentState.ChocolateyFailureRepeatCount | Should -Be 0
         [string]$script:CurrentState.ChocolateyFailureSignature | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Completion claim composition' {
+    <# ADR-0003: deferred inventory does not fail a phase, but it does prevent an
+       unqualified claim of convergence. The claim string is the log-facing carrier of
+       that qualification. Export-BootUpdateDiagnostics matches
+       'BOOT UPDATE CYCLE COMPLETE\b', so every claim must keep COMPLETE as its first
+       word or a completed cycle stops being recognised as completed. #>
+
+    It 'claims unqualified completion when nothing is outstanding' {
+        Get-BootUpdateCompletionClaim -Qualifiers @() | Should -Be 'COMPLETE'
+    }
+
+    It 'qualifies the claim when deferred inventory remains' {
+        Get-BootUpdateCompletionClaim -Qualifiers @('DEFERRED INVENTORY') |
+            Should -Be 'COMPLETE WITH DEFERRED INVENTORY'
+    }
+
+    It 'preserves the established single-qualifier claims' {
+        Get-BootUpdateCompletionClaim -Qualifiers @('WINGET QUARANTINE') |
+            Should -Be 'COMPLETE WITH WINGET QUARANTINE'
+        Get-BootUpdateCompletionClaim -Qualifiers @('CLEANUP ADVISORY') |
+            Should -Be 'COMPLETE WITH CLEANUP ADVISORY'
+    }
+
+    It 'joins two qualifiers with AND' {
+        Get-BootUpdateCompletionClaim -Qualifiers @('WINGET QUARANTINE', 'CLEANUP ADVISORY') |
+            Should -Be 'COMPLETE WITH WINGET QUARANTINE AND CLEANUP ADVISORY'
+    }
+
+    It 'joins three qualifiers with a serial comma' {
+        Get-BootUpdateCompletionClaim -Qualifiers @('WINGET QUARANTINE', 'CLEANUP ADVISORY', 'DEFERRED INVENTORY') |
+            Should -Be 'COMPLETE WITH WINGET QUARANTINE, CLEANUP ADVISORY, AND DEFERRED INVENTORY'
+    }
+
+    It 'orders qualifiers canonically rather than by argument order' {
+        <# The claim is written to a log humans and greps read across runs; the same set of
+           outstanding work must render identically however the call site assembled it. #>
+        Get-BootUpdateCompletionClaim -Qualifiers @('DEFERRED INVENTORY', 'WINGET QUARANTINE') |
+            Should -Be 'COMPLETE WITH WINGET QUARANTINE AND DEFERRED INVENTORY'
+    }
+
+    It 'ignores empty and duplicate qualifiers' {
+        Get-BootUpdateCompletionClaim -Qualifiers @('DEFERRED INVENTORY', '', 'DEFERRED INVENTORY', $null) |
+            Should -Be 'COMPLETE WITH DEFERRED INVENTORY'
+    }
+
+    It 'always begins with COMPLETE so the diagnostics completion probe still matches' {
+        $claim = Get-BootUpdateCompletionClaim -Qualifiers @('WINGET QUARANTINE', 'CLEANUP ADVISORY', 'DEFERRED INVENTORY')
+        "BOOT UPDATE CYCLE $claim" | Should -Match '(?im)^\s*(?:\[[^\]]+\]\s*)*BOOT UPDATE CYCLE COMPLETE\b'
+    }
+}
+
+Describe 'Deferred inventory durability' {
+    <# ADR-0003: deferred inventory qualifies the completion claim. The claim is made in
+       whichever pass finishes the cycle, but the inventory is observed while a provider
+       phase runs — and a phase already marked done does not run again in a later pass. So
+       the observation must live in cycle state, not in a per-run variable, or the claim is
+       made by a pass that never saw it. #>
+
+    BeforeAll {
+        function New-DeferredState { [pscustomobject]@{ DeferredInventory = @() } }
+        function Get-RoundTripped {
+            param([Parameter(Mandatory)][pscustomobject]$State)
+            return ($State | ConvertTo-Json -Depth 10 | ConvertFrom-Json)
+        }
+    }
+
+    It 'records an observation so a later pass can read it back' {
+        $state = New-DeferredState
+        Add-BootUpdateDeferredInventory -State $state -Provider 'Winget' -Scope 'machine' `
+            -Records @([pscustomobject]@{ Kind = 'TechnologyBlocked'; Count = 1 })
+        $actual = @(Get-BootUpdateDeferredInventory -State $state)
+        $actual.Count | Should -Be 1
+        $actual[0].Provider | Should -Be 'Winget'
+        $actual[0].Scope | Should -Be 'machine'
+        $actual[0].Kind | Should -Be 'TechnologyBlocked'
+    }
+
+    It 'survives the state file round-trip' {
+        <# The safety rule requires this assertion across ConvertTo-Json/ConvertFrom-Json:
+           literal-only tests cannot see rehydration defects. #>
+        $state = New-DeferredState
+        Add-BootUpdateDeferredInventory -State $state -Provider 'Winget' -Scope 'machine' `
+            -Records @([pscustomobject]@{ Kind = 'TechnologyBlocked'; Count = 1 })
+        $reloaded = Get-RoundTripped $state
+        $actual = @(Get-BootUpdateDeferredInventory -State $reloaded)
+        $actual.Count | Should -Be 1
+        $actual[0].Kind | Should -Be 'TechnologyBlocked'
+    }
+
+    It 'returns a single rehydrated record as a collection, not a scalar' {
+        <# ConvertTo-Json renders a one-element array as a bare object, so a caller that
+           reads .Count off the rehydrated value gets $null and silently claims a clean
+           cycle. This is the exact shape of the defect the round-trip rule exists for. #>
+        $state = New-DeferredState
+        Add-BootUpdateDeferredInventory -State $state -Provider 'Winget' -Scope 'machine' `
+            -Records @([pscustomobject]@{ Kind = 'Pinned'; Count = 2 })
+        $reloaded = Get-RoundTripped $state
+        $result = Get-BootUpdateDeferredInventory -State $reloaded
+        @($result).Count | Should -Be 1
+        $result.Count | Should -Not -BeNullOrEmpty -Because 'a collection must report its own Count'
+    }
+
+    It 'replaces the prior observation for the same provider and scope' {
+        <# A re-run that finds less outstanding work must shrink the inventory, never
+           accumulate it, or a resolved deferral would qualify the claim forever. #>
+        $state = New-DeferredState
+        Add-BootUpdateDeferredInventory -State $state -Provider 'Winget' -Scope 'machine' `
+            -Records @([pscustomobject]@{ Kind = 'Pinned'; Count = 2 })
+        Add-BootUpdateDeferredInventory -State $state -Provider 'Winget' -Scope 'machine' `
+            -Records @([pscustomobject]@{ Kind = 'TechnologyBlocked'; Count = 1 })
+        $actual = @(Get-BootUpdateDeferredInventory -State $state)
+        $actual.Count | Should -Be 1
+        $actual[0].Kind | Should -Be 'TechnologyBlocked'
+    }
+
+    It 'clears the observation when a re-run finds nothing outstanding' {
+        $state = New-DeferredState
+        Add-BootUpdateDeferredInventory -State $state -Provider 'Winget' -Scope 'machine' `
+            -Records @([pscustomobject]@{ Kind = 'Pinned'; Count = 2 })
+        Add-BootUpdateDeferredInventory -State $state -Provider 'Winget' -Scope 'machine' -Records @()
+        @(Get-BootUpdateDeferredInventory -State $state).Count | Should -Be 0
+    }
+
+    It 'keeps observations from other scopes and providers independent' {
+        $state = New-DeferredState
+        Add-BootUpdateDeferredInventory -State $state -Provider 'Winget' -Scope 'machine' `
+            -Records @([pscustomobject]@{ Kind = 'TechnologyBlocked'; Count = 1 })
+        Add-BootUpdateDeferredInventory -State $state -Provider 'Winget' -Scope 'user' `
+            -Records @([pscustomobject]@{ Kind = 'Pinned'; Count = 3 })
+        Add-BootUpdateDeferredInventory -State $state -Provider 'Chocolatey' -Scope 'machine' `
+            -Records @([pscustomobject]@{ Kind = 'Quarantined'; Count = 1 })
+        @(Get-BootUpdateDeferredInventory -State $state).Count | Should -Be 3
+        Add-BootUpdateDeferredInventory -State $state -Provider 'Winget' -Scope 'machine' -Records @()
+        $remaining = @(Get-BootUpdateDeferredInventory -State $state)
+        $remaining.Count | Should -Be 2
+        @($remaining | Where-Object { $_.Provider -eq 'Winget' -and $_.Scope -eq 'machine' }).Count | Should -Be 0
+    }
+
+    It 'tolerates state that predates the field' {
+        <# Continuation across a self-update means a pass can load a checkpoint written by
+           an older build that has no DeferredInventory property at all. #>
+        $legacy = [pscustomobject]@{ Iteration = 3 }
+        @(Get-BootUpdateDeferredInventory -State $legacy).Count | Should -Be 0
+        { Add-BootUpdateDeferredInventory -State $legacy -Provider 'Winget' -Scope 'machine' `
+            -Records @([pscustomobject]@{ Kind = 'Pinned'; Count = 1 }) } | Should -Not -Throw
+        @(Get-BootUpdateDeferredInventory -State $legacy).Count | Should -Be 1
+    }
+}
+
+Describe 'Completion notification severity' {
+    <# The regression this fixes, observed 2026-08-24 17:00 on real hardware: the cycle
+       logged "Winget machine: deferred inventory - 1 install-technology blocked"
+       (Microsoft.Edge) and then sent a Success toast claiming the machine was up to date.
+       The toast is the surface a human actually reads, so it is where the false
+       reassurance landed. ADR-0003: nothing failed, so this is not an Error — but it is
+       not an unqualified success either. #>
+
+    BeforeAll {
+        function New-DeferredRecord {
+            param([string]$Kind = 'TechnologyBlocked', [int]$Count = 1, [string]$Detail = '')
+            [pscustomobject]@{ Provider = 'Winget'; Scope = 'machine'; Kind = $Kind; Count = $Count; Detail = $Detail }
+        }
+    }
+
+    It 'claims unqualified success when nothing is outstanding' {
+        $actual = Get-BootUpdateCompletionNotification -TotalVerified 3 -DurationMinutes 2.3
+        $actual.Kind | Should -Be 'Success'
+    }
+
+    It 'does not claim success when deferred inventory remains' {
+        $actual = Get-BootUpdateCompletionNotification -TotalVerified 1 -DurationMinutes 2.3 `
+            -DeferredInventory @(New-DeferredRecord)
+        $actual.Kind | Should -Not -Be 'Success' -Because 'the machine is not fully up to date'
+    }
+
+    It 'does not report deferred inventory as an error, because nothing failed' {
+        $actual = Get-BootUpdateCompletionNotification -TotalVerified 1 -DurationMinutes 2.3 `
+            -DeferredInventory @(New-DeferredRecord)
+        $actual.Kind | Should -Not -Be 'Error'
+    }
+
+    It 'drops the all-clear wording when deferred inventory remains' {
+        <# The unqualified message ends "you are all set", which is a claim of full
+           convergence and is false while work is outstanding. #>
+        $clean = Get-BootUpdateCompletionNotification -TotalVerified 1 -DurationMinutes 2.3
+        $clean.Message | Should -Match 'all set'
+        $qualified = Get-BootUpdateCompletionNotification -TotalVerified 1 -DurationMinutes 2.3 `
+            -DeferredInventory @(New-DeferredRecord)
+        $qualified.Message | Should -Not -Match 'all set'
+    }
+
+    It 'names the outstanding work in the message' {
+        $actual = Get-BootUpdateCompletionNotification -TotalVerified 1 -DurationMinutes 2.3 `
+            -DeferredInventory @(New-DeferredRecord -Kind 'TechnologyBlocked' -Count 1)
+        $actual.Message | Should -Match 'Winget'
+    }
+
+    It 'preserves the existing quarantine downgrade' {
+        $actual = Get-BootUpdateCompletionNotification -TotalVerified 1 -DurationMinutes 2.3 -QuarantineCount 2
+        $actual.Kind | Should -Be 'Progress'
+        $actual.Message | Should -Match 'pinned'
+    }
+
+    It 'reports both when a run carries quarantine and deferred inventory' {
+        $actual = Get-BootUpdateCompletionNotification -TotalVerified 1 -DurationMinutes 2.3 `
+            -QuarantineCount 1 -DeferredInventory @(New-DeferredRecord)
+        $actual.Kind | Should -Be 'Progress'
+        $actual.Message | Should -Match 'pinned'
+        $actual.Message | Should -Match 'Winget'
+    }
+
+    It 'keeps the verified count truthful in every variant' {
+        <# Deferred work is never a verified update; qualifying the claim must not inflate
+           or suppress the count of things that genuinely changed. #>
+        foreach ($deferred in @(@(), @((New-DeferredRecord)))) {
+            $actual = Get-BootUpdateCompletionNotification -TotalVerified 7 -DurationMinutes 2.3 `
+                -DeferredInventory $deferred
+            $actual.Message | Should -Match '\b7\b'
+        }
+    }
+}
+
+Describe 'Deferred inventory summary' {
+    It 'summarises one provider scope' {
+        Get-BootUpdateDeferredInventorySummary -Records @(
+            [pscustomobject]@{ Provider = 'Winget'; Scope = 'machine'; Kind = 'TechnologyBlocked'; Count = 1 }
+        ) | Should -Match 'Winget machine'
+    }
+
+    It 'reports nothing for an empty inventory' {
+        Get-BootUpdateDeferredInventorySummary -Records @() | Should -BeNullOrEmpty
+    }
+
+    It 'groups multiple kinds within a scope' {
+        $actual = Get-BootUpdateDeferredInventorySummary -Records @(
+            [pscustomobject]@{ Provider = 'Winget'; Scope = 'machine'; Kind = 'TechnologyBlocked'; Count = 1 }
+            [pscustomobject]@{ Provider = 'Winget'; Scope = 'machine'; Kind = 'Pinned'; Count = 2 }
+        )
+        $actual | Should -Match 'TechnologyBlocked'
+        $actual | Should -Match 'Pinned'
+    }
+}
+
+Describe 'Repair plan reports deferred inventory' {
+    <# ADR-0003 names the repair plan as a carrier of the qualified claim. It is only
+       written when the cycle stops for manual attention, so this covers the run that both
+       failed something terminally AND left work it could not attempt: the human gets the
+       whole picture rather than only the failure. #>
+
+    BeforeEach {
+        $script:InstallDir = $TestDrive
+        Mock Set-BootUpdateClipboardText { $true }
+    }
+
+    It 'states deferred inventory as fact without prescribing a remedy' {
+        <# ADR-0001: the plan states facts and options and never steers the reader toward
+           weakening a verification boundary. Winget's own advice for an install-technology
+           block is "uninstall each package, then install the newer version", which for a
+           system component like Edge is actively wrong, so it is not reproduced here. #>
+        $result = Write-BootUpdateRepairPlan -Items @(
+            [pscustomobject]@{ Name='iCUE'; Id='Corsair.iCUE.5'; Code=1; Hex='0x1'; Command='winget install --id Corsair.iCUE.5 -e --force' }
+        ) -DeferredInventory @(
+            [pscustomobject]@{ Provider='Winget'; Scope='machine'; Kind='TechnologyBlocked'; Count=1 }
+        )
+        $text = (Get-Content -LiteralPath $result.Path) -join "`n"
+        $text | Should -Match 'Winget machine'
+        $text | Should -Match 'TechnologyBlocked'
+        $text | Should -Not -Match '(?i)uninstall each package'
+        $text | Should -Not -Match '(?i)ignore-checksums'
+    }
+
+    It 'keeps the deferred section out of the copy/paste block' {
+        <# The block is consumed verbatim by an elevated Command Prompt; a prose line in it
+           is a syntax error at the moment the reader is least able to diagnose one. #>
+        $result = Write-BootUpdateRepairPlan -Items @(
+            [pscustomobject]@{ Name='iCUE'; Id='Corsair.iCUE.5'; Code=1; Hex='0x1'; Command='winget install --id Corsair.iCUE.5 -e --force' }
+        ) -DeferredInventory @(
+            [pscustomobject]@{ Provider='Winget'; Scope='machine'; Kind='TechnologyBlocked'; Count=1 }
+        )
+        $lines = Get-Content -LiteralPath $result.Path
+        $blockStart = [array]::IndexOf($lines,'COPY/PASTE BLOCK — ELEVATED COMMAND PROMPT') + 1
+        $block = @($lines | Select-Object -Skip $blockStart)
+        @($block | Where-Object { $_ -notmatch '^(?:REM(?:\s|$)|winget\s|upd$)' }).Count | Should -Be 0
+    }
+
+    It 'omits the section entirely when nothing was deferred' {
+        $result = Write-BootUpdateRepairPlan -Items @(
+            [pscustomobject]@{ Name='iCUE'; Id='Corsair.iCUE.5'; Code=1; Hex='0x1'; Command='winget install --id Corsair.iCUE.5 -e --force' }
+        )
+        ((Get-Content -LiteralPath $result.Path) -join "`n") | Should -Not -Match '(?i)could not be attempted'
+    }
+}
+
+Describe 'Deferred inventory records only canonical Winget scopes' {
+    <# Write-WingetScopeSummary is also called with synthetic scope labels — "machine-retry"
+       for the retry attempt and "machine/<PackageId>" for a targeted single-package run.
+       Those are sub-observations of a real scope, not scopes of their own. Recording them
+       as separate ledger entries double-reports the same deferral and, because an entry is
+       only ever replaced by another summary for the identical label, strands a
+       "machine-retry" entry that nothing clears for the rest of the cycle. #>
+
+    BeforeEach {
+        $script:CurrentState = [pscustomobject]@{ DeferredInventory = @() }
+        $script:WingetResolvedAbsentPath = Join-Path $TestDrive 'winget-resolved-absent.json'
+    }
+
+    It 'records the canonical machine scope' {
+        $null = Write-WingetScopeSummary -Scope 'machine' -ExitCode 0 -Lines @(
+            'Name Id Version Available Source'
+            '1 package(s) have upgrades blocked because newer versions use a different install technology than the current installation.'
+        )
+        $actual = @(Get-BootUpdateDeferredInventory -State $script:CurrentState)
+        $actual.Count | Should -Be 1
+        $actual[0].Scope | Should -Be 'machine'
+    }
+
+    It 'does not create a separate entry for the retry sub-observation' {
+        $lines = @(
+            'Name Id Version Available Source'
+            '1 package(s) have upgrades blocked because newer versions use a different install technology than the current installation.'
+        )
+        $null = Write-WingetScopeSummary -Scope 'machine' -ExitCode 0 -Lines $lines
+        $null = Write-WingetScopeSummary -Scope 'machine-retry' -ExitCode 0 -Lines $lines
+        $actual = @(Get-BootUpdateDeferredInventory -State $script:CurrentState)
+        $actual.Count | Should -Be 1 -Because 'the retry is the same scope, not a second one'
+        $actual[0].Scope | Should -Be 'machine'
+    }
+
+    It 'does not create a per-package entry for a targeted single-package run' {
+        $null = Write-WingetScopeSummary -Scope 'machine/Microsoft.Edge' -ExitCode 0 -Lines @(
+            'Name Id Version Available Source'
+            '1 package(s) have upgrades blocked because newer versions use a different install technology than the current installation.'
+        )
+        @(Get-BootUpdateDeferredInventory -State $script:CurrentState).Count | Should -Be 0
+    }
+
+    It 'keeps user and machine as independent canonical scopes' {
+        $lines = @(
+            'Name Id Version Available Source'
+            '1 package(s) have upgrades blocked because newer versions use a different install technology than the current installation.'
+        )
+        $null = Write-WingetScopeSummary -Scope 'machine' -ExitCode 0 -Lines $lines
+        $null = Write-WingetScopeSummary -Scope 'user' -ExitCode 0 -Lines $lines
+        @(Get-BootUpdateDeferredInventory -State $script:CurrentState).Count | Should -Be 2
     }
 }
