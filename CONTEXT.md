@@ -18,6 +18,8 @@ Domain glossary for Boot Update Cycle. Terms only — no implementation detail, 
 
 **Qualified convergence** — a cycle that completed with every phase complete and no restart pending, but still carrying deferred inventory. The machine is as converged as this cycle could make it, and is not fully up to date. Stated as such: an unqualified claim of convergence would be false, and a claim of failure would be equally false, because nothing failed.
 
+**Cleanup advisory** — delete-only file operations an installer has queued for the next restart, as distinct from servicing work the machine owes. A cleanup advisory neither blocks convergence nor makes the machine out of date: the cycle converged, and some queued deletions simply have not happened yet. It is therefore not deferred inventory, which means work is still outstanding, and it does not produce qualified convergence. A cycle carrying one converged and says so, while declining to imply that nothing at all is pending.
+
 ## Phase outcomes
 
 **Phase** — one provider's slice of a pass (Winget, Chocolatey, Windows Update, Defender, …). A phase is enabled or skipped, and if enabled it is complete or incomplete.
@@ -39,5 +41,7 @@ Domain glossary for Boot Update Cycle. Terms only — no implementation detail, 
 ## Evidence
 
 **Pending reboot** — a restart the machine needs before further servicing is safe. Confirmed by two probes separated in time, because servicing signals can appear shortly after boot.
+
+**Negative evidence** — a recorded observation that a condition was checked and found absent. Distinct from the absence of any observation, which records nothing and licenses no conclusion. Only negative evidence can support a claim that something is not the case; silence cannot, because silence has many causes and the reader cannot tell them apart. Diagnostic surfaces must therefore say which of the two they hold.
 
 **Repair plan** — the handoff written when the updater stops for manual attention: what failed, the evidence, and what a human can do about it. It states facts and options; it does not instruct the reader to weaken a verification boundary.
