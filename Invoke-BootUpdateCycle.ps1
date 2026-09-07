@@ -968,8 +968,13 @@ function Format-NativeExitCode {
 function Get-InstallerExitSummary {
     param([Parameter(Mandatory)][long]$Code)
     switch ($Code) {
+        1603 { return 'installer reported a fatal error during installation' }
         1605 { return 'product is not currently installed' }
         1612 { return 'installation source is unavailable' }
+        <# 1618 is contention, not a defect in the package: the Windows Installer mutex is
+           held by another install. Naming it keeps a retryable collision from being logged
+           as an unexplained failure. #>
+        1618 { return 'another installation is already in progress' }
         2147942405 { return 'access is denied' }
         3221226525 { return 'installer terminated with a fatal exception' }
         default { return "installer exit $(Format-NativeExitCode $Code)"
@@ -2770,11 +2775,22 @@ function Get-ProcessTreeActivity {
     $allProcs = Get-CimInstance Win32_Process -EA SilentlyContinue
     if (-not $allProcs) { return [pscustomobject]@{ TotalCpuTime = [timespan]::Zero; ProcessCount = 0; HandleCount = 0 } }
 
+    <# Win32_Process exposes ProcessId/ParentProcessId as UInt32, but the traversal queue
+       below is Queue[int]. A Hashtable keyed by UInt32 never matches an Int32 lookup, so
+       every probe missed and this function silently reported an empty tree — which turned
+       the idle timeout into a fixed wall-clock kill. Normalize every PID to [int] at both
+       write and read so the key types cannot diverge.
+
+       The loop locals are deliberately not named $parentPid: PowerShell variable names are
+       case-insensitive, so that name overwrites the $ParentPid parameter and reroots the
+       walk on whichever process CIM happened to enumerate last. #>
     $byPid = @{}; $childMap = @{}
     foreach ($p in $allProcs) {
-        $byPid[$p.ProcessId] = $p
-        if (-not $childMap.ContainsKey($p.ParentProcessId)) { $childMap[$p.ParentProcessId] = [System.Collections.Generic.List[int]]::new() }
-        $childMap[$p.ParentProcessId].Add($p.ProcessId)
+        $procKey = [int]$p.ProcessId
+        $parentKey = [int]$p.ParentProcessId
+        $byPid[$procKey] = $p
+        if (-not $childMap.ContainsKey($parentKey)) { $childMap[$parentKey] = [System.Collections.Generic.List[int]]::new() }
+        $childMap[$parentKey].Add($procKey)
     }
 
     $queue = [System.Collections.Generic.Queue[int]]::new(); $visited = [System.Collections.Generic.HashSet[int]]::new()
@@ -2789,7 +2805,22 @@ function Get-ProcessTreeActivity {
             $totalCpuMs += ([int64]$cim.KernelModeTime + [int64]$cim.UserModeTime) / 10000
             $handles += [int]$cim.HandleCount; $procCount++
         }
-        if ($childMap.ContainsKey($procId)) { foreach ($c in $childMap[$procId]) { if (-not $visited.Contains($c)) { $queue.Enqueue($c) } } }
+        <# A process keeps its ParentProcessId after the parent exits, and Windows reuses
+           PIDs. Without this check a recycled PID adopts every orphan that still names it,
+           dragging unrelated subtrees into the total: an observed reading jumped from
+           71 minutes of stranger CPU to 2 seconds of real CPU between consecutive samples.
+           That is worse than noise — a total that falls can never exceed the previous high
+           water mark, so the idle clock advances and kills a process that is working.
+           A child cannot start before its parent, so reject any edge that claims it did. #>
+        if ($childMap.ContainsKey($procId)) {
+            $parentStart = if ($cim) { $cim.CreationDate } else { $null }
+            foreach ($c in $childMap[$procId]) {
+                if ($visited.Contains($c)) { continue }
+                $childCim = $byPid[$c]
+                if ($parentStart -and $childCim -and $childCim.CreationDate -and $childCim.CreationDate -lt $parentStart) { continue }
+                $queue.Enqueue($c)
+            }
+        }
     }
     return [pscustomobject]@{ TotalCpuTime = [timespan]::FromMilliseconds($totalCpuMs); ProcessCount = $procCount; HandleCount = $handles }
 }
@@ -2803,6 +2834,7 @@ function Wait-ProcessWithIdleTimeout {
         [ValidateRange(0.2,30)][double]$PollIntervalSeconds = 1
     )
     $startTime = [datetime]::UtcNow; $lastCpuIncrease = $startTime; $lastCpuTime = [timespan]::Zero; $finalCpu = [timespan]::Zero
+    $unobservedTree = $false
     $hardLimit = [timespan]::FromMinutes($HardTimeoutMinutes); $idleLimit = [timespan]::FromMinutes($IdleTimeoutMinutes)
 
     function Remove-ProcessTree { param([int]$RootPid)
@@ -2818,10 +2850,28 @@ function Wait-ProcessWithIdleTimeout {
             }
         }
         $all = Get-CimInstance Win32_Process -EA SilentlyContinue; if (-not $all) { return }
-        $cm = @{}; foreach ($p in $all) { if (-not $cm.ContainsKey($p.ParentProcessId)) { $cm[$p.ParentProcessId] = [System.Collections.Generic.List[int]]::new() }; $cm[$p.ParentProcessId].Add($p.ProcessId) }
+        <# PIDs normalized to [int]; see Get-ProcessTreeActivity for why UInt32 keys break lookups.
+           The creation-time check matters more here than there: this path kills what it finds,
+           so adopting an orphan through a reused PID would terminate an unrelated process. #>
+        $cm = @{}; $startById = @{}
+        foreach ($p in $all) {
+            $pp = [int]$p.ParentProcessId
+            $startById[[int]$p.ProcessId] = $p.CreationDate
+            if (-not $cm.ContainsKey($pp)) { $cm[$pp] = [System.Collections.Generic.List[int]]::new() }
+            $cm[$pp].Add([int]$p.ProcessId)
+        }
         $ordered = [System.Collections.Generic.List[int]]::new(); $q = [System.Collections.Generic.Queue[int]]::new(); $v = [System.Collections.Generic.HashSet[int]]::new()
         $q.Enqueue($RootPid)
-        while ($q.Count -gt 0) { $id = $q.Dequeue(); if (-not $v.Add($id)) { continue }; $ordered.Add($id); if ($cm.ContainsKey($id)) { foreach ($c in $cm[$id]) { $q.Enqueue($c) } } }
+        while ($q.Count -gt 0) {
+            $id = $q.Dequeue(); if (-not $v.Add($id)) { continue }; $ordered.Add($id)
+            if ($cm.ContainsKey($id)) {
+                $parentStart = $startById[$id]
+                foreach ($c in $cm[$id]) {
+                    if ($parentStart -and $startById[$c] -and $startById[$c] -lt $parentStart) { continue }
+                    $q.Enqueue($c)
+                }
+            }
+        }
         $ordered.Reverse()
         foreach ($id in $ordered) { $p = Get-Process -Id $id -EA SilentlyContinue; if ($p -and -not $p.HasExited) { try { $p.Kill(); Write-Log "Killed PID $id ($($p.ProcessName))" -Level Warn } catch { } } }
     }
@@ -2842,7 +2892,22 @@ function Wait-ProcessWithIdleTimeout {
             return @{ Reason = 'HardTimeout'; Elapsed = $elapsed; FinalCpuTime = $tree.TotalCpuTime; ExitCode = $null }
         }
         $activity = Get-ProcessTreeActivity -ParentPid $Process.Id; $finalCpu = $activity.TotalCpuTime
-        if ($activity.TotalCpuTime -gt $lastCpuTime) { $lastCpuTime = $activity.TotalCpuTime; $lastCpuIncrease = [datetime]::UtcNow }
+
+        <# An unobservable tree is not an idle tree. The process is still running (checked
+           above), so ProcessCount=0 means the probe failed — a CIM hiccup, or a package
+           whose real work runs out-of-tree (msiexec is parented to services.exe, not to
+           us). Advancing the idle clock on a failed measurement is how a healthy install
+           gets killed. Hold the clock instead and let the hard timeout bound the wait. #>
+        if ($activity.ProcessCount -eq 0) {
+            if (-not $unobservedTree) {
+                $unobservedTree = $true
+                Write-Log "  Process tree for PID $($Process.Id) is not observable; holding the idle clock and relying on the ${HardTimeoutMinutes}m hard timeout." -Level Warn
+            }
+            $lastCpuIncrease = [datetime]::UtcNow
+        } else {
+            $unobservedTree = $false
+            if ($activity.TotalCpuTime -gt $lastCpuTime) { $lastCpuTime = $activity.TotalCpuTime; $lastCpuIncrease = [datetime]::UtcNow }
+        }
         $idleFor = [datetime]::UtcNow - $lastCpuIncrease
         if ($idleFor -ge $idleLimit) {
             Write-Log "IDLE TIMEOUT: PID $($Process.Id) idle $([math]::Round($idleFor.TotalMinutes,1))m (threshold: ${IdleTimeoutMinutes}m), final CPU=$([math]::Round($activity.TotalCpuTime.TotalSeconds,1))s. Killing." -Level Error
@@ -4583,7 +4648,10 @@ function Update-PowerShellModules {
             $_.Type -eq 'Module'
         } | Select-Object -ExpandProperty Name -Unique)
         if (-not $moduleNames) { Write-Log 'No updatable modules found.'; return @{ Success = $true; Count = 0 } }
-        Write-Log "Found $($moduleNames.Count) module(s) to update."
+        <# These are update *candidates* (installed, non-excluded modules), not modules
+           known to be outdated: no version comparison has happened yet. Saying "to update"
+           made every run read as "found 2, updated 0" — a failure that never occurred. #>
+        Write-Log "Found $($moduleNames.Count) module(s) to check."
         if ($PSCmdlet.ShouldProcess("$($moduleNames.Count) modules", 'Update-PSResource')) {
             $throttle = [Math]::Min(8, [Math]::Max(2, [Environment]::ProcessorCount))
             Write-Log "Running parallel updates (throttle: $throttle)..."
@@ -7038,7 +7106,8 @@ function Invoke-BootUpdateCycle {
                             $_.Type -eq 'Module'
                         } | Select-Object -ExpandProperty Name -Unique)
                         if (-not $moduleNames) { $log.Add('No updatable modules found.'); return @{ Phase='PowerShellModules'; Success=$true; Count=0; LogLines=$log.ToArray() } }
-                        $log.Add("Found $($moduleNames.Count) module(s) to update.")
+                        <# Candidates to check, not known-outdated modules. See the sequential twin. #>
+                        $log.Add("Found $($moduleNames.Count) module(s) to check.")
                         if ($IsWhatIf) { $log.Add("  [WHATIF] Would run: Update-PSResource for $($moduleNames.Count) modules"); return @{ Phase='PowerShellModules'; Success=$true; Count=0; LogLines=$log.ToArray() } }
                         $log.Add("Running parallel updates (throttle: $throttle)...")
                         $job = Start-Job -ScriptBlock {

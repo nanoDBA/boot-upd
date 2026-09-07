@@ -59,6 +59,7 @@ BeforeAll {
         'Test-WindowsUpdateConvergence',
           'Format-NativeExitCode',
           'Get-InstallerExitSummary',
+          'Get-ProcessTreeActivity',
           'Get-WingetInventoryPackageIds',
           'Get-WingetOutputSummary',
           'Get-ChocolateyOutputSummary',
@@ -2444,5 +2445,78 @@ Describe 'Deferred inventory records only canonical Winget scopes' {
         $null = Write-WingetScopeSummary -Scope 'machine' -ExitCode 0 -Lines $lines
         $null = Write-WingetScopeSummary -Scope 'user' -ExitCode 0 -Lines $lines
         @(Get-BootUpdateDeferredInventory -State $script:CurrentState).Count | Should -Be 2
+    }
+}
+
+
+Describe 'Process activity measurement' {
+    <# Regression cover for a silent instrument failure: Win32_Process exposes
+       ProcessId/ParentProcessId as UInt32 while the traversal queue is Queue[int].
+       A Hashtable keyed by UInt32 never matched the Int32 probe, so the walk always
+       reported an empty tree with zero CPU. Because the idle timer only advances on
+       CPU growth, the idle clock never reset and every package longer than the idle
+       threshold was killed mid-install regardless of how busy it was. The observable
+       symptom in shipped logs was 'heartbeat: CPU=0s procs=0' for phases that were
+       demonstrably working, then 'Tree at kill: 0 processes, handles=0'. #>
+
+    It 'observes a live process tree instead of reporting it empty' {
+        <# Measured against this very process: it is guaranteed present in Win32_Process
+           and guaranteed to have consumed CPU, so a zero here means the walk is broken
+           rather than that the target was quiet. Spawning a child would reintroduce the
+           tree-membership instability tracked in -y9es and make this test flaky. #>
+        $activity = Get-ProcessTreeActivity -ParentPid $PID
+        $activity.ProcessCount |
+            Should -BeGreaterThan 0 -Because 'a running process must be visible to the idle detector'
+        $activity.HandleCount |
+            Should -BeGreaterThan 0 -Because 'an observed process always holds handles'
+        $activity.TotalCpuTime.TotalSeconds |
+            Should -BeGreaterThan 0 -Because 'a process that has executed must report consumed CPU'
+    }
+
+    It 'does not shadow its own root parameter while indexing processes' {
+        <# PowerShell variable names are case-insensitive, so a loop local named
+           $parentPid overwrites the $ParentPid parameter and silently reroots the walk
+           on whichever process CIM enumerated last. That produced readings for one PID
+           swinging between 0.08s and 73 minutes. No behavioural assertion catches this
+           reliably: a mis-rooted walk still returns a plausible non-zero tree, and an
+           observed buggy run reported MORE CPU than the correct one. Assert the shape. #>
+        $text = Get-FunctionText $invokeAst 'Get-ProcessTreeActivity'
+        $body = $text.Substring($text.IndexOf('$allProcs'))
+        $body | Should -Not -Match '(?i)\$parentPid\s*='
+        $body | Should -Match '\$childMap\[\$parentKey\]'
+    }
+
+    It 'accumulates CPU time for a busy tree so the idle clock can advance' {
+        $first = Get-ProcessTreeActivity -ParentPid $PID
+        $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+        $sink = 0.0
+        while ($stopwatch.Elapsed.TotalSeconds -lt 2) { $sink += [math]::Sqrt($stopwatch.ElapsedTicks) }
+        $second = Get-ProcessTreeActivity -ParentPid $PID
+        $second.TotalCpuTime |
+            Should -BeGreaterThan $first.TotalCpuTime -Because 'ongoing work must move the idle detector off its last reading'
+    }
+
+    It 'holds the idle clock when the tree cannot be observed' {
+        <# Absence of a measurement is not evidence of idleness. msiexec is parented to
+           services.exe, so a package whose real work runs out-of-tree legitimately reads
+           as zero processes; killing on that reading is how a healthy install dies. #>
+        $text = Get-FunctionText $invokeAst 'Wait-ProcessWithIdleTimeout'
+        $text | Should -Match '\$activity\.ProcessCount -eq 0'
+        $text | Should -Match 'not observable'
+        $text.IndexOf('$activity.ProcessCount -eq 0') |
+            Should -BeLessThan $text.IndexOf('$idleFor -ge $idleLimit') -Because 'the guard must run before the kill decision'
+    }
+}
+
+Describe 'Installer exit-code vocabulary' {
+    It 'names Windows Installer contention rather than logging it as unknown' {
+        <# Six machine-scope packages failed 0x00000652 in one shipped run while a
+           concurrent msiexec held the installer mutex. Reported as an opaque hex code
+           it read as six unexplained package defects. #>
+        Get-InstallerExitSummary -Code 1618 | Should -Match 'already in progress'
+    }
+
+    It 'still formats genuinely unknown codes as hex' {
+        Get-InstallerExitSummary -Code 123456 | Should -Match '0x0001E240'
     }
 }
