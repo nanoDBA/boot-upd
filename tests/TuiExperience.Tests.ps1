@@ -522,14 +522,23 @@ Describe 'Animated progress behavior' {
     }
 
     It 'keeps animating through the production background-operation adapter' {
+        <# The operation must outlast at least one 1s poll interval. At 450ms it could
+           finish inside the first wait, yielding a single render and a spurious liveness
+           failure - observed at the v2.5.76 tag as 'expected >= 5, got 1'. #>
         $result = Invoke-BootUpdateBackgroundOperation -Name 'Adapter test' `
             -Status 'Silent operation running' -TimeoutMinutes 1 `
-            -ScriptBlock { Start-Sleep -Milliseconds 450; 'adapter-complete' }
+            -ScriptBlock { Start-Sleep -Milliseconds 1500; 'adapter-complete' }
         $result.Failed | Should -BeFalse
         $result.TimedOut | Should -BeFalse
         $result.Output | Should -Contain 'adapter-complete'
         $script:ProgressCaptures.Count | Should -BeGreaterOrEqual 5
-        @($script:ProgressCaptures.Status | Select-Object -Unique).Count | Should -Be 4
+        <# Not an exact unique-text count. The rendered line carries live CPU, process
+           count, idle and elapsed readings, so the number of distinct lines depends on
+           where the run lands against 0.1-unit rounding boundaries. The animation claim
+           this test makes is about the propeller, which cycles deterministically. #>
+        @($script:ProgressCaptures | ForEach-Object {
+            [regex]::Match($_.Text, 'BOOT//PULSE \[([^\]]+)\]').Groups[1].Value
+        } | Select-Object -Unique).Count | Should -Be 4 -Because 'the propeller must cycle all four frames while the operation runs'
         @($script:ProgressCaptures.PaletteIndex | Select-Object -Unique).Count |
             Should -Be $script:ProgressCaptures.Count
     }
@@ -545,7 +554,11 @@ Describe 'Animated progress behavior' {
         $result.Failed | Should -BeFalse
         $result.Output | Should -Contain 'external-complete'
         $script:ProgressCaptures.Count | Should -BeGreaterOrEqual 5
-        @($script:ProgressCaptures.Status | Select-Object -Unique).Count | Should -Be 4
+        <# See the adapter test: the status line embeds varying readings, so assert the
+           propeller cycle rather than a distinct-line count. #>
+        @($script:ProgressCaptures | ForEach-Object {
+            [regex]::Match($_.Text, 'BOOT//PULSE \[([^\]]+)\]').Groups[1].Value
+        } | Select-Object -Unique).Count | Should -Be 4 -Because 'the propeller must cycle all four frames while the operation runs'
         @($script:ProgressCaptures.PaletteIndex | Select-Object -Unique).Count |
             Should -Be $script:ProgressCaptures.Count
     }
@@ -574,9 +587,14 @@ Describe 'Animated progress behavior' {
     }
 
     It 'captures partial output and kills a silent native process tree at timeout' {
+        <# The deadline must exceed the time the nested pwsh needs to start and flush its
+           first line, or the kill lands before any output exists and the partial-output
+           assertion cannot succeed. Measured at 4.0s on this class of machine; 0.2 min
+           (12s) leaves headroom while staying far below the child's 30s sleep, so the
+           timeout still fires. The prior 0.02 min (1.2s) could never pass. #>
         $pwshPath = (Get-Process -Id $PID).Path
         $result = Invoke-BootUpdateBackgroundOperation -Name 'Process-tree timeout test' `
-            -Status 'Waiting for forced cleanup' -TimeoutMinutes 0.02 `
+            -Status 'Waiting for forced cleanup' -TimeoutMinutes 0.2 `
             -ScriptBlock {
                 param($Path)
                 & $Path -NoProfile -NonInteractive -Command '"CHILD_PID|$PID"; Start-Sleep -Seconds 30'
