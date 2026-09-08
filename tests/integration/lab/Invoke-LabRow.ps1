@@ -38,7 +38,11 @@ param(
        D, E and G all work by disturbing the cycle at a specific moment rather than by
        letting it run clean, and the moment they care about is announced in the log. #>
     [string]$InjectWhen = '',
-    [scriptblock]$InjectAction = $null
+    [scriptblock]$InjectAction = $null,
+    <# Extra arguments for Deploy-BootUpdateCycle.ps1. Row C needs -RebootDelaySec above
+       zero: the default is 0, documented as "immediate, /f = force-close apps, no abort",
+       so with the shipped default there is no countdown for a cancel to act on at all. #>
+    [string]$DeployArgs = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -137,10 +141,17 @@ if ($n -lt $limit -and $n -lt $features.Count) {
    updater's own BootUpdateCycleFallback task runs in, which is what such a row exercises. #>
 if ($SystemContext) { Say 'launching the cycle as SYSTEM (no interactive user)' }
 else { Say 'launching the cycle in the interactive session' }
-Invoke-Command -VMName $VMName -Credential $cred -ArgumentList $GuestUser, ([bool]$SystemContext) -ScriptBlock {
-    param($User, $AsSystem)
+Invoke-Command -VMName $VMName -Credential $cred -ArgumentList $GuestUser, ([bool]$SystemContext), $DeployArgs -ScriptBlock {
+    param($User, $AsSystem, $Extra)
+    <# Capture Deploy's own stdout and stderr. Without this a failing deploy leaves nothing
+       behind at all: the updater log stops wherever the script died, and everything the
+       script itself printed goes to a scheduled task and is lost. Row B first failed with
+       nothing but exit code 1 to go on. #>
+    $inner = '& "C:\Lab\boot-upd\Deploy-BootUpdateCycle.ps1" -NonInteractive -OutputMode Normal EXTRA_ARGS *>&1 | Tee-Object -FilePath C:\Lab\deploy-output.txt'
+    $inner = $inner.Replace('EXTRA_ARGS', $Extra)
+    $argument = '-NoProfile -ExecutionPolicy Bypass -Command "' + $inner.Replace('"', '\"') + '"'
     $a = New-ScheduledTaskAction -Execute 'C:\Program Files\PowerShell\7\pwsh.exe' `
-         -Argument '-NoProfile -ExecutionPolicy Bypass -File "C:\Lab\boot-upd\Deploy-BootUpdateCycle.ps1" -NonInteractive -OutputMode Normal' `
+         -Argument $argument `
          -WorkingDirectory 'C:\Lab\boot-upd'
     $p = if ($AsSystem) { New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest }
          else { New-ScheduledTaskPrincipal -UserId "$env:COMPUTERNAME\$User" -LogonType Interactive -RunLevel Highest }
@@ -204,16 +215,26 @@ $evidence = Invoke-Command -VMName $VMName -Credential $cred -ScriptBlock {
            result: a SYSTEM-fallback claim means nothing if somebody was quietly logged in. #>
         ConsoleUser     = (Get-CimInstance Win32_ComputerSystem).UserName
         ExplorerCount   = @(Get-Process explorer -ErrorAction SilentlyContinue).Count
+        DeployOutput    = if (Test-Path 'C:\Lab\deploy-output.txt') { @(Get-Content 'C:\Lab\deploy-output.txt' -ErrorAction SilentlyContinue) } else { @() }
+        DeployTaskResult = (Get-ScheduledTaskInfo -TaskName 'Lab-RunDeploy' -ErrorAction SilentlyContinue).LastTaskResult
     }
 }
 
 $evidence.Log | Set-Content (Join-Path $evidenceDir 'BootUpdateCycle.log')
+if ($evidence.DeployOutput.Count) { $evidence.DeployOutput | Set-Content (Join-Path $evidenceDir 'deploy-output.txt') }
 $timeline    | Set-Content (Join-Path $evidenceDir 'host-timeline.txt')
 & 'C:\HyperV\Get-VmScreen.ps1' -VMName $VMName -Path (Join-Path $evidenceDir 'console.png') | Out-Null
 
 $startLine = $evidence.Log | Where-Object { $_ -match 'BOOT UPDATE CYCLE STARTED' } | Select-Object -First 1
 $sessionStart = if ($startLine -match '\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]') { [datetime]$Matches[1] } else { (Get-Date).AddHours(-2) }
-$bootsDuringRun = @($evidence.OsBootTimes | Where-Object { $_ -ge $sessionStart })
+<# Bound the window at BOTH ends. Filtering only on "at or after the session started" let a
+   stray event stamped hours in the future - left in the image from its own creation - count
+   as a boot, and the row then reported the updater under-claiming when it had not. An
+   acceptance check that can produce a false accusation is as useless as one that can be
+   silently satisfied. #>
+$completionLine = $evidence.Log | Where-Object { $_ -match 'BOOT UPDATE CYCLE COMPLETE' } | Select-Object -Last 1
+$sessionEnd = if ($completionLine -match '\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]') { ([datetime]$Matches[1]).AddMinutes(2) } else { (Get-Date).AddMinutes(2) }
+$bootsDuringRun = @($evidence.OsBootTimes | Where-Object { $_ -ge $sessionStart -and $_ -le $sessionEnd })
 $claimed = 0
 $claimLine = $evidence.Log | Where-Object { $_ -match 'BOOT UPDATE CYCLE COMPLETE' } | Select-Object -Last 1
 if ($claimLine -match '(\d+) reboot\(s\)') { $claimed = [int]$Matches[1] }
@@ -231,6 +252,8 @@ $summary = [pscustomobject]@{
     TasksRemaining   = $evidence.TasksRemaining
     CbsPending       = $evidence.CbsPending
     Injected         = $injected
+    DeployTaskResult = $evidence.DeployTaskResult
+    DeployOutputTail = ($evidence.DeployOutput | Select-Object -Last 3) -join ' | '
     ConsoleUser      = $evidence.ConsoleUser
     ExplorerCount    = $evidence.ExplorerCount
     EvidenceDir      = $evidenceDir
