@@ -62,6 +62,7 @@ BeforeAll {
           'Get-ProcessTreeActivity',
           'Get-BootUpdateUptimeSeconds',
           'Get-BootUpdateMonotonicBootId',
+          'Resolve-BootUpdateResumeAccount',
           'Get-WingetInventoryPackageIds',
           'Get-WingetOutputSummary',
           'Get-ChocolateyOutputSummary',
@@ -2659,5 +2660,44 @@ Describe 'Fast reboot accounting' {
         $b = Get-BootUpdateUptimeSeconds
         $a | Should -BeGreaterThan 0
         $b | Should -BeGreaterOrEqual $a
+    }
+}
+
+
+Describe 'Resume account resolution' {
+    <# Regression cover for -2jsd, found by VM matrix row B. With nobody signed in,
+       resume-user discovery falls through to LogonUI's LastLoggedOnSAMUser, which returns
+       the '.
+ame' form. Task Scheduler cannot map that to a SID, so Register-ScheduledTask
+       threw a terminating error, the cycle died right after pre-flight, and no continuation
+       task was registered at all - a headless machine could never resume. #>
+
+    It 'expands the .
+ame form LogonUI actually returns' {
+        $resolved = Resolve-BootUpdateResumeAccount -Account ".\$env:USERNAME"
+        $resolved | Should -Be "$env:COMPUTERNAME\$env:USERNAME"
+    }
+
+    It 'qualifies a bare account name with the computer name' {
+        Resolve-BootUpdateResumeAccount -Account $env:USERNAME |
+            Should -Be "$env:COMPUTERNAME\$env:USERNAME"
+    }
+
+    It 'passes an already qualified account through unchanged' {
+        $qualified = "$env:COMPUTERNAME\$env:USERNAME"
+        Resolve-BootUpdateResumeAccount -Account $qualified | Should -Be $qualified
+    }
+
+    It 'returns nothing for an account that cannot be resolved, rather than throwing' {
+        <# The caller falls back to the SYSTEM-only resume chain on $null. Throwing here is
+           what killed the cycle outright, which is strictly worse than a SYSTEM-only
+           continuation on a machine with no resolvable user. #>
+        Resolve-BootUpdateResumeAccount -Account '.
+osuchuser_zzq' | Should -BeNullOrEmpty
+    }
+
+    It 'returns nothing for empty input' {
+        Resolve-BootUpdateResumeAccount -Account '' | Should -BeNullOrEmpty
+        Resolve-BootUpdateResumeAccount -Account $null | Should -BeNullOrEmpty
     }
 }

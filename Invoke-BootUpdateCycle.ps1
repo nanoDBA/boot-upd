@@ -5188,6 +5188,38 @@ function Test-ArsoAvailable {
     } catch { return $false }
 }
 
+function Resolve-BootUpdateResumeAccount {
+    <# Turn a discovered account name into one Task Scheduler will accept, or nothing.
+
+       With no interactive user, resume-user discovery falls through to LogonUI's
+       LastLoggedOnSAMUser, which returns the '.\name' form. Task Scheduler cannot map that
+       to a SID: Register-ScheduledTask throws a terminating CimException, "No mapping
+       between account names and security IDs was done", and because that happens before
+       the next Write-Log the updater's own log simply stops after pre-flight. The cycle
+       died leaving a state file and NO continuation task, so a headless machine could
+       never resume. Verified on a lab guest: '.\updtest' fails to translate while
+       'UPDTESTVM\updtest' resolves.
+
+       Returns $null when the account cannot be resolved, so the caller can fall back to
+       the SYSTEM-only branch. A machine with no resolvable user must still get its SYSTEM
+       continuation rather than no continuation at all. #>
+    param([AllowNull()][string]$Account)
+
+    if ([string]::IsNullOrWhiteSpace($Account)) { return $null }
+    $candidate = $Account.Trim()
+    # '.\name' and bare 'name' both mean a local account on this machine.
+    if ($candidate -like '.\*') { $candidate = "$env:COMPUTERNAME\" + $candidate.Substring(2) }
+    elseif ($candidate -notmatch '[\\@]') { $candidate = "$env:COMPUTERNAME\$candidate" }
+
+    try {
+        $null = ([System.Security.Principal.NTAccount]$candidate).Translate([System.Security.Principal.SecurityIdentifier])
+        return $candidate
+    } catch {
+        Write-Log "Resume account '$Account' does not resolve to a security identifier; continuing with the SYSTEM-only resume chain." -Level Warn
+        return $null
+    }
+}
+
 function Register-BootUpdateTaskForReboot {
     param(
         [switch]$RetrySoon,
@@ -5268,7 +5300,11 @@ function Register-BootUpdateTaskForReboot {
        If no interactive identity is discoverable, a SYSTEM task is retained; callers
        must add a dated retry when user-scoped completion is still pending. #>
     $currentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-    $resumeUser = if ($script:ResumeUser) { $script:ResumeUser } elseif ($currentIdentity.User.Value -ne 'S-1-5-18') { $currentIdentity.Name } else { $null }
+    $resumeUserRaw = if ($script:ResumeUser) { $script:ResumeUser } elseif ($currentIdentity.User.Value -ne 'S-1-5-18') { $currentIdentity.Name } else { $null }
+    <# Never hand a raw discovered name to Task Scheduler. An unresolvable one throws a
+       terminating error that kills the cycle before any continuation exists; resolving to
+       $null here degrades to the SYSTEM-only branch below instead. #>
+    $resumeUser = Resolve-BootUpdateResumeAccount -Account $resumeUserRaw
     if ($resumeUser) {
         $currentUser = $resumeUser
         $userTrigger   = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
