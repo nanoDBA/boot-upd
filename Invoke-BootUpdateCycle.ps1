@@ -1543,22 +1543,33 @@ function Get-BootUpdateBootSessionId {
 }
 
 function Get-BootUpdateUptimeSeconds {
-    <# Independent corroboration for a reboot, because LastBootUpTime alone cannot supply it.
-
-       Boot identity is compared through a tolerance window, since LastBootUpTime jitters by
-       seconds within a single boot. But the updater's own reboot cycle can complete in less
-       than that window: row A observed real boots 96 seconds apart against a 120-second
-       tolerance, so one boot was absorbed and the completed-reboot count under-reported it.
-       Since that count gates the reboot limit, a fast loop could evade the cap entirely.
-
-       Shrinking the window cannot separate the two cases: jitter is seconds and fast reboots
-       are tens of seconds, and the ranges overlap. Uptime does separate them. Within one boot
-       it only ever increases; across a boot it resets. So uptime running BACKWARDS is
-       positive proof of a restart, whatever the timestamps say.
-
-       TickCount64 is used rather than a second LastBootUpTime read: it is the monotonic
-       counter the jitter problem does not apply to. #>
+    <# Seconds since this Windows boot, from the monotonic tick counter rather than from
+       LastBootUpTime, which is derived and jitters by seconds between reads. #>
     return [math]::Round([System.Environment]::TickCount64 / 1000.0, 0)
+}
+
+function Get-BootUpdateMonotonicBootId {
+    <# A boot identity that does not jitter, used to catch reboots the tolerance window hides.
+
+       Boot identity is compared through a 120-second tolerance because LastBootUpTime jitters
+       within one boot. But the updater's own reboot cycle finishes faster than that: row A saw
+       real boots 96 seconds apart, so one was absorbed and the completed-reboot count
+       under-reported it. That count gates the reboot limit, so a fast loop could evade the cap
+       entirely - this project's namesake failure. Shrinking the window cannot help, because
+       jitter is seconds and fast reboots are tens of seconds and the ranges overlap.
+
+       Subtracting the monotonic uptime from the current time reconstructs the instant this
+       boot began. Within a boot that value is stable to well under a second, because both
+       terms advance together. Across a boot it jumps forward by however long the machine was
+       down. So the same comparison that needs a 120-second window against LastBootUpTime
+       needs only a few seconds here, which cleanly separates jitter from a fast restart.
+
+       A first attempt compared raw uptime and asked whether it had run backwards. That is
+       true only when the earlier pass ran later in its boot than the current pass does in
+       its own; with each pass running about 40 seconds after its boot, uptime crept forward
+       across a real restart and the reboot was still missed. This formulation has no such
+       dependency on where in each boot the passes happen to land. #>
+    return ([datetime]::UtcNow.AddSeconds(-(Get-BootUpdateUptimeSeconds))).ToString('o')
 }
 
 function Test-BootUpdateSameBootSession {
@@ -1593,17 +1604,27 @@ function Update-BootUpdateStateForBootSession {
     param(
         [Parameter(Mandatory)][pscustomobject]$State,
         [Parameter(Mandatory)][string]$CurrentBootSessionId,
-        [AllowNull()][object]$CurrentUptimeSeconds = $null
+        [AllowNull()][object]$CurrentUptimeSeconds = $null,
+        [AllowNull()][string]$CurrentMonotonicBootId = $null,
+        [int]$MonotonicToleranceSeconds = 15
     )
     $priorBootSessionId = ConvertTo-BootUpdateTimestampString -Value $State.LastBootSessionId
     $sameSession = Test-BootUpdateSameBootSession -Left $priorBootSessionId -Right $CurrentBootSessionId
 
-    <# Uptime regression is independent proof of a restart that the tolerance window cannot
-       see. It can only ever ADD a detected reboot, never suppress the jitter protection, so
-       a boot inside the tolerance is still counted when uptime says the machine restarted. #>
-    $priorUptime = if ($State.PSObject.Properties.Name -contains 'LastUptimeSeconds') { $State.LastUptimeSeconds } else { $null }
-    $uptimeWentBackwards = ($null -ne $CurrentUptimeSeconds -and $null -ne $priorUptime -and [double]$CurrentUptimeSeconds -lt [double]$priorUptime)
-    if ($uptimeWentBackwards) { $sameSession = $false }
+    <# The monotonic boot instant is stable to well under a second within one boot and jumps
+       by the downtime across one, so a few seconds of tolerance separates jitter from a fast
+       restart that the 120-second window would swallow. Additive only: it can add a detected
+       reboot, never suppress the jitter protection the wider window provides. #>
+    $priorMonotonic = if ($State.PSObject.Properties.Name -contains 'LastMonotonicBootId') { $State.LastMonotonicBootId } else { $null }
+    if ($CurrentMonotonicBootId -and $priorMonotonic) {
+        $priorInstant = [datetimeoffset]::MinValue
+        $currentInstant = [datetimeoffset]::MinValue
+        $styles = [System.Globalization.DateTimeStyles]::RoundtripKind
+        if ([datetimeoffset]::TryParse($priorMonotonic, [cultureinfo]::InvariantCulture, $styles, [ref]$priorInstant) -and
+            [datetimeoffset]::TryParse($CurrentMonotonicBootId, [cultureinfo]::InvariantCulture, $styles, [ref]$currentInstant)) {
+            if ([math]::Abs(($currentInstant - $priorInstant).TotalSeconds) -gt $MonotonicToleranceSeconds) { $sameSession = $false }
+        }
+    }
 
     if ($State.LastBootSessionId -and -not $sameSession) {
         if ($State.Phase -eq 'Rebooting' -or @($State.ExplicitRebootRequests).Count -gt 0) {
@@ -1625,6 +1646,10 @@ function Update-BootUpdateStateForBootSession {
     if ($null -ne $CurrentUptimeSeconds) {
         if ($State.PSObject.Properties.Name -contains 'LastUptimeSeconds') { $State.LastUptimeSeconds = $CurrentUptimeSeconds }
         else { $State | Add-Member -NotePropertyName 'LastUptimeSeconds' -NotePropertyValue $CurrentUptimeSeconds -Force }
+    }
+    if ($CurrentMonotonicBootId) {
+        if ($State.PSObject.Properties.Name -contains 'LastMonotonicBootId') { $State.LastMonotonicBootId = $CurrentMonotonicBootId }
+        else { $State | Add-Member -NotePropertyName 'LastMonotonicBootId' -NotePropertyValue $CurrentMonotonicBootId -Force }
     }
     return $State
 }
@@ -6481,16 +6506,26 @@ function Invoke-BootUpdateCycle {
     if ($isFirstIteration) { $state.StartTime = Get-Date -Format 'o' }
     $currentBootSessionId = Get-BootUpdateBootSessionId
     $currentUptimeSeconds = Get-BootUpdateUptimeSeconds
+    $currentMonotonicBootId = Get-BootUpdateMonotonicBootId
     $priorBootSessionId = $state.LastBootSessionId
-    $priorUptimeSeconds = if ($state.PSObject.Properties.Name -contains 'LastUptimeSeconds') { $state.LastUptimeSeconds } else { $null }
-    $state = Update-BootUpdateStateForBootSession -State $state -CurrentBootSessionId $currentBootSessionId -CurrentUptimeSeconds $currentUptimeSeconds
+    $priorMonotonicBootId = if ($state.PSObject.Properties.Name -contains 'LastMonotonicBootId') { $state.LastMonotonicBootId } else { $null }
+    $state = Update-BootUpdateStateForBootSession -State $state -CurrentBootSessionId $currentBootSessionId `
+        -CurrentUptimeSeconds $currentUptimeSeconds -CurrentMonotonicBootId $currentMonotonicBootId
     <# Mirrors the detection inside Update-BootUpdateStateForBootSession, uptime signal
        included. Re-testing the timestamps alone here would report a different number of
        boots than the state actually counted, which is how a log comes to disagree with
        the machine while staying internally consistent. #>
+    $monotonicMoved = $false
+    if ($priorMonotonicBootId -and $currentMonotonicBootId) {
+        $pi = [datetimeoffset]::MinValue; $ci = [datetimeoffset]::MinValue
+        $st = [System.Globalization.DateTimeStyles]::RoundtripKind
+        if ([datetimeoffset]::TryParse($priorMonotonicBootId, [cultureinfo]::InvariantCulture, $st, [ref]$pi) -and
+            [datetimeoffset]::TryParse($currentMonotonicBootId, [cultureinfo]::InvariantCulture, $st, [ref]$ci)) {
+            $monotonicMoved = [math]::Abs(($ci - $pi).TotalSeconds) -gt 15
+        }
+    }
     $newBootObserved = $priorBootSessionId -and (
-        (-not (Test-BootUpdateSameBootSession -Left $priorBootSessionId -Right $currentBootSessionId)) -or
-        ($null -ne $priorUptimeSeconds -and [double]$currentUptimeSeconds -lt [double]$priorUptimeSeconds))
+        (-not (Test-BootUpdateSameBootSession -Left $priorBootSessionId -Right $currentBootSessionId)) -or $monotonicMoved)
     if ($newBootObserved) {
         Write-Log "Observed a new Windows boot session; completed reboot count is now $($state.RebootCount)." -Visibility Verbose
     }

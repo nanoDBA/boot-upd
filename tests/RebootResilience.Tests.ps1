@@ -61,6 +61,7 @@ BeforeAll {
           'Get-InstallerExitSummary',
           'Get-ProcessTreeActivity',
           'Get-BootUpdateUptimeSeconds',
+          'Get-BootUpdateMonotonicBootId',
           'Get-WingetInventoryPackageIds',
           'Get-WingetOutputSummary',
           'Get-ChocolateyOutputSummary',
@@ -2534,22 +2535,84 @@ Describe 'Fast reboot accounting' {
         $script:BootSessionToleranceSeconds = 120
     }
 
-    It 'counts two boots that fall inside the tolerance window when uptime reset' {
-        $first  = [datetime]::UtcNow.AddMinutes(-10)
-        $second = $first.AddSeconds(96)   # the exact gap observed in row A
+    It 'counts a fast reboot even when uptime crept FORWARD across it' {
+        <# The case that defeated the first fix. Uptime only runs backwards if the earlier
+           pass ran later in its boot than the current pass does in its own. Observed on the
+           lab guest: each pass ran ~40s after its boot, so uptime went 40 -> 45 across a real
+           restart and the reboot was missed anyway. The monotonic boot instant does not care
+           where in each boot the passes land. #>
+        $now = [datetime]::UtcNow
+        $firstBoot  = $now.AddMinutes(-3)          # pass 3 ran 40s into this boot
+        $secondBoot = $firstBoot.AddSeconds(81)    # real restart, 81s later
         $state = [pscustomobject]@{
-            LastBootSessionId = $first.ToString('o')
-            LastUptimeSeconds = 400        # prior pass was 400s into that boot
-            RebootCount       = 1
-            Phase             = 'Rebooting'
+            LastBootSessionId   = $firstBoot.ToString('o')
+            LastUptimeSeconds   = 40
+            LastMonotonicBootId = $firstBoot.ToString('o')
+            RebootCount         = 1
+            Phase               = 'Rebooting'
             ExplicitRebootRequests = @()
         }
         $updated = Update-BootUpdateStateForBootSession -State $state `
-            -CurrentBootSessionId $second.ToString('o') -CurrentUptimeSeconds 30
+            -CurrentBootSessionId $secondBoot.ToString('o') `
+            -CurrentUptimeSeconds 45 `
+            -CurrentMonotonicBootId $secondBoot.ToString('o')
 
         $updated.RebootCount |
-            Should -Be 2 -Because 'uptime running backwards is proof of a restart even inside the tolerance'
+            Should -Be 2 -Because 'the boot instant moved 81s even though uptime went 40 -> 45'
+    }
+
+    It 'treats a stable monotonic boot instant as one session however the timestamp jitters' {
+        $now = [datetime]::UtcNow
+        $boot = $now.AddMinutes(-30)
+        $state = [pscustomobject]@{
+            LastBootSessionId   = $boot.ToString('o')
+            LastUptimeSeconds   = 400
+            LastMonotonicBootId = $boot.ToString('o')
+            RebootCount         = 1
+            Phase               = 'Rebooting'
+            ExplicitRebootRequests = @()
+        }
+        # Boot timestamp jitters by 4s; the monotonic instant moves by 2s. Same boot.
+        $updated = Update-BootUpdateStateForBootSession -State $state `
+            -CurrentBootSessionId $boot.AddSeconds(4).ToString('o') `
+            -CurrentUptimeSeconds 460 `
+            -CurrentMonotonicBootId $boot.AddSeconds(2).ToString('o')
+
+        $updated.RebootCount | Should -Be 1 -Because 'a couple of seconds of drift is not a restart'
+        $updated.LastBootSessionId | Should -Be $boot.ToString('o')
+    }
+
+    It 'reconstructs a boot instant that is stable across successive reads' {
+        $a = Get-BootUpdateMonotonicBootId
+        Start-Sleep -Milliseconds 1500
+        $b = Get-BootUpdateMonotonicBootId
+        $drift = [math]::Abs((([datetimeoffset]$b) - ([datetimeoffset]$a)).TotalSeconds)
+        $drift | Should -BeLessThan 5 -Because 'within one boot the reconstructed instant must barely move'
+    }
+
+    It 'counts two boots that fall inside the tolerance window' {
+        <# The original row A observation: real boots 96 seconds apart, inside the
+           120-second LastBootUpTime tolerance, so the second was absorbed and the
+           completed-reboot count under-reported it. #>
+        $first  = [datetime]::UtcNow.AddMinutes(-10)
+        $second = $first.AddSeconds(96)   # the exact gap observed in row A
+        $state = [pscustomobject]@{
+            LastBootSessionId   = $first.ToString('o')
+            LastUptimeSeconds   = 400
+            LastMonotonicBootId = $first.ToString('o')
+            RebootCount         = 1
+            Phase               = 'Rebooting'
+            ExplicitRebootRequests = @()
+        }
+        $updated = Update-BootUpdateStateForBootSession -State $state `
+            -CurrentBootSessionId $second.ToString('o') `
+            -CurrentUptimeSeconds 30 `
+            -CurrentMonotonicBootId $second.ToString('o')
+
+        $updated.RebootCount |
+            Should -Be 2 -Because 'the boot instant moved 96s, far past the 15s monotonic tolerance'
         $updated.LastUptimeSeconds | Should -Be 30
+        $updated.LastMonotonicBootId | Should -Be $second.ToString('o')
     }
 
     It 'still treats same-boot jitter as one session when uptime keeps climbing' {
