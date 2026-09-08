@@ -32,7 +32,13 @@ param(
     [string]$GuestUser    = 'updtest',
     [string]$GuestPassword = $env:BOOTUPD_LAB_PASSWORD,
     [int]$TimeoutMinutes  = 60,
-    [switch]$SkipSync
+    [switch]$SkipSync,
+    [switch]$SystemContext,
+    <# Fires inside the guest the first time the updater's log matches -InjectWhen. Rows C,
+       D, E and G all work by disturbing the cycle at a specific moment rather than by
+       letting it run clean, and the moment they care about is announced in the log. #>
+    [string]$InjectWhen = '',
+    [scriptblock]$InjectAction = $null
 )
 
 $ErrorActionPreference = 'Stop'
@@ -126,13 +132,18 @@ if ($n -lt $limit -and $n -lt $features.Count) {
     } | Out-Null
 }
 
-Say 'launching the cycle in the interactive session'
-Invoke-Command -VMName $VMName -Credential $cred -ArgumentList $GuestUser -ScriptBlock {
-    param($User)
+<# An Interactive principal cannot run while nobody is signed in - the task just stays
+   queued - so a no-user row has to launch as SYSTEM. That is also the context the
+   updater's own BootUpdateCycleFallback task runs in, which is what such a row exercises. #>
+if ($SystemContext) { Say 'launching the cycle as SYSTEM (no interactive user)' }
+else { Say 'launching the cycle in the interactive session' }
+Invoke-Command -VMName $VMName -Credential $cred -ArgumentList $GuestUser, ([bool]$SystemContext) -ScriptBlock {
+    param($User, $AsSystem)
     $a = New-ScheduledTaskAction -Execute 'C:\Program Files\PowerShell\7\pwsh.exe' `
          -Argument '-NoProfile -ExecutionPolicy Bypass -File "C:\Lab\boot-upd\Deploy-BootUpdateCycle.ps1" -NonInteractive -OutputMode Normal' `
          -WorkingDirectory 'C:\Lab\boot-upd'
-    $p = New-ScheduledTaskPrincipal -UserId "$env:COMPUTERNAME\$User" -LogonType Interactive -RunLevel Highest
+    $p = if ($AsSystem) { New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest }
+         else { New-ScheduledTaskPrincipal -UserId "$env:COMPUTERNAME\$User" -LogonType Interactive -RunLevel Highest }
     $s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::FromHours(6))
     Register-ScheduledTask -TaskName 'Lab-RunDeploy' -Action $a -Principal $p -Settings $s -Force | Out-Null
     Start-ScheduledTask -TaskName 'Lab-RunDeploy'
@@ -142,9 +153,13 @@ Say 'monitoring'
 $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
 $timeline = [System.Collections.Generic.List[string]]::new()
 $complete = $false
+$injected = $false
+$injectArmed = [bool]($InjectWhen -and $InjectAction)
+if ($injectArmed) { Say "injection armed on /$InjectWhen/" }
 while ((Get-Date) -lt $deadline) {
     try {
-        $r = Invoke-Command -VMName $VMName -Credential $cred -ErrorAction Stop -ScriptBlock {
+        $r = Invoke-Command -VMName $VMName -Credential $cred -ErrorAction Stop -ArgumentList $InjectWhen -ScriptBlock {
+            param($Pattern)
             $log = 'C:\ProgramData\BootUpdateCycle\BootUpdateCycle.log'
             $lines = if (Test-Path $log) { @(Get-Content $log -ErrorAction SilentlyContinue) } else { @() }
             [pscustomobject]@{
@@ -153,12 +168,22 @@ while ((Get-Date) -lt $deadline) {
                 Complete = ($lines -match 'BOOT UPDATE CYCLE COMPLETE').Count
                 Tasks    = @(Get-ScheduledTask -TaskName 'BootUpdateCycle*' -ErrorAction SilentlyContinue).Count
                 Last     = if ($lines.Count) { ($lines[-1] -replace '\s+', ' ').Trim() } else { '' }
+                Matched  = if ($Pattern) { ($lines -match $Pattern).Count -gt 0 } else { $false }
             }
         }
         $timeline.Add(("{0} passes={1} lines={2} tasks={3} :: {4}" -f (Get-Date -Format 'HH:mm:ss'), $r.Passes, $r.Lines, $r.Tasks, $r.Last))
+        if ($injectArmed -and -not $injected -and $r.Matched) {
+            Say "injecting on match at $(Get-Date -Format 'HH:mm:ss')"
+            $timeline.Add(("{0} INJECTED on /{1}/" -f (Get-Date -Format 'HH:mm:ss'), $InjectWhen))
+            try { Invoke-Command -VMName $VMName -Credential $cred -ScriptBlock $InjectAction -ErrorAction Stop | Out-Null }
+            catch { $timeline.Add(("{0} injection failed: {1}" -f (Get-Date -Format 'HH:mm:ss'), $_.Exception.Message)) }
+            $injected = $true
+        }
         if ($r.Complete -ge 1 -and $r.Tasks -eq 0) { $complete = $true; Say "cycle complete after $($r.Passes) pass(es)"; break }
     } catch { $timeline.Add(("{0} unreachable (rebooting)" -f (Get-Date -Format 'HH:mm:ss'))) }
-    Start-Sleep -Seconds 40
+    <# Poll fast while waiting to inject: a restart countdown is measured in seconds, so a
+       40-second cadence would sail past the only moment the row cares about. #>
+    Start-Sleep -Seconds $(if ($injectArmed -and -not $injected) { 3 } else { 40 })
 }
 
 Say 'collecting evidence'
@@ -175,6 +200,10 @@ $evidence = Invoke-Command -VMName $VMName -Credential $cred -ScriptBlock {
         StateFileExists = Test-Path 'C:\ProgramData\BootUpdateCycle\BootUpdateCycle.state.json'
         TasksRemaining  = @(Get-ScheduledTask -TaskName 'BootUpdateCycle*' -ErrorAction SilentlyContinue).Count
         CbsPending      = Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
+        <# For a no-user row, proof that no interactive session ever appeared is part of the
+           result: a SYSTEM-fallback claim means nothing if somebody was quietly logged in. #>
+        ConsoleUser     = (Get-CimInstance Win32_ComputerSystem).UserName
+        ExplorerCount   = @(Get-Process explorer -ErrorAction SilentlyContinue).Count
     }
 }
 
@@ -201,6 +230,9 @@ $summary = [pscustomobject]@{
     StateFileRemains = $evidence.StateFileExists
     TasksRemaining   = $evidence.TasksRemaining
     CbsPending       = $evidence.CbsPending
+    Injected         = $injected
+    ConsoleUser      = $evidence.ConsoleUser
+    ExplorerCount    = $evidence.ExplorerCount
     EvidenceDir      = $evidenceDir
 }
 $summary | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $evidenceDir 'summary.json')
