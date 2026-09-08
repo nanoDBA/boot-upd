@@ -1542,6 +1542,25 @@ function Get-BootUpdateBootSessionId {
     }
 }
 
+function Get-BootUpdateUptimeSeconds {
+    <# Independent corroboration for a reboot, because LastBootUpTime alone cannot supply it.
+
+       Boot identity is compared through a tolerance window, since LastBootUpTime jitters by
+       seconds within a single boot. But the updater's own reboot cycle can complete in less
+       than that window: row A observed real boots 96 seconds apart against a 120-second
+       tolerance, so one boot was absorbed and the completed-reboot count under-reported it.
+       Since that count gates the reboot limit, a fast loop could evade the cap entirely.
+
+       Shrinking the window cannot separate the two cases: jitter is seconds and fast reboots
+       are tens of seconds, and the ranges overlap. Uptime does separate them. Within one boot
+       it only ever increases; across a boot it resets. So uptime running BACKWARDS is
+       positive proof of a restart, whatever the timestamps say.
+
+       TickCount64 is used rather than a second LastBootUpTime read: it is the monotonic
+       counter the jitter problem does not apply to. #>
+    return [math]::Round([System.Environment]::TickCount64 / 1000.0, 0)
+}
+
 function Test-BootUpdateSameBootSession {
     <# LastBootUpTime is a derived value, not a stored constant: on VMs and on hosts that
        resync the clock it jitters by seconds between reads inside a single boot. Compared
@@ -1573,10 +1592,19 @@ function Test-BootUpdateSameBootSession {
 function Update-BootUpdateStateForBootSession {
     param(
         [Parameter(Mandatory)][pscustomobject]$State,
-        [Parameter(Mandatory)][string]$CurrentBootSessionId
+        [Parameter(Mandatory)][string]$CurrentBootSessionId,
+        [AllowNull()][object]$CurrentUptimeSeconds = $null
     )
     $priorBootSessionId = ConvertTo-BootUpdateTimestampString -Value $State.LastBootSessionId
     $sameSession = Test-BootUpdateSameBootSession -Left $priorBootSessionId -Right $CurrentBootSessionId
+
+    <# Uptime regression is independent proof of a restart that the tolerance window cannot
+       see. It can only ever ADD a detected reboot, never suppress the jitter protection, so
+       a boot inside the tolerance is still counted when uptime says the machine restarted. #>
+    $priorUptime = if ($State.PSObject.Properties.Name -contains 'LastUptimeSeconds') { $State.LastUptimeSeconds } else { $null }
+    $uptimeWentBackwards = ($null -ne $CurrentUptimeSeconds -and $null -ne $priorUptime -and [double]$CurrentUptimeSeconds -lt [double]$priorUptime)
+    if ($uptimeWentBackwards) { $sameSession = $false }
+
     if ($State.LastBootSessionId -and -not $sameSession) {
         if ($State.Phase -eq 'Rebooting' -or @($State.ExplicitRebootRequests).Count -gt 0) {
             $State.RebootCount = [int]$State.RebootCount + 1
@@ -1589,6 +1617,15 @@ function Update-BootUpdateStateForBootSession {
     <# Anchor on the first identity observed for this boot. Rewriting it on every same-boot
        pass would let per-read jitter ratchet past the tolerance across a long recovery chain. #>
     if (-not $State.LastBootSessionId -or -not $sameSession) { $State.LastBootSessionId = $CurrentBootSessionId }
+
+    <# Always recorded, including on same-boot passes, so the next pass compares against the
+       most recent reading. Anchoring this the way LastBootSessionId is anchored would make a
+       long same-boot recovery chain compare against a stale, tiny uptime and read every pass
+       as a reboot. #>
+    if ($null -ne $CurrentUptimeSeconds) {
+        if ($State.PSObject.Properties.Name -contains 'LastUptimeSeconds') { $State.LastUptimeSeconds = $CurrentUptimeSeconds }
+        else { $State | Add-Member -NotePropertyName 'LastUptimeSeconds' -NotePropertyValue $CurrentUptimeSeconds -Force }
+    }
     return $State
 }
 
@@ -6443,9 +6480,18 @@ function Invoke-BootUpdateCycle {
     $isFirstIteration = -not $state.StartTime
     if ($isFirstIteration) { $state.StartTime = Get-Date -Format 'o' }
     $currentBootSessionId = Get-BootUpdateBootSessionId
+    $currentUptimeSeconds = Get-BootUpdateUptimeSeconds
     $priorBootSessionId = $state.LastBootSessionId
-    $state = Update-BootUpdateStateForBootSession -State $state -CurrentBootSessionId $currentBootSessionId
-    if ($priorBootSessionId -and -not (Test-BootUpdateSameBootSession -Left $priorBootSessionId -Right $currentBootSessionId)) {
+    $priorUptimeSeconds = if ($state.PSObject.Properties.Name -contains 'LastUptimeSeconds') { $state.LastUptimeSeconds } else { $null }
+    $state = Update-BootUpdateStateForBootSession -State $state -CurrentBootSessionId $currentBootSessionId -CurrentUptimeSeconds $currentUptimeSeconds
+    <# Mirrors the detection inside Update-BootUpdateStateForBootSession, uptime signal
+       included. Re-testing the timestamps alone here would report a different number of
+       boots than the state actually counted, which is how a log comes to disagree with
+       the machine while staying internally consistent. #>
+    $newBootObserved = $priorBootSessionId -and (
+        (-not (Test-BootUpdateSameBootSession -Left $priorBootSessionId -Right $currentBootSessionId)) -or
+        ($null -ne $priorUptimeSeconds -and [double]$currentUptimeSeconds -lt [double]$priorUptimeSeconds))
+    if ($newBootObserved) {
         Write-Log "Observed a new Windows boot session; completed reboot count is now $($state.RebootCount)." -Visibility Verbose
     }
     $currentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()

@@ -60,6 +60,7 @@ BeforeAll {
           'Format-NativeExitCode',
           'Get-InstallerExitSummary',
           'Get-ProcessTreeActivity',
+          'Get-BootUpdateUptimeSeconds',
           'Get-WingetInventoryPackageIds',
           'Get-WingetOutputSummary',
           'Get-ChocolateyOutputSummary',
@@ -2518,5 +2519,82 @@ Describe 'Installer exit-code vocabulary' {
 
     It 'still formats genuinely unknown codes as hex' {
         Get-InstallerExitSummary -Code 123456 | Should -Match '0x0001E240'
+    }
+}
+
+
+Describe 'Fast reboot accounting' {
+    <# Regression cover for -6qpf, found by VM matrix row A on real hardware-equivalent
+       runs. Windows event 6005 recorded three boots; the updater counted two. Two of the
+       boots were 96 seconds apart, inside the 120-second boot-session tolerance, so one was
+       absorbed as the same session. That count gates the reboot limit, so a fast reboot
+       loop could run past the cap - this project's namesake failure. #>
+
+    BeforeEach {
+        $script:BootSessionToleranceSeconds = 120
+    }
+
+    It 'counts two boots that fall inside the tolerance window when uptime reset' {
+        $first  = [datetime]::UtcNow.AddMinutes(-10)
+        $second = $first.AddSeconds(96)   # the exact gap observed in row A
+        $state = [pscustomobject]@{
+            LastBootSessionId = $first.ToString('o')
+            LastUptimeSeconds = 400        # prior pass was 400s into that boot
+            RebootCount       = 1
+            Phase             = 'Rebooting'
+            ExplicitRebootRequests = @()
+        }
+        $updated = Update-BootUpdateStateForBootSession -State $state `
+            -CurrentBootSessionId $second.ToString('o') -CurrentUptimeSeconds 30
+
+        $updated.RebootCount |
+            Should -Be 2 -Because 'uptime running backwards is proof of a restart even inside the tolerance'
+        $updated.LastUptimeSeconds | Should -Be 30
+    }
+
+    It 'still treats same-boot jitter as one session when uptime keeps climbing' {
+        <# The protection the tolerance exists for. Repeated LastBootUpTime reads inside one
+           boot differ by seconds; treating those as new boots zeroes the same-boot retry
+           budget and lets a permanently failing phase retry forever. #>
+        $first  = [datetime]::UtcNow.AddMinutes(-10)
+        $jitter = $first.AddSeconds(3)
+        $state = [pscustomobject]@{
+            LastBootSessionId = $first.ToString('o')
+            LastUptimeSeconds = 400
+            RebootCount       = 1
+            Phase             = 'Rebooting'
+            ExplicitRebootRequests = @()
+        }
+        $updated = Update-BootUpdateStateForBootSession -State $state `
+            -CurrentBootSessionId $jitter.ToString('o') -CurrentUptimeSeconds 460
+
+        $updated.RebootCount | Should -Be 1 -Because 'uptime advanced, so the machine never restarted'
+        $updated.LastBootSessionId |
+            Should -Be $first.ToString('o') -Because 'the anchor must not drift with jitter'
+    }
+
+    It 'records uptime on same-boot passes so the next comparison is against a fresh reading' {
+        <# Anchoring uptime the way LastBootSessionId is anchored would compare a long
+           same-boot recovery chain against a stale tiny value and read every pass as a boot. #>
+        $boot = [datetime]::UtcNow.AddMinutes(-10)
+        $state = [pscustomobject]@{
+            LastBootSessionId = $boot.ToString('o')
+            LastUptimeSeconds = 100
+            RebootCount       = 0
+            Phase             = 'Init'
+            ExplicitRebootRequests = @()
+        }
+        $updated = Update-BootUpdateStateForBootSession -State $state `
+            -CurrentBootSessionId $boot.ToString('o') -CurrentUptimeSeconds 700
+        $updated.LastUptimeSeconds | Should -Be 700
+        $updated.RebootCount | Should -Be 0
+    }
+
+    It 'reports a monotonic uptime that does not depend on the jittering boot timestamp' {
+        $a = Get-BootUpdateUptimeSeconds
+        Start-Sleep -Milliseconds 1200
+        $b = Get-BootUpdateUptimeSeconds
+        $a | Should -BeGreaterThan 0
+        $b | Should -BeGreaterOrEqual $a
     }
 }
