@@ -25,6 +25,31 @@ Microsoft documents a machine with no signed-in user as the *unblocked* servicin
 - v2.5.77 attributed row B's failure to converge to `wuauserv` being stopped on the guest image, framed as an environmental artefact. **That was wrong.** A stopped `wuauserv` is the documented, normal resting state, not a broken image, and the updater started it on demand in every subsequent run. Row B did not converge because of defects in the updater: the unbounded user wait and the retry-budget reset above.
 - v2.5.77 reported multi-reboot convergence as "four of seven rows". Those seven rows are this project's own decomposition of the gate, not a bar `docs/TESTING.md` sets - the gate is defined there as reported, not blocking, and states no completion criterion. "Four of seven" reads as a score against an external standard, and should not have.
 - v2.5.77's README framed the `Microsoft-Windows-International-Core` requirement in the `oobeSystem` pass as a discovery. It is documented: Microsoft describes the `-WinPE` variant as applying only in the `windowsPE` pass and directs you to the non-WinPE component for `oobeSystem`.
+### Validation
+
+```text
+Unit/process behavior:       PASS  (392 tests, 0 failed)
+User/SYSTEM boundary:        PASS
+Published launcher upgrade:  PASS
+Live bootstrap:              NOT RUN
+Provider integration:        NOT RUN
+Multi-reboot convergence:    PASS  (rows A and B, see below)
+Release assets:              PASS
+```
+
+Both rows ran on a Windows 11 Enterprise LTSC 2024 guest rebuilt during this cycle, so neither inherited state from the v2.5.77 lab.
+
+- **Row A**, interactive-user continuation across real reboots: **PASS.** Four passes, three reboots, converged with 2 verified updates; both continuation tasks removed and no state file left. The reboot count the updater claimed equals the OS boot record. The reboots were **67 and 58 seconds apart** - inside the 120-second boot-session tolerance - and each was observed exactly once, so the fix above did not buy same-boot stability by going blind to the fast restarts that motivated the monotonic signal in the first place.
+- **Row B**, SYSTEM continuation with nobody signed in: **PASS**, against a guest verified headless before the row started (no Explorer, active LogonUI, empty console user). The new-boot observation fired exactly once for the one real reboot, where before the fix it fired five times across two. The retry budget therefore accumulated, and the cycle stopped itself: *"Same-boot recovery limit 3 reached; incomplete phases: WindowsUpdate. Continuation tasks were removed and verified absent."* No continuation tasks remained, and diagnostic state was retained deliberately, as the limit path documents.
+
+Two limits on what row B establishes, stated plainly:
+
+- **It reached a truthful terminal state, not convergence.** `Update for Windows Security platform - KB5007651` reports as installed on every pass and is still applicable on the next scan, so this image cannot converge. Whether that is an environmental re-offer or the phase counting an install that did not happen is filed separately and is not claimed either way here.
+- **The bounded user wait was not exercised by the lab.** `-MaxUserIdentityWaits` never fired, because the recovery limit is reached first on this image. It has unit cover; it does not yet have lab cover.
+
+Rows C, D, E, F and G were **NOT RUN** for this release. C and E passed under v2.5.77 and were not re-run against the rebuilt guest.
+
+No live update cycle was run on the maintainer's own machine during validation; every reboot was performed on a disposable guest.
 ## v2.5.77 (2026-09-08)
 
 Multi-reboot gate release. The gate defined in `docs/TESTING.md` was executed on a disposable VM lab for the first time, and it found two P1 defects that every prior release shipped with, including v2.5.76. Neither was visible to the unit suite.
