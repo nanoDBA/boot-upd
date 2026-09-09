@@ -363,6 +363,23 @@ $evidence.Log | Set-Content (Join-Path $evidenceDir 'BootUpdateCycle.log')
 if ($evidence.DeployOutput.Count) { $evidence.DeployOutput | Set-Content (Join-Path $evidenceDir 'deploy-output.txt') }
 & 'C:\HyperV\Get-VmScreen.ps1' -VMName $VMName -Path (Join-Path $evidenceDir 'console.png') | Out-Null
 
+<# Completed is a fact about the machine, not about whether a poll happened to catch it.
+
+   Row B against the v2.5.79 build converged at 14:18:29 and the monitor's deadline fell at
+   14:18:57, so the loop exited on the timeout 28 seconds later without ever observing the
+   completion line - and summary.json said Completed=false for a run whose log says
+   "BOOT UPDATE CYCLE COMPLETE WITH DEFERRED INVENTORY", with both tasks removed and no state
+   file left. A reader checking the summary against a release note claiming a pass would have
+   found them contradicting each other, which is the exact pattern this release exists to
+   stop. The collected evidence is the more reliable witness, so it decides. #>
+if (-not $complete) {
+    $completedInLog = @($evidence.Log | Where-Object { $_ -match 'BOOT UPDATE CYCLE COMPLETE' }).Count -ge 1
+    if ($completedInLog -and $evidence.TasksRemaining -eq 0) {
+        $complete = $true
+        Say 'cycle had already completed when the monitor stopped watching; taking that from the evidence'
+    }
+}
+
 $startLine = @($evidence.Log) | Where-Object { $_ -match 'BOOT UPDATE CYCLE STARTED' } | Select-Object -First 1
 $sessionStart = if ($startLine -match '\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]') { [datetime]$Matches[1] } else { (Get-Date).AddHours(-2) }
 <# Bound the window at BOTH ends. Filtering only on "at or after the session started" let a
