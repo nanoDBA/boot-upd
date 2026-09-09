@@ -74,7 +74,11 @@ function ConvertTo-SanitizedBeadsExport {
     function New-BeadsFieldSanitizer {
         param(
             [string]$FieldName,
-            [string]$Replacement
+            [string]$Replacement,
+            <# Values that are not identities and must survive untouched. bd writes
+               "unknown" for an author it has no record of; rewriting that to the
+               maintainer placeholder would invent attribution rather than remove it. #>
+            [string[]]$Preserve = @('unknown')
         )
 
         # Matches a top-level JSON string value for $FieldName, capturing its
@@ -84,7 +88,7 @@ function ConvertTo-SanitizedBeadsExport {
         $evaluator = {
             param($match)
             $current = $match.Groups[1].Value
-            if ([string]::IsNullOrEmpty($current) -or $current -eq $Replacement) {
+            if ([string]::IsNullOrEmpty($current) -or $current -eq $Replacement -or $Preserve -contains $current) {
                 return $match.Value
             }
             return '"' + $FieldName + '":"' + $Replacement + '"'
@@ -96,9 +100,18 @@ function ConvertTo-SanitizedBeadsExport {
         }
     }
 
+    <# created_by and author carry the same real name as assignee, on far more rows (274
+       and 2 of 216 issues at the time this was written, against 216 assignees). Sanitizing
+       assignee alone would have closed the ticket while leaving the file leaking, so every
+       structured identity field bd writes is covered here. Prose inside description, notes
+       and comments is NOT rewritten: it is ticket content rather than something the
+       exporter composes, and a blind substitution there would corrupt meaning. Real
+       identities in prose are tracked separately. #>
     $sanitizers = @(
-        (New-BeadsFieldSanitizer -FieldName 'assignee' -Replacement 'maintainer')
-        (New-BeadsFieldSanitizer -FieldName 'owner' -Replacement '')
+        (New-BeadsFieldSanitizer -FieldName 'assignee'   -Replacement 'maintainer')
+        (New-BeadsFieldSanitizer -FieldName 'created_by' -Replacement 'maintainer')
+        (New-BeadsFieldSanitizer -FieldName 'author'     -Replacement 'maintainer')
+        (New-BeadsFieldSanitizer -FieldName 'owner'      -Replacement '')
     )
 
     $raw = Get-Content -LiteralPath $Path -Raw
