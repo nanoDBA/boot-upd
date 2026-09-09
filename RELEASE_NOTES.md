@@ -1,10 +1,51 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.76
-**Release Date:** 2026-08-25
+**Current Version:** v2.5.77
+**Release Date:** 2026-09-08
 **Status:** STABLE
 
 ---
+
+## v2.5.77 (2026-09-08)
+
+Multi-reboot gate release. The gate defined in `docs/TESTING.md` was executed on a disposable VM lab for the first time, and it found two P1 defects that every prior release shipped with, including v2.5.76. Neither was visible to the unit suite.
+
+### Fixed
+
+- **The idle timeout never measured idleness.** `Get-ProcessTreeActivity` walked `Win32_Process` from the provider PID, but `ProcessId`/`ParentProcessId` are `UInt32` while the traversal queue is `Queue[int]`, and a `Hashtable` keyed by `UInt32` never matches an `Int32` probe. Every lookup missed, so the function reported an empty tree with zero CPU for every process it was ever asked about. Zero never exceeds the previous zero, so the idle clock never reset: the idle timeout was a fixed wall-clock kill at `IdleTimeoutMinutes`, applied to healthy and wedged packages alike. Shipped logs carry the fingerprint plainly — `heartbeat: CPU=0s procs=0` beside phases that completed normally. On 2026-09-06 it killed an Acrobat Reader upgrade at exactly five minutes, orphaning an `msiexec` that then failed the next six packages with `1618`, at a cost of three iterations and 39.6 minutes.
+- An unobservable process tree is no longer treated as an idle one. `msiexec` is parented to `services.exe`, so an MSI-backed package legitimately does its work outside the tree being watched; killing on that reading is how a healthy install dies. The hard timeout remains the bound. See `docs/adr/0005`.
+- Parent edges are rejected when the claimed child predates the claimed parent. A reused PID adopted every orphan still naming it; one reading moved from 71 minutes of stranger CPU to 2 seconds of real CPU between consecutive samples, and a total that *falls* can never exceed the previous high-water mark, so the idle clock advances and kills working software.
+- **Fast reboots were absorbed by the boot-session tolerance, letting the reboot limit be evaded.** Two boots inside the 120-second window counted as one, so the completed-reboot count under-reported and the claim said "2 reboot(s)" where Windows event 6005 recorded three. That count gates the reboot limit, so a loop faster than the tolerance never increments toward the cap. Shrinking the window cannot fix it: jitter is seconds, fast reboots are tens of seconds, and the ranges overlap. The boot instant is now reconstructed by subtracting monotonic uptime from the current time, which is stable within a boot and jumps by the downtime across one.
+- **A cycle started as SYSTEM with nobody signed in died at task registration.** Resume-user discovery falls through to `LastLoggedOnSAMUser`, which returns the `.\name` form; Task Scheduler cannot map that to a SID and `Register-ScheduledTask` throws a terminating `CimException`. The cycle died immediately after pre-flight leaving a state file and **no continuation task at all**, so a machine where nobody logs in could never resume. Discovered names are now expanded and SID-checked, and an unresolvable account degrades to the SYSTEM-only registration branch rather than terminating.
+- Three progress assertions in `tests/TuiExperience.Tests.ps1` measured something other than what they claimed and had been failing on real hardware since before v2.5.76. Two demanded an exact count of distinct rendered status lines, which varies with rounding boundaries; the third set a 1.2-second deadline for output that takes a measured 4.0 seconds to appear.
+
+### Added
+
+- `tests/integration/lab/` builds and drives the disposable Hyper-V lab `docs/TESTING.md` requires: one call per guest, rows runnable on parallel VMs, and a README recording the traps each script encodes. Guest credentials come from `BOOTUPD_LAB_PASSWORD` and are never committed.
+- Every row records Windows event 6005 beside the updater's own log and reports whether the two agree about how many restarts happened. That comparison found the reboot-accounting defect, and later caught the first fix for it being wrong.
+- `docs/adr/0005-an-unobservable-process-tree-is-not-an-idle-one.md`.
+
+### Validation
+
+```text
+Unit/process behavior:       PASS  (375 tests, 0 failed)
+User/SYSTEM boundary:        PASS
+Published launcher upgrade:  PASS
+Live bootstrap:              NOT RUN
+Provider integration:        NOT RUN
+Multi-reboot convergence:    PARTIAL - three of seven rows, see below
+Release assets:              PASS
+```
+
+Multi-reboot convergence was executed for the first time, on Windows 11 Enterprise LTSC 2024 guests under Hyper-V. Three of seven rows ran:
+
+- **Row A**, two or more real reboots with interactive-user continuation: **PASS.** Four passes across three real reboots; the claimed reboot count equals the OS boot record; both continuation tasks removed; no state file left.
+- **Row B**, SYSTEM-fallback continuation with no user logged on: **PARTIAL.** The mechanism is verified — tasks register, the cycle resumed across four real reboots as SYSTEM with nobody signed in, and user-scope work was deferred rather than claimed. It did not reach a completion claim, because `wuauserv` is stopped on the guest image and the Windows Update phase cannot finish. The updater withheld the claim rather than asserting convergence, which is the correct behaviour, but the row demonstrates truthful *incompleteness* rather than truthful completion.
+- **Row C**, canceled delayed restart: **PASS.** With the restart cancelled 13 seconds into a 60-second countdown, the updater did not record a reboot that never happened, did not advance its pass number, and left the resume chain armed. A later reboot resumed and completed it.
+
+Rows D (failed restart command), E (delayed reboot signal), F (PowerShell 5.1-only bootstrap) and G (killed-process recovery) are **NOT RUN**. Each is filed individually and names the checkpoint it starts from.
+
+No live update cycle was run on the maintainer's own machine during validation; every reboot was performed on a disposable guest.
 
 ## v2.5.76 (2026-08-25)
 
