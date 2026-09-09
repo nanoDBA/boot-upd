@@ -7044,7 +7044,14 @@ function Invoke-BootUpdateCycle {
     $pendingIteration = $state.Iteration + 1
 
     $sessionId = ([datetime]$state.StartTime).ToString('yyyy-MM-dd HH:mm:ss')
-    $cycleVerb = if ($isFirstIteration) { 'STARTED' } else { 'RESUMED (after reboot)' }
+    <# A pass is not a reboot. Matrix row D drove five passes with the restart command
+       rejected every time, and every one of them announced "RESUMED (after reboot)" while
+       the same line reported Reboots: 0/5 - the counter was right and the banner beside it
+       was not. The boot observation is already computed above, so use it rather than
+       assuming any non-first pass followed a restart. #>
+    $cycleVerb = if ($isFirstIteration) { 'STARTED' }
+                 elseif ($newBootObserved) { 'RESUMED (after reboot)' }
+                 else { 'RESUMED (same boot)' }
     $context = if (([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value) -eq 'S-1-5-18') { 'SYSTEM (scheduled task)' } else { "$env:USERNAME (user context)" }
 
     <# Console: BBS splash on every run.  Entry-point may have already shown it before

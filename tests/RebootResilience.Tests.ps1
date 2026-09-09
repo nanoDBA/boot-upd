@@ -3601,3 +3601,32 @@ Describe 'An update the machine says it installed and offers again is inventory,
         $toast.Message | Should -Not -Match 'you are all set'
     }
 }
+
+Describe 'A pass that followed no reboot does not say it resumed after one' {
+    <# Found in matrix row D (-n6qn) on 2026-09-09, evidence dir
+       C:\HyperV\evidence\D-failed-restart-lab-b-20260909-092536. With shutdown.exe rejecting
+       every restart, five passes each announced "BOOT UPDATE CYCLE RESUMED (after reboot)"
+       while the same line correctly reported "Reboots: 0/5". The counter was right and the
+       banner beside it was not - the same family of defect as -9nj2, where a deliberate
+       withhold was announced as a crash. #>
+
+    It 'chooses the banner verb from the boot observation, not from the pass number' {
+        $text = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
+        $text | Should -Match "elseif \(\`$newBootObserved\) \{ 'RESUMED \(after reboot\)' \}"
+        $text | Should -Match "else \{ 'RESUMED \(same boot\)' \}"
+        <# The observation must be established before the banner reads it. #>
+        $text.IndexOf('$newBootObserved = $priorBootSessionId') | Should -BeLessThan $text.IndexOf('$cycleVerb = if ($isFirstIteration)')
+    }
+
+    It 'keeps both spellings matchable by everything that greps for a pass' {
+        <# The lab harness counts passes with 'BOOT UPDATE CYCLE (STARTED|RESUMED)' and the
+           diagnostics exporter detects a session the same way, so the new wording must stay
+           inside that prefix or a same-boot retry chain would become invisible. #>
+        foreach ($verb in 'RESUMED (after reboot)', 'RESUMED (same boot)') {
+            "BOOT UPDATE CYCLE $verb | Session: x | Pass: 2" |
+                Should -Match 'BOOT UPDATE CYCLE (STARTED|RESUMED)'
+            "[2026-09-09 09:34:47] [Info] BOOT UPDATE CYCLE $verb | Pass: 2" |
+                Should -Match '(?im)^\s*(?:\[[^\]]+\]\s*)*BOOT UPDATE CYCLE (?:STARTED|RESUMED)\b'
+        }
+    }
+}
