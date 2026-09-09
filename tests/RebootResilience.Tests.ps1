@@ -58,6 +58,8 @@ BeforeAll {
         'Get-WindowsUpdateInstallOutputSummary',
         'Test-WindowsUpdateServiceReady',
         'Test-WindowsUpdateConvergence',
+        'Get-WindowsUpdateReofferedAfterSuccess',
+        'Get-WindowsUpdateInstallHistory',
           'Format-NativeExitCode',
           'Get-InstallerExitSummary',
           'Get-ProcessTreeActivity',
@@ -1694,6 +1696,11 @@ Describe 'Behavioral Windows Update convergence' {
         Mock Get-BootUpdateBootSessionId { 'boot-a' }
         Mock Write-Log {}
         Mock Set-WindowsUpdateAssessmentCache {}
+        <# Pin the two environment reads the re-offer classification makes, so these tests
+           say nothing about the machine they happen to run on. #>
+        $script:TestBootInstant = [datetime]::new(2026, 9, 9, 12, 40, 0, [System.DateTimeKind]::Utc)
+        Mock Get-WindowsUpdateInstallHistory { @() }
+        Mock Get-CimInstance { [pscustomobject]@{ LastBootUpTime = $script:TestBootInstant } } -ParameterFilter { $ClassName -eq 'Win32_OperatingSystem' }
     }
 
     It 'verifies zero applicable updates' {
@@ -1736,6 +1743,39 @@ Describe 'Behavioral Windows Update convergence' {
         $result = Test-WindowsUpdateConvergence
         $result.Verified | Should -BeTrue
         $result.Count | Should -Be 1
+        $result.Unexplained | Should -Be 1 -Because 'an update with no successful install behind it is outstanding work'
+        @($result.Reoffered).Count | Should -Be 0
+    }
+
+    It 'explains an update Windows Update says it already installed in this boot' {
+        <# -k610 end to end through the convergence check: the scan still offers KB5007651,
+           and the agent's own history says it installed it successfully twenty minutes ago,
+           after the last restart. Count stays 1 because the update really is applicable;
+           Unexplained drops to 0 because none of it is work this cycle can do. #>
+        $title = 'Update for Windows Security platform - KB5007651 (Version 10.0.29628.1000)'
+        Mock Get-WindowsUpdateEnvironmentFingerprint { 'fingerprint' }
+        Mock Set-WindowsUpdateAssessmentCache {}
+        Mock Invoke-BootUpdateBackgroundOperation { [pscustomobject]@{ Output=@("BOOTUPDATE_APPLICABLE|id-1|204|$title",'BOOTUPDATE_SCAN_COMPLETE|1'); Failed=$false; TimedOut=$false } }
+        Mock Get-WindowsUpdateInstallHistory {
+            @([pscustomobject]@{ Title = $title; ResultCode = 2; InstalledAt = $script:TestBootInstant.AddMinutes(20) })
+        }
+
+        $result = Test-WindowsUpdateConvergence
+        $result.Verified | Should -BeTrue
+        $result.Count | Should -Be 1
+        $result.Unexplained | Should -Be 0
+        @($result.Reoffered).Count | Should -Be 1
+        @($result.Reoffered)[0].KB | Should -Be 'KB5007651'
+    }
+
+    It 'does not classify anything when the scan itself could not be verified' {
+        <# Guessing about an unverified scan would turn a scan failure into a qualified
+           completion claim, which is the exact failure mode this release is correcting. #>
+        Mock Invoke-BootUpdateBackgroundOperation { [pscustomobject]@{ Output=@('BOOTUPDATE_ERROR|offline'); Failed=$false; TimedOut=$false } }
+        Mock Get-WindowsUpdateInstallHistory { throw 'the history must not be consulted for an unverified scan' }
+        $result = Test-WindowsUpdateConvergence
+        $result.Verified | Should -BeFalse
+        @($result.Reoffered).Count | Should -Be 0
     }
 
     It 'withholds verification after a scan error' {
@@ -3445,5 +3485,119 @@ Describe 'A killed package tree does not race the installer it orphaned' {
             $kill | Should -BeGreaterThan 0
             $wait | Should -BeGreaterThan $kill -Because 'the wait is for what the kill left behind'
         }
+    }
+}
+
+Describe 'An update the machine says it installed and offers again is inventory, not retry fuel' {
+    <# -k610. On the lab image KB5007651, the Windows Security platform update, installs,
+       genuinely advances the platform, is recorded by Windows Update with result code 2, and
+       is offered again by the very next scan. Diagnosed 2026-09-09 from
+       C:\HyperV\evidence\k610-diagnosis-20260909-083408: AMProductVersion moved
+       4.18.23110.3 -> 4.18.26080.3 and a Platform directory 4.18.26080.3-0 appeared where
+       there had been none, while WU history gained five KB5007651 entries, every one result
+       code 2 - and the update stayed applicable. Six passes, no convergence, the whole
+       budget spent in a loop the machine cannot exit.
+
+       So the environment re-offers it. The truthful response is to name it as deferred
+       inventory and qualify the claim, not to retry forever and not to pretend it converged.
+       Only result code 2 qualifies: a failed install is a real failure and stays retryable,
+       which is the whole reason for reading the result code rather than a log line. #>
+
+    BeforeAll {
+        $script:Boot = [datetime]::new(2026, 9, 9, 12, 40, 0, [System.DateTimeKind]::Utc)
+        $script:Kb5007651 = 'Update for Windows Security platform - KB5007651 (Version 10.0.29628.1000)'
+        function New-HistoryEntry {
+            param([string]$Title, [int]$ResultCode = 2, [datetime]$At)
+            [pscustomobject]@{ Title = $Title; ResultCode = $ResultCode; InstalledAt = $At }
+        }
+    }
+
+    It 'classifies an update installed successfully in this boot and offered again' {
+        $history = @(
+            (New-HistoryEntry -Title $script:Kb5007651 -At $script:Boot.AddMinutes(6)),
+            (New-HistoryEntry -Title $script:Kb5007651 -At $script:Boot.AddMinutes(35))
+        )
+        $records = @(Get-WindowsUpdateReofferedAfterSuccess -Applicable @($script:Kb5007651) -History $history -SinceUtc $script:Boot)
+
+        $records.Count | Should -Be 1
+        $records[0].KB | Should -Be 'KB5007651' -Because 'the record has to name the update a human will go looking for'
+        $records[0].Installs | Should -Be 2
+        $records[0].LastSuccess | Should -Be $script:Boot.AddMinutes(35)
+    }
+
+    It 'leaves a genuinely outstanding update alone' {
+        $records = @(Get-WindowsUpdateReofferedAfterSuccess `
+            -Applicable @('2026-09 Security Update (KB5124008) (26100.9445)') `
+            -History @((New-HistoryEntry -Title $script:Kb5007651 -At $script:Boot.AddMinutes(6))) `
+            -SinceUtc $script:Boot)
+        $records.Count | Should -Be 0 -Because 'an update nobody has installed is work, not inventory'
+    }
+
+    It 'does not excuse a failed install' {
+        foreach ($code in 3, 4, 5) {
+            $records = @(Get-WindowsUpdateReofferedAfterSuccess -Applicable @($script:Kb5007651) `
+                -History @((New-HistoryEntry -Title $script:Kb5007651 -ResultCode $code -At $script:Boot.AddMinutes(6))) `
+                -SinceUtc $script:Boot)
+            $records.Count | Should -Be 0 -Because "result code $code is not success, and a failure must stay retryable"
+        }
+    }
+
+    It 'does not count a success from a previous boot' {
+        <# The claim is that the machine installed it and re-offered it WITHIN this boot. A
+           success from before the last restart proves nothing about the current one, and
+           accepting it would let a stale record suppress real work forever. #>
+        $records = @(Get-WindowsUpdateReofferedAfterSuccess -Applicable @($script:Kb5007651) `
+            -History @((New-HistoryEntry -Title $script:Kb5007651 -At $script:Boot.AddMinutes(-20))) `
+            -SinceUtc $script:Boot)
+        $records.Count | Should -Be 0
+    }
+
+    It 'reports nothing when the history is unreadable' {
+        @(Get-WindowsUpdateReofferedAfterSuccess -Applicable @($script:Kb5007651) -History @() -SinceUtc $script:Boot).Count |
+            Should -Be 0 -Because 'no history is no evidence; the update stays outstanding and retryable'
+    }
+
+    It 'separates re-offers from real work when both are present' {
+        $real = '2026-09 .NET Framework Security Update (KB5126052)'
+        $records = @(Get-WindowsUpdateReofferedAfterSuccess -Applicable @($script:Kb5007651, $real) `
+            -History @((New-HistoryEntry -Title $script:Kb5007651 -At $script:Boot.AddMinutes(6))) `
+            -SinceUtc $script:Boot)
+        $records.Count | Should -Be 1
+        $records[0].Title | Should -Be $script:Kb5007651
+    }
+
+    It 'withholds convergence while any update is unexplained, and qualifies it when none is' {
+        <# The call-site rule, pinned against the orchestrator's own text: the withhold is
+           driven by Unexplained, not by the raw applicable count, and the qualified branch
+           records deferred inventory instead of clearing WindowsUpdateDone. #>
+        $text = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
+        $text | Should -Match '\[int\]\$wuConvergence\.Unexplained -gt 0'
+        $text | Should -Match "Kind   = 'ReofferedAfterSuccess'"
+        $text | Should -Match 'Windows Update convergence qualified'
+
+        $start = $text.IndexOf('$wuConvergence = Test-WindowsUpdateConvergence')
+        $start | Should -BeGreaterThan 0
+        $block = $text.Substring($start, $text.IndexOf('$incompletePhases = @($enabledPhases', $start) - $start)
+        $qualified = $block.Substring($block.IndexOf('} elseif ($reoffered.Count -gt 0) {'))
+        $qualified | Should -Not -Match '\$state\.WindowsUpdateDone = \$false' -Because 'a re-offer is not an incomplete phase, so it must not become retry fuel'
+
+        <# And a clean pass must retract a previous pass's observation, or resolved work would
+           qualify the claim for the rest of the cycle. #>
+        $block | Should -Match "Add-BootUpdateDeferredInventory -State \`$state -Provider 'WindowsUpdate' -Scope 'machine' -Records @\(\)"
+    }
+
+    It 'produces a qualified claim from that inventory, not an all-clear' {
+        $state = New-BootUpdateStateV2
+        Add-BootUpdateDeferredInventory -State $state -Provider 'WindowsUpdate' -Scope 'machine' -Records @(
+            [pscustomobject]@{ Kind = 'ReofferedAfterSuccess'; Count = 1; Detail = 'KB5007651 was installed successfully 5 time(s) in this boot session.' }
+        )
+        $inventory = @(Get-BootUpdateDeferredInventory -State $state)
+        $inventory.Count | Should -Be 1
+        $inventory[0].Kind | Should -Be 'ReofferedAfterSuccess'
+
+        Get-BootUpdateCompletionClaim -Qualifiers @('DEFERRED INVENTORY') | Should -Be 'COMPLETE WITH DEFERRED INVENTORY'
+        $toast = Get-BootUpdateCompletionNotification -TotalVerified 4 -DurationMinutes 20 -DeferredInventory $inventory
+        $toast.Kind | Should -Be 'Progress'
+        $toast.Message | Should -Not -Match 'you are all set'
     }
 }

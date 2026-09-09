@@ -4313,6 +4313,81 @@ function Install-WindowsUpdates {
     return @{ Success = (-not $failed); Count = $count }
 }
 
+function Get-WindowsUpdateInstallHistory {
+    <# The Windows Update Agent's own record of what it installed and how that turned out.
+
+       The updater has until now taken PSWindowsUpdate's "Installed [n] Updates" line as its
+       account of an install. That line is prose written for a human; the agent's history is
+       the machine's own record, and it carries a result code per update. Where the two
+       disagree, the history wins. #>
+    param([int]$MaxRecords = 100)
+    $session = $null
+    try {
+        $session = New-Object -ComObject Microsoft.Update.Session -ErrorAction Stop
+        $searcher = $session.CreateUpdateSearcher()
+        $total = [int]$searcher.GetTotalHistoryCount()
+        if ($total -le 0) { return @() }
+        return @($searcher.QueryHistory(0, [math]::Min($total, $MaxRecords)) | ForEach-Object {
+            [pscustomobject]@{
+                Title       = [string]$_.Title
+                ResultCode  = [int]$_.ResultCode
+                InstalledAt = [datetime]$_.Date
+            }
+        })
+    } catch {
+        Write-Log "Windows Update history is unreadable; re-offer classification is unavailable this pass: $_" -Level Warn -Visibility Verbose
+        return @()
+    } finally {
+        if ($session -and [Runtime.InteropServices.Marshal]::IsComObject($session)) {
+            try { $null = [Runtime.InteropServices.Marshal]::FinalReleaseComObject($session) } catch { }
+        }
+    }
+}
+
+function Get-WindowsUpdateReofferedAfterSuccess {
+    <# Which of the updates still applicable at the end of a pass were already installed
+       SUCCESSFULLY in this same boot?
+
+       KB5007651, the Windows Security platform update, does this on the lab image and on
+       real machines: it installs, the platform genuinely advances - observed
+       4.18.23110.3 -> 4.18.26080.3 with a new Platform directory appearing - Windows Update
+       records result code 2, and the very next scan offers it again. Five successful
+       installs in one 45-minute run, five re-offers, six passes, no convergence.
+
+       Retrying that is not diligence; it is a loop the machine cannot exit, and the cycle
+       spent its whole budget in it. An update the machine says it installed and then offers
+       again is DEFERRED INVENTORY - observed, named, not counted as a verified update and
+       not counted as retry fuel - and the completion claim is qualified accordingly. That
+       is CONTEXT.md's negative evidence: the absence of convergence here is a fact about the
+       environment, and saying so is more truthful than retrying forever.
+
+       Only result code 2 (succeeded) qualifies. A failed or partially failed install is a
+       real failure and stays retryable - that distinction is the whole point of reading the
+       result code instead of a log line.
+
+       Pure: the caller supplies the history and the boot instant, so this is testable
+       without a Windows Update agent. #>
+    param(
+        [object[]]$Applicable = @(),
+        [object[]]$History = @(),
+        [datetime]$SinceUtc = [datetime]::MinValue
+    )
+    $succeeded = @($History | Where-Object { $_ -and [int]$_.ResultCode -eq 2 -and
+        ([datetime]$_.InstalledAt).ToUniversalTime() -ge $SinceUtc.ToUniversalTime() })
+    $records = foreach ($title in @($Applicable | Where-Object { $_ })) {
+        $installs = @($succeeded | Where-Object { [string]$_.Title -eq [string]$title })
+        if (-not $installs.Count) { continue }
+        $latest = ($installs | Sort-Object { [datetime]$_.InstalledAt } | Select-Object -Last 1)
+        $kb = if ($title -match '(?i)\b(KB\d{6,7})\b') { $Matches[1] } else { $null }
+        [pscustomobject]@{
+            Title       = [string]$title
+            KB          = $kb
+            Installs    = $installs.Count
+            LastSuccess = ([datetime]$latest.InstalledAt).ToUniversalTime()
+        }
+    }
+    return @($records)
+}
 function Test-WindowsUpdateConvergence {
     <# A successful install call is not convergence: dependency updates can become
        applicable immediately without setting a reboot flag. Require a fresh,
@@ -4367,7 +4442,26 @@ function Test-WindowsUpdateConvergence {
         })
         Set-WindowsUpdateAssessmentCache -Scope $verificationScope -ApplicableUpdates $identities
     }
-    return [pscustomobject]@{ Verified=$verified; Count=$updates.Count; Detail=$(if($verified){"$($updates.Count) applicable update(s)"}else{'scan failed'}) }
+    <# Separate the updates that are outstanding from the ones the machine says it already
+       installed successfully in this boot and is offering again. Only the former are work.
+       Classification is attempted only on a verified scan: guessing about an unverified one
+       would turn a scan failure into a qualified claim. #>
+    $reoffered = @()
+    if ($verified -and $updates.Count -gt 0) {
+        $titles = @($updates | ForEach-Object { ($_ -split '\|', 4)[3] })
+        $bootInstant = try { (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime.ToUniversalTime() }
+                       catch { [datetime]::MinValue }
+        $reoffered = @(Get-WindowsUpdateReofferedAfterSuccess -Applicable $titles `
+            -History (Get-WindowsUpdateInstallHistory) -SinceUtc $bootInstant)
+    }
+    $unexplained = $updates.Count - $reoffered.Count
+    return [pscustomobject]@{
+        Verified    = $verified
+        Count       = $updates.Count
+        Reoffered   = $reoffered
+        Unexplained = $(if ($verified) { $unexplained } else { $updates.Count })
+        Detail      = $(if($verified){"$($updates.Count) applicable update(s)"}else{'scan failed'})
+    }
 }
 
 function Install-DriverFirmwareUpdates {
@@ -7838,12 +7932,42 @@ function Invoke-BootUpdateCycle {
 
         if (-not $WhatIfPreference -and [bool]$state.WindowsUpdateDone) {
             $wuConvergence = Test-WindowsUpdateConvergence
-            if (-not $wuConvergence.Verified -or $wuConvergence.Count -gt 0) {
+            $reoffered = @($wuConvergence.Reoffered)
+            if (-not $wuConvergence.Verified -or [int]$wuConvergence.Unexplained -gt 0) {
                 $state.WindowsUpdateDone = $false
                 Set-BootUpdateState -State $state
-                $why = if (-not $wuConvergence.Verified) { 'the final scan could not be verified' } else { "$($wuConvergence.Count) update(s) remain applicable" }
+                $why = if (-not $wuConvergence.Verified) { 'the final scan could not be verified' } else { "$([int]$wuConvergence.Unexplained) update(s) remain applicable" }
                 Write-Log "Windows Update convergence withheld: $why." -Level Warn
+            } elseif ($reoffered.Count -gt 0) {
+                <# Every update still applicable is one Windows Update itself records as
+                   installed successfully in this boot, and is offering again. Retrying it is
+                   a loop the machine cannot exit - KB5007651 did exactly this for six passes
+                   and five successful installs while the Defender platform genuinely
+                   advanced. Record it as deferred inventory, do not count it as retry fuel,
+                   and qualify the completion claim rather than either claiming full
+                   convergence or retrying forever. #>
+                Add-BootUpdateDeferredInventory -State $state -Provider 'WindowsUpdate' -Scope 'machine' -Records @(
+                    $reoffered | ForEach-Object {
+                        $name = if ($_.KB) { $_.KB } else { $_.Title }
+                        [pscustomobject]@{
+                            Kind   = 'ReofferedAfterSuccess'
+                            Count  = 1
+                            Detail = ("{0} was installed successfully {1} time(s) in this boot session (Windows Update result code 2, most recently {2}Z) and is still offered by the final scan. Recorded as an environmental re-offer, not retried." -f `
+                                      $name, $_.Installs, ([datetime]$_.LastSuccess).ToString('yyyy-MM-dd HH:mm:ss'))
+                        }
+                    }
+                )
+                Set-BootUpdateState -State $state
+                foreach ($record in $reoffered) {
+                    Write-Log ("Windows Update re-offer after success: {0} installed successfully {1} time(s) since this boot (result code 2, latest {2}Z), still applicable on the final scan. Recorded as deferred inventory rather than retried." -f `
+                               $(if ($record.KB) { $record.KB } else { $record.Title }), $record.Installs, ([datetime]$record.LastSuccess).ToString('yyyy-MM-dd HH:mm:ss')) -Level Warn
+                }
+                Write-Log "Windows Update convergence qualified: $($reoffered.Count) update(s) re-offered after a successful install remain; no other update is applicable."
             } else {
+                <# A clean pass must retract a previous pass's observation, or resolved work
+                   would qualify the claim for the rest of the cycle. #>
+                Add-BootUpdateDeferredInventory -State $state -Provider 'WindowsUpdate' -Scope 'machine' -Records @()
+                Set-BootUpdateState -State $state
                 Write-Log 'Windows Update convergence verified: zero applicable updates remain in the configured category scope.'
             }
         }
