@@ -101,35 +101,69 @@ Say 'guest ready'
 
 if (-not $SkipSync) {
     Say 'syncing working tree'
-    <# Try the default endpoint, then Windows PowerShell. A PowerShell 7 host opening a
-       PowerShell Direct session negotiates the PowerShell.7 configuration by default, and
-       row F's guest deliberately has no PowerShell 7 at all - New-PSSession then fails with
-       "An error has occurred which PowerShell cannot handle. A remote session might have
-       ended." while Invoke-Command against the same guest keeps working, which makes the
-       failure read as a dead guest rather than a missing endpoint. Asking for
-       Microsoft.PowerShell unconditionally is not the fix either: on a guest that HAS
-       PowerShell 7 that name fails with "Cannot create or open the configuration session
-       Microsoft.PowerShell", so a hard-coded name simply moves the breakage to every other
-       row. The session is only used to copy files, so either endpoint will do. #>
-    $s = try { New-PSSession -VMName $VMName -Credential $cred -ErrorAction Stop }
-         catch { New-PSSession -VMName $VMName -Credential $cred -ConfigurationName 'Microsoft.PowerShell' -ErrorAction Stop }
-    try {
-        Invoke-Command -Session $s -ScriptBlock { New-Item -ItemType Directory -Path 'C:\Lab\boot-upd' -Force | Out-Null }
-        $files = Get-ChildItem -LiteralPath $SourceRoot -Recurse -File |
-                 Where-Object { $_.FullName -notmatch '\\\.git\\|\\\.beads\\|\\testResults\.xml' }
-        $dirs = $files | ForEach-Object { Split-Path ($_.FullName.Substring($SourceRoot.Length).TrimStart('\')) -Parent } |
-                Where-Object { $_ } | Sort-Object -Unique
-        Invoke-Command -Session $s -ArgumentList (, $dirs) -ScriptBlock {
-            param($ds) foreach ($d in $ds) { New-Item -ItemType Directory -Path (Join-Path 'C:\Lab\boot-upd' $d) -Force | Out-Null }
+    $files = Get-ChildItem -LiteralPath $SourceRoot -Recurse -File |
+             Where-Object { $_.FullName -notmatch '\\\.git\\|\\\.beads\\|\\testResults\.xml' }
+    <# Two ways in, because one of them does not work on every guest.
+
+       PowerShell Direct sessions are the fast path, but a PowerShell 7 host negotiates the
+       PowerShell.7 configuration by default and row F's guest deliberately has no PowerShell
+       7 at all: New-PSSession fails there with "An error has occurred which PowerShell cannot
+       handle. A remote session might have ended." Naming Microsoft.PowerShell instead does
+       not help - it fails the same way on that guest, and on a guest that HAS PowerShell 7 it
+       fails with "Cannot create or open the configuration session Microsoft.PowerShell", so a
+       hard-coded name only moves the breakage. Ad-hoc Invoke-Command keeps working on both.
+
+       So when no session can be opened, ship one zip over the Hyper-V guest service channel,
+       which does not care what PowerShell the guest has, and expand it with the Windows
+       PowerShell that every Windows guest ships. Either way the orchestrator hash is
+       verified afterwards, which is what actually proves the guest is running this tree. #>
+    $session = $null
+    try { $session = New-PSSession -VMName $VMName -Credential $cred -ErrorAction Stop } catch { $session = $null }
+    if ($session) {
+        try {
+            Invoke-Command -Session $session -ScriptBlock { New-Item -ItemType Directory -Path 'C:\Lab\boot-upd' -Force | Out-Null }
+            $dirs = $files | ForEach-Object { Split-Path ($_.FullName.Substring($SourceRoot.Length).TrimStart('\')) -Parent } |
+                    Where-Object { $_ } | Sort-Object -Unique
+            Invoke-Command -Session $session -ArgumentList (, $dirs) -ScriptBlock {
+                param($ds) foreach ($d in $ds) { New-Item -ItemType Directory -Path (Join-Path 'C:\Lab\boot-upd' $d) -Force | Out-Null }
+            }
+            foreach ($f in $files) {
+                Copy-Item -LiteralPath $f.FullName -Destination (Join-Path 'C:\Lab\boot-upd' $f.FullName.Substring($SourceRoot.Length).TrimStart('\')) -ToSession $session -Force
+            }
+        } finally { Remove-PSSession $session }
+    } else {
+        Say 'no PowerShell Direct session available; syncing over the guest service channel'
+        $stage = Join-Path ([IO.Path]::GetTempPath()) ("boot-upd-sync-{0}" -f [guid]::NewGuid().ToString('N'))
+        $zip = "$stage.zip"
+        try {
+            foreach ($f in $files) {
+                $relative = $f.FullName.Substring($SourceRoot.Length).TrimStart('\')
+                $target = Join-Path $stage $relative
+                $parent = Split-Path $target -Parent
+                if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+                Copy-Item -LiteralPath $f.FullName -Destination $target -Force
+            }
+            Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -Force
+            Enable-VMIntegrationService -VMName $VMName -Name 'Guest Service Interface' -ErrorAction SilentlyContinue
+            Invoke-Command -VMName $VMName -Credential $cred -ScriptBlock {
+                Remove-Item 'C:\Lab\boot-upd' -Recurse -Force -ErrorAction SilentlyContinue
+                Remove-Item 'C:\Lab\boot-upd-sync.zip' -Force -ErrorAction SilentlyContinue
+                New-Item -ItemType Directory -Path 'C:\Lab' -Force | Out-Null
+            }
+            Copy-VMFile -Name $VMName -SourcePath $zip -DestinationPath 'C:\Lab\boot-upd-sync.zip' -CreateFullPath -FileSource Host -Force
+            Invoke-Command -VMName $VMName -Credential $cred -ScriptBlock {
+                Expand-Archive -LiteralPath 'C:\Lab\boot-upd-sync.zip' -DestinationPath 'C:\Lab\boot-upd' -Force
+                Remove-Item 'C:\Lab\boot-upd-sync.zip' -Force -ErrorAction SilentlyContinue
+            }
+        } finally {
+            Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
         }
-        foreach ($f in $files) {
-            Copy-Item -LiteralPath $f.FullName -Destination (Join-Path 'C:\Lab\boot-upd' $f.FullName.Substring($SourceRoot.Length).TrimStart('\')) -ToSession $s -Force
-        }
-        $hash = Invoke-Command -Session $s -ScriptBlock { (Get-FileHash 'C:\Lab\boot-upd\Invoke-BootUpdateCycle.ps1' -Algorithm SHA256).Hash }
-        $hostHash = (Get-FileHash (Join-Path $SourceRoot 'Invoke-BootUpdateCycle.ps1') -Algorithm SHA256).Hash
-        if ($hash -ne $hostHash) { throw "Orchestrator hash mismatch: guest $hash vs host $hostHash" }
-        Say "synced $($files.Count) files, orchestrator hash verified"
-    } finally { Remove-PSSession $s }
+    }
+    $hash = Invoke-Command -VMName $VMName -Credential $cred -ScriptBlock { (Get-FileHash 'C:\Lab\boot-upd\Invoke-BootUpdateCycle.ps1' -Algorithm SHA256).Hash }
+    $hostHash = (Get-FileHash (Join-Path $SourceRoot 'Invoke-BootUpdateCycle.ps1') -Algorithm SHA256).Hash
+    if ($hash -ne $hostHash) { throw "Orchestrator hash mismatch: guest $hash vs host $hostHash" }
+    Say "synced $($files.Count) files, orchestrator hash verified"
 }
 
 if ($ArmReboots -gt 0) {
