@@ -3043,7 +3043,24 @@ Describe 'Resume identity discovery through the state object' {
             -LastLogonProvider  { throw 'the LogonUI lookup must not run for an interactive identity' }
 
         $state.ResumeUser    | Should -Be 'LABHOST\alice'
-        $state.ResumeUserSid | Should -BeNullOrEmpty -Because 'no SID is recorded when the name is already the running identity'
+        $state.ResumeUserSid | Should -Be 'S-1-5-21-1-2-3-500' -Because 'the name and the SID must always describe the same account'
+    }
+
+    It 'replaces a SID recorded for a different account rather than leaving it beside the new name' {
+        <# The failure this prevents: a SYSTEM pass records LogonUI's SID for one user, a
+           later pass runs as another, and the resolver - which prefers the SID absolutely -
+           registers the resume task for the first. Harmless while the SID path was dead,
+           which is why a fresh-state assertion could not see it. #>
+        $state = New-BootUpdateStateV2
+        $state.ResumeUser    = 'LABHOST\alice'
+        $state.ResumeUserSid = 'S-1-5-21-9-9-9-1001'
+
+        $null = Update-BootUpdateResumeIdentity -State $state `
+            -IdentityName 'LABHOST\bob' -IdentitySid 'S-1-5-21-1-2-3-500' `
+            -ConsoleUserProvider { throw 'must not look' } -LastLogonProvider { throw 'must not look' }
+
+        $state.ResumeUser    | Should -Be 'LABHOST\bob'
+        $state.ResumeUserSid | Should -Be 'S-1-5-21-1-2-3-500' -Because 'a stale SID outranks the fresh name at the resolver'
     }
 }
 
@@ -3286,6 +3303,24 @@ Describe 'Every pending-file cleanup probe is recorded, whatever the log does' {
         $records.Count | Should -Be 2
         @($records.Pass) | Should -Be @(2,3) -Because 'whether a fingerprint survived a restart is only answerable across passes'
         $script:CurrentState.Iteration = 2
+    }
+
+    It 'writes the record even under -WhatIf, which is the whole point of an evidence lifecycle' {
+        <# Behavioural, not a source-text match, because a source-text match is what let the
+           last claim of this kind survive a release. Set-Content implements ShouldProcess and
+           therefore obeys $WhatIfPreference like any other cmdlet: without an explicit
+           -WhatIf:$false the artifact was never written under -WhatIf, the phase-skipped
+           record that exists only for that path recorded nothing, and the exporter then
+           stamped unknown-legacy-log on a current-format bundle - which ADR-0004 names as a
+           bug. "The phase did not run" is precisely the state this artifact was created to be
+           able to state. #>
+        $WhatIfPreference = $true
+        Add-BootUpdatePendingCleanupRecord -Context 'after updates' -Observation 'phase-skipped' -Source 'whatif'
+
+        Test-Path -LiteralPath $script:PendingCleanupEvidencePath | Should -BeTrue -Because 'evidence is not a mutation the run is asked to simulate'
+        $record = (Get-CleanupRecords)[-1]
+        $record.Observation | Should -Be 'phase-skipped'
+        $record.Source      | Should -Be 'whatif'
     }
 
     It 'never lets a recording failure break the run' {
@@ -3653,8 +3688,15 @@ Describe 'A pass that followed no reboot does not say it resumed after one' {
         $text = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
         $text | Should -Match "elseif \(\`$newBootObserved\) \{ 'RESUMED \(after reboot\)' \}"
         $text | Should -Match "else \{ 'RESUMED \(same boot\)' \}"
-        <# The observation must be established before the banner reads it. #>
-        $text.IndexOf('$newBootObserved = $priorBootSessionId') | Should -BeLessThan $text.IndexOf('$cycleVerb = if ($isFirstIteration)')
+        <# The observation must be established before the banner reads it. Both offsets are
+           required to be real first: an IndexOf that returns -1 for a string the code no
+           longer contains makes this assertion pass no matter what the order is, which is
+           exactly what happened when the boot-session restructure landed a commit later. #>
+        $observationAt = $text.IndexOf('$newBootObserved = $bootObservation.NewBoot')
+        $bannerAt      = $text.IndexOf('$cycleVerb = if ($isFirstIteration)')
+        $observationAt | Should -BeGreaterThan 0
+        $bannerAt      | Should -BeGreaterThan 0
+        $observationAt | Should -BeLessThan $bannerAt
     }
 
     It 'keeps both spellings matchable by everything that greps for a pass' {
@@ -3915,5 +3957,104 @@ Describe 'One call decides whether this pass followed a reboot' {
         $shim | Should -Match 'Update-BootUpdateBootSession'
         $shim | Should -Not -Match 'Test-BootUpdateSameBootSession'
         $shim | Should -Not -Match 'RebootCount'
+    }
+}
+
+Describe 'The convergence check returns one shape, whichever way it returns' {
+    <# Found by the v2.5.79 Standards review, and it was a crash on the ORDINARY path. Two
+       early returns of Test-WindowsUpdateConvergence omitted the fields the re-offer
+       classification added. The caller read $wuConvergence.Reoffered as @($null), whose
+       .Count is 1 - the array-collapse trap this same release fixes in the lab harness - so
+       a pass that reused fresh post-install zero-work evidence took the QUALIFIED branch,
+       claimed qualified convergence on a machine with nothing applicable, and then threw on
+       [datetime]$null while building the record.
+
+       Every unit test missed it because they all mock the background scan, which means they
+       only ever drive the full-scan return. #>
+
+    BeforeEach {
+        $script:ExcludePatterns = @('SQL')
+        $script:PackageTimeoutMinutes = 30
+        $script:CurrentState = $null
+        Mock Get-Module { [pscustomobject]@{ Name='PSWindowsUpdate' } }
+        Mock Get-BootUpdateBootSessionId { 'boot-a' }
+        Mock Write-Log {}
+        Mock Set-WindowsUpdateAssessmentCache {}
+        Mock Get-WindowsUpdateInstallHistory { @() }
+    }
+
+    It 'reuses fresh post-install zero evidence without claiming a re-offer' {
+        Mock Test-WindowsUpdateZeroEvidence { $true }
+        $script:CurrentState = [pscustomobject]@{ WindowsUpdateZeroEvidence = [pscustomobject]@{ Source = 'test' } }
+        Mock Invoke-BootUpdateBackgroundOperation { throw 'the scan must not run when fresh evidence is reused' }
+
+        $result = Test-WindowsUpdateConvergence
+
+        $result.Verified | Should -BeTrue
+        $result.Count | Should -Be 0
+        @($result.Reoffered).Count | Should -Be 0 -Because '@($null) has one element, and one element takes the qualified branch'
+        $result.Unexplained | Should -Be 0
+    }
+
+    It 'gives the unavailable-module return the same shape, with nothing claimed as known' {
+        Mock Test-WindowsUpdateZeroEvidence { $false }
+        Mock Get-Module { $null }
+
+        $result = Test-WindowsUpdateConvergence
+
+        $result.Verified | Should -BeFalse
+        $result.Count | Should -Be -1
+        @($result.Reoffered).Count | Should -Be 0
+        $result.Unexplained | Should -Be -1 -Because 'not zero and not known are different, and zero reads as nothing outstanding'
+    }
+
+    It 'never lets a null reach the deferred-inventory record builder' {
+        <# The call site's own guard, stated separately from the contract above, because the
+           two must both hold: a partial shape from anywhere must not become a record. #>
+        $text = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
+        $text | Should -Match '\$reoffered = @\(\$wuConvergence\.Reoffered \| Where-Object \{ \$null -ne \$_ \}\)'
+    }
+}
+
+Describe 'An installer mutex that cannot be examined is not an absent one' {
+    <# ADR-0005, applied to the probe added for -ynvn. OpenExisting throws
+       WaitHandleCannotBeOpenedException when the mutex genuinely does not exist, and
+       UnauthorizedAccessException when it exists but the caller may not open it. Catching
+       both as "absent" would send the cycle straight into the next package against a live
+       transaction - the 1618 the wait exists to prevent. #>
+
+    BeforeEach {
+        $script:InstallerMutexProbeWarned = $false
+        $script:Logged = [System.Collections.Generic.List[object]]::new()
+        function Write-Log { param([string]$Message,[string]$Level,[string]$Visibility) $script:Logged.Add([pscustomobject]@{ Message=$Message; Level=$Level }) }
+    }
+
+    It 'reports absent only for the exception that means absent' {
+        Test-BootUpdateInstallerMutexHeld -MutexName ('Local\boot-upd-absent-{0}' -f [guid]::NewGuid().ToString('N')) |
+            Should -BeFalse
+        $script:Logged.Count | Should -Be 0 -Because 'an absent mutex is the ordinary case and must be silent'
+    }
+
+    It 'still reports absent for a name too long to name anything' {
+        <# Checked rather than assumed: an over-long name throws
+           WaitHandleCannotBeOpenedException, the same exception as genuine absence, so it
+           belongs on the absent side and not on the unobservable one. #>
+        Test-BootUpdateInstallerMutexHeld -MutexName ('Local\' + ('x' * 400)) | Should -BeFalse
+    }
+
+    It 'treats an unopenable mutex as held, and says so once' {
+        <# An empty name throws ArgumentException, which is the not-WaitHandle branch under
+           test - the same shape an ACL denial takes on a real machine. #>
+        Test-BootUpdateInstallerMutexHeld -MutexName '' | Should -BeTrue -Because 'unobservable is not absent'
+        Test-BootUpdateInstallerMutexHeld -MutexName '' | Should -BeTrue
+        @($script:Logged | Where-Object { $_.Message -match 'could not be examined' }).Count |
+            Should -Be 1 -Because 'the caller polls, so this must not be logged on every probe'
+    }
+
+    It 'carries the outcome out with the timeout result instead of discarding it' {
+        $text = Get-FunctionText $invokeAst 'Wait-ProcessWithIdleTimeout'
+        ([regex]::Matches($text, 'InstallerMutexHeld = \(-not \$mutexClear\)')).Count |
+            Should -Be 2 -Because 'a later 1618 should be attributable to this orphan rather than guessed at'
+        $text | Should -Not -Match '\$null = Wait-BootUpdateInstallerMutex'
     }
 }

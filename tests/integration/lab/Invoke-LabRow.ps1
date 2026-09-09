@@ -121,7 +121,14 @@ if (-not $SkipSync) {
     try { $session = New-PSSession -VMName $VMName -Credential $cred -ErrorAction Stop } catch { $session = $null }
     if ($session) {
         try {
-            Invoke-Command -Session $session -ScriptBlock { New-Item -ItemType Directory -Path 'C:\Lab\boot-upd' -Force | Out-Null }
+            <# Delete before copying, as the service-channel path does. Copying over whatever
+               is already there leaves a file removed or renamed on the host alive on the
+               guest indefinitely, and the orchestrator hash still matches - so the check
+               below would keep saying the guest runs this tree while it ran that file too. #>
+            Invoke-Command -Session $session -ScriptBlock {
+                Remove-Item 'C:\Lab\boot-upd' -Recurse -Force -ErrorAction SilentlyContinue
+                New-Item -ItemType Directory -Path 'C:\Lab\boot-upd' -Force | Out-Null
+            }
             $dirs = $files | ForEach-Object { Split-Path ($_.FullName.Substring($SourceRoot.Length).TrimStart('\')) -Parent } |
                     Where-Object { $_ } | Sort-Object -Unique
             Invoke-Command -Session $session -ArgumentList (, $dirs) -ScriptBlock {
@@ -162,6 +169,8 @@ if (-not $SkipSync) {
     }
     $hash = Invoke-Command -VMName $VMName -Credential $cred -ScriptBlock { (Get-FileHash 'C:\Lab\boot-upd\Invoke-BootUpdateCycle.ps1' -Algorithm SHA256).Hash }
     $hostHash = (Get-FileHash (Join-Path $SourceRoot 'Invoke-BootUpdateCycle.ps1') -Algorithm SHA256).Hash
+    <# One file, named for what it is: this proves the orchestrator matches, and both copy
+       paths now start from an empty directory so nothing stale can survive beside it. #>
     if ($hash -ne $hostHash) { throw "Orchestrator hash mismatch: guest $hash vs host $hostHash" }
     Say "synced $($files.Count) files, orchestrator hash verified"
 }
@@ -294,8 +303,8 @@ while ((Get-Date) -lt $deadline) {
                 Matched  = if ($Pattern) { @($lines | Where-Object { $_ -match $Pattern }).Count -gt 0 } else { $false }
             }
         }
-        if ($r.PSObject.Properties.Name -contains 'Consent') { $maxConsent = [math]::Max($maxConsent, [int]$r.Consent) }
-        if ($r.PSObject.Properties.Name -contains 'Pwsh' -and $r.Pwsh) { $pwshSeen = $true }
+        $maxConsent = [math]::Max($maxConsent, [int]$r.Consent)
+        if ($r.Pwsh) { $pwshSeen = $true }
         Add-Timeline (("{0} passes={1} lines={2} tasks={3} :: {4}" -f (Get-Date -Format 'HH:mm:ss'), $r.Passes, $r.Lines, $r.Tasks, $r.Last))
         if ($injectArmed -and -not $injectAttempted -and $r.Matched) {
             Say "injecting on match at $(Get-Date -Format 'HH:mm:ss')"
@@ -370,7 +379,7 @@ $bootsDuringRun = @($evidence.OsBootTimes | Where-Object { $_ -ge $sessionStart 
    reboots on a run where it had correctly declined to claim anything. $null says "no claim
    to compare", which is the truth, and keeps the disagreement flag meaningful. #>
 $claimed = $null
-$claimLine = @($evidence.Log) | Where-Object { $_ -match 'BOOT UPDATE CYCLE COMPLETE' } | Select-Object -Last 1
+$claimLine = $completionLine
 if ($claimLine -match '(\d+) reboot\(s\)') { $claimed = [int]$Matches[1] }
 
 $summary = [pscustomobject]@{

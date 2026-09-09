@@ -2674,13 +2674,29 @@ function Add-BootUpdatePendingCleanupRecord {
             try {
                 $raw = Get-Content -LiteralPath $script:PendingCleanupEvidencePath -Raw -ErrorAction Stop
                 if (-not [string]::IsNullOrWhiteSpace($raw)) { $existing = @($raw | ConvertFrom-Json) }
-            } catch { $existing = @() }
+            } catch {
+                <# Preserve the damaged file rather than overwriting it. This artifact exists
+                   to be compared across passes, and silently replacing an unreadable one
+                   with a single new record is a deletion its own design forbids - in exactly
+                   the scenario the matrix exercises, a pass killed mid-write. #>
+                $existing = @()
+                $quarantine = "$($script:PendingCleanupEvidencePath).unreadable-$([datetime]::UtcNow.ToString('yyyyMMddHHmmss'))"
+                try { Move-Item -LiteralPath $script:PendingCleanupEvidencePath -Destination $quarantine -Force -WhatIf:$false } catch { }
+            }
         }
         $all = @($existing) + @($record)
         <# Capped by count, never by age: an evidence artifact must not decide that old
            evidence has expired. #>
         if ($all.Count -gt 500) { $all = @($all[($all.Count - 500)..($all.Count - 1)]) }
-        $all | ConvertTo-Json -Depth 6 -AsArray | Set-Content -LiteralPath $script:PendingCleanupEvidencePath -Encoding UTF8
+        <# -WhatIf:$false is the whole point of the evidence lifecycle, and without it this
+           was a claim rather than a behaviour. Set-Content implements ShouldProcess, so it
+           obeys the script's $WhatIfPreference like any other cmdlet: under -WhatIf the file
+           was never written, the phase-skipped record that exists only for that path recorded
+           nothing, and the exporter then stamped unknown-legacy-log on a current-format
+           bundle - which ADR-0004 names as a bug. The artifact must be written even when the
+           run changes nothing, because "the phase did not run" is exactly the state it was
+           created to be able to state. #>
+        $all | ConvertTo-Json -Depth 6 -AsArray | Set-Content -LiteralPath $script:PendingCleanupEvidencePath -Encoding UTF8 -WhatIf:$false
     } catch {
         <# Recording evidence must never be able to fail a run. A missing record reads as
            unknown, which is exactly what the manifest is now able to say. #>
@@ -3139,9 +3155,20 @@ function Test-BootUpdateInstallerMutexHeld {
     $mutex = $null
     try {
         $mutex = [System.Threading.Mutex]::OpenExisting($MutexName)
-    } catch {
-        <# Not present at all: no transaction has claimed it. #>
+    } catch [System.Threading.WaitHandleCannotBeOpenedException] {
+        <# Genuinely absent: no transaction has ever claimed it. #>
         return $false
+    } catch {
+        <# Anything else - an ACL denial, most plausibly - means the mutex could not be
+           OBSERVED, which ADR-0005 says is not the same as it being absent. Report a
+           transaction in progress so the caller waits; the wait is bounded either way, and
+           proceeding blind is how the cycle earned a 1618 against its own orphan. Warned
+           once per process, because the caller polls. #>
+        if (-not $script:InstallerMutexProbeWarned) {
+            $script:InstallerMutexProbeWarned = $true
+            Write-Log "Windows Installer mutex '$MutexName' could not be examined ($($_.Exception.GetType().Name)); treating it as held rather than assuming it is free." -Level Warn
+        }
+        return $true
     }
     try {
         <# Zero-timeout acquire, then release immediately. Holding it for the length of one
@@ -3175,7 +3202,11 @@ function Wait-BootUpdateInstallerMutex {
        recovery, and a caller that proceeds anyway must be able to say the mutex was still
        held. #>
     param(
-        [double]$TimeoutMinutes = 10,
+        <# 30 minutes, not 10: the incident this exists for left msiexec alive for 28. A
+           bound that would not have covered the case that motivated it is decoration. The
+           wait costs nothing when no transaction is running, because the probe returns
+           immediately. #>
+        [double]$TimeoutMinutes = 30,
         [double]$PollSeconds = 5,
         [string]$MutexName = 'Global\_MSIExecute'
     )
@@ -3257,9 +3288,10 @@ function Wait-ProcessWithIdleTimeout {
             $tree = Get-ProcessTreeActivity -ParentPid $Process.Id
             Write-Log "  Tree at kill: $($tree.ProcessCount) processes, CPU=$([math]::Round($tree.TotalCpuTime.TotalSeconds,1))s, handles=$($tree.HandleCount)" -Level Warn
             Remove-ProcessTree -RootPid $Process.Id
-            <# The kill covers the tree; msiexec is not in it. #>
-            $null = Wait-BootUpdateInstallerMutex
-            return @{ Reason = 'HardTimeout'; Elapsed = $elapsed; FinalCpuTime = $tree.TotalCpuTime; ExitCode = $null }
+            <# The kill covers the tree; msiexec is not in it. The outcome travels with the
+               result so a later 1618 can be attributed to this orphan rather than guessed at. #>
+            $mutexClear = Wait-BootUpdateInstallerMutex
+            return @{ Reason = 'HardTimeout'; Elapsed = $elapsed; FinalCpuTime = $tree.TotalCpuTime; ExitCode = $null; InstallerMutexHeld = (-not $mutexClear) }
         }
         $activity = Get-ProcessTreeActivity -ParentPid $Process.Id; $finalCpu = $activity.TotalCpuTime
 
@@ -3283,9 +3315,10 @@ function Wait-ProcessWithIdleTimeout {
             Write-Log "IDLE TIMEOUT: PID $($Process.Id) idle $([math]::Round($idleFor.TotalMinutes,1))m (threshold: ${IdleTimeoutMinutes}m), final CPU=$([math]::Round($activity.TotalCpuTime.TotalSeconds,1))s. Killing." -Level Error
             Write-Log "  Tree at kill: $($activity.ProcessCount) processes, handles=$($activity.HandleCount)" -Level Warn
             Remove-ProcessTree -RootPid $Process.Id
-            <# The kill covers the tree; msiexec is not in it. #>
-            $null = Wait-BootUpdateInstallerMutex
-            return @{ Reason = 'IdleTimeout'; Elapsed = $elapsed; FinalCpuTime = $finalCpu; ExitCode = $null }
+            <# The kill covers the tree; msiexec is not in it. The outcome travels with the
+               result so a later 1618 can be attributed to this orphan rather than guessed at. #>
+            $mutexClear = Wait-BootUpdateInstallerMutex
+            return @{ Reason = 'IdleTimeout'; Elapsed = $elapsed; FinalCpuTime = $finalCpu; ExitCode = $null; InstallerMutexHeld = (-not $mutexClear) }
         }
         $progressStatus = "$Status | CPU $([math]::Round($activity.TotalCpuTime.TotalSeconds,1))s | $($activity.ProcessCount) proc | idle $([math]::Round($idleFor.TotalMinutes,1))m | elapsed $([math]::Round($elapsed.TotalMinutes,1))m"
         $percent = [math]::Min(99, [math]::Floor(($elapsed.TotalSeconds / $hardLimit.TotalSeconds) * 100))
@@ -4484,14 +4517,22 @@ function Test-WindowsUpdateConvergence {
     if ($script:CurrentState -and (Test-WindowsUpdateZeroEvidence -Evidence $script:CurrentState.WindowsUpdateZeroEvidence `
             -BootSessionId $bootSessionId -ScopeSignature $verificationScope.Signature)) {
         Write-Log 'Windows Update convergence: reusing fresh post-install zero-work evidence from this boot and verification scope.'
-        return [pscustomobject]@{ Verified=$true; Count=0; Detail='0 applicable update(s) (fresh post-install evidence)' }
+        <# Every return carries the whole contract, including the fields added for the
+           re-offer classification. An early return that omitted them was read by the caller
+           as @($null), whose .Count is 1 - the array-collapse trap this release fixes
+           elsewhere - so the ordinary converged path entered the QUALIFIED branch and threw
+           on [datetime]$null. A partial shape is how one function comes to mean two things. #>
+        return [pscustomobject]@{ Verified=$true; Count=0; Reoffered=@(); Unexplained=0; Detail='0 applicable update(s) (fresh post-install evidence)' }
     }
     if ($script:CurrentState -and $script:CurrentState.WindowsUpdateZeroEvidence) {
         $script:CurrentState.WindowsUpdateZeroEvidence = $null
         Set-BootUpdateState -State $script:CurrentState
     }
     if (-not (Get-Module -ListAvailable PSWindowsUpdate)) {
-        return [pscustomobject]@{ Verified=$false; Count=-1; Detail='PSWindowsUpdate is unavailable for the final scan' }
+        <# Count and Unexplained are both -1 here for the same reason: not zero, not known.
+           Verified=$false already forces the caller to withhold, and a 0 would read as
+           "nothing outstanding" to anyone reading the object on its own. #>
+        return [pscustomobject]@{ Verified=$false; Count=-1; Reoffered=@(); Unexplained=-1; Detail='PSWindowsUpdate is unavailable for the final scan' }
     }
     $result = Invoke-BootUpdateBackgroundOperation -Name 'Verifying Windows Update convergence' `
         -Status 'Final read-only Windows Update scan is running' -TimeoutMinutes $script:PackageTimeoutMinutes `
@@ -5654,7 +5695,16 @@ function Update-BootUpdateResumeIdentity {
         }
     )
 
-    if ($IdentitySid -ne 'S-1-5-18') { $State.ResumeUser = $IdentityName; return $State }
+    if ($IdentitySid -ne 'S-1-5-18') {
+        <# Record BOTH, always. Overwriting only the name would leave a SID recorded by an
+           earlier pass for a different account beside it, and Resolve-BootUpdateResumeAccount
+           prefers the SID absolutely - so a pass run by one user could register the resume
+           task for another. Harmless while the SID path was dead; not harmless now that it
+           works. #>
+        $State.ResumeUser    = $IdentityName
+        $State.ResumeUserSid = $IdentitySid
+        return $State
+    }
     if ($State.ResumeUser) { return $State }
 
     $State.ResumeUser = & $ConsoleUserProvider
@@ -5739,6 +5789,13 @@ function Test-BootUpdateInteractiveUserPresent {
        documents that machine as the *unblocked* servicing path - so its wait is bounded, and
        on exhaustion the user-scope work becomes deferred inventory.
 
+       Scope, stated because this repo does not let a comment overstate a probe: the lookup
+       is Win32_ComputerSystem.UserName, which is the CONSOLE session. An RDP-only server
+       with a signed-in administrator reports nothing here and is therefore bounded. That is
+       the safe direction - it completes with a qualified claim naming the deferred work,
+       rather than waiting forever - but it is not the same question as "is anyone logged
+       on", and a second signal would be needed to make it so.
+
        The console lookup is a parameter so a test can drive both machines. #>
     param(
         [scriptblock]$ConsoleUserProvider = {
@@ -5811,7 +5868,10 @@ function Get-BootUpdateRetryTriggerTime {
 function Register-BootUpdateTaskForReboot {
     param(
         [switch]$RetrySoon,
-        [Nullable[datetime]]$RetryAt = $null
+        <# [AllowNull()][object], not [Nullable[datetime]]: the binder converts the latter to
+           a plain System.DateTime, which is why the HasValue guard here was dead for every
+           release that shipped it. Get-BootUpdateRetryTriggerTime null-tests instead. #>
+        [AllowNull()][object]$RetryAt = $null
     )
     $taskName = 'BootUpdateCycle'
     $pwshPath = (Get-Command pwsh -EA SilentlyContinue).Source
@@ -8070,7 +8130,8 @@ function Invoke-BootUpdateCycle {
 
         if (-not $WhatIfPreference -and [bool]$state.WindowsUpdateDone) {
             $wuConvergence = Test-WindowsUpdateConvergence
-            $reoffered = @($wuConvergence.Reoffered)
+            <# Filtered, not merely wrapped: @($null) has one element. #>
+            $reoffered = @($wuConvergence.Reoffered | Where-Object { $null -ne $_ })
             if (-not $wuConvergence.Verified -or [int]$wuConvergence.Unexplained -gt 0) {
                 $state.WindowsUpdateDone = $false
                 Set-BootUpdateState -State $state
