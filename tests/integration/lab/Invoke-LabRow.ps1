@@ -182,7 +182,12 @@ if ($launchProbe.State -ne 'Running' -and $launchProbe.Result -ne 0 -and $launch
 }
 Say 'monitoring'
 $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
-$timeline = [System.Collections.Generic.List[string]]::new()
+<# Append every poll line to the evidence file as it is produced. Accumulating the timeline
+   in memory and writing it once at the end meant a row killed or timed out mid-run left no
+   timeline at all, and nothing was tailable while the row ran. With this, Get-Content -Wait
+   on one or several guests' host-timeline.txt is a live view that costs no agent at all. #>
+$timelinePath = Join-Path $evidenceDir 'host-timeline.txt'
+function Add-Timeline { param([string]$Line) Add-Content -LiteralPath $timelinePath -Value $Line }
 $complete = $false
 $injected = $false
 $injectArmed = [bool]($InjectWhen -and $InjectAction)
@@ -207,17 +212,17 @@ while ((Get-Date) -lt $deadline) {
                 Matched  = if ($Pattern) { ($lines -match $Pattern).Count -gt 0 } else { $false }
             }
         }
-        $timeline.Add(("{0} passes={1} lines={2} tasks={3} :: {4}" -f (Get-Date -Format 'HH:mm:ss'), $r.Passes, $r.Lines, $r.Tasks, $r.Last))
+        Add-Timeline (("{0} passes={1} lines={2} tasks={3} :: {4}" -f (Get-Date -Format 'HH:mm:ss'), $r.Passes, $r.Lines, $r.Tasks, $r.Last))
         if ($injectArmed -and -not $injected -and $r.Matched) {
             Say "injecting on match at $(Get-Date -Format 'HH:mm:ss')"
-            $timeline.Add(("{0} INJECTED on /{1}/" -f (Get-Date -Format 'HH:mm:ss'), $InjectWhen))
+            Add-Timeline (("{0} INJECTED on /{1}/" -f (Get-Date -Format 'HH:mm:ss'), $InjectWhen))
             try { Invoke-Command -VMName $VMName -Credential $cred -ScriptBlock $InjectAction -ErrorAction Stop | Out-Null }
-            catch { $timeline.Add(("{0} injection failed: {1}" -f (Get-Date -Format 'HH:mm:ss'), $_.Exception.Message)) }
+            catch { Add-Timeline (("{0} injection failed: {1}" -f (Get-Date -Format 'HH:mm:ss'), $_.Exception.Message)) }
             $injected = $true
         }
         if ($r.Complete -ge 1 -and $r.Tasks -eq 0) { $complete = $true; Say "cycle complete after $($r.Passes) pass(es)"; break }
         if ($r.Terminal -ge 1 -and $r.Tasks -eq 0) { Say "cycle stopped itself at a limit after $($r.Passes) pass(es)"; break }
-    } catch { $timeline.Add(("{0} unreachable (rebooting)" -f (Get-Date -Format 'HH:mm:ss'))) }
+    } catch { Add-Timeline (("{0} unreachable (rebooting)" -f (Get-Date -Format 'HH:mm:ss'))) }
     <# Poll fast while waiting to inject: a restart countdown is measured in seconds, so a
        40-second cadence would sail past the only moment the row cares about. #>
     Start-Sleep -Seconds $(if ($injectArmed -and -not $injected) { 3 } else { 40 })
@@ -248,7 +253,6 @@ $evidence = Invoke-Command -VMName $VMName -Credential $cred -ScriptBlock {
 
 $evidence.Log | Set-Content (Join-Path $evidenceDir 'BootUpdateCycle.log')
 if ($evidence.DeployOutput.Count) { $evidence.DeployOutput | Set-Content (Join-Path $evidenceDir 'deploy-output.txt') }
-$timeline    | Set-Content (Join-Path $evidenceDir 'host-timeline.txt')
 & 'C:\HyperV\Get-VmScreen.ps1' -VMName $VMName -Path (Join-Path $evidenceDir 'console.png') | Out-Null
 
 $startLine = $evidence.Log | Where-Object { $_ -match 'BOOT UPDATE CYCLE STARTED' } | Select-Object -First 1
