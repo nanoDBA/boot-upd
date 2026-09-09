@@ -63,6 +63,7 @@ BeforeAll {
           'Get-ProcessTreeActivity',
           'Get-BootUpdateUptimeSeconds',
           'Get-BootUpdateMonotonicBootId',
+          'Test-CrashRecovery',
           'New-BootUpdateStateV2',
           'Update-BootUpdateStateSchema',
           'Update-BootUpdateResumeIdentity',
@@ -3088,5 +3089,70 @@ Describe 'No interactive user exhausts the bounded wait and completes with defer
         $exhausted | Should -Match "\`$state\.Phase = 'Running'"
         $exhausted | Should -Not -Match 'Register-BootUpdateTaskForReboot' -Because 'an exhausted wait completes; it does not schedule another rediscovery'
         $exhausted | Should -Match 'No interactive user appeared after' -Because 'the lab row reads this line as its evidence that the bound fired'
+    }
+}
+
+Describe 'A withheld phase is not reported as a crash' {
+    <# -9nj2. An unfinished phase leaves one footprint - LastPhaseStarted set, Done false -
+       for three different histories, and only one of them is a crash. Lab row B emitted
+       "Previous run crashed during [WindowsUpdate]" on every one of seven passes while the
+       phase had run correctly and the claim had been withheld on purpose, which makes a
+       healthy retry cycle read as repeated crashes in the log and in every diagnostics
+       bundle built from it. #>
+
+    BeforeAll {
+        $script:CrashLog = [System.Collections.Generic.List[object]]::new()
+        function Write-Log { param([string]$Message, [string]$Level, [string]$Visibility)
+            $script:CrashLog.Add([pscustomobject]@{ Message = $Message; Level = $Level })
+        }
+        function New-UnfinishedPhaseState {
+            param([string]$Phase)
+            $state = New-BootUpdateStateV2
+            $state.Phase              = $Phase
+            $state.LastPhaseStarted   = 'WindowsUpdate'
+            $state.LastPhaseTimestamp = (Get-Date).AddMinutes(-3).ToString('o')
+            $state.WindowsUpdateDone  = $false
+            return $state
+        }
+    }
+
+    BeforeEach { $script:CrashLog.Clear() }
+
+
+    It 'names a deliberately withheld verification as withheld, not as a crash' {
+        Test-CrashRecovery -State (New-UnfinishedPhaseState -Phase 'RetryPending') | Should -BeTrue
+        $entry = $script:CrashLog[-1]
+        $entry.Message | Should -Match 'did not verify \[WindowsUpdate\]'
+        $entry.Message | Should -Match 'nothing crashed'
+        $entry.Message | Should -Not -Match 'crashed during'
+        $entry.Level   | Should -Be 'Info' -Because 'a withhold-and-retry cycle is the design working, not a warning'
+    }
+
+    It 'treats a pass still waiting for a user context the same way' {
+        Test-CrashRecovery -State (New-UnfinishedPhaseState -Phase 'UserContextPending') | Should -BeTrue
+        $script:CrashLog[-1].Message | Should -Not -Match 'crashed during'
+    }
+
+    It 'names a planned restart as a restart' {
+        Test-CrashRecovery -State (New-UnfinishedPhaseState -Phase 'Rebooting') | Should -BeTrue
+        $entry = $script:CrashLog[-1]
+        $entry.Message | Should -Match 'restarted Windows during \[WindowsUpdate\]'
+        $entry.Message | Should -Not -Match 'crashed during'
+    }
+
+    It 'still reports a real crash as a crash' {
+        <# Phase left mid-run with no terminal disposition: the process died. This is the
+           case the message was written for and it must keep its warning. #>
+        Test-CrashRecovery -State (New-UnfinishedPhaseState -Phase 'WindowsUpdate') | Should -BeTrue
+        $entry = $script:CrashLog[-1]
+        $entry.Message | Should -Match 'Previous run crashed during \[WindowsUpdate\]'
+        $entry.Level   | Should -Be 'Warn'
+    }
+
+    It 'says nothing at all about a phase that finished' {
+        $state = New-UnfinishedPhaseState -Phase 'RetryPending'
+        $state.WindowsUpdateDone = $true
+        Test-CrashRecovery -State $state | Should -BeFalse
+        $script:CrashLog.Count | Should -Be 0
     }
 }

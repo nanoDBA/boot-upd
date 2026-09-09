@@ -2095,7 +2095,27 @@ function Test-CrashRecovery {
     $isDone = if ($flagName -and ($State.PSObject.Properties.Name -contains $flagName)) { [bool]$State.$flagName } else { $false }
     if (-not $isDone) {
         $time = if ($State.LastPhaseTimestamp) { try { ([datetime]$State.LastPhaseTimestamp).ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss') } catch { $State.LastPhaseTimestamp } } else { '(unknown)' }
-        Write-Log "Previous run crashed during [$($State.LastPhaseStarted)] at [$time]. Restarting that phase." -Level Warn
+        <# An unfinished phase has three possible histories and only one of them is a crash.
+           The previous pass may have exited deliberately - withholding verification and
+           queueing a retry, or waiting for a user context - or it may have restarted the
+           machine on purpose part-way through. Both leave exactly the same footprint here:
+           LastPhaseStarted set, the Done flag false. Reporting all three as "crashed" made
+           a healthy withhold-and-retry cycle read as repeated crashes; lab row B emitted
+           the crash line on every one of seven passes while nothing had crashed at all.
+           The previous pass's own terminal disposition is still on the state, so use it.
+           The action is identical in all three cases - re-run the phase - so only the
+           account of why changes. #>
+        switch ($State.Phase) {
+            { $_ -in @('RetryPending','UserContextPending') } {
+                Write-Log "Previous pass did not verify [$($State.LastPhaseStarted)] at [$time] and queued this pass deliberately; nothing crashed. Re-running that phase." -Level Info
+            }
+            'Rebooting' {
+                Write-Log "Previous pass restarted Windows during [$($State.LastPhaseStarted)] at [$time]; nothing crashed. Re-running that phase." -Level Info
+            }
+            default {
+                Write-Log "Previous run crashed during [$($State.LastPhaseStarted)] at [$time]. Restarting that phase." -Level Warn
+            }
+        }
         return $true
     }
     return $false
