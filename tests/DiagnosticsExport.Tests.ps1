@@ -102,6 +102,70 @@ Version: 10.20.30.40; peer 10.20.30.41
         $activity.Iteration | Should -Be 1
     }
 
+    It 'never treats phase(s)/phases prose as a phase, across every such banner the orchestrator writes (-vla0)' {
+        # Regression for -vla0: the manifest once reported Phase="s ran" and
+        # Iteration=null for a completed run whose log plainly said Pass: 1,
+        # because the phase matcher struck the word "phase(s)" in prose and
+        # only "Iteration" (never "Pass") was recognized. Exercise every
+        # phase(s)/phases prose line the orchestrator actually writes
+        # (Invoke-BootUpdateCycle.ps1: parallel-cohort banner, staged-rollout
+        # remaining count, incomplete-phase(s) verification-withheld notice,
+        # and the Windows Update prefetch "other phases ran" aside) plus an
+        # accumulated log with no explicit Pass/Iteration marker, alongside one
+        # explicit anchored "Phase:" line to prove the matcher still fires on
+        # the real thing.
+        $noExplicitMarkerText = @'
+[2026-08-17 17:00:00] [Info] BOOT UPDATE CYCLE STARTED
+[2026-08-17 17:02:00] [Info] --- Parallel cohort: 5 phase(s): Pip, Npm, Scoop, DotnetTools, Vscode ---
+[2026-08-17 17:05:00] [Info] Windows Update prefetch: complete (3 downloaded while other phases ran).
+[2026-08-17 17:06:00] [Info] Staged rollout: 2 phase(s) remaining. A near-term checkpoint will run [Winget].
+[2026-08-17 17:07:00] [Warn] Verification withheld: incomplete phase(s): Winget, WindowsUpdate. Automatic retry queued for two minutes.
+[2026-08-17 17:09:00] [Info] BOOT UPDATE CYCLE COMPLETE
+'@
+        $noMarkerActivity = Get-BootUpdateDiagnosticActivity -Text $noExplicitMarkerText
+        $noMarkerActivity.ActiveAtCapture | Should -BeFalse
+        $noMarkerActivity.Phase | Should -BeNullOrEmpty
+        $noMarkerActivity.Iteration | Should -BeNullOrEmpty
+
+        $explicitPhaseText = @'
+[2026-08-17 17:00:00] [Info] BOOT UPDATE CYCLE RESUMED | Pass: 4
+[2026-08-17 17:02:00] [Info] --- Parallel cohort: 5 phase(s): Pip, Npm, Scoop, DotnetTools, Vscode ---
+[2026-08-17 17:05:00] [Info] Windows Update prefetch: complete (3 downloaded while other phases ran).
+[2026-08-17 17:06:00] [Info] Phase: WindowsUpdate
+'@
+        $explicitActivity = Get-BootUpdateDiagnosticActivity -Text $explicitPhaseText
+        $explicitActivity.ActiveAtCapture | Should -BeTrue
+        $explicitActivity.Phase | Should -Be 'WindowsUpdate'
+        $explicitActivity.Iteration | Should -Be 4
+    }
+
+    It 'exports a completed run with a parallel-cohort banner to a manifest with Phase null and a valid Iteration, not "s ran" (-vla0)' {
+        # Full pipeline regression for -vla0's exact reported symptom: a real
+        # completed bundle whose manifest.json showed Phase="s ran" and
+        # Iteration=null even though the core log plainly said Pass: 1.
+        $source = Join-Path $TestDrive 'vla0-source'; $output = Join-Path $TestDrive 'vla0-output'
+        New-Item -ItemType Directory -Path $source,$output | Out-Null
+        Set-Content (Join-Path $source 'BootUpdateCycle.log') @'
+[2026-08-17 17:00:00] [Info] BOOT UPDATE CYCLE STARTED | Pass: 1
+[2026-08-17 17:02:00] [Info] --- Parallel cohort: 5 phase(s): Pip, Npm, Scoop, DotnetTools, Vscode ---
+[2026-08-17 17:05:00] [Info] Windows Update prefetch: complete (3 downloaded while other phases ran).
+[2026-08-17 17:06:00] [Info] Staged rollout: 2 phase(s) remaining. A near-term checkpoint will run [Winget].
+[2026-08-17 17:07:00] [Warn] Verification withheld: incomplete phase(s): Winget, WindowsUpdate. Automatic retry queued for two minutes.
+[2026-08-17 17:09:00] [Info] BOOT UPDATE CYCLE COMPLETE
+'@
+        $null = & $exportPath -SourceDirectory $source -OutputDirectory $output -NoClipboard 6>&1
+        $zip = Get-ChildItem -LiteralPath $output -Filter 'BootUpdateCycle-diagnostics-*.zip' | Select-Object -First 1
+        $expanded = Join-Path $TestDrive 'vla0-expanded'
+        Expand-Archive -LiteralPath $zip.FullName -DestinationPath $expanded
+        $manifestRaw = Get-Content (Join-Path $expanded 'manifest.json') -Raw
+        $manifestRaw | Should -Not -Match 'Phase["\s:]*"?s ran'
+        $manifest = $manifestRaw | ConvertFrom-Json
+        $manifest.CaptureState | Should -Be 'completed'
+        $manifest.ActiveAtCapture | Should -BeFalse
+        $manifest.Phase | Should -BeNullOrEmpty
+        $manifest.Iteration | Should -Be 1
+    }
+
     It 'records persistent before-and-after cleanup fingerprints without exposing paths' {
         $text = @'
 [Info] Pending-file cleanup [before mutation]: PackageManagementPrototypeCleanup=6. Routine delete-only housekeeping; no restart is required.
