@@ -257,6 +257,8 @@ $complete = $false
 $injected = $false
 $maxConsent = 0
 $pwshSeen = $false
+$injectAttempted = $false
+$injectionError = $null
 $injectArmed = [bool]($InjectWhen -and $InjectAction)
 if ($injectArmed) { Say "injection armed on /$InjectWhen/" }
 while ((Get-Date) -lt $deadline) {
@@ -295,12 +297,24 @@ while ((Get-Date) -lt $deadline) {
         if ($r.PSObject.Properties.Name -contains 'Consent') { $maxConsent = [math]::Max($maxConsent, [int]$r.Consent) }
         if ($r.PSObject.Properties.Name -contains 'Pwsh' -and $r.Pwsh) { $pwshSeen = $true }
         Add-Timeline (("{0} passes={1} lines={2} tasks={3} :: {4}" -f (Get-Date -Format 'HH:mm:ss'), $r.Passes, $r.Lines, $r.Tasks, $r.Last))
-        if ($injectArmed -and -not $injected -and $r.Matched) {
+        if ($injectArmed -and -not $injectAttempted -and $r.Matched) {
             Say "injecting on match at $(Get-Date -Format 'HH:mm:ss')"
             Add-Timeline (("{0} INJECTED on /{1}/" -f (Get-Date -Format 'HH:mm:ss'), $InjectWhen))
-            try { Invoke-Command -VMName $VMName -Credential $cred -ScriptBlock $InjectAction -ErrorAction Stop | Out-Null }
-            catch { Add-Timeline (("{0} injection failed: {1}" -f (Get-Date -Format 'HH:mm:ss'), $_.Exception.Message)) }
-            $injected = $true
+        <# An injection that THREW is not an injection. This used to set $injected either
+           way, so summary.json reported Injected=true for a row whose scriptblock had died -
+           row G v3's used try/catch as an expression, which PowerShell does not allow, and
+           nothing was killed. The timeline line was the only thing that gave it away, and a
+           reader going by the summary would have recorded a pass for a scenario that never
+           happened. #>
+            try {
+                Invoke-Command -VMName $VMName -Credential $cred -ScriptBlock $InjectAction -ErrorAction Stop | Out-Null
+                $injected = $true
+            } catch {
+                $injectionError = $_.Exception.Message
+                Add-Timeline (("{0} injection failed: {1}" -f (Get-Date -Format 'HH:mm:ss'), $injectionError))
+                Say "injection FAILED: $injectionError"
+            }
+            $injectAttempted = $true
         }
         <# Requiring a pass as well as a completion line is belt and braces after the scalar
            bug above: a cycle cannot complete before it has started, so a claim of completion
@@ -310,7 +324,7 @@ while ((Get-Date) -lt $deadline) {
     } catch { Add-Timeline (("{0} unreachable (rebooting)" -f (Get-Date -Format 'HH:mm:ss'))) }
     <# Poll fast while waiting to inject: a restart countdown is measured in seconds, so a
        40-second cadence would sail past the only moment the row cares about. #>
-    Start-Sleep -Seconds $(if ($injectArmed -and -not $injected) { 3 } else { 40 })
+    Start-Sleep -Seconds $(if ($injectArmed -and -not $injectAttempted) { 3 } else { 40 })
 }
 
 Say 'collecting evidence'
@@ -372,6 +386,8 @@ $summary = [pscustomobject]@{
     TasksRemaining   = $evidence.TasksRemaining
     CbsPending       = $evidence.CbsPending
     Injected         = $injected
+    InjectionAttempted = $injectAttempted
+    InjectionError   = $injectionError
     Launcher         = $Launcher
     <# Zero here means no prompt was observed, which for an already-elevated scheduled task is expected and is NOT evidence that the interactive flow demands none. #>
     MaxConsentPrompts = $maxConsent
