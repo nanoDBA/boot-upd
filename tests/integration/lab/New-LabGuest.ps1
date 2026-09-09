@@ -120,6 +120,27 @@ while ((Get-Date) -lt $deadline) {
 }
 if (-not $ready) { throw "Guest never reached a desktop within $InstallTimeoutMinutes minutes." }
 
+<# The updater is a PowerShell 7 program and its scheduled tasks execute pwsh.exe by absolute
+   path, but Windows ships only Windows PowerShell 5.1. A guest without PS7 therefore fails at
+   task execution with 0x80070002, ERROR_FILE_NOT_FOUND, which surfaces as a task result rather
+   than as output - the run looks like it started and produced nothing. That cost a full
+   40-minute row before anyone asked what the task had actually executed.
+
+   Installed with Microsoft's own install-powershell.ps1 rather than a pinned MSI URL, so the
+   guest tracks the current release instead of an asset path that rots. #>
+Say 'installing PowerShell 7'
+Invoke-Command -VMName $Name -Credential $cred -ScriptBlock {
+    $ProgressPreference = 'SilentlyContinue'
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    Invoke-WebRequest -Uri 'https://aka.ms/install-powershell.ps1' -OutFile "$env:TEMP\install-powershell.ps1" -UseBasicParsing
+    & "$env:TEMP\install-powershell.ps1" -UseMSI -Quiet
+} | Out-Null
+
+$pwshPath = Invoke-Command -VMName $Name -Credential $cred -ScriptBlock {
+    if (Test-Path 'C:\Program Files\PowerShell\7\pwsh.exe') { (& 'C:\Program Files\PowerShell\7\pwsh.exe' -NoProfile -Command '$PSVersionTable.PSVersion.ToString()') } else { $null }
+}
+if (-not $pwshPath) { throw 'PowerShell 7 did not install; the guest cannot run the updater.' }
+Say "PowerShell $pwshPath installed"
 Say 'installing the auto-logon repair task'
 Invoke-Command -VMName $Name -Credential $cred -ArgumentList $GuestUser, $GuestPassword, $Name -ScriptBlock {
     param($User, $Password, $Machine)

@@ -164,6 +164,22 @@ Invoke-Command -VMName $VMName -Credential $cred -ArgumentList $GuestUser, ([boo
     Start-ScheduledTask -TaskName 'Lab-RunDeploy'
 } | Out-Null
 
+<# Confirm the task actually started something. A scheduled task whose Execute path does not
+   exist fails instantly with 0x80070002 and reports that only as a task result, so the row
+   below would monitor an empty log for its whole timeout and then call the run inconclusive.
+   Forty minutes were spent that way on a guest with no PowerShell 7 installed. #>
+Start-Sleep -Seconds 10
+$launchProbe = Invoke-Command -VMName $VMName -Credential $cred -ScriptBlock {
+    [pscustomobject]@{
+        Result  = (Get-ScheduledTaskInfo -TaskName 'Lab-RunDeploy').LastTaskResult
+        State   = (Get-ScheduledTask     -TaskName 'Lab-RunDeploy').State
+        HasPwsh = Test-Path 'C:\Program Files\PowerShell\7\pwsh.exe'
+    }
+}
+if ($launchProbe.State -ne 'Running' -and $launchProbe.Result -ne 0 -and $launchProbe.Result -ne 267009) {
+    $hint = if (-not $launchProbe.HasPwsh) { ' PowerShell 7 is not installed in the guest, so pwsh.exe does not exist.' } else { '' }
+    throw ("Deploy task did not start: LastTaskResult 0x{0:X8}, state {1}.{2}" -f $launchProbe.Result, $launchProbe.State, $hint)
+}
 Say 'monitoring'
 $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
 $timeline = [System.Collections.Generic.List[string]]::new()
