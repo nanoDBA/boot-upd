@@ -197,6 +197,11 @@ while ((Get-Date) -lt $deadline) {
                 Lines    = $lines.Count
                 Passes   = ($lines -match 'BOOT UPDATE CYCLE (STARTED|RESUMED)').Count
                 Complete = ($lines -match 'BOOT UPDATE CYCLE COMPLETE').Count
+                <# A cycle that stops itself at a limit is just as terminal as one that
+                   converges, and waiting out the timeout after it has already disarmed and
+                   reported adds nothing but wall-clock. Row B v5 sat here for eight minutes
+                   after the updater had finished saying everything it had to say. #>
+                Terminal = ($lines -match '(recovery limit|Reboot limit) .*reached').Count
                 Tasks    = @(Get-ScheduledTask -TaskName 'BootUpdateCycle*' -ErrorAction SilentlyContinue).Count
                 Last     = if ($lines.Count) { ($lines[-1] -replace '\s+', ' ').Trim() } else { '' }
                 Matched  = if ($Pattern) { ($lines -match $Pattern).Count -gt 0 } else { $false }
@@ -211,6 +216,7 @@ while ((Get-Date) -lt $deadline) {
             $injected = $true
         }
         if ($r.Complete -ge 1 -and $r.Tasks -eq 0) { $complete = $true; Say "cycle complete after $($r.Passes) pass(es)"; break }
+        if ($r.Terminal -ge 1 -and $r.Tasks -eq 0) { Say "cycle stopped itself at a limit after $($r.Passes) pass(es)"; break }
     } catch { $timeline.Add(("{0} unreachable (rebooting)" -f (Get-Date -Format 'HH:mm:ss'))) }
     <# Poll fast while waiting to inject: a restart countdown is measured in seconds, so a
        40-second cadence would sail past the only moment the row cares about. #>
@@ -255,7 +261,12 @@ $sessionStart = if ($startLine -match '\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]
 $completionLine = $evidence.Log | Where-Object { $_ -match 'BOOT UPDATE CYCLE COMPLETE' } | Select-Object -Last 1
 $sessionEnd = if ($completionLine -match '\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]') { ([datetime]$Matches[1]).AddMinutes(2) } else { (Get-Date).AddMinutes(2) }
 $bootsDuringRun = @($evidence.OsBootTimes | Where-Object { $_ -ge $sessionStart -and $_ -le $sessionEnd })
-$claimed = 0
+<# The claim is only made in a completion line, so a run that never completes has made no
+   claim at all. Reporting that absence as 0 asserted something the updater never said, and
+   RebootAccountingAgrees then read false - the row accusing the updater of under-counting
+   reboots on a run where it had correctly declined to claim anything. $null says "no claim
+   to compare", which is the truth, and keeps the disagreement flag meaningful. #>
+$claimed = $null
 $claimLine = $evidence.Log | Where-Object { $_ -match 'BOOT UPDATE CYCLE COMPLETE' } | Select-Object -Last 1
 if ($claimLine -match '(\d+) reboot\(s\)') { $claimed = [int]$Matches[1] }
 
@@ -267,7 +278,7 @@ $summary = [pscustomobject]@{
     Passes           = ($evidence.Log -match 'BOOT UPDATE CYCLE (STARTED|RESUMED)').Count
     RebootsClaimed   = $claimed
     RebootsObservedOS = $bootsDuringRun.Count
-    RebootAccountingAgrees = ($claimed -eq $bootsDuringRun.Count)
+    RebootAccountingAgrees = if ($null -eq $claimed) { $null } else { $claimed -eq $bootsDuringRun.Count }
     StateFileRemains = $evidence.StateFileExists
     TasksRemaining   = $evidence.TasksRemaining
     CbsPending       = $evidence.CbsPending

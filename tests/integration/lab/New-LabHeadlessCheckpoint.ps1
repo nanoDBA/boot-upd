@@ -117,4 +117,14 @@ if ((Get-VM -Name $VMName).State -ne 'Off') { throw 'Guest did not shut down cle
 Get-VMCheckpoint -VMName $VMName -Name $Name -ErrorAction SilentlyContinue |
     Remove-VMCheckpoint -Confirm:$false
 Checkpoint-VM -Name $VMName -SnapshotName $Name
+<# Checkpoint-VM can return before the snapshot is enumerable, so a caller that restores it
+   immediately gets "Unable to find a snapshot matching the given criteria" against a
+   checkpoint that does exist moments later. Wait for it to become visible rather than
+   handing back a name that is not yet usable. #>
+$settle = [Diagnostics.Stopwatch]::StartNew()
+while (-not (Get-VMCheckpoint -VMName $VMName -Name $Name -ErrorAction SilentlyContinue) -and
+       $settle.Elapsed.TotalSeconds -lt 60) { Start-Sleep -Seconds 2 }
+if (-not (Get-VMCheckpoint -VMName $VMName -Name $Name -ErrorAction SilentlyContinue)) {
+    throw "Checkpoint '$Name' did not become enumerable within 60 seconds."
+}
 Say "cold checkpoint '$Name' taken; guest has no interactive user"
