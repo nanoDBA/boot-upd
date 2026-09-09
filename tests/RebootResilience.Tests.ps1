@@ -2992,3 +2992,101 @@ Describe 'Resume identity discovery through the state object' {
         $state.ResumeUserSid | Should -BeNullOrEmpty -Because 'no SID is recorded when the name is already the running identity'
     }
 }
+
+Describe 'No interactive user exhausts the bounded wait and completes with deferred inventory' {
+    <# -35qb.4. Only the counter (Update-BootUpdateUserIdentityWait) had cover; the branch
+       the counter unlocks had none, and that branch is what the release notes describe as
+       producing a qualified claim. grep NoInteractiveUser tests/ returned nothing.
+
+       The three assertions the ticket asks for are split by what can carry them. The
+       inventory record and the claim are composed by real functions, so those are driven
+       behaviourally. The fall-through - Phase set to Running, no further continuation task
+       registered - lives inline in Invoke-BootUpdateCycle, so it is pinned the way this
+       file already pins orchestrator-inline invariants, against the function's own text. #>
+
+    BeforeAll {
+        $script:MaxUserIdentityWaits = 2
+    }
+
+    It 'stops deferring only after the configured number of rediscovery attempts' {
+        $state = New-BootUpdateStateV2
+        $state.ResumeUser = $null
+
+        <# The production call passes -UserUnknown from an empty ResumeUser, so drive it the
+           same way rather than hard-coding $true. #>
+        $unknown = [string]::IsNullOrWhiteSpace([string]$state.ResumeUser)
+        $unknown | Should -BeTrue
+
+        Update-BootUpdateUserIdentityWait -State $state -UserUnknown $unknown -MaxWaits $script:MaxUserIdentityWaits | Should -BeFalse
+        Update-BootUpdateUserIdentityWait -State $state -UserUnknown $unknown -MaxWaits $script:MaxUserIdentityWaits | Should -BeFalse
+        Update-BootUpdateUserIdentityWait -State $state -UserUnknown $unknown -MaxWaits $script:MaxUserIdentityWaits |
+            Should -BeTrue -Because 'the bound is a bound: the wait ends, it does not repeat forever'
+    }
+
+    It 'records the unattemptable user-scope work as NoInteractiveUser deferred inventory' {
+        $state = New-BootUpdateStateV2
+        $state.ResumeUser = $null
+        $phases = @([pscustomobject]@{ Name = 'Winget' }, [pscustomobject]@{ Name = 'Scoop' })
+
+        $exhausted = $false
+        while (-not $exhausted) {
+            $exhausted = Update-BootUpdateUserIdentityWait -State $state -UserUnknown $true -MaxWaits $script:MaxUserIdentityWaits
+        }
+        foreach ($phase in $phases) {
+            Add-BootUpdateDeferredInventory -State $state -Provider $phase.Name -Scope 'user' -Records @(
+                [pscustomobject]@{ Kind = 'NoInteractiveUser'; Count = 1; Detail = 'No interactive user signed in, so user-scope work could not be attempted from this machine.' }
+            )
+        }
+
+        $inventory = @(Get-BootUpdateDeferredInventory -State $state)
+        $inventory.Count | Should -Be 2
+        @($inventory | Where-Object Kind -eq 'NoInteractiveUser').Count | Should -Be 2
+        @($inventory | Where-Object Scope -eq 'user').Count | Should -Be 2 -Because 'the work was never attemptable in machine scope'
+        ($inventory | Where-Object Provider -eq 'Winget').Detail | Should -Match 'No interactive user'
+
+        <# It must survive the state file: the completion that reads it back may be a later
+           pass in a different process. #>
+        $roundTripped = $state | ConvertTo-Json -Depth 6 | ConvertFrom-Json
+        @(Get-BootUpdateDeferredInventory -State $roundTripped | Where-Object Kind -eq 'NoInteractiveUser').Count | Should -Be 2
+
+        Get-BootUpdateDeferredInventorySummary -Records $inventory |
+            Should -Match 'Winget user \(NoInteractiveUser=1\)'
+    }
+
+    It 'qualifies the completion claim rather than claiming full convergence' {
+        $state = New-BootUpdateStateV2
+        Add-BootUpdateDeferredInventory -State $state -Provider 'Winget' -Scope 'user' -Records @(
+            [pscustomobject]@{ Kind = 'NoInteractiveUser'; Count = 1; Detail = 'No interactive user signed in.' }
+        )
+        $hasDeferredInventory = @(Get-BootUpdateDeferredInventory -State $state).Count -gt 0
+        $hasDeferredInventory | Should -BeTrue
+
+        Get-BootUpdateCompletionClaim -Qualifiers @(if ($hasDeferredInventory) { 'DEFERRED INVENTORY' }) |
+            Should -Be 'COMPLETE WITH DEFERRED INVENTORY'
+
+        <# And the surface a human reads must not say all-clear. #>
+        $toast = Get-BootUpdateCompletionNotification -TotalVerified 3 -DurationMinutes 12 `
+            -DeferredInventory @(Get-BootUpdateDeferredInventory -State $state)
+        $toast.Kind | Should -Not -Be 'Error' -Because 'nothing failed; the work was simply not attemptable here'
+        $toast.Kind | Should -Be 'Progress' -Because 'a run that could not attempt user-scope work is not an all-clear'
+        $toast.Message | Should -Match 'Winget user \(NoInteractiveUser=1\)'
+        $toast.Message | Should -Not -Match 'you are all set'
+    }
+
+    It 'falls through to the ordinary completion path instead of arming another retry' {
+        <# This is assertion (c): the exhausted branch must NOT register a further
+           continuation, and must hand the run to the same completion path whose cleanup and
+           verification ordering is pinned in 'Evidence-backed completion'. #>
+        $text = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
+        $start = $text.IndexOf('$identityExhausted = Update-BootUpdateUserIdentityWait')
+        $start | Should -BeGreaterThan 0
+        $branch = $text.Substring($start, $text.IndexOf('$disposition.Kind -eq ''UserContext'' -and $state.Phase -eq ''UserContextPending''', $start) - $start)
+
+        $exhausted = $branch.Substring($branch.IndexOf('if ($identityExhausted)'), $branch.IndexOf('} else {') - $branch.IndexOf('if ($identityExhausted)'))
+        $exhausted | Should -Match "Kind = 'NoInteractiveUser'"
+        $exhausted | Should -Match "-Scope 'user'"
+        $exhausted | Should -Match "\`$state\.Phase = 'Running'"
+        $exhausted | Should -Not -Match 'Register-BootUpdateTaskForReboot' -Because 'an exhausted wait completes; it does not schedule another rediscovery'
+        $exhausted | Should -Match 'No interactive user appeared after' -Because 'the lab row reads this line as its evidence that the bound fired'
+    }
+}
