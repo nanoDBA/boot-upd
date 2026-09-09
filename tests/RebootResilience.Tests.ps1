@@ -77,6 +77,7 @@ BeforeAll {
           'Resolve-BootUpdateResumeAccount',
           'Update-BootUpdateUserIdentityWait',
           'Test-BootUpdateInteractiveUserPresent',
+          'Get-BootUpdateRetryTriggerTime',
           'ConvertTo-BootUpdatePrincipalSid',
           'Get-WingetInventoryPackageIds',
           'Get-WingetOutputSummary',
@@ -3718,5 +3719,74 @@ Describe 'The bounded wait is about an absent session, not an unknown name' {
            pass runs, the counter never advances, and the bound can never be reached - which
            is precisely how the headless guest came to sit there. #>
         $text | Should -Match 'Register-BootUpdateTaskForReboot -RetrySoon:\$retryForUnknownUser'
+    }
+}
+
+Describe 'The dated watchdog trigger is actually armed' {
+    <# Found by matrix row C on 2026-09-09, evidence
+       C:\HyperV\evidence\C-cancelled-restart-v3-lab-b-20260909-101428. Start-BootUpdateRestart
+       arms a dated watchdog before every restart, for the case the code comment names: if
+       the user takes the documented `shutdown /a` escape hatch, neither startup nor logon
+       fires, so a time trigger is what keeps the chain alive. It had never been armed.
+
+       The parameter was declared [Nullable[datetime]], but PowerShell's parameter binder
+       converts that to a plain System.DateTime. The bound variable has no HasValue member,
+       so `$RetryAt.HasValue` evaluated to $null - never $true - and the retry trigger was
+       always $null. On the guest, after the cancel, Export-ScheduledTask showed exactly one
+       LogonTrigger and nothing else; the task never ran and the cycle sat there for the
+       whole 40-minute row. -RetrySoon is a [switch], so the two-minute retries everywhere
+       else kept working and hid this for every release that shipped it. #>
+
+    It 'reproduces the binder behaviour the old test relied on' {
+        <# Stated as a test because it is the entire cause and it is counter-intuitive:
+           declaring [Nullable[datetime]] does not give you a Nullable at the other end. #>
+        function Test-NullableBinding { param([Nullable[datetime]]$Value = $null) $Value }
+        $bound = Test-NullableBinding -Value ([datetime]'2026-09-09T10:23:42')
+        $bound.GetType().Name | Should -Be 'DateTime'
+        $bound.HasValue | Should -BeNullOrEmpty -Because 'a System.DateTime has no HasValue member, so the old guard could never be true'
+        ($null -ne $bound) | Should -BeTrue -Because 'a null test is what actually distinguishes supplied from omitted'
+    }
+
+    It 'returns the requested moment when a dated retry is asked for' {
+        $at = [datetime]'2026-09-09T10:30:42'
+        Get-BootUpdateRetryTriggerTime -RetryAt $at -RetrySoon $false | Should -Be $at
+    }
+
+    It 'still honours the two-minute retry switch' {
+        $now = [datetime]'2026-09-09T10:00:00'
+        Get-BootUpdateRetryTriggerTime -RetrySoon $true -Now $now | Should -Be $now.AddMinutes(2)
+    }
+
+    It 'prefers an explicit moment over the switch' {
+        $at = [datetime]'2026-09-09T11:00:00'
+        Get-BootUpdateRetryTriggerTime -RetryAt $at -RetrySoon $true -Now ([datetime]'2026-09-09T10:00:00') |
+            Should -Be $at
+    }
+
+    It 'asks for no trigger when neither is requested' {
+        Get-BootUpdateRetryTriggerTime | Should -BeNullOrEmpty
+        Get-BootUpdateRetryTriggerTime -RetryAt $null -RetrySoon $false | Should -BeNullOrEmpty
+    }
+
+    It 'survives the binder that broke it, end to end through a declared Nullable parameter' {
+        <# The regression this file exists to prevent: call it the way the orchestrator does,
+           through a [Nullable[datetime]] parameter, and require a trigger time back. #>
+        function Invoke-LikeTheOrchestrator {
+            param([switch]$RetrySoon, [Nullable[datetime]]$RetryAt = $null)
+            Get-BootUpdateRetryTriggerTime -RetryAt $RetryAt -RetrySoon ([bool]$RetrySoon)
+        }
+        $watchdog = [datetime]'2026-09-09T10:30:42'
+        Invoke-LikeTheOrchestrator -RetryAt $watchdog | Should -Be $watchdog
+        Invoke-LikeTheOrchestrator | Should -BeNullOrEmpty
+    }
+
+    It 'makes the registration expect the time trigger it just asked for' {
+        <# If the trigger is armed, the resume-chain verification must also expect it -
+           otherwise a missing watchdog would still verify clean, which is how this survived
+           a release with 'Resume chain verified' printed beside it. #>
+        $text = Get-FunctionText $invokeAst 'Register-BootUpdateTaskForReboot'
+        $text | Should -Match 'Get-BootUpdateRetryTriggerTime -RetryAt \$RetryAt -RetrySoon \(\[bool\]\$RetrySoon\)'
+        $text | Should -Not -Match '\$RetryAt\.HasValue'
+        $text | Should -Match "MSFT_TaskTimeTrigger"
     }
 }

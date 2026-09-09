@@ -5713,6 +5713,30 @@ function Update-BootUpdateUserIdentityWait {
     return ($waits -gt $MaxWaits)
 }
 
+function Get-BootUpdateRetryTriggerTime {
+    <# When, if ever, should the continuation task also carry a dated trigger?
+
+       This was inline and it was dead. The parameter was declared [Nullable[datetime]], but
+       PowerShell's parameter binder converts that to a plain System.DateTime, so the bound
+       variable has no HasValue member at all: `$RetryAt.HasValue` evaluated to $null - never
+       $true - and `$RetryAt.Value` to $null. Every -RetryAt caller therefore registered a
+       task with no time trigger, silently, and Start-BootUpdateRestart's watchdog for the
+       documented `shutdown /a` escape hatch has never existed. Matrix row C proved it from
+       the machine: after the cancel, Export-ScheduledTask on the guest showed a single
+       LogonTrigger and nothing else, the task never ran, and the cycle sat for the whole
+       row. -RetrySoon is a [switch] and was unaffected, which is why the two-minute retries
+       everywhere else kept working and hid this.
+
+       Pure, and separate, so the choice can be tested without registering a real task. #>
+    param(
+        [AllowNull()][object]$RetryAt = $null,
+        [bool]$RetrySoon = $false,
+        [datetime]$Now = (Get-Date)
+    )
+    if ($null -ne $RetryAt) { return [datetime]$RetryAt }
+    if ($RetrySoon) { return $Now.AddMinutes(2) }
+    return $null
+}
 function Register-BootUpdateTaskForReboot {
     param(
         [switch]$RetrySoon,
@@ -5777,7 +5801,7 @@ function Register-BootUpdateTaskForReboot {
     $registeredTaskNames = [System.Collections.Generic.List[string]]::new()
     $expectedPrincipal = @{}
     $expectedTriggerTypes = @{}
-    $retryTime = if ($RetryAt.HasValue) { $RetryAt.Value } elseif ($RetrySoon) { (Get-Date).AddMinutes(2) } else { $null }
+    $retryTime = Get-BootUpdateRetryTriggerTime -RetryAt $RetryAt -RetrySoon ([bool]$RetrySoon)
     $retryTrigger = if ($retryTime) { New-ScheduledTaskTrigger -Once -At $retryTime } else { $null }
     <# Do not launch the user and SYSTEM retry tasks at the same instant. The fallback
        remains available when the interactive principal cannot run, but waits long
