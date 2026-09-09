@@ -42,7 +42,14 @@ param(
     <# Extra arguments for Deploy-BootUpdateCycle.ps1. Row C needs -RebootDelaySec above
        zero: the default is 0, documented as "immediate, /f = force-close apps, no abort",
        so with the shipped default there is no countdown for a cancel to act on at all. #>
-    [string]$DeployArgs = ''
+    [string]$DeployArgs = '',
+    <# Which entry point the row exercises.
+
+       'deploy' runs Deploy-BootUpdateCycle.ps1 under pwsh.exe, which is what every row that
+       already has PowerShell 7 wants. 'upd' runs upd.cmd under cmd.exe instead: that is the
+       documented fresh-install path, and the only one that works on a guest with Windows
+       PowerShell 5.1 only, since pwsh.exe does not exist there for a task to execute. #>
+    [ValidateSet('deploy','upd')][string]$Launcher = 'deploy'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -145,18 +152,28 @@ if ($n -lt $limit -and $n -lt $features.Count) {
    updater's own BootUpdateCycleFallback task runs in, which is what such a row exercises. #>
 if ($SystemContext) { Say 'launching the cycle as SYSTEM (no interactive user)' }
 else { Say 'launching the cycle in the interactive session' }
-Invoke-Command -VMName $VMName -Credential $cred -ArgumentList $GuestUser, ([bool]$SystemContext), $DeployArgs -ScriptBlock {
-    param($User, $AsSystem, $Extra)
+Invoke-Command -VMName $VMName -Credential $cred -ArgumentList $GuestUser, ([bool]$SystemContext), $DeployArgs, $Launcher -ScriptBlock {
+    param($User, $AsSystem, $Extra, $Entry)
     <# Capture Deploy's own stdout and stderr. Without this a failing deploy leaves nothing
        behind at all: the updater log stops wherever the script died, and everything the
        script itself printed goes to a scheduled task and is lost. Row B first failed with
        nothing but exit code 1 to go on. #>
-    $inner = '& "C:\Lab\boot-upd\Deploy-BootUpdateCycle.ps1" -NonInteractive -OutputMode Normal EXTRA_ARGS *>&1 | Tee-Object -FilePath C:\Lab\deploy-output.txt'
-    $inner = $inner.Replace('EXTRA_ARGS', $Extra)
-    $argument = '-NoProfile -ExecutionPolicy Bypass -Command "' + $inner.Replace('"', '\"') + '"'
-    $a = New-ScheduledTaskAction -Execute 'C:\Program Files\PowerShell\7\pwsh.exe' `
-         -Argument $argument `
-         -WorkingDirectory 'C:\Lab\boot-upd'
+    $a = if ($Entry -eq 'upd') {
+        <# cmd.exe, not pwsh: on a PowerShell 5.1-only guest pwsh.exe does not exist, and a
+           task whose Execute path is missing fails instantly with 0x80070002 and reports it
+           only as a task result. upd.cmd is the entry point that knows how to bootstrap
+           PowerShell 7 for itself. #>
+        New-ScheduledTaskAction -Execute 'C:\Windows\System32\cmd.exe' `
+            -Argument ('/c ""C:\Lab\boot-upd\upd.cmd" ' + $Extra + ' > C:\Lab\deploy-output.txt 2>&1"') `
+            -WorkingDirectory 'C:\Lab\boot-upd'
+    } else {
+        $inner = '& "C:\Lab\boot-upd\Deploy-BootUpdateCycle.ps1" -NonInteractive -OutputMode Normal EXTRA_ARGS *>&1 | Tee-Object -FilePath C:\Lab\deploy-output.txt'
+        $inner = $inner.Replace('EXTRA_ARGS', $Extra)
+        $argument = '-NoProfile -ExecutionPolicy Bypass -Command "' + $inner.Replace('"', '\"') + '"'
+        New-ScheduledTaskAction -Execute 'C:\Program Files\PowerShell\7\pwsh.exe' `
+            -Argument $argument `
+            -WorkingDirectory 'C:\Lab\boot-upd'
+    }
     $p = if ($AsSystem) { New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest }
          else { New-ScheduledTaskPrincipal -UserId "$env:COMPUTERNAME\$User" -LogonType Interactive -RunLevel Highest }
     $s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::FromHours(6))
@@ -177,9 +194,12 @@ $launchProbe = Invoke-Command -VMName $VMName -Credential $cred -ScriptBlock {
     }
 }
 if ($launchProbe.State -ne 'Running' -and $launchProbe.Result -ne 0 -and $launchProbe.Result -ne 267009) {
-    $hint = if (-not $launchProbe.HasPwsh) { ' PowerShell 7 is not installed in the guest, so pwsh.exe does not exist.' } else { '' }
+    <# Absent pwsh.exe is a fault for every row except the one whose whole point is starting
+       without it. #>
+    $hint = if (-not $launchProbe.HasPwsh -and $Launcher -ne 'upd') { ' PowerShell 7 is not installed in the guest, so pwsh.exe does not exist.' } else { '' }
     throw ("Deploy task did not start: LastTaskResult 0x{0:X8}, state {1}.{2}" -f $launchProbe.Result, $launchProbe.State, $hint)
 }
+if ($Launcher -eq 'upd') { Say ("guest PowerShell 7 present at launch: {0}" -f $launchProbe.HasPwsh) }
 Say 'monitoring'
 $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
 <# Append every poll line to the evidence file as it is produced. Accumulating the timeline
@@ -190,6 +210,8 @@ $timelinePath = Join-Path $evidenceDir 'host-timeline.txt'
 function Add-Timeline { param([string]$Line) Add-Content -LiteralPath $timelinePath -Value $Line }
 $complete = $false
 $injected = $false
+$maxConsent = 0
+$pwshSeen = $false
 $injectArmed = [bool]($InjectWhen -and $InjectAction)
 if ($injectArmed) { Say "injection armed on /$InjectWhen/" }
 while ((Get-Date) -lt $deadline) {
@@ -218,10 +240,15 @@ while ((Get-Date) -lt $deadline) {
                    after the updater had finished saying everything it had to say. #>
                 Terminal = @($lines | Where-Object { $_ -match '(recovery limit|Reboot limit) .*reached' }).Count
                 Tasks    = @(Get-ScheduledTask -TaskName 'BootUpdateCycle*' -ErrorAction SilentlyContinue).Count
+                <# consent.exe is the UAC consent dialog itself, so counting it counts real prompts rather than inferring them from a log. #>
+                Consent  = @(Get-Process consent -ErrorAction SilentlyContinue).Count
+                Pwsh     = Test-Path 'C:\Program Files\PowerShell\7\pwsh.exe'
                 Last     = if ($lines.Count) { ($lines[-1] -replace '\s+', ' ').Trim() } else { '' }
                 Matched  = if ($Pattern) { @($lines | Where-Object { $_ -match $Pattern }).Count -gt 0 } else { $false }
             }
         }
+        if ($r.PSObject.Properties.Name -contains 'Consent') { $maxConsent = [math]::Max($maxConsent, [int]$r.Consent) }
+        if ($r.PSObject.Properties.Name -contains 'Pwsh' -and $r.Pwsh) { $pwshSeen = $true }
         Add-Timeline (("{0} passes={1} lines={2} tasks={3} :: {4}" -f (Get-Date -Format 'HH:mm:ss'), $r.Passes, $r.Lines, $r.Tasks, $r.Last))
         if ($injectArmed -and -not $injected -and $r.Matched) {
             Say "injecting on match at $(Get-Date -Format 'HH:mm:ss')"
@@ -300,6 +327,10 @@ $summary = [pscustomobject]@{
     TasksRemaining   = $evidence.TasksRemaining
     CbsPending       = $evidence.CbsPending
     Injected         = $injected
+    Launcher         = $Launcher
+    <# Zero here means no prompt was observed, which for an already-elevated scheduled task is expected and is NOT evidence that the interactive flow demands none. #>
+    MaxConsentPrompts = $maxConsent
+    Ps7SeenDuringRun = $pwshSeen
     DeployTaskResult = $evidence.DeployTaskResult
     DeployOutputTail = ($evidence.DeployOutput | Select-Object -Last 3) -join ' | '
     ConsoleUser      = $evidence.ConsoleUser
