@@ -50,6 +50,11 @@
 param(
     [ValidateRange(1,50)][int]$MaxIterations = 5,
     [ValidateRange(1,50)][int]$MaxRetryPasses = 5,
+    <# How many times the cycle will re-look for an interactive user before concluding that
+       none is coming. Only consumed when NO user is known at all: when a user has been seen,
+       the continuation waits on a logon trigger instead and costs nothing. At the two-minute
+       rediscovery interval the default is roughly twenty minutes. #>
+    [ValidateRange(1,500)][int]$MaxUserIdentityWaits = 10,
     [int]$PackageTimeoutMinutes = 30,
     [int]$RebootDelaySec = 0,
     [switch]$SkipPip,
@@ -269,6 +274,7 @@ $script:PackageTimeoutMinutes = $PackageTimeoutMinutes
 $script:RebootDelaySec        = $RebootDelaySec
 $script:MaxIterations         = $MaxIterations
 $script:MaxRetryPasses        = $MaxRetryPasses
+$script:MaxUserIdentityWaits  = $MaxUserIdentityWaits
 <# Widest observed same-boot LastBootUpTime jitter, with headroom. Far below the
    shortest realistic boot-to-boot interval, so it cannot mask a genuine restart. #>
 $script:BootSessionToleranceSeconds = 120
@@ -5220,6 +5226,40 @@ function Resolve-BootUpdateResumeAccount {
     }
 }
 
+function Update-BootUpdateUserIdentityWait {
+    <# Decides whether to keep waiting for an interactive user, and returns $true when the
+       wait is exhausted and the caller should stop deferring.
+
+       Scope deferral is defined as a handoff to a later user-context pass. On a machine
+       nobody ever signs into there is no later pass, and the wait was unbounded: a
+       two-minute rediscovery retry repeating forever, deliberately exempted from the
+       iteration safety valve. Microsoft documents a device with no signed-in user as the
+       *unblocked* servicing path, so a cycle that can never finish there is wrong about the
+       platform, not merely slow.
+
+       Only the unknown-user case is bounded. When a user has been seen, the continuation
+       waits on a logon trigger, costs nothing, and must keep waiting: a laptop whose owner
+       returns tomorrow has not stopped having a user. That case resets the counter, so an
+       intermittent identity lookup cannot accumulate its way to a false exhaustion. #>
+    param(
+        [Parameter(Mandatory)][pscustomobject]$State,
+        [Parameter(Mandatory)][bool]$UserUnknown,
+        [int]$MaxWaits = 10
+    )
+
+    if (-not $UserUnknown) {
+        if ($State.PSObject.Properties.Name -contains 'UserIdentityWaitCount') { $State.UserIdentityWaitCount = 0 }
+        return $false
+    }
+
+    $prior = if ($State.PSObject.Properties.Name -contains 'UserIdentityWaitCount') { [int]$State.UserIdentityWaitCount } else { 0 }
+    $waits = $prior + 1
+    if ($State.PSObject.Properties.Name -contains 'UserIdentityWaitCount') { $State.UserIdentityWaitCount = $waits }
+    else { $State | Add-Member -NotePropertyName 'UserIdentityWaitCount' -NotePropertyValue $waits -Force }
+
+    return ($waits -gt $MaxWaits)
+}
+
 function Register-BootUpdateTaskForReboot {
     param(
         [switch]$RetrySoon,
@@ -7534,11 +7574,46 @@ function Invoke-BootUpdateCycle {
             exit 0
         }
         if (-not $WhatIfPreference -and $disposition.Kind -eq 'UserContext') {
-            $state.Phase = 'UserContextPending'
-            Set-BootUpdateState -State $state
             $deferredNames = $disposition.Phases.Name -join ', '
             $retryForUnknownUser = [string]::IsNullOrWhiteSpace([string]$state.ResumeUser)
-            $null = Register-BootUpdateTaskForReboot -RetrySoon:$retryForUnknownUser
+
+            <# Scope deferral is a handoff to a later user-context pass. On a machine nobody
+               ever signs into there is no later pass, and without a bound this waited
+               forever: a two-minute rediscovery retry, repeating indefinitely, deliberately
+               exempted from the iteration safety valve. Microsoft's documented position is
+               that a device with no signed-in user is the *unblocked* servicing path, so an
+               updater that can never finish there is wrong about the platform.
+
+               Bound only the unknown-user case. When a user HAS been seen the continuation
+               waits on a logon trigger, costs nothing, and must keep waiting - a laptop
+               whose owner returns tomorrow has not stopped having a user.
+
+               On exhaustion the work stops being a scope deferral and becomes deferred
+               inventory: not attemptable from here, never counted as a verified update,
+               and qualifying the completion claim. The cycle then completes normally and
+               reports qualified convergence, which is the truthful reading of a machine
+               that is as converged as it can be made without a user. #>
+            $identityExhausted = Update-BootUpdateUserIdentityWait -State $state `
+                -UserUnknown $retryForUnknownUser -MaxWaits $script:MaxUserIdentityWaits
+
+            if ($identityExhausted) {
+                Write-Log ("No interactive user appeared after {0} rediscovery attempts; recording user-scope work as deferred inventory rather than waiting indefinitely: {1}" -f $script:MaxUserIdentityWaits, $deferredNames) -Level Warn
+                foreach ($deferredPhase in @($disposition.Phases)) {
+                    Add-BootUpdateDeferredInventory -State $state -Provider $deferredPhase.Name -Scope 'user' -Records @(
+                        [pscustomobject]@{ Kind = 'NoInteractiveUser'; Count = 1; Detail = 'No interactive user signed in, so user-scope work could not be attempted from this machine.' }
+                    )
+                }
+                $state.Phase = 'Running'
+                Set-BootUpdateState -State $state
+                # Falls through to the normal completion path, which now qualifies its claim.
+            } else {
+                $state.Phase = 'UserContextPending'
+                Set-BootUpdateState -State $state
+                $null = Register-BootUpdateTaskForReboot -RetrySoon:$retryForUnknownUser
+            }
+        }
+
+        if (-not $WhatIfPreference -and $disposition.Kind -eq 'UserContext' -and $state.Phase -eq 'UserContextPending') {
             $userToastMessage = if ($retryForUnknownUser) {
                 "Waiting to identify an interactive user for: $deferredNames. A retry is scheduled; no restart is required."
             } else {

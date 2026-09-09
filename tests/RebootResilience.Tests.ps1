@@ -63,6 +63,7 @@ BeforeAll {
           'Get-BootUpdateUptimeSeconds',
           'Get-BootUpdateMonotonicBootId',
           'Resolve-BootUpdateResumeAccount',
+          'Update-BootUpdateUserIdentityWait',
           'Get-WingetInventoryPackageIds',
           'Get-WingetOutputSummary',
           'Get-ChocolateyOutputSummary',
@@ -2699,5 +2700,61 @@ osuchuser_zzq' | Should -BeNullOrEmpty
     It 'returns nothing for empty input' {
         Resolve-BootUpdateResumeAccount -Account '' | Should -BeNullOrEmpty
         Resolve-BootUpdateResumeAccount -Account $null | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Bounded wait for an interactive user' {
+    <# Regression cover for the unbounded UserContextPending loop. Scope deferral is defined
+       in CONTEXT.md as a handoff to a later user-context pass; on a machine nobody signs
+       into there is no later pass, and the cycle retried every two minutes forever, exempt
+       from the iteration safety valve. Microsoft documents a device with no signed-in user
+       as the *unblocked* servicing path, so never finishing there is a defect. #>
+
+    It 'keeps waiting while the wait budget remains' {
+        $state = [pscustomobject]@{ UserIdentityWaitCount = 0 }
+        $exhausted = Update-BootUpdateUserIdentityWait -State $state -UserUnknown $true -MaxWaits 3
+        $exhausted | Should -BeFalse
+        $state.UserIdentityWaitCount | Should -Be 1
+    }
+
+    It 'reports exhaustion once the budget is spent' {
+        $state = [pscustomobject]@{ UserIdentityWaitCount = 3 }
+        Update-BootUpdateUserIdentityWait -State $state -UserUnknown $true -MaxWaits 3 |
+            Should -BeTrue -Because 'the fourth attempt exceeds a budget of three'
+    }
+
+    It 'never bounds the wait when a user is known' {
+        <# The laptop case. A logon-triggered continuation costs nothing and must keep
+           waiting: an owner who returns tomorrow has not stopped having a user. #>
+        $state = [pscustomobject]@{ UserIdentityWaitCount = 99 }
+        Update-BootUpdateUserIdentityWait -State $state -UserUnknown $false -MaxWaits 3 |
+            Should -BeFalse
+    }
+
+    It 'resets the counter when a user becomes known again' {
+        <# Prevents an intermittent identity lookup accumulating its way to a false
+           exhaustion on a machine that does have a user. #>
+        $state = [pscustomobject]@{ UserIdentityWaitCount = 2 }
+        $null = Update-BootUpdateUserIdentityWait -State $state -UserUnknown $false -MaxWaits 3
+        $state.UserIdentityWaitCount | Should -Be 0
+    }
+
+    It 'starts counting on a state that has never carried the property' {
+        $state = [pscustomobject]@{ Phase = 'Running' }
+        Update-BootUpdateUserIdentityWait -State $state -UserUnknown $true -MaxWaits 1 | Should -BeFalse
+        $state.UserIdentityWaitCount | Should -Be 1
+        Update-BootUpdateUserIdentityWait -State $state -UserUnknown $true -MaxWaits 1 | Should -BeTrue
+    }
+
+    It 'survives a state-file round trip, so the budget cannot silently reset each pass' {
+        <# The counter only bounds anything if it persists across passes; each pass is a
+           fresh process reading state back from JSON. #>
+        $state = [pscustomobject]@{ UserIdentityWaitCount = 0 }
+        1..2 | ForEach-Object {
+            $null = Update-BootUpdateUserIdentityWait -State $state -UserUnknown $true -MaxWaits 5
+            $state = $state | ConvertTo-Json -Depth 5 | ConvertFrom-Json
+        }
+        $state.UserIdentityWaitCount | Should -Be 2
+        Update-BootUpdateUserIdentityWait -State $state -UserUnknown $true -MaxWaits 5 | Should -BeFalse
     }
 }

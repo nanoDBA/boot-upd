@@ -9,9 +9,10 @@
     * AutoLogon LogonCount 999. The matrix requires two or more reboots with the
       interactive-user continuation path live; a small count would silently stop
       auto-signing-in partway through a run and look like an updater failure.
-    * The password below is a throwaway on a disposable guest that is reverted from
-      a checkpoint between scenarios. It must never be reused, and this file must
-      never be committed to the repository.
+    * The password is the placeholder __LAB_PASSWORD__, substituted at ISO build time
+      from BOOTUPD_LAB_PASSWORD into a temporary copy that is deleted afterwards. This
+      tracked file therefore carries no credential, which is what lets it live in a
+      public repository at all.
 -->
 <unattend xmlns="urn:schemas-microsoft-com:unattend">
 
@@ -112,12 +113,17 @@
 
   <settings pass="oobeSystem">
     <!--
-      International-Core must appear in oobeSystem as well as windowsPE. Without it the
-      Windows 11 OOBE still presents "Is this the right country or region?" and the
-      keyboard-layout screens, and waits there forever with no user. The windowsPE copy
-      only covers Setup itself, not the out-of-box experience, which is why the install
-      completed unattended while OOBE stalled. Verified against a guest whose Panther
-      answer file contained all three passes and logged no UnattendGC errors.
+      International-Core is required here, not only in windowsPE. Microsoft documents the
+      WinPE variant as applying "only in the windowsPE configuration pass" and directs you
+      to this component for oobeSystem; Automate OOBE states the general rule that "OOBE
+      screens that aren't configured in Unattend will display when a user goes through
+      OOBE". So the install completing unattended while OOBE waited is the documented
+      behaviour, not a quirk.
+
+      The observed symptom was the language, region and keyboard screens waiting for input,
+      which on a headless guest is indistinguishable from a hang. Microsoft's text names the
+      language selection page specifically; mapping that to the region and keyboard screens
+      is inference from the general rule and from community practice, not quoted guidance.
     -->
     <component name="Microsoft-Windows-International-Core"
                processorArchitecture="amd64"
@@ -134,11 +140,16 @@
                processorArchitecture="amd64"
                publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
                xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <!--
+        HideLocalAccountScreen is deliberately absent. Microsoft documents it as applying
+        "only to the Windows Server editions", so on Windows 11 client it does nothing. The
+        screen it looks like it targets is suppressed by defining the account in UserAccounts
+        below, which is the documented mechanism and is what actually works here.
+      -->
       <OOBE>
         <HideEULAPage>true</HideEULAPage>
         <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
         <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
-        <HideLocalAccountScreen>true</HideLocalAccountScreen>
         <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
         <ProtectYourPC>3</ProtectYourPC>
       </OOBE>
