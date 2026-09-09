@@ -40,13 +40,17 @@ param(
     [int64]$MemoryMaximumBytes = 6GB,
     [int64]$DiskSize     = 50GB,
     [string]$GuestUser   = 'updtest',
-    [string]$GuestPassword = $env:BOOTUPD_LAB_PASSWORD,
+    [string]$GuestPassword,
     [string]$Checkpoint  = '',
     [int]$InstallTimeoutMinutes = 45
 )
 
 $ErrorActionPreference = 'Stop'
-if (-not $GuestPassword) { throw 'Set BOOTUPD_LAB_PASSWORD (the disposable guest password) before running lab scripts.' }
+. (Join-Path $PSScriptRoot 'LabCredential.ps1')
+if (-not $GuestPassword) { $GuestPassword = Get-BootUpdLabPassword }
+if (-not $GuestPassword) {
+    throw 'No lab guest password available. Store one with: . ./LabCredential.ps1; Set-BootUpdLabPassword -Generate'
+}
 function Say { param($m) Write-Host ("[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $m) -ForegroundColor Cyan }
 
 if (Get-VM -Name $Name -ErrorAction SilentlyContinue) { throw "VM '$Name' already exists." }

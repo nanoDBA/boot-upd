@@ -9,8 +9,15 @@ cleanup. These scripts build and drive that lab on Hyper-V.
 ```powershell
 $env:BOOTUPD_LAB_PASSWORD = '<a throwaway password for the guest>'
 ./New-UnattendIso.ps1                       # renders the template, builds unattend.iso
+# One-time: store the disposable guest credential where it survives the session.
+. ./LabCredential.ps1; Set-BootUpdLabPassword -Generate
+
 ./New-LabGuest.ps1 -Name lab-a -Checkpoint fresh
 ./Invoke-LabRow.ps1 -VMName lab-a -Row A -Checkpoint fresh -ArmReboots 3
+
+# For the rows that need a machine nobody signs into:
+./New-LabHeadlessCheckpoint.ps1 -VMName lab-a -From fresh -Name headless
+./Invoke-LabRow.ps1 -VMName lab-a -Row B -Checkpoint headless -SystemContext -ArmReboots 1
 ```
 
 The guest password is supplied through `BOOTUPD_LAB_PASSWORD` and never committed. The
