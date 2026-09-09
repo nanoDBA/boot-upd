@@ -34,7 +34,15 @@ try {
         $configuration.Output.Verbosity = 'Normal'
         $pester = Invoke-Pester -Configuration $configuration
         if ($pester.TotalCount -eq 0 -or $pester.FailedCount) {
-            throw "Pester gate failed: $($pester.FailedCount) of $($pester.TotalCount) tests failed."
+            <# Name them. A gate that reports only a count cannot be diagnosed after the fact:
+               this gate failed once at 1 of 477 during the v2.5.79 release, the suite passed
+               on every rerun, and which test it was is now unknowable. An intermittent test
+               in a release gate is a finding, and a finding needs a name. #>
+            $failed = @($pester.Failed | ForEach-Object {
+                "  - $($_.ExpandedPath): $((($_.ErrorRecord.Exception.Message -split "`n") | Select-Object -First 1).Trim())"
+            })
+            $detail = if ($failed.Count) { "`n" + ($failed -join "`n") } else { '' }
+            throw "Pester gate failed: $($pester.FailedCount) of $($pester.TotalCount) tests failed.$detail"
         }
     }
     if (-not $SkipOsBoundary) {
