@@ -84,7 +84,16 @@ Also changed, not a defect: `-jjyx` deepened boot-session identity into one call
 - **The beads export leaked the maintainer's identity into a public repo**: 600 fields across
   216 rows (`created_by` 274, `owner` 211, `assignee` 113, `author` 2), plus one real profile
   path in ticket prose. Sanitised forward-only (`205b4c2`, `4834eeb`); the prose case was
-  corrected in the tracker itself so it survives future exports. Verified: 0 matches.
+  corrected in the tracker itself so it survives future exports.
+- **The first privacy sweep was narrower than the rule, and missed a real computer name.**
+  After the release was cut, a re-read of `.claude/rules/public-repository-privacy.md` turned
+  up `This machine (DEADAIR) is Windows 11 PRO` in ticket `-3tw`'s notes — a real computer
+  name, which the rule forbids alongside usernames. The earlier check had verified "0 matches
+  for the real name" and stopped there; the rule covers usernames, **computer names**,
+  domains, employer and customer names, and private drive layouts. Corrected in the tracker so
+  it survives export, and forward-only, consistent with the decision recorded on `-35qb.3`.
+  The v2.5.79 release notes and the published release body were checked and are clean.
+  Lesson: verify against the whole rule, not against the last thing that went wrong.
 - **`docs/TESTING.md` had no written reporting rule** — PASS/PARTIAL/FAIL/NOT RUN was
   re-derived each release. Now stated (`6ebf845`).
 - **A new test could not fail**: an ordering assertion searched for a string the boot-session
@@ -185,6 +194,10 @@ Three observations worth keeping, because they are the reason the release is wha
 - **The two-axis review caught a crash on the common path and a false claim in the notes.**
   Both were committed by this session, hours apart, while it was actively correcting the same
   class of defect in v2.5.78. Self-review would not have found either.
+- **A privacy check that verifies one field is not a privacy check.** The identity
+  sanitisation was thorough about the four structured fields it set out to fix and verified
+  itself precisely — and still left a real computer name in prose, because the verification
+  was written against the defect rather than against the rule.
 - **A one-line label collision nearly poisoned the evidence.** F2's harness bug produced a
   PASS-shaped `summary.json` for a cycle that never started. It was caught only because the
   numbers inside it disagreed with each other (`Completed: true`, `Passes: 0`). Reading the
