@@ -34,6 +34,21 @@ Before releasing changes to checkpointing, tasks, reboot detection, mutexes, pro
 
 Capture the updater log, every checkpoint revision, task definitions and results, boot identifiers, effective identities, provider exit/reboot evidence, and the final cleanup inventory. A scenario passes only when every enabled phase converges, no reboot evidence remains after settling, health checks pass, and both tasks and active state are absent.
 
+## How to report a gate
+
+A row or gate is **PASS** only when every enabled phase converged, no reboot
+evidence remains, health checks pass, and both continuation tasks and active
+state are absent.
+
+Anything short of that is **PARTIAL** (name what *was* established) or
+**FAIL** (name why).
+
+**NOT RUN** is its own word, never folded into PASS — a gate you did not
+execute is NOT RUN, not PASS.
+
+A summary or gate line may report PASS only when every row it summarizes is
+PASS; one PARTIAL or FAIL underneath means the summary is not PASS either.
+
 ## Release evidence
 
 Report each gate independently:
