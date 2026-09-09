@@ -33,17 +33,19 @@ User/SYSTEM boundary:        PASS
 Published launcher upgrade:  PASS
 Live bootstrap:              NOT RUN
 Provider integration:        NOT RUN
-Multi-reboot convergence:    PARTIAL - three of seven rows, see below
+Multi-reboot convergence:    PARTIAL - four of seven rows, see below
 Release assets:              PASS
 ```
 
-Multi-reboot convergence was executed for the first time, on Windows 11 Enterprise LTSC 2024 guests under Hyper-V. Three of seven rows ran:
+Multi-reboot convergence was executed for the first time, on Windows 11 Enterprise LTSC 2024 guests under Hyper-V. Four of seven rows ran:
 
 - **Row A**, two or more real reboots with interactive-user continuation: **PASS.** Four passes across three real reboots; the claimed reboot count equals the OS boot record; both continuation tasks removed; no state file left.
 - **Row B**, SYSTEM-fallback continuation with no user logged on: **PARTIAL.** The mechanism is verified — tasks register, the cycle resumed across four real reboots as SYSTEM with nobody signed in, and user-scope work was deferred rather than claimed. It did not reach a completion claim, because `wuauserv` is stopped on the guest image and the Windows Update phase cannot finish. The updater withheld the claim rather than asserting convergence, which is the correct behaviour, but the row demonstrates truthful *incompleteness* rather than truthful completion.
 - **Row C**, canceled delayed restart: **PASS.** With the restart cancelled 13 seconds into a 60-second countdown, the updater did not record a reboot that never happened, did not advance its pass number, and left the resume chain armed. A later reboot resumed and completed it.
 
-Rows D (failed restart command), E (delayed reboot signal), F (PowerShell 5.1-only bootstrap) and G (killed-process recovery) are **NOT RUN**. Each is filed individually and names the checkpoint it starts from.
+- **Row E**, delayed reboot signal: **PASS**, for the after-window case only. The signal was injected 10 seconds *after* the 20-second settle window closed rather than inside it, so the in-window detection path was not exercised. What the row does establish is the property that matters most: a reboot signal arriving after the probe was not silently ignored. It was caught at the after-updates check, the cycle rebooted, resumed, and completed with a claimed reboot count matching the OS boot record and no state or task residue.
+
+Rows D (failed restart command), F (PowerShell 5.1-only bootstrap) and G (killed-process recovery) are **NOT RUN**. Row G was attempted and is recorded as not run rather than failed: the injected kill did not match the orchestrator's process, so the run proved nothing about crash recovery. Each remaining row is filed individually and names the checkpoint it starts from.
 
 No live update cycle was run on the maintainer's own machine during validation; every reboot was performed on a disposable guest.
 
