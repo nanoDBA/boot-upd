@@ -197,19 +197,29 @@ while ((Get-Date) -lt $deadline) {
         $r = Invoke-Command -VMName $VMName -Credential $cred -ErrorAction Stop -ArgumentList $InjectWhen -ScriptBlock {
             param($Pattern)
             $log = 'C:\ProgramData\BootUpdateCycle\BootUpdateCycle.log'
-            $lines = if (Test-Path $log) { @(Get-Content $log -ErrorAction SilentlyContinue) } else { @() }
+            <# @() OUTSIDE the if, not inside it. `$x = if (...) { @('one') }` assigns the
+               STRING, because the statement's output is enumerated on the way out, and a
+               one-line log then makes every idiom below lie at once: `$string -match 'x'`
+               returns a BOOLEAN, and $false.Count is 1, so Complete=1 and the row breaks out
+               of the loop announcing a converged cycle; Passes reads 1; Matched reads true
+               and fires the injection; and $lines[-1] indexes a CHARACTER. Row D on lab-b
+               ended 80 seconds in, "complete after 1 pass", against a log holding one
+               self-update line. #>
+            $lines = @(if (Test-Path $log) { Get-Content $log -ErrorAction SilentlyContinue })
+            <# Where-Object rather than -match for the same reason: it returns a collection
+               whatever it is given, so no count here can be a boolean in disguise. #>
             [pscustomobject]@{
                 Lines    = $lines.Count
-                Passes   = ($lines -match 'BOOT UPDATE CYCLE (STARTED|RESUMED)').Count
-                Complete = ($lines -match 'BOOT UPDATE CYCLE COMPLETE').Count
+                Passes   = @($lines | Where-Object { $_ -match 'BOOT UPDATE CYCLE (STARTED|RESUMED)' }).Count
+                Complete = @($lines | Where-Object { $_ -match 'BOOT UPDATE CYCLE COMPLETE' }).Count
                 <# A cycle that stops itself at a limit is just as terminal as one that
                    converges, and waiting out the timeout after it has already disarmed and
                    reported adds nothing but wall-clock. Row B v5 sat here for eight minutes
                    after the updater had finished saying everything it had to say. #>
-                Terminal = ($lines -match '(recovery limit|Reboot limit) .*reached').Count
+                Terminal = @($lines | Where-Object { $_ -match '(recovery limit|Reboot limit) .*reached' }).Count
                 Tasks    = @(Get-ScheduledTask -TaskName 'BootUpdateCycle*' -ErrorAction SilentlyContinue).Count
                 Last     = if ($lines.Count) { ($lines[-1] -replace '\s+', ' ').Trim() } else { '' }
-                Matched  = if ($Pattern) { ($lines -match $Pattern).Count -gt 0 } else { $false }
+                Matched  = if ($Pattern) { @($lines | Where-Object { $_ -match $Pattern }).Count -gt 0 } else { $false }
             }
         }
         Add-Timeline (("{0} passes={1} lines={2} tasks={3} :: {4}" -f (Get-Date -Format 'HH:mm:ss'), $r.Passes, $r.Lines, $r.Tasks, $r.Last))
@@ -220,7 +230,10 @@ while ((Get-Date) -lt $deadline) {
             catch { Add-Timeline (("{0} injection failed: {1}" -f (Get-Date -Format 'HH:mm:ss'), $_.Exception.Message)) }
             $injected = $true
         }
-        if ($r.Complete -ge 1 -and $r.Tasks -eq 0) { $complete = $true; Say "cycle complete after $($r.Passes) pass(es)"; break }
+        <# Requiring a pass as well as a completion line is belt and braces after the scalar
+           bug above: a cycle cannot complete before it has started, so a claim of completion
+           with zero observed passes is a harness fault, not a result. #>
+        if ($r.Complete -ge 1 -and $r.Passes -ge 1 -and $r.Tasks -eq 0) { $complete = $true; Say "cycle complete after $($r.Passes) pass(es)"; break }
         if ($r.Terminal -ge 1 -and $r.Tasks -eq 0) { Say "cycle stopped itself at a limit after $($r.Passes) pass(es)"; break }
     } catch { Add-Timeline (("{0} unreachable (rebooting)" -f (Get-Date -Format 'HH:mm:ss'))) }
     <# Poll fast while waiting to inject: a restart countdown is measured in seconds, so a
@@ -231,7 +244,7 @@ while ((Get-Date) -lt $deadline) {
 Say 'collecting evidence'
 $evidence = Invoke-Command -VMName $VMName -Credential $cred -ScriptBlock {
     $log = 'C:\ProgramData\BootUpdateCycle\BootUpdateCycle.log'
-    $lines = if (Test-Path $log) { @(Get-Content $log -ErrorAction SilentlyContinue) } else { @() }
+    $lines = @(if (Test-Path $log) { Get-Content $log -ErrorAction SilentlyContinue })
     # Event 6005 is the OS's own boot record, written by the event log service. It is the
     # independent check the updater's log cannot provide about itself.
     $boots = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 6005 } -MaxEvents 40 -ErrorAction SilentlyContinue |
@@ -246,7 +259,7 @@ $evidence = Invoke-Command -VMName $VMName -Credential $cred -ScriptBlock {
            result: a SYSTEM-fallback claim means nothing if somebody was quietly logged in. #>
         ConsoleUser     = (Get-CimInstance Win32_ComputerSystem).UserName
         ExplorerCount   = @(Get-Process explorer -ErrorAction SilentlyContinue).Count
-        DeployOutput    = if (Test-Path 'C:\Lab\deploy-output.txt') { @(Get-Content 'C:\Lab\deploy-output.txt' -ErrorAction SilentlyContinue) } else { @() }
+        DeployOutput    = @(if (Test-Path 'C:\Lab\deploy-output.txt') { Get-Content 'C:\Lab\deploy-output.txt' -ErrorAction SilentlyContinue })
         DeployTaskResult = (Get-ScheduledTaskInfo -TaskName 'Lab-RunDeploy' -ErrorAction SilentlyContinue).LastTaskResult
     }
 }
@@ -255,14 +268,14 @@ $evidence.Log | Set-Content (Join-Path $evidenceDir 'BootUpdateCycle.log')
 if ($evidence.DeployOutput.Count) { $evidence.DeployOutput | Set-Content (Join-Path $evidenceDir 'deploy-output.txt') }
 & 'C:\HyperV\Get-VmScreen.ps1' -VMName $VMName -Path (Join-Path $evidenceDir 'console.png') | Out-Null
 
-$startLine = $evidence.Log | Where-Object { $_ -match 'BOOT UPDATE CYCLE STARTED' } | Select-Object -First 1
+$startLine = @($evidence.Log) | Where-Object { $_ -match 'BOOT UPDATE CYCLE STARTED' } | Select-Object -First 1
 $sessionStart = if ($startLine -match '\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]') { [datetime]$Matches[1] } else { (Get-Date).AddHours(-2) }
 <# Bound the window at BOTH ends. Filtering only on "at or after the session started" let a
    stray event stamped hours in the future - left in the image from its own creation - count
    as a boot, and the row then reported the updater under-claiming when it had not. An
    acceptance check that can produce a false accusation is as useless as one that can be
    silently satisfied. #>
-$completionLine = $evidence.Log | Where-Object { $_ -match 'BOOT UPDATE CYCLE COMPLETE' } | Select-Object -Last 1
+$completionLine = @($evidence.Log) | Where-Object { $_ -match 'BOOT UPDATE CYCLE COMPLETE' } | Select-Object -Last 1
 $sessionEnd = if ($completionLine -match '\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]') { ([datetime]$Matches[1]).AddMinutes(2) } else { (Get-Date).AddMinutes(2) }
 $bootsDuringRun = @($evidence.OsBootTimes | Where-Object { $_ -ge $sessionStart -and $_ -le $sessionEnd })
 <# The claim is only made in a completion line, so a run that never completes has made no
@@ -271,7 +284,7 @@ $bootsDuringRun = @($evidence.OsBootTimes | Where-Object { $_ -ge $sessionStart 
    reboots on a run where it had correctly declined to claim anything. $null says "no claim
    to compare", which is the truth, and keeps the disagreement flag meaningful. #>
 $claimed = $null
-$claimLine = $evidence.Log | Where-Object { $_ -match 'BOOT UPDATE CYCLE COMPLETE' } | Select-Object -Last 1
+$claimLine = @($evidence.Log) | Where-Object { $_ -match 'BOOT UPDATE CYCLE COMPLETE' } | Select-Object -Last 1
 if ($claimLine -match '(\d+) reboot\(s\)') { $claimed = [int]$Matches[1] }
 
 $summary = [pscustomobject]@{
@@ -279,7 +292,7 @@ $summary = [pscustomobject]@{
     VM               = $VMName
     Checkpoint       = $Checkpoint
     Completed        = $complete
-    Passes           = ($evidence.Log -match 'BOOT UPDATE CYCLE (STARTED|RESUMED)').Count
+    Passes           = @($evidence.Log | Where-Object { $_ -match 'BOOT UPDATE CYCLE (STARTED|RESUMED)' }).Count
     RebootsClaimed   = $claimed
     RebootsObservedOS = $bootsDuringRun.Count
     RebootAccountingAgrees = if ($null -eq $claimed) { $null } else { $claimed -eq $bootsDuringRun.Count }
