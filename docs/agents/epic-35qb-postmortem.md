@@ -87,7 +87,7 @@ Also changed, not a defect: `-jjyx` deepened boot-session identity into one call
   corrected in the tracker itself so it survives future exports.
 - **The first privacy sweep was narrower than the rule, and missed a real computer name.**
   After the release was cut, a re-read of `.claude/rules/public-repository-privacy.md` turned
-  up `This machine (DEADAIR) is Windows 11 PRO` in ticket `-3tw`'s notes — a real computer
+  up a real computer name in ticket `-3tw`'s notes — `This machine (<REDACTED>) is Windows 11 PRO`, a real computer
   name, which the rule forbids alongside usernames. The earlier check had verified "0 matches
   for the real name" and stopped there; the rule covers usernames, **computer names**,
   domains, employer and customer names, and private drive layouts. Corrected in the tracker so
