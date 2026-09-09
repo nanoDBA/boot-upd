@@ -101,14 +101,18 @@ Say 'guest ready'
 
 if (-not $SkipSync) {
     Say 'syncing working tree'
-    <# Name the endpoint explicitly. A PowerShell 7 host opening a PowerShell Direct session
-       negotiates the PowerShell.7 configuration by default, and row F's guest deliberately
-       has no PowerShell 7 at all - New-PSSession then fails with "An error has occurred
-       which PowerShell cannot handle. A remote session might have ended." while
-       Invoke-Command against the same guest still works, which makes the failure look like a
-       dead guest rather than a missing endpoint. Microsoft.PowerShell is Windows PowerShell
-       5.1 and exists on every Windows guest; the session is only used to copy files. #>
-    $s = New-PSSession -VMName $VMName -Credential $cred -ConfigurationName 'Microsoft.PowerShell'
+    <# Try the default endpoint, then Windows PowerShell. A PowerShell 7 host opening a
+       PowerShell Direct session negotiates the PowerShell.7 configuration by default, and
+       row F's guest deliberately has no PowerShell 7 at all - New-PSSession then fails with
+       "An error has occurred which PowerShell cannot handle. A remote session might have
+       ended." while Invoke-Command against the same guest keeps working, which makes the
+       failure read as a dead guest rather than a missing endpoint. Asking for
+       Microsoft.PowerShell unconditionally is not the fix either: on a guest that HAS
+       PowerShell 7 that name fails with "Cannot create or open the configuration session
+       Microsoft.PowerShell", so a hard-coded name simply moves the breakage to every other
+       row. The session is only used to copy files, so either endpoint will do. #>
+    $s = try { New-PSSession -VMName $VMName -Credential $cred -ErrorAction Stop }
+         catch { New-PSSession -VMName $VMName -Credential $cred -ConfigurationName 'Microsoft.PowerShell' -ErrorAction Stop }
     try {
         Invoke-Command -Session $s -ScriptBlock { New-Item -ItemType Directory -Path 'C:\Lab\boot-upd' -Force | Out-Null }
         $files = Get-ChildItem -LiteralPath $SourceRoot -Recurse -File |
