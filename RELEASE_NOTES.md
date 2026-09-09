@@ -40,7 +40,7 @@ Four of these were found on a machine after the unit suite had agreed with the c
 ### Validation
 
 ```text
-Unit/process behavior:       PASS     (477 tests, 0 failed)
+Unit/process behavior:       PASS     (478 tests, 0 failed)
 User/SYSTEM boundary:        PASS
 Published launcher upgrade:  PASS     (from v2.5.43)
 Live bootstrap:              PASS     (row F - but see the qualification below)
