@@ -1606,12 +1606,46 @@ function Test-BootUpdateSameBootSession {
     return ([math]::Abs(($leftTime - $rightTime).TotalSeconds) -le $ToleranceSeconds)
 }
 
+function Test-BootUpdateMonotonicBootMoved {
+    <# Has the reconstructed boot instant moved far enough to mean a real restart?
+
+       Both sides go through ConvertTo-BootUpdateTimestampString first, and neither parameter
+       is typed [string]. That is the whole point of this function existing. LastMonotonicBootId
+       is persisted, and ConvertFrom-Json rehydrates an ISO-8601 string as a [datetime]: coercing
+       that back to text for TryParse uses the current culture, which emits no offset, so the
+       parse treats a UTC instant as local. The comparison then picks up the machine's entire UTC
+       offset - hours - instead of the seconds of jitter the tolerance was sized for, and every
+       same-boot pass reads as a fresh boot. That zeroes ConsecutiveRetryCount, so the same-boot
+       recovery limit never fires and a permanently applicable update retries forever. Row B saw
+       exactly that: five "new boot session" observations across two real reboots, on a guest in
+       Eastern time.
+
+       This is the same defect class the boot-session tolerance already carries a rule about; it
+       recurred because a second persisted timestamp was added without routing it through the
+       normaliser. Two call sites needed the comparison, so it lives here once rather than being
+       mirrored and drifting. #>
+    param(
+        [AllowNull()]$Prior,
+        [AllowNull()]$Current,
+        [int]$ToleranceSeconds = 15
+    )
+    $priorText = ConvertTo-BootUpdateTimestampString -Value $Prior
+    $currentText = ConvertTo-BootUpdateTimestampString -Value $Current
+    if ([string]::IsNullOrWhiteSpace($priorText) -or [string]::IsNullOrWhiteSpace($currentText)) { return $false }
+    $priorInstant = [datetimeoffset]::MinValue
+    $currentInstant = [datetimeoffset]::MinValue
+    $styles = [System.Globalization.DateTimeStyles]::RoundtripKind
+    if (-not [datetimeoffset]::TryParse($priorText, [cultureinfo]::InvariantCulture, $styles, [ref]$priorInstant)) { return $false }
+    if (-not [datetimeoffset]::TryParse($currentText, [cultureinfo]::InvariantCulture, $styles, [ref]$currentInstant)) { return $false }
+    return ([math]::Abs(($currentInstant - $priorInstant).TotalSeconds) -gt $ToleranceSeconds)
+}
+
 function Update-BootUpdateStateForBootSession {
     param(
         [Parameter(Mandatory)][pscustomobject]$State,
         [Parameter(Mandatory)][string]$CurrentBootSessionId,
         [AllowNull()][object]$CurrentUptimeSeconds = $null,
-        [AllowNull()][string]$CurrentMonotonicBootId = $null,
+        [AllowNull()][object]$CurrentMonotonicBootId = $null,
         [int]$MonotonicToleranceSeconds = 15
     )
     $priorBootSessionId = ConvertTo-BootUpdateTimestampString -Value $State.LastBootSessionId
@@ -1622,14 +1656,8 @@ function Update-BootUpdateStateForBootSession {
        restart that the 120-second window would swallow. Additive only: it can add a detected
        reboot, never suppress the jitter protection the wider window provides. #>
     $priorMonotonic = if ($State.PSObject.Properties.Name -contains 'LastMonotonicBootId') { $State.LastMonotonicBootId } else { $null }
-    if ($CurrentMonotonicBootId -and $priorMonotonic) {
-        $priorInstant = [datetimeoffset]::MinValue
-        $currentInstant = [datetimeoffset]::MinValue
-        $styles = [System.Globalization.DateTimeStyles]::RoundtripKind
-        if ([datetimeoffset]::TryParse($priorMonotonic, [cultureinfo]::InvariantCulture, $styles, [ref]$priorInstant) -and
-            [datetimeoffset]::TryParse($CurrentMonotonicBootId, [cultureinfo]::InvariantCulture, $styles, [ref]$currentInstant)) {
-            if ([math]::Abs(($currentInstant - $priorInstant).TotalSeconds) -gt $MonotonicToleranceSeconds) { $sameSession = $false }
-        }
+    if (Test-BootUpdateMonotonicBootMoved -Prior $priorMonotonic -Current $CurrentMonotonicBootId -ToleranceSeconds $MonotonicToleranceSeconds) {
+        $sameSession = $false
     }
 
     if ($State.LastBootSessionId -and -not $sameSession) {
@@ -6638,19 +6666,10 @@ function Invoke-BootUpdateCycle {
     $priorMonotonicBootId = if ($state.PSObject.Properties.Name -contains 'LastMonotonicBootId') { $state.LastMonotonicBootId } else { $null }
     $state = Update-BootUpdateStateForBootSession -State $state -CurrentBootSessionId $currentBootSessionId `
         -CurrentUptimeSeconds $currentUptimeSeconds -CurrentMonotonicBootId $currentMonotonicBootId
-    <# Mirrors the detection inside Update-BootUpdateStateForBootSession, uptime signal
-       included. Re-testing the timestamps alone here would report a different number of
-       boots than the state actually counted, which is how a log comes to disagree with
-       the machine while staying internally consistent. #>
-    $monotonicMoved = $false
-    if ($priorMonotonicBootId -and $currentMonotonicBootId) {
-        $pi = [datetimeoffset]::MinValue; $ci = [datetimeoffset]::MinValue
-        $st = [System.Globalization.DateTimeStyles]::RoundtripKind
-        if ([datetimeoffset]::TryParse($priorMonotonicBootId, [cultureinfo]::InvariantCulture, $st, [ref]$pi) -and
-            [datetimeoffset]::TryParse($currentMonotonicBootId, [cultureinfo]::InvariantCulture, $st, [ref]$ci)) {
-            $monotonicMoved = [math]::Abs(($ci - $pi).TotalSeconds) -gt 15
-        }
-    }
+    <# Uses the same helper the state update uses, so the log cannot report a different
+       number of boots than the state actually counted - which is how a log comes to
+       disagree with the machine while staying internally consistent. #>
+    $monotonicMoved = Test-BootUpdateMonotonicBootMoved -Prior $priorMonotonicBootId -Current $currentMonotonicBootId
     $newBootObserved = $priorBootSessionId -and (
         (-not (Test-BootUpdateSameBootSession -Left $priorBootSessionId -Right $currentBootSessionId)) -or $monotonicMoved)
     if ($newBootObserved) {

@@ -29,6 +29,7 @@ BeforeAll {
     foreach ($functionName in @(
         'ConvertTo-BootUpdateTimestampString',
         'Test-BootUpdateSameBootSession',
+        'Test-BootUpdateMonotonicBootMoved',
         'Update-BootUpdateStateForBootSession',
         'Get-BootUpdateLaunchContract',
         'Test-PostUpdateHealth',
@@ -2836,5 +2837,88 @@ Describe 'Principal comparison accepts names and SIDs on either side' {
         ConvertTo-BootUpdatePrincipalSid -Value 'nosuchprincipal_zzq' | Should -BeNullOrEmpty
         ConvertTo-BootUpdatePrincipalSid -Value 'S-1-5-not-a-sid'     | Should -BeNullOrEmpty
         ConvertTo-BootUpdatePrincipalSid -Value ''                    | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Boot instant survives the state file' {
+    <# Regression cover for the row B unbounded retry loop. LastMonotonicBootId is persisted,
+       and ConvertFrom-Json rehydrates an ISO-8601 string as a [datetime]. Coercing that back
+       to text for a parse uses the current culture, which emits no offset, so a UTC instant is
+       read as local and the comparison picks up the machine's whole UTC offset instead of
+       seconds of jitter. Every same-boot pass then reads as a fresh boot, which zeroes
+       ConsecutiveRetryCount, so the same-boot recovery limit never fires and a permanently
+       applicable update retries forever. The lab guest ran 7 passes on 2 reboots and only
+       stopped when the harness timed out.
+
+       These assertions go through a real ConvertTo-Json/ConvertFrom-Json round-trip. The
+       earlier tests fed string literals straight in, which cannot see this class of defect at
+       all - the same reason the boot-session tolerance rule already demands round-trip
+       assertions. #>
+
+    BeforeEach {
+        $script:BootSessionToleranceSeconds = 120
+    }
+
+    It 'keeps one boot session across a round-trip when the machine is not on UTC' {
+        $boot = [datetime]::UtcNow.AddMinutes(-30)
+        $state = [pscustomobject]@{
+            LastBootSessionId      = $boot.ToString('o')
+            LastUptimeSeconds      = 1800
+            LastMonotonicBootId    = $boot.ToString('o')
+            RebootCount            = 1
+            ConsecutiveRetryCount  = 3
+            Phase                  = 'Running'
+            ExplicitRebootRequests = @()
+        }
+        # Exactly what the next pass reads back off disk.
+        $rehydrated = $state | ConvertTo-Json -Depth 6 | ConvertFrom-Json
+
+        $updated = Update-BootUpdateStateForBootSession -State $rehydrated `
+            -CurrentBootSessionId $boot.AddSeconds(2).ToString('o') `
+            -CurrentUptimeSeconds 2100 `
+            -CurrentMonotonicBootId $boot.AddSeconds(1).ToString('o')
+
+        $updated.ConsecutiveRetryCount |
+            Should -Be 3 -Because 'a same-boot recovery pass must not reset the retry budget'
+        $updated.RebootCount | Should -Be 1
+    }
+
+    It 'still catches a real fast reboot across a round-trip' {
+        <# The fix must not buy same-boot stability by going blind to fast restarts, which is
+           the defect the monotonic signal was added for in the first place. #>
+        $firstBoot  = [datetime]::UtcNow.AddMinutes(-3)
+        $secondBoot = $firstBoot.AddSeconds(81)
+        $state = [pscustomobject]@{
+            LastBootSessionId      = $firstBoot.ToString('o')
+            LastUptimeSeconds      = 40
+            LastMonotonicBootId    = $firstBoot.ToString('o')
+            RebootCount            = 1
+            ConsecutiveRetryCount  = 3
+            Phase                  = 'Rebooting'
+            ExplicitRebootRequests = @()
+        }
+        $rehydrated = $state | ConvertTo-Json -Depth 6 | ConvertFrom-Json
+
+        $updated = Update-BootUpdateStateForBootSession -State $rehydrated `
+            -CurrentBootSessionId $secondBoot.ToString('o') `
+            -CurrentUptimeSeconds 45 `
+            -CurrentMonotonicBootId $secondBoot.ToString('o')
+
+        $updated.RebootCount | Should -Be 2
+        $updated.ConsecutiveRetryCount | Should -Be 0 -Because 'a real boot does reset the budget'
+    }
+
+    It 'compares a rehydrated [datetime] against an ISO string without inventing an offset' {
+        <# The narrowest statement of the bug: the two sides arrive as different types, and the
+           helper must normalise both. A local-time [datetime] on an Eastern machine sat about
+           4-5 hours from the UTC string it was written from. #>
+        $boot = [datetime]::UtcNow.AddMinutes(-30)
+        $asDateTime = ([pscustomobject]@{ V = $boot.ToString('o') } | ConvertTo-Json | ConvertFrom-Json).V
+
+        Test-BootUpdateMonotonicBootMoved -Prior $asDateTime -Current $boot.AddSeconds(1).ToString('o') |
+            Should -BeFalse -Because 'one second of jitter is not a reboot, whatever the local offset is'
+
+        Test-BootUpdateMonotonicBootMoved -Prior $asDateTime -Current $boot.AddSeconds(81).ToString('o') |
+            Should -BeTrue -Because '81 seconds is a real restart'
     }
 }
