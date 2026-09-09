@@ -224,6 +224,82 @@ function Get-BootUpdateDiagnosticCleanupSummary {
     }
 }
 
+function Get-BootUpdateDiagnosticCleanupEvidence {
+    <# Derive pending-file cleanup state from the evidence sidecar the cycle now writes,
+       rather than from whether a human-readable log line happened to appear.
+
+       ADR-0004: absence of a record is not a record of absence. The log-parsing path below
+       cannot distinguish "probed, found nothing" from "never probed", "probed but the line
+       was suppressed as a duplicate" and "the phase did not run", and collapsed all four to
+       Persistent=null. The sidecar states each of them, so the manifest can too.
+
+       Returns $null when the text is not a usable sidecar, which is the caller's signal to
+       fall back to the legacy log path. #>
+    param([AllowNull()][string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+    $records = $null
+    try { $records = @($Text | ConvertFrom-Json) } catch { return $null }
+    $records = @($records | Where-Object { $_ -and $_.PSObject.Properties.Name -contains 'Observation' })
+    if (-not $records.Count) { return $null }
+
+    <# One session at a time. Records accumulate across passes and across runs, and mixing a
+       previous run's before-state with this run's after-state would manufacture a
+       comparison that never happened. #>
+    $sessionId = $records[-1].SessionId
+    $session = @($records | Where-Object { [string]$_.SessionId -eq [string]$sessionId })
+
+    $pick = {
+        param($Context)
+        @($session | Where-Object { [string]$_.Context -eq $Context }) | Select-Object -Last 1
+    }
+    $beforeRecord = & $pick 'before mutation'
+    $afterRecord  = & $pick 'after updates'
+
+    $shape = {
+        param($Record)
+        if (-not $Record) { return $null }
+        $categories = [ordered]@{}
+        if ($Record.Categories) {
+            foreach ($property in $Record.Categories.PSObject.Properties) { $categories[$property.Name] = [int]$property.Value }
+        }
+        [pscustomobject]@{
+            Categories   = [pscustomobject]$categories
+            Fingerprints = @($Record.Fingerprints)
+            Observation  = [string]$Record.Observation
+            Source       = [string]$Record.Source
+            Pass         = $Record.Pass
+        }
+    }
+
+    $signature = {
+        param($Record)
+        $categories = @()
+        if ($Record.Categories) {
+            $categories = @($Record.Categories.PSObject.Properties | Sort-Object Name | ForEach-Object { "$($_.Name)=$([int]$_.Value)" })
+        }
+        (($categories -join ',') + '|' + ((@($Record.Fingerprints) | Sort-Object) -join ','))
+    }
+
+    <# Persistent is a claim about two observations, so it stays null unless both ends were
+       actually observed. A skipped phase or an unprobed explicit-reboot path is not
+       evidence that nothing was pending. #>
+    $observed = @('observed-empty','observed-nonempty','suppressed-duplicate')
+    $persistent = $null
+    if ($beforeRecord -and $afterRecord -and
+        $observed -contains [string]$beforeRecord.Observation -and
+        $observed -contains [string]$afterRecord.Observation) {
+        $persistent = ((& $signature $beforeRecord) -eq (& $signature $afterRecord))
+    }
+
+    return [pscustomobject]@{
+        BeforeMutation      = & $shape $beforeRecord
+        AfterUpdates        = & $shape $afterRecord
+        Persistent          = $persistent
+        BeforeMutationState = if ($beforeRecord) { [string]$beforeRecord.Observation } else { 'not-probed' }
+        Source              = 'evidence-sidecar'
+        SessionId           = $sessionId
+    }
+}
 function Assert-BootUpdateDiagnosticIsSanitized {
     param([Parameter(Mandatory)][string]$Text,[string[]]$SensitiveValues = @())
     foreach ($value in $SensitiveValues) {
@@ -271,7 +347,7 @@ if (-not (Test-Path -LiteralPath $OutputDirectory)) {
 
 $sensitive = @(Get-BootUpdateSensitiveValues -Additional $AdditionalRedaction)
 $logs = @(Get-ChildItem -LiteralPath $SourceDirectory -File -ErrorAction Stop |
-    Where-Object { $_.Name -match '^BootUpdateCycle(?:\.(?:providers|aws))?(?:\.\d{8}-\d{6})?\.log$' -or $_.Name -in @('BootUpdateCycle-repair-plan.txt','BootUpdateCycle-winget-quarantine.json','BootUpdateCycle-winget-resolved-absent.json','BootUpdateCycle.wu-assessment.json') } |
+    Where-Object { $_.Name -match '^BootUpdateCycle(?:\.(?:providers|aws))?(?:\.\d{8}-\d{6})?\.log$' -or $_.Name -in @('BootUpdateCycle-repair-plan.txt','BootUpdateCycle-winget-quarantine.json','BootUpdateCycle-winget-resolved-absent.json','BootUpdateCycle.wu-assessment.json','BootUpdateCycle.pending-cleanup.json') } |
     Sort-Object LastWriteTimeUtc)
 if (-not $logs.Count) { throw 'No Boot Update Cycle log files were found to export.' }
 
@@ -286,6 +362,7 @@ try {
     $sourceRecords = [Collections.Generic.List[object]]::new()
     $warnings = [Collections.Generic.List[string]]::new()
     $coreText = $null
+    $cleanupEvidenceText = $null
     foreach ($log in $logs) {
         $snapshotPath = Join-Path $snapshotDirectory $log.Name
         $record = Copy-BootUpdateDiagnosticSnapshot -Source $log -Destination $snapshotPath
@@ -297,6 +374,7 @@ try {
         if ($decoded.Warning) { $warnings.Add($decoded.Warning) }
         $raw = $decoded.Text
         if ($log.Name -eq 'BootUpdateCycle.log') { $coreText = $raw }
+        if ($log.Name -eq 'BootUpdateCycle.pending-cleanup.json') { $cleanupEvidenceText = $raw }
         $safe = Protect-BootUpdateDiagnosticText -Text $raw -SensitiveValues $sensitive
         Assert-BootUpdateDiagnosticIsSanitized -Text $safe -SensitiveValues $sensitive
         $sections.Add("===== $($log.Name) =====`r`n$safe")
@@ -305,7 +383,21 @@ try {
     $activity = if ($currentRunText) { Get-BootUpdateDiagnosticActivity -Text $currentRunText } else {
         [pscustomobject]@{ ActiveAtCapture=$null; Phase=$null; Iteration=$null }
     }
-    $cleanupSummary = if ($currentRunText) { Get-BootUpdateDiagnosticCleanupSummary -Text $currentRunText } else { $null }
+    <# Prefer the evidence sidecar. Log parsing is retained solely for bundles captured
+       before the sidecar existed, and those now say so - unknown-legacy-log - instead of
+       reporting a bare null a reader would mistake for "observed nothing". #>
+    $cleanupSummary = Get-BootUpdateDiagnosticCleanupEvidence -Text $cleanupEvidenceText
+    if (-not $cleanupSummary) {
+        $legacy = if ($currentRunText) { Get-BootUpdateDiagnosticCleanupSummary -Text $currentRunText } else { $null }
+        $cleanupSummary = [pscustomobject]@{
+            BeforeMutation      = if ($legacy) { $legacy.BeforeMutation } else { $null }
+            AfterUpdates        = if ($legacy) { $legacy.AfterUpdates } else { $null }
+            Persistent          = if ($legacy) { $legacy.Persistent } else { $null }
+            BeforeMutationState = 'unknown-legacy-log'
+            Source              = 'log-parsing'
+            SessionId           = $null
+        }
+    }
     $snapshotComplete = @($sourceRecords | Where-Object { -not $_.Stable }).Count -eq 0
     $captureState = if (-not $snapshotComplete) { 'unstable-snapshot' } elseif ($activity.ActiveAtCapture -eq $true) { 'active-at-capture' } elseif ($activity.ActiveAtCapture -eq $false) { 'completed' } else { 'unknown' }
     $sanitizedPath = Join-Path $stage 'BootUpdateCycle.sanitized.log'

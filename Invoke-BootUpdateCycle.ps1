@@ -264,6 +264,14 @@ $script:InstallDir            = $PSScriptRoot
 $script:ProviderTranscriptPath = Join-Path $PSScriptRoot 'BootUpdateCycle.providers.log'
 $script:StatePath             = Join-Path $PSScriptRoot 'BootUpdateCycle.state.json'
 $script:WingetQuarantinePath  = Join-Path $PSScriptRoot 'BootUpdateCycle-winget-quarantine.json'
+<# Pending-file cleanup evidence. ADR-0004: absence of a record is not a record of absence.
+   This is on an EVIDENCE lifecycle, not a cache lifecycle - never TTL'd, never invalidated
+   on a fingerprint, never skipped under -WhatIf - because its whole purpose is to answer
+   "was this probed, and what did it see" later, from a diagnostics bundle. Modelled on
+   BootUpdateCycle-repair-plan.txt, deliberately NOT on BootUpdateCycle.wu-assessment.json,
+   which is a TTL'd cache: copying that lifecycle would reproduce the very gap this closes. #>
+$script:PendingCleanupEvidencePath = Join-Path $PSScriptRoot 'BootUpdateCycle.pending-cleanup.json'
+$script:PendingCleanupProbeIndex   = 0
 $script:WingetResolvedAbsentPath = Join-Path $PSScriptRoot 'BootUpdateCycle-winget-resolved-absent.json'
 $script:WindowsUpdateAssessmentPath = Join-Path $PSScriptRoot 'BootUpdateCycle.wu-assessment.json'
 $script:WindowsUpdateOnlineAssessmentTtlHours = 6
@@ -2550,16 +2558,86 @@ function Get-PendingFileCleanupDisplaySummary {
     }) -join ', '
 }
 
+function Add-BootUpdatePendingCleanupRecord {
+    <# Append one pending-file cleanup observation to the evidence sidecar.
+
+       The manifest used to derive this state from whether a log line appeared, and
+       Write-PendingFileRenameAdvisory declines to emit that line for four unrelated
+       reasons - empty advisory set, duplicate suppression, the phase not running, and the
+       explicit-reboot short-circuit - all of which collapsed to the same null. A completed,
+       converged run therefore reported Persistent=null when the truthful answer was false.
+
+       Records are appended per probe and keyed by session and pass, not overwritten,
+       because "did this fingerprint survive a restart" is only answerable across passes. #>
+    param(
+        [Parameter(Mandatory)][string]$Context,
+        [Parameter(Mandatory)]
+        [ValidateSet('observed-empty','observed-nonempty','suppressed-duplicate','not-probed','phase-skipped')]
+        [string]$Observation,
+        [AllowNull()][object[]]$Operations = @(),
+        [string]$Source = 'two-probe'
+    )
+    <# A caller with no evidence path configured records nothing rather than raising a
+       non-terminating error past this function's own catch. #>
+    if ([string]::IsNullOrWhiteSpace($script:PendingCleanupEvidencePath)) { return }
+    try {
+        $script:PendingCleanupProbeIndex++
+        $current = $script:CurrentState
+        $categories = [ordered]@{}
+        foreach ($group in @($Operations | Group-Object Category | Sort-Object Name)) {
+            $categories[$group.Name] = $group.Count
+        }
+        $record = [pscustomobject]@{
+            SessionId     = if ($current) { [string](ConvertTo-BootUpdateTimestampString -Value $current.StartTime) } else { $null }
+            Pass          = if ($current) { [int]$current.Iteration } else { $null }
+            ProbeIndex    = $script:PendingCleanupProbeIndex
+            Context       = $Context
+            Observation   = $Observation
+            Source        = $Source
+            ObservedAtUtc = [datetime]::UtcNow.ToString('o')
+            Categories    = [pscustomobject]$categories
+            Fingerprints  = @($Operations.Fingerprint | Sort-Object -Unique)
+        }
+        $existing = @()
+        if (Test-Path -LiteralPath $script:PendingCleanupEvidencePath) {
+            try {
+                $raw = Get-Content -LiteralPath $script:PendingCleanupEvidencePath -Raw -ErrorAction Stop
+                if (-not [string]::IsNullOrWhiteSpace($raw)) { $existing = @($raw | ConvertFrom-Json) }
+            } catch { $existing = @() }
+        }
+        $all = @($existing) + @($record)
+        <# Capped by count, never by age: an evidence artifact must not decide that old
+           evidence has expired. #>
+        if ($all.Count -gt 500) { $all = @($all[($all.Count - 500)..($all.Count - 1)]) }
+        $all | ConvertTo-Json -Depth 6 -AsArray | Set-Content -LiteralPath $script:PendingCleanupEvidencePath -Encoding UTF8
+    } catch {
+        <# Recording evidence must never be able to fail a run. A missing record reads as
+           unknown, which is exactly what the manifest is now able to say. #>
+    }
+}
+
 function Write-PendingFileRenameAdvisory {
     param(
         [AllowNull()][object[]]$Operations = @(),
-        [string]$Context = 'verification'
+        [string]$Context = 'verification',
+        <# Marks a record taken outside the ordinary two-probe confirmation, so a reader can
+           see it did not come from one. #>
+        [string]$Source = 'two-probe'
     )
     $advisory = @($Operations | Where-Object { -not $_.IsBlocking })
-    if (-not $advisory.Count) { return }
-
     $fingerprint = (($advisory.Fingerprint | Sort-Object -Unique) -join ',')
-    if ($script:LastPendingFileCleanupFingerprint -eq "$Context|$fingerprint") { return }
+    $duplicate = ($advisory.Count -gt 0 -and $script:LastPendingFileCleanupFingerprint -eq "$Context|$fingerprint")
+
+    <# Record first, and record every time. The duplicate guard below STAYS - suppressing a
+       repeated probe line in a human-readable log is legitimate - but it no longer decides
+       what is known, because the log is no longer the evidence. #>
+    $observation = if (-not $advisory.Count) { 'observed-empty' }
+                   elseif ($duplicate) { 'suppressed-duplicate' }
+                   else { 'observed-nonempty' }
+    Add-BootUpdatePendingCleanupRecord -Context $Context -Observation $observation -Operations $advisory -Source $Source
+
+    if (-not $advisory.Count) { return }
+    if ($duplicate) { return }
     $script:LastPendingFileCleanupFingerprint = "$Context|$fingerprint"
     $categories = @($advisory | Group-Object Category | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Count)" }) -join ', '
     Write-Log "Pending-file cleanup [$Context]: $categories. Routine delete-only housekeeping; no restart is required for update convergence." `
@@ -2567,6 +2645,22 @@ function Write-PendingFileRenameAdvisory {
     Write-Log "Pending-file cleanup detail [$Context]: id=$fingerprint" -Level Info -Visibility Debug
 }
 
+function Update-BootUpdatePendingFileRenameSnapshot {
+    <# Read Session Manager's PendingFileRenameOperations and assess them, refreshing the
+       script-scope snapshot the cleanup advisory reports from. Returns the assessed
+       operations.
+
+       Split out of Test-PendingReboot so the explicit-reboot path in
+       Get-ConfirmedPendingReboot can refresh the snapshot before it returns. That path
+       deliberately bypasses the settle-and-recheck wait, and must keep doing so; what it
+       must not keep doing is bypass the RECORDING, which is one registry read away. #>
+    $script:LastPendingFileRenameOperations = @()
+    $value = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name 'PendingFileRenameOperations' -EA Ignore
+    if ($value -and $value.PendingFileRenameOperations.Count -gt 0) {
+        $script:LastPendingFileRenameOperations = @(Get-PendingFileRenameOperations -Entries @($value.PendingFileRenameOperations))
+    }
+    return @($script:LastPendingFileRenameOperations)
+}
 function Test-PendingReboot {
     <# Comprehensive pending-reboot detection based on Boxstarter/Brian Wilhite's
        Get-PendingReboot approach.  Checks every OS-level signal that a reboot is
@@ -2601,11 +2695,8 @@ function Test-PendingReboot {
             try { $null = [Runtime.InteropServices.Marshal]::FinalReleaseComObject($wuaSystemInfo) } catch { }
         }
     }
-    $script:LastPendingFileRenameOperations = @()
-    $val = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name 'PendingFileRenameOperations' -EA Ignore
-    if ($val -and $val.PendingFileRenameOperations.Count -gt 0) {
-        $assessedOperations = @(Get-PendingFileRenameOperations -Entries @($val.PendingFileRenameOperations))
-        $script:LastPendingFileRenameOperations = $assessedOperations
+    $assessedOperations = @(Update-BootUpdatePendingFileRenameSnapshot)
+    if ($assessedOperations.Count -gt 0) {
         $operations = @($assessedOperations | Where-Object IsBlocking)
         if ($operations.Count -gt 0) {
             $sample = @($operations | Select-Object -First 3 | ForEach-Object {
@@ -2641,6 +2732,15 @@ function Get-ConfirmedPendingReboot {
        Explicit 3010/1641 evidence is durable for the process and bypasses the wait. #>
     param([string]$Context = 'verification')
     if ($script:ExplicitRebootRequests.Count -gt 0) {
+        <# The short-circuit itself is correct and stays: explicit 3010/1641 evidence is
+           durable for the process, so this path must not pay for two probes plus a
+           20-second settle. The defect was that bypassing the WAIT also bypassed the
+           RECORDING - and it did so precisely when real servicing had just happened, which
+           is when the pending-file evidence is most worth having. One registry read
+           refreshes the snapshot; no settle wait is introduced. The record is marked
+           explicit-reboot so a reader can see it did not come from a full confirmation. #>
+        Write-PendingFileRenameAdvisory -Operations (Update-BootUpdatePendingFileRenameSnapshot) `
+            -Context $Context -Source 'explicit-reboot'
         return @($script:ExplicitRebootRequests)
     }
 
@@ -7580,7 +7680,12 @@ function Invoke-BootUpdateCycle {
 
     <# ---- Post-update reboot decision ---- #>
     <# In WhatIf mode, always report clean — no reboot or task registration ever happens #>
-    $pending = if ($WhatIfPreference) { @() } else { Get-ConfirmedPendingReboot -Context 'after updates' }
+    $pending = if ($WhatIfPreference) {
+        <# -WhatIf skips the probe, which is correct, but the manifest must not read that as
+           "probed and found nothing". Evidence artifacts are written under -WhatIf. #>
+        Add-BootUpdatePendingCleanupRecord -Context 'after updates' -Observation 'phase-skipped' -Source 'whatif'
+        @()
+    } else { Get-ConfirmedPendingReboot -Context 'after updates' }
     if ($pending) {
         Write-Log 'Pending reboot after updates: YES' -Level Warn
         $pending | ForEach-Object { Write-Log "  - $($_.Source): $($_.Detail)" -Level Warn }

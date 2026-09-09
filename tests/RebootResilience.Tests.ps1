@@ -64,6 +64,9 @@ BeforeAll {
           'Get-BootUpdateUptimeSeconds',
           'Get-BootUpdateMonotonicBootId',
           'Test-CrashRecovery',
+          'Add-BootUpdatePendingCleanupRecord',
+          'Update-BootUpdatePendingFileRenameSnapshot',
+          'Get-ConfirmedPendingReboot',
           'New-BootUpdateStateV2',
           'Update-BootUpdateStateSchema',
           'Update-BootUpdateResumeIdentity',
@@ -936,8 +939,12 @@ Describe 'Delayed and explicit reboot evidence' {
     }
 
     It 'uses confirmed reboot evidence for the final decision' {
-        (Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle') |
-            Should -Match '\$pending = if \(\$WhatIfPreference\) \{ @\(\) \} else \{ Get-ConfirmedPendingReboot -Context ''after updates'' \}'
+        $text = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
+        $text | Should -Match '\$pending = if \(\$WhatIfPreference\) \{'
+        $text | Should -Match '\} else \{ Get-ConfirmedPendingReboot -Context ''after updates'' \}'
+        <# -WhatIf must still skip the probe, and must now say that it skipped it rather
+           than leaving the manifest to read the silence as "found nothing" (-h2z0). #>
+        $text | Should -Match "Add-BootUpdatePendingCleanupRecord -Context 'after updates' -Observation 'phase-skipped'"
     }
 
     It 'also requires two clean probes before the first mutating phase' {
@@ -3154,5 +3161,166 @@ Describe 'A withheld phase is not reported as a crash' {
         $state.WindowsUpdateDone = $true
         Test-CrashRecovery -State $state | Should -BeFalse
         $script:CrashLog.Count | Should -Be 0
+    }
+}
+
+Describe 'Every pending-file cleanup probe is recorded, whatever the log does' {
+    <# -h2z0. Write-PendingFileRenameAdvisory declines to emit its log line for four
+       unrelated reasons and the manifest read all four as the same null. The log line is
+       still suppressed where suppression is right; what changed is that the record is
+       written first and unconditionally, because the log is no longer the evidence. #>
+
+    BeforeAll {
+        $script:PendingCleanupEvidencePath = Join-Path ([IO.Path]::GetTempPath()) ("pending-cleanup-{0}.json" -f [guid]::NewGuid().ToString('N'))
+        $script:PendingCleanupProbeIndex = 0
+        $script:CurrentState = [pscustomobject]@{ StartTime = '2026-09-09T08:00:00.0000000Z'; Iteration = 2 }
+        $script:LastPendingFileCleanupFingerprint = $null
+
+        function Get-CleanupRecords {
+            if (-not (Test-Path -LiteralPath $script:PendingCleanupEvidencePath)) { return @() }
+            @(Get-Content -LiteralPath $script:PendingCleanupEvidencePath -Raw | ConvertFrom-Json)
+        }
+        function New-AdvisoryOperation {
+            param([string]$Category = 'ApplicationCleanup', [string]$Fingerprint = 'AAAA1111BBBB')
+            [pscustomobject]@{ IsBlocking = $false; Category = $Category; Fingerprint = $Fingerprint }
+        }
+    }
+
+    BeforeEach {
+        Remove-Item -LiteralPath $script:PendingCleanupEvidencePath -Force -ErrorAction SilentlyContinue
+        $script:LastPendingFileCleanupFingerprint = $null
+    }
+
+    AfterAll { Remove-Item -LiteralPath $script:PendingCleanupEvidencePath -Force -ErrorAction SilentlyContinue }
+
+    It 'records an empty advisory set as observed-empty instead of saying nothing' {
+        Write-PendingFileRenameAdvisory -Operations @() -Context 'before mutation'
+        $records = Get-CleanupRecords
+        $records.Count | Should -Be 1
+        $records[-1].Observation | Should -Be 'observed-empty'
+        $records[-1].Context     | Should -Be 'before mutation'
+    }
+
+    It 'records a repeat probe as suppressed-duplicate while still suppressing the log line' {
+        $ops = @(New-AdvisoryOperation)
+        Write-PendingFileRenameAdvisory -Operations $ops -Context 'before mutation'
+        Write-PendingFileRenameAdvisory -Operations $ops -Context 'before mutation'
+        $records = Get-CleanupRecords
+        $records.Count | Should -Be 2 -Because 'Get-ConfirmedPendingReboot probes twice on purpose'
+        $records[0].Observation | Should -Be 'observed-nonempty'
+        $records[1].Observation | Should -Be 'suppressed-duplicate'
+        $records[1].Fingerprints | Should -Contain 'AAAA1111BBBB' -Because 'a suppressed record still has to carry what it saw'
+    }
+
+    It 'keeps the observation content so a later comparison is possible' {
+        Write-PendingFileRenameAdvisory -Operations @(New-AdvisoryOperation) -Context 'after updates'
+        $record = (Get-CleanupRecords)[-1]
+        $record.Categories.ApplicationCleanup | Should -Be 1
+        $record.Pass       | Should -Be 2
+        <# ConvertFrom-Json rehydrates an ISO-8601 value as [datetime], so the session key
+           has to be normalised before it is compared - the trap this repo has been bitten
+           by before with LastBootSessionId. #>
+        ConvertTo-BootUpdateTimestampString -Value $record.SessionId | Should -Be '2026-09-09T08:00:00.0000000Z'
+        $record.Source     | Should -Be 'two-probe'
+        $record.ProbeIndex | Should -BeGreaterThan 0
+    }
+
+    It 'ignores blocking operations, which are not cleanup advisories' {
+        Write-PendingFileRenameAdvisory -Context 'before mutation' -Operations @(
+            [pscustomobject]@{ IsBlocking = $true; Category = 'RealRename'; Fingerprint = 'CCCC2222DDDD' }
+        )
+        (Get-CleanupRecords)[-1].Observation | Should -Be 'observed-empty'
+    }
+
+    It 'appends across passes rather than overwriting the previous observation' {
+        Write-PendingFileRenameAdvisory -Operations @() -Context 'before mutation'
+        $script:CurrentState.Iteration = 3
+        Write-PendingFileRenameAdvisory -Operations @(New-AdvisoryOperation) -Context 'after updates'
+        $records = Get-CleanupRecords
+        $records.Count | Should -Be 2
+        @($records.Pass) | Should -Be @(2,3) -Because 'whether a fingerprint survived a restart is only answerable across passes'
+        $script:CurrentState.Iteration = 2
+    }
+
+    It 'never lets a recording failure break the run' {
+        $saved = $script:PendingCleanupEvidencePath
+        try {
+            $script:PendingCleanupEvidencePath = 'Z:\no-such-volume\pending-cleanup.json'
+            { Write-PendingFileRenameAdvisory -Operations @() -Context 'before mutation' } | Should -Not -Throw
+        } finally { $script:PendingCleanupEvidencePath = $saved }
+    }
+}
+
+Describe 'An explicit 3010 records pending-file state instead of skipping it' {
+    <# -qibm. Get-ConfirmedPendingReboot returns early on an explicit 3010/1641 request,
+       before Test-PendingReboot and before the cleanup advisory. That short-circuit is
+       correct - the evidence is durable for the process and must not pay for two probes and
+       a 20-second settle - but it also skipped the RECORDING, and it fires precisely when
+       real servicing has just happened, which is when the pending-file evidence is most
+       worth capturing. A reboot was about to occur and the bundle said nothing about what
+       was queued to be deleted across it. #>
+
+    BeforeAll {
+        $script:PendingCleanupEvidencePath = Join-Path ([IO.Path]::GetTempPath()) ("qibm-cleanup-{0}.json" -f [guid]::NewGuid().ToString('N'))
+        $script:PendingCleanupProbeIndex = 0
+        $script:CurrentState = [pscustomobject]@{ StartTime = '2026-09-09T09:00:00.0000000Z'; Iteration = 4 }
+        $script:RebootSignalSettleSeconds = 20
+
+        function Get-CleanupRecords {
+            if (-not (Test-Path -LiteralPath $script:PendingCleanupEvidencePath)) { return @() }
+            @(Get-Content -LiteralPath $script:PendingCleanupEvidencePath -Raw | ConvertFrom-Json)
+        }
+    }
+
+    BeforeEach {
+        Remove-Item -LiteralPath $script:PendingCleanupEvidencePath -Force -ErrorAction SilentlyContinue
+        $script:LastPendingFileCleanupFingerprint = $null
+        $script:LastPendingFileRenameOperations = @()
+        $script:ExplicitRebootRequests = [System.Collections.Generic.List[object]]::new()
+        $script:SettleWaits = 0
+        $script:ProbeCount = 0
+        function Wait-BootUpdateUiInterval { param($Seconds,$Activity,$Status,$PercentComplete) $script:SettleWaits++ }
+        function Test-PendingReboot { $script:ProbeCount++; @() }
+        function Update-BootUpdatePendingFileRenameSnapshot {
+            $script:LastPendingFileRenameOperations = @(
+                [pscustomobject]@{ IsBlocking = $false; Category = 'ApplicationCleanup'; Fingerprint = 'EEEE3333FFFF' }
+            )
+            return @($script:LastPendingFileRenameOperations)
+        }
+    }
+
+    AfterAll { Remove-Item -LiteralPath $script:PendingCleanupEvidencePath -Force -ErrorAction SilentlyContinue }
+
+    It 'records what was queued for deletion before returning the explicit request' {
+        $script:ExplicitRebootRequests.Add([pscustomobject]@{ Source = 'Chocolatey'; Detail = 'exit 3010' })
+
+        $result = @(Get-ConfirmedPendingReboot -Context 'before mutation')
+
+        $result.Count | Should -Be 1
+        $result[0].Source | Should -Be 'Chocolatey' -Because 'the short-circuit itself must be unchanged'
+        $records = Get-CleanupRecords
+        $records.Count | Should -Be 1
+        $records[-1].Observation | Should -Be 'observed-nonempty' -Because 'not-probed was the whole complaint'
+        $records[-1].Context     | Should -Be 'before mutation'
+        $records[-1].Fingerprints | Should -Contain 'EEEE3333FFFF'
+    }
+
+    It 'marks the record as taken on the explicit-reboot path' {
+        $script:ExplicitRebootRequests.Add([pscustomobject]@{ Source = 'Winget'; Detail = 'exit 1641' })
+        $null = Get-ConfirmedPendingReboot -Context 'after updates'
+        (Get-CleanupRecords)[-1].Source | Should -Be 'explicit-reboot' -Because 'a reader must be able to tell this from a full two-probe confirmation'
+    }
+
+    It 'introduces no settle wait and no second pending-reboot probe on that path' {
+        $script:ExplicitRebootRequests.Add([pscustomobject]@{ Source = 'Chocolatey'; Detail = 'exit 3010' })
+        $null = Get-ConfirmedPendingReboot -Context 'after updates'
+        $script:SettleWaits | Should -Be 0 -Because 'explicit 3010/1641 evidence is durable and must not pay for the wait'
+        $script:ProbeCount  | Should -Be 0 -Because 'the bypass of the two-probe confirmation is the behaviour being preserved'
+    }
+
+    It 'still runs the ordinary two-probe confirmation when no explicit request exists' {
+        $null = Get-ConfirmedPendingReboot -Context 'after updates'
+        $script:ProbeCount  | Should -Be 2
+        $script:SettleWaits | Should -Be 1
     }
 }

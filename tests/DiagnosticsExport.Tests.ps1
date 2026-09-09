@@ -14,7 +14,7 @@ BeforeAll {
         $function | Should -Not -BeNullOrEmpty
         return $function.Extent.Text
     }
-    foreach ($name in @('Protect-BootUpdateDiagnosticText','Assert-BootUpdateDiagnosticIsSanitized','Read-BootUpdateDiagnosticText','Copy-BootUpdateDiagnosticSnapshot','Get-BootUpdateDiagnosticActivity','Get-BootUpdateDiagnosticCurrentRunText','Get-BootUpdateDiagnosticCleanupSummary')) {
+    foreach ($name in @('Protect-BootUpdateDiagnosticText','Assert-BootUpdateDiagnosticIsSanitized','Read-BootUpdateDiagnosticText','Copy-BootUpdateDiagnosticSnapshot','Get-BootUpdateDiagnosticActivity','Get-BootUpdateDiagnosticCurrentRunText','Get-BootUpdateDiagnosticCleanupSummary','Get-BootUpdateDiagnosticCleanupEvidence')) {
         . ([scriptblock]::Create((Get-FunctionText -Ast $exportAst -Name $name)))
     }
     foreach ($name in @('Enable-BootUpdateNtfsCompression','Invoke-BootUpdateLogRotation')) {
@@ -275,5 +275,110 @@ Describe 'Bounded compressed log lifecycle' {
         $compression | Should -Match 'catch'
         $rotation | Should -Match 'Enable-BootUpdateNtfsCompression -Path \$Path'
         $rotation | Should -Match 'Enable-BootUpdateNtfsCompression -Path \$archivePath'
+    }
+}
+
+Describe 'Pending-file cleanup is read from evidence, not from the absence of a log line' {
+    <# -h2z0. Bundle 20260825-130554Z, a completed and converged run, reported
+       PendingFileCleanup.BeforeMutation=null and Persistent=null. The truthful answer was
+       Persistent=false: the two ApplicationCleanup entries were created by that cycle's own
+       Chocolatey upgrade and cleared on the next reboot. The manifest could not say so
+       because it inferred the before-state from whether one log line appeared, and the
+       cycle declines to emit that line for four unrelated reasons. #>
+
+    BeforeAll {
+        function New-CleanupRecord {
+            param(
+                [string]$Context,
+                [string]$Observation,
+                [hashtable]$Categories = @{},
+                [string[]]$Fingerprints = @(),
+                [string]$SessionId = '2026-08-25T08:20:56.0000000Z',
+                [int]$Pass = 1,
+                [string]$Source = 'two-probe'
+            )
+            [pscustomobject]@{
+                SessionId     = $SessionId
+                Pass          = $Pass
+                ProbeIndex    = 1
+                Context       = $Context
+                Observation   = $Observation
+                Source        = $Source
+                ObservedAtUtc = '2026-08-25T08:21:00.0000000Z'
+                Categories    = [pscustomobject]$Categories
+                Fingerprints  = @($Fingerprints)
+            }
+        }
+        function ConvertTo-SidecarText { param([object[]]$Records) @($Records) | ConvertTo-Json -Depth 6 -AsArray }
+    }
+
+    It 'reports Persistent false for the observed-empty before-state that used to read null' {
+        $text = ConvertTo-SidecarText @(
+            (New-CleanupRecord -Context 'before mutation' -Observation 'observed-empty'),
+            (New-CleanupRecord -Context 'after updates'   -Observation 'observed-nonempty' `
+                -Categories @{ ApplicationCleanup = 2 } -Fingerprints @('5F8FDB30BE01','8956A7C22992'))
+        )
+        $summary = Get-BootUpdateDiagnosticCleanupEvidence -Text $text
+        $summary.BeforeMutationState | Should -Be 'observed-empty'
+        $summary.Persistent | Should -BeOfType [bool]
+        $summary.Persistent | Should -BeFalse -Because 'new, self-inflicted and cleared on reboot is a different story from unknown'
+        $summary.AfterUpdates.Categories.ApplicationCleanup | Should -Be 2
+    }
+
+    It 'reports Persistent true when the same fingerprints survive the whole run' {
+        $text = ConvertTo-SidecarText @(
+            (New-CleanupRecord -Context 'before mutation' -Observation 'observed-nonempty' -Categories @{ ApplicationCleanup = 1 } -Fingerprints @('AAAA1111BBBB')),
+            (New-CleanupRecord -Context 'after updates'   -Observation 'observed-nonempty' -Categories @{ ApplicationCleanup = 1 } -Fingerprints @('AAAA1111BBBB'))
+        )
+        (Get-BootUpdateDiagnosticCleanupEvidence -Text $text).Persistent | Should -BeTrue
+    }
+
+    It 'says a suppressed duplicate was suppressed, and still compares it' {
+        <# The duplicate guard stays in the log, but it no longer decides what is known. #>
+        $text = ConvertTo-SidecarText @(
+            (New-CleanupRecord -Context 'before mutation' -Observation 'suppressed-duplicate' -Categories @{ ApplicationCleanup = 1 } -Fingerprints @('AAAA1111BBBB')),
+            (New-CleanupRecord -Context 'after updates'   -Observation 'observed-nonempty'    -Categories @{ ApplicationCleanup = 1 } -Fingerprints @('AAAA1111BBBB'))
+        )
+        $summary = Get-BootUpdateDiagnosticCleanupEvidence -Text $text
+        $summary.BeforeMutationState | Should -Be 'suppressed-duplicate'
+        $summary.Persistent | Should -BeTrue
+    }
+
+    It 'refuses to compare against a phase that never ran' {
+        $text = ConvertTo-SidecarText @(
+            (New-CleanupRecord -Context 'before mutation' -Observation 'observed-nonempty' -Categories @{ ApplicationCleanup = 1 } -Fingerprints @('AAAA1111BBBB')),
+            (New-CleanupRecord -Context 'after updates'   -Observation 'phase-skipped' -Source 'whatif')
+        )
+        $summary = Get-BootUpdateDiagnosticCleanupEvidence -Text $text
+        $summary.BeforeMutationState | Should -Be 'observed-nonempty'
+        $summary.Persistent | Should -BeNullOrEmpty -Because 'a skipped phase is not evidence that nothing was pending'
+        $summary.AfterUpdates.Observation | Should -Be 'phase-skipped'
+    }
+
+    It 'reports not-probed when the sidecar exists but never recorded a before-state' {
+        $text = ConvertTo-SidecarText @(
+            (New-CleanupRecord -Context 'after updates' -Observation 'observed-empty')
+        )
+        $summary = Get-BootUpdateDiagnosticCleanupEvidence -Text $text
+        $summary.BeforeMutationState | Should -Be 'not-probed'
+        $summary.Persistent | Should -BeNullOrEmpty
+    }
+
+    It 'never mixes one run session with another' {
+        $text = ConvertTo-SidecarText @(
+            (New-CleanupRecord -Context 'before mutation' -Observation 'observed-nonempty' -SessionId 'older-session' -Categories @{ ApplicationCleanup = 9 } -Fingerprints @('DEADBEEF0001')),
+            (New-CleanupRecord -Context 'before mutation' -Observation 'observed-empty'    -SessionId 'current-session'),
+            (New-CleanupRecord -Context 'after updates'   -Observation 'observed-empty'    -SessionId 'current-session')
+        )
+        $summary = Get-BootUpdateDiagnosticCleanupEvidence -Text $text
+        $summary.SessionId | Should -Be 'current-session'
+        $summary.BeforeMutationState | Should -Be 'observed-empty'
+        $summary.Persistent | Should -BeTrue
+    }
+
+    It 'falls back to log parsing for a bundle that predates the sidecar, and labels it' {
+        Get-BootUpdateDiagnosticCleanupEvidence -Text $null   | Should -BeNullOrEmpty
+        Get-BootUpdateDiagnosticCleanupEvidence -Text 'not json at all' | Should -BeNullOrEmpty
+        Get-BootUpdateDiagnosticCleanupEvidence -Text '[]'    | Should -BeNullOrEmpty -Because 'an empty array carries no observation to report'
     }
 }
