@@ -3581,14 +3581,46 @@ Describe 'An update the machine says it installed and offers again is inventory,
         }
     }
 
-    It 'does not count a success from a previous boot' {
-        <# The claim is that the machine installed it and re-offered it WITHIN this boot. A
-           success from before the last restart proves nothing about the current one, and
-           accepting it would let a stale record suppress real work forever. #>
+    It 'does not count a success from before the window' {
+        <# A success from before the run began proves nothing about it, and accepting one
+           would let a stale record suppress real work indefinitely. #>
         $records = @(Get-WindowsUpdateReofferedAfterSuccess -Applicable @($script:Kb5007651) `
             -History @((New-HistoryEntry -Title $script:Kb5007651 -At $script:Boot.AddMinutes(-20))) `
             -SinceUtc $script:Boot)
         $records.Count | Should -Be 0
+    }
+
+    It 'counts a success from an earlier boot of the same run' {
+        <# The defect lab row B found on the second guest. The update installs successfully,
+           the cycle reboots for an unrelated pending signal, and the final scan in the next
+           boot re-offers it. Under a boot-scoped window there is no success "since this boot",
+           so the re-offer read as outstanding work and the cycle withheld, retried, rebooted
+           and looped - six passes, no convergence, 45-minute timeout. The first guest
+           converged only because its installs and its final scan happened to land in the same
+           boot. The window has to be the run. #>
+        $runStart   = $script:Boot.AddMinutes(-30)
+        $installedBeforeTheReboot = $script:Boot.AddMinutes(-10)
+
+        @(Get-WindowsUpdateReofferedAfterSuccess -Applicable @($script:Kb5007651) `
+            -History @((New-HistoryEntry -Title $script:Kb5007651 -At $installedBeforeTheReboot)) `
+            -SinceUtc $script:Boot).Count |
+            Should -Be 0 -Because 'this is what the boot-scoped window saw, and why the row looped'
+
+        $records = @(Get-WindowsUpdateReofferedAfterSuccess -Applicable @($script:Kb5007651) `
+            -History @((New-HistoryEntry -Title $script:Kb5007651 -At $installedBeforeTheReboot)) `
+            -SinceUtc $runStart)
+        $records.Count | Should -Be 1
+        $records[0].KB | Should -Be 'KB5007651'
+    }
+
+    It 'takes the window from the run, falling back to the boot instant when there is no run' {
+        <# Pinned at the call site: the caller chooses the window, and choosing the boot
+           instant is what broke it. The fallback is stricter than the run, never looser. #>
+        $text = Get-FunctionText $invokeAst 'Test-WindowsUpdateConvergence'
+        $text | Should -Match '-SinceUtc \$sessionStart'
+        $text | Should -Match '\$script:CurrentState\.StartTime'
+        $text | Should -Match 'ConvertTo-BootUpdateTimestampString -Value \$script:CurrentState\.StartTime'
+        $text | Should -Not -Match '-SinceUtc \$bootInstant'
     }
 
     It 'treats an Unspecified-kind history date as the UTC it already is' {

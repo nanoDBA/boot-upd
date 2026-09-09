@@ -4456,7 +4456,7 @@ function Get-WindowsUpdateInstallHistory {
 
 function Get-WindowsUpdateReofferedAfterSuccess {
     <# Which of the updates still applicable at the end of a pass were already installed
-       SUCCESSFULLY in this same boot?
+       SUCCESSFULLY during this run?
 
        KB5007651, the Windows Security platform update, does this on the lab image and on
        real machines: it installs, the platform genuinely advances - observed
@@ -4473,7 +4473,10 @@ function Get-WindowsUpdateReofferedAfterSuccess {
 
        Only result code 2 (succeeded) qualifies. A failed or partially failed install is a
        real failure and stays retryable - that distinction is the whole point of reading the
-       result code instead of a log line.
+       result code instead of a log line. The WINDOW is the caller's to choose, and it passes
+       the run's start rather than the boot instant: a cycle reboots between an install and
+       the final scan as a matter of course, and a boot-scoped window loses the evidence
+       across exactly the restart the classification exists to stop repeating.
 
        Pure: the caller supplies the history and the boot instant, so this is testable
        without a Windows Update agent. #>
@@ -4577,10 +4580,32 @@ function Test-WindowsUpdateConvergence {
     $reoffered = @()
     if ($verified -and $updates.Count -gt 0) {
         $titles = @($updates | ForEach-Object { ($_ -split '\|', 4)[3] })
-        $bootInstant = try { (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime.ToUniversalTime() }
-                       catch { [datetime]::MinValue }
+        <# The window is THIS RUN, not this boot.
+
+           It was the boot instant, and lab row B on the second guest showed why that is
+           wrong: the update installs successfully in one boot, the cycle reboots for an
+           unrelated pending signal, and the final scan in the next boot re-offers it. There
+           is no success "since this boot" any more, so the re-offer read as outstanding work,
+           the pass withheld, retried, rebooted, and the loop the classification exists to
+           break came straight back - six passes, no convergence, 45-minute timeout. The
+           first guest converged only because its installs and its final scan happened to land
+           in the same boot.
+
+           The run's own start is the honest bound: it still refuses a success from a previous
+           run, which is what the boot instant was protecting against, while spanning the
+           reboots that are a normal part of one cycle. It falls back to the boot instant when
+           there is no session to ask, which is stricter, not looser. #>
+        $sessionStart = $null
+        if ($script:CurrentState -and $script:CurrentState.StartTime) {
+            $normalised = ConvertTo-BootUpdateTimestampString -Value $script:CurrentState.StartTime
+            try { $sessionStart = ([datetime]::Parse($normalised, $null, [System.Globalization.DateTimeStyles]::RoundtripKind)).ToUniversalTime() } catch { $sessionStart = $null }
+        }
+        if (-not $sessionStart) {
+            $sessionStart = try { (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime.ToUniversalTime() }
+                            catch { [datetime]::MinValue }
+        }
         $reoffered = @(Get-WindowsUpdateReofferedAfterSuccess -Applicable $titles `
-            -History (Get-WindowsUpdateInstallHistory) -SinceUtc $bootInstant)
+            -History (Get-WindowsUpdateInstallHistory) -SinceUtc $sessionStart)
     }
     $unexplained = $updates.Count - $reoffered.Count
     return [pscustomobject]@{
