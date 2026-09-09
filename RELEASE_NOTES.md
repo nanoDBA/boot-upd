@@ -1,11 +1,30 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.77
-**Release Date:** 2026-09-08
+**Current Version:** v2.5.78
+**Release Date:** 2026-09-09
 **Status:** STABLE
 
 ---
 
+## v2.5.78 (2026-09-09)
+
+Headless-servicing release. v2.5.77 shipped the lab that found its own defects; running that lab against a machine nobody signs into found four more, and one of them was introduced by v2.5.77 itself.
+
+Microsoft documents a machine with no signed-in user as the *unblocked* servicing path. The updater could not converge there at all. Every fix below is on that path.
+
+### Fixed
+
+- **A same-boot recovery pass reset the retry budget, so a permanently applicable update retried forever.** The monotonic boot instant v2.5.77 added is persisted, and `ConvertFrom-Json` rehydrates an ISO-8601 string as a `[datetime]`; coercing that back to text for the comparison uses the current culture, which emits no offset, so a UTC instant parses as local and the delta picks up the machine's entire UTC offset rather than the seconds of jitter the tolerance was sized for. Measured on an Eastern host: **14,398 seconds of phantom skew where the true delta was 1 second**. Every same-boot pass therefore read as a fresh boot, which zeroes `ConsecutiveRetryCount`, so the same-boot recovery limit never fired. Lab row B ran seven passes across two real reboots and stopped only when the harness timed out. This is the defect class the boot-session rule already documents; it recurred because a second persisted timestamp was added without routing it through `ConvertTo-BootUpdateTimestampString`. The comparison now lives in one helper that normalises both sides and types neither as `[string]`, so the two call sites cannot drift apart again. The reboot count stayed truthful only by luck - its increment is gated on the phase being `Rebooting`, which these retries were not.
+- **The wait for an interactive user was unbounded, so a machine nobody signs into could never finish.** User-scope work legitimately defers until a user context exists; with no user ever appearing, that condition never cleared. The wait is now bounded by `-MaxUserIdentityWaits` (default 10). On exhaustion the outstanding user-scope work becomes *deferred inventory*, which produces a **qualified** convergence claim rather than an unqualified one. A headless machine now reaches a terminal state and says truthfully what it could not do.
+- **The resume account preferred a name over the SID sitting next to it.** `LastLoggedOnSAMUser` returns the `.\name` form, which `LookupAccountName` cannot map (`ERROR_NONE_MAPPED`). `LastLoggedOnUserSID` is recorded beside it and is unambiguous, so it is now preferred; it also covers the `AzureAD\` and `MicrosoftAccount\` forms that no string expansion would fix.
+- **Resume-chain verification compared a SID against a name and failed.** A direct regression from the fix above: with the expected principal now a SID, `[NTAccount]::Translate` throws on SID input and the fallback compared a leaf name against a full SID. The cycle registered both tasks and then killed itself one line later - indistinguishable from the original no-user death it was meant to fix. Both sides are now normalised to SIDs before comparison, and the failure message quotes both values.
+- **Pre-flight warned about a healthy Windows Update service.** A `Stopped` `wuauserv` was reported as a problem. It is demand-start: stopped is the normal resting state of essentially every idle Windows machine, and the WU COM client starts it on the first method call. Only `Disabled` is a warning now; the resting state is logged as normal.
+
+### Corrections to v2.5.77's notes
+
+- v2.5.77 attributed row B's failure to converge to `wuauserv` being stopped on the guest image, framed as an environmental artefact. **That was wrong.** A stopped `wuauserv` is the documented, normal resting state, not a broken image, and the updater started it on demand in every subsequent run. Row B did not converge because of defects in the updater: the unbounded user wait and the retry-budget reset above.
+- v2.5.77 reported multi-reboot convergence as "four of seven rows". Those seven rows are this project's own decomposition of the gate, not a bar `docs/TESTING.md` sets - the gate is defined there as reported, not blocking, and states no completion criterion. "Four of seven" reads as a score against an external standard, and should not have.
+- v2.5.77's README framed the `Microsoft-Windows-International-Core` requirement in the `oobeSystem` pass as a discovery. It is documented: Microsoft describes the `-WinPE` variant as applying only in the `windowsPE` pass and directs you to the non-WinPE component for `oobeSystem`.
 ## v2.5.77 (2026-09-08)
 
 Multi-reboot gate release. The gate defined in `docs/TESTING.md` was executed on a disposable VM lab for the first time, and it found two P1 defects that every prior release shipped with, including v2.5.76. Neither was visible to the unit suite.
@@ -41,6 +60,8 @@ Multi-reboot convergence was executed for the first time, on Windows 11 Enterpri
 
 - **Row A**, two or more real reboots with interactive-user continuation: **PASS.** Four passes across three real reboots; the claimed reboot count equals the OS boot record; both continuation tasks removed; no state file left.
 - **Row B**, SYSTEM-fallback continuation with no user logged on: **PARTIAL.** The mechanism is verified — tasks register, the cycle resumed across four real reboots as SYSTEM with nobody signed in, and user-scope work was deferred rather than claimed. It did not reach a completion claim, because `wuauserv` is stopped on the guest image and the Windows Update phase cannot finish. The updater withheld the claim rather than asserting convergence, which is the correct behaviour, but the row demonstrates truthful *incompleteness* rather than truthful completion.
+
+  > **Correction (2026-09-09, v2.5.78).** The `wuauserv` attribution above is wrong. A stopped Windows Update service is the normal resting state of an idle machine, not a defect in the guest image, and the updater starts it on demand. Row B did not converge because of two defects in the updater itself: an unbounded wait for an interactive user, and a retry budget that reset on every same-boot pass. Both are fixed in v2.5.78.
 - **Row C**, canceled delayed restart: **PASS.** With the restart cancelled 13 seconds into a 60-second countdown, the updater did not record a reboot that never happened, did not advance its pass number, and left the resume chain armed. A later reboot resumed and completed it.
 
 - **Row E**, delayed reboot signal: **PASS**, for the after-window case only. The signal was injected 10 seconds *after* the 20-second settle window closed rather than inside it, so the in-window detection path was not exercised. What the row does establish is the property that matters most: a reboot signal arriving after the probe was not silently ignored. It was caught at the after-updates check, the cycle rebooted, resumed, and completed with a claimed reboot count matching the OS boot record and no state or task residue.

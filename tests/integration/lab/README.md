@@ -40,10 +40,21 @@ Each cost real time to find and is commented at the point it matters.
 - **`Microsoft-Windows-International-Core` must appear in the `oobeSystem` pass**, not only
   `windowsPE`. Without it OOBE stalls on the region and keyboard screens with nobody to
   click, even though the install itself completed unattended and the answer file logged no
-  errors.
-- **Windows deletes `AutoAdminLogon`, `DefaultUserName` and `DefaultPassword`** after
-  consuming an auto-logon, so configuring it once is a one-shot rather than a property. A
-  SYSTEM startup task re-asserts it every boot.
+  errors. This one is **documented**, and cost time only because it was not read first:
+  Microsoft describes the `-WinPE` variant as applying only in the `windowsPE` pass and
+  directs you to the non-WinPE component for `oobeSystem`, and states the general rule that
+  OOBE screens not configured in the answer file are shown. Mapping that to the specific
+  region and keyboard screens is inference from the general rule; the language page is the
+  one Microsoft names.
+- **Observed: Windows deleted `AutoAdminLogon`, `DefaultUserName` and `DefaultPassword`**
+  after consuming an auto-logon, making it a one-shot rather than a property. A SYSTEM
+  startup task re-asserts it every boot, which works. The *cause* is unproven and is **not
+  explained by the documentation**: the documented `AutoLogonCount` teardown sets
+  `AutoAdminLogon` to `0` rather than deleting it, never touches `DefaultUserName`, and only
+  runs when `AutoLogonCount` was present, which it was not here. Treat the mitigation as
+  load-bearing and the mechanism as an open question. Cheap diagnostics if it matters later:
+  the `Authentication/UserInterface` log for "Autologon removed because of an EAS Policy",
+  and Security event 4657 on the Winlogon key.
 - **A Windows Boot Manager entry is a UEFI *File* entry.** Setting the raw disk as first
   boot device finds no `\EFI\BOOT\BOOTX64.EFI` on a Windows system partition and falls
   through to the DVD and then PXE.
