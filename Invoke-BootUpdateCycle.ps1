@@ -5205,6 +5205,23 @@ function Test-ArsoAvailable {
     } catch { return $false }
 }
 
+function ConvertTo-BootUpdatePrincipalSid {
+    <# Normalise a scheduled-task principal to a SID string, accepting either an account
+       name or a SID. Needed because the two sides of the resume-chain verification no
+       longer share a form: the expected value is a SID (that is what the resume account
+       resolves to, and what Task Scheduler stores), while the read-back can be a name.
+       Returns $null when the value resolves to neither, so the caller can fall back rather
+       than treating an unresolvable value as a mismatch. #>
+    param([AllowNull()][string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+    $candidate = $Value.Trim()
+    if ($candidate -match '^S-1-') {
+        try { return ([System.Security.Principal.SecurityIdentifier]$candidate).Value } catch { return $null }
+    }
+    if ($candidate -in @('SYSTEM', 'NT AUTHORITY\SYSTEM')) { return 'S-1-5-18' }
+    try { return ([System.Security.Principal.NTAccount]$candidate).Translate([System.Security.Principal.SecurityIdentifier]).Value } catch { return $null }
+}
+
 function Resolve-BootUpdateResumeAccount {
     <# Turn a discovered account name into one Task Scheduler will accept, or nothing.
 
@@ -5422,17 +5439,19 @@ function Register-BootUpdateTaskForReboot {
         if ($expectedUser -eq 'SYSTEM') {
             if ($actualPrincipal -notin @('SYSTEM','S-1-5-18')) { throw "Resume task '$registeredName' has the wrong principal." }
         } else {
-            <# Task Scheduler normalizes 'DOMAIN\user' to a bare user name on read-back;
-               compare SIDs (falling back to the leaf name) instead of raw strings. #>
+            <# Compare as SIDs, and accept EITHER side already being one. Task Scheduler
+               normalises 'DOMAIN\user' to a bare name on read-back, and the expected value
+               is now itself a SID because that is what the resume account resolves to.
+               Feeding a SID string to [NTAccount]::Translate throws, and the old leaf-name
+               fallback then compared 'updtest' against a full SID, never matched, and threw
+               "wrong principal" - killing the cycle immediately after registering its own
+               tasks. Normalise both sides first. #>
             $principalMatches = $false
-            try {
-                $expectedSid = ([System.Security.Principal.NTAccount]$expectedUser).Translate([System.Security.Principal.SecurityIdentifier]).Value
-                $actualSid   = ([System.Security.Principal.NTAccount]$actualPrincipal).Translate([System.Security.Principal.SecurityIdentifier]).Value
-                $principalMatches = ($expectedSid -eq $actualSid)
-            } catch {
-                $principalMatches = (($actualPrincipal -split '\\')[-1] -eq ($expectedUser -split '\\')[-1])
-            }
-            if (-not $principalMatches) { throw "Resume task '$registeredName' has the wrong principal." }
+            $expectedSid = ConvertTo-BootUpdatePrincipalSid -Value $expectedUser
+            $actualSid   = ConvertTo-BootUpdatePrincipalSid -Value $actualPrincipal
+            if ($expectedSid -and $actualSid) { $principalMatches = ($expectedSid -eq $actualSid) }
+            else { $principalMatches = (($actualPrincipal -split '\\')[-1] -eq ($expectedUser -split '\\')[-1]) }
+            if (-not $principalMatches) { throw "Resume task '$registeredName' has the wrong principal (expected '$expectedUser', found '$actualPrincipal')." }
         }
         if ([int]$task.Settings.RestartCount -ne 3) { throw "Resume task '$registeredName' is missing its retry policy." }
         $matchingAction = @($task.Actions | Where-Object {

@@ -64,6 +64,7 @@ BeforeAll {
           'Get-BootUpdateMonotonicBootId',
           'Resolve-BootUpdateResumeAccount',
           'Update-BootUpdateUserIdentityWait',
+          'ConvertTo-BootUpdatePrincipalSid',
           'Get-WingetInventoryPackageIds',
           'Get-WingetOutputSummary',
           'Get-ChocolateyOutputSummary',
@@ -2797,5 +2798,43 @@ Describe 'Resume account prefers the recorded SID' {
     It 'still yields nothing when neither the SID nor the name resolves' {
         Resolve-BootUpdateResumeAccount -Account '.\nosuchuser_zzq' -PreferredSid 'S-1-5-21-0-0-0-9999' |
             Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Principal comparison accepts names and SIDs on either side' {
+    <# Regression cover for a self-inflicted break. Once the resume account resolved to a
+       SID, the resume-chain verifier still converted the EXPECTED value with
+       [NTAccount]::Translate, which throws on a SID string. Its fallback then compared the
+       leaf name 'updtest' against a full SID, never matched, and threw "wrong principal" -
+       so the cycle registered its own continuation tasks and then killed itself one line
+       later. Verified on the lab: tasks present, log ending at registration, exit code 1. #>
+
+    It 'normalises an account name to a SID' {
+        ConvertTo-BootUpdatePrincipalSid -Value "$env:COMPUTERNAME\$env:USERNAME" |
+            Should -Be ([System.Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
+    }
+
+    It 'passes a SID through unchanged' {
+        $sid = ([System.Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
+        ConvertTo-BootUpdatePrincipalSid -Value $sid | Should -Be $sid
+    }
+
+    It 'maps both spellings of SYSTEM to its well-known SID' {
+        ConvertTo-BootUpdatePrincipalSid -Value 'SYSTEM'              | Should -Be 'S-1-5-18'
+        ConvertTo-BootUpdatePrincipalSid -Value 'NT AUTHORITY\SYSTEM' | Should -Be 'S-1-5-18'
+    }
+
+    It 'matches a SID against the name that Task Scheduler reads back' {
+        <# The exact shape that broke: expected side a SID, actual side a name. #>
+        $sid  = ([System.Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
+        $name = "$env:COMPUTERNAME\$env:USERNAME"
+        (ConvertTo-BootUpdatePrincipalSid -Value $sid) |
+            Should -Be (ConvertTo-BootUpdatePrincipalSid -Value $name)
+    }
+
+    It 'returns nothing for an unresolvable value so the caller can fall back' {
+        ConvertTo-BootUpdatePrincipalSid -Value 'nosuchprincipal_zzq' | Should -BeNullOrEmpty
+        ConvertTo-BootUpdatePrincipalSid -Value 'S-1-5-not-a-sid'     | Should -BeNullOrEmpty
+        ConvertTo-BootUpdatePrincipalSid -Value ''                    | Should -BeNullOrEmpty
     }
 }
