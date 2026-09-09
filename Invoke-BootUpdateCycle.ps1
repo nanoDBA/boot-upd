@@ -1648,29 +1648,72 @@ function Test-BootUpdateMonotonicBootMoved {
     return ([math]::Abs(($currentInstant - $priorInstant).TotalSeconds) -gt $ToleranceSeconds)
 }
 
-function Update-BootUpdateStateForBootSession {
+function Get-BootUpdateBootReading {
+    <# The three readings that identify a boot, taken together.
+
+       This is the module's internal seam: production takes the real reading, a test
+       constructs one. Nothing outside the boot-session functions needs to know that
+       timestamps are involved, which is the point - the previous shape had callers gather
+       three readings through three getters and hand raw timestamps across the boundary, and
+       twice a new signal was added that bypassed the normaliser on the way. #>
+    return [pscustomobject]@{
+        SessionId       = Get-BootUpdateBootSessionId
+        UptimeSeconds   = Get-BootUpdateUptimeSeconds
+        MonotonicBootId = Get-BootUpdateMonotonicBootId
+    }
+}
+
+function Update-BootUpdateBootSession {
+    <# Decide whether this pass follows a reboot, record the consequences on the state, and
+       hand back the observation.
+
+       One call, one result, readings taken inside. The boot-session cluster produced the
+       same defect class twice - a persisted timestamp compared without normalisation - and
+       both times the cause was the shape of the interface rather than the logic: callers
+       gathered readings themselves, passed raw timestamps in, and then RE-DERIVED the
+       new-boot decision at the logging site from those same raw values. The invariant
+       "normalise a persisted timestamp before comparing it" lived in the caller.
+
+       Everything that decides now lives here: normalisation, the 120-second identity
+       tolerance and the 15-second monotonic one, the anchoring policy (LastBootSessionId
+       anchored to the first identity of the boot, LastMonotonicBootId and LastUptimeSeconds
+       rewritten every pass), the Phase-gated reboot increment, and the retry-budget reset.
+       Callers consume the observation and cannot mishandle a timestamp they never see.
+
+       Returns: NewBoot, Reason (identity | monotonic | $null), RebootCounted, State. #>
     param(
         [Parameter(Mandatory)][pscustomobject]$State,
-        [Parameter(Mandatory)][string]$CurrentBootSessionId,
-        [AllowNull()][object]$CurrentUptimeSeconds = $null,
-        [AllowNull()][object]$CurrentMonotonicBootId = $null,
+        <# A reading, for tests; omitted in production, where the real one is taken here. #>
+        [AllowNull()][object]$Reading = $null,
         [int]$MonotonicToleranceSeconds = 15
     )
+    if (-not $Reading) { $Reading = Get-BootUpdateBootReading }
+    $currentSessionId    = [string]$Reading.SessionId
+    $currentUptime       = $Reading.UptimeSeconds
+    $currentMonotonicId  = $Reading.MonotonicBootId
+
     $priorBootSessionId = ConvertTo-BootUpdateTimestampString -Value $State.LastBootSessionId
-    $sameSession = Test-BootUpdateSameBootSession -Left $priorBootSessionId -Right $CurrentBootSessionId
+    $identityMoved = -not (Test-BootUpdateSameBootSession -Left $priorBootSessionId -Right $currentSessionId)
 
     <# The monotonic boot instant is stable to well under a second within one boot and jumps
        by the downtime across one, so a few seconds of tolerance separates jitter from a fast
        restart that the 120-second window would swallow. Additive only: it can add a detected
        reboot, never suppress the jitter protection the wider window provides. #>
     $priorMonotonic = if ($State.PSObject.Properties.Name -contains 'LastMonotonicBootId') { $State.LastMonotonicBootId } else { $null }
-    if (Test-BootUpdateMonotonicBootMoved -Prior $priorMonotonic -Current $CurrentMonotonicBootId -ToleranceSeconds $MonotonicToleranceSeconds) {
-        $sameSession = $false
-    }
+    $monotonicMoved = Test-BootUpdateMonotonicBootMoved -Prior $priorMonotonic -Current $currentMonotonicId -ToleranceSeconds $MonotonicToleranceSeconds
 
-    if ($State.LastBootSessionId -and -not $sameSession) {
+    $sameSession = -not ($identityMoved -or $monotonicMoved)
+    <# A first-ever pass has nothing to have moved away from, so it is not a new boot. #>
+    $newBoot = [bool]$State.LastBootSessionId -and -not $sameSession
+    $reason = if (-not $newBoot) { $null } elseif ($identityMoved) { 'identity' } else { 'monotonic' }
+
+    $rebootCounted = $false
+    if ($newBoot) {
+        <# Gated on the phase, so a crash-and-restart the updater did not ask for is not
+           charged to the reboot budget. #>
         if ($State.Phase -eq 'Rebooting' -or @($State.ExplicitRebootRequests).Count -gt 0) {
             $State.RebootCount = [int]$State.RebootCount + 1
+            $rebootCounted = $true
         }
         if ($State.PSObject.Properties.Name -contains 'ConsecutiveRetryCount') { $State.ConsecutiveRetryCount = 0 }
         else { $State | Add-Member -NotePropertyName 'ConsecutiveRetryCount' -NotePropertyValue 0 -Force }
@@ -1679,21 +1722,49 @@ function Update-BootUpdateStateForBootSession {
     }
     <# Anchor on the first identity observed for this boot. Rewriting it on every same-boot
        pass would let per-read jitter ratchet past the tolerance across a long recovery chain. #>
-    if (-not $State.LastBootSessionId -or -not $sameSession) { $State.LastBootSessionId = $CurrentBootSessionId }
+    if (-not $State.LastBootSessionId -or -not $sameSession) { $State.LastBootSessionId = $currentSessionId }
 
     <# Always recorded, including on same-boot passes, so the next pass compares against the
        most recent reading. Anchoring this the way LastBootSessionId is anchored would make a
        long same-boot recovery chain compare against a stale, tiny uptime and read every pass
        as a reboot. #>
-    if ($null -ne $CurrentUptimeSeconds) {
-        if ($State.PSObject.Properties.Name -contains 'LastUptimeSeconds') { $State.LastUptimeSeconds = $CurrentUptimeSeconds }
-        else { $State | Add-Member -NotePropertyName 'LastUptimeSeconds' -NotePropertyValue $CurrentUptimeSeconds -Force }
+    if ($null -ne $currentUptime) {
+        if ($State.PSObject.Properties.Name -contains 'LastUptimeSeconds') { $State.LastUptimeSeconds = $currentUptime }
+        else { $State | Add-Member -NotePropertyName 'LastUptimeSeconds' -NotePropertyValue $currentUptime -Force }
     }
-    if ($CurrentMonotonicBootId) {
-        if ($State.PSObject.Properties.Name -contains 'LastMonotonicBootId') { $State.LastMonotonicBootId = $CurrentMonotonicBootId }
-        else { $State | Add-Member -NotePropertyName 'LastMonotonicBootId' -NotePropertyValue $CurrentMonotonicBootId -Force }
+    if ($currentMonotonicId) {
+        if ($State.PSObject.Properties.Name -contains 'LastMonotonicBootId') { $State.LastMonotonicBootId = $currentMonotonicId }
+        else { $State | Add-Member -NotePropertyName 'LastMonotonicBootId' -NotePropertyValue $currentMonotonicId -Force }
     }
-    return $State
+    return [pscustomobject]@{
+        NewBoot       = $newBoot
+        Reason        = $reason
+        RebootCounted = $rebootCounted
+        State         = $State
+    }
+}
+
+function Update-BootUpdateStateForBootSession {
+    <# Compatibility shim over Update-BootUpdateBootSession, returning only the state.
+
+       Retained because a large body of round-trip tests drives the boot-session rules
+       through this signature, and rewriting them alongside the restructure would remove the
+       independent check on it. It holds no logic of its own: everything is decided in
+       Update-BootUpdateBootSession, so a new signal cannot bypass the normaliser through
+       this door either. Production uses the observation-returning function. #>
+    param(
+        [Parameter(Mandatory)][pscustomobject]$State,
+        [Parameter(Mandatory)][string]$CurrentBootSessionId,
+        [AllowNull()][object]$CurrentUptimeSeconds = $null,
+        [AllowNull()][object]$CurrentMonotonicBootId = $null,
+        [int]$MonotonicToleranceSeconds = 15
+    )
+    $reading = [pscustomobject]@{
+        SessionId       = $CurrentBootSessionId
+        UptimeSeconds   = $CurrentUptimeSeconds
+        MonotonicBootId = $CurrentMonotonicBootId
+    }
+    return (Update-BootUpdateBootSession -State $State -Reading $reading -MonotonicToleranceSeconds $MonotonicToleranceSeconds).State
 }
 
 function Set-BootUpdateRebootCheckpoint {
@@ -7060,21 +7131,14 @@ function Invoke-BootUpdateCycle {
     $state = Get-BootUpdateState
     $isFirstIteration = -not $state.StartTime
     if ($isFirstIteration) { $state.StartTime = Get-Date -Format 'o' }
-    $currentBootSessionId = Get-BootUpdateBootSessionId
-    $currentUptimeSeconds = Get-BootUpdateUptimeSeconds
-    $currentMonotonicBootId = Get-BootUpdateMonotonicBootId
-    $priorBootSessionId = $state.LastBootSessionId
-    $priorMonotonicBootId = if ($state.PSObject.Properties.Name -contains 'LastMonotonicBootId') { $state.LastMonotonicBootId } else { $null }
-    $state = Update-BootUpdateStateForBootSession -State $state -CurrentBootSessionId $currentBootSessionId `
-        -CurrentUptimeSeconds $currentUptimeSeconds -CurrentMonotonicBootId $currentMonotonicBootId
-    <# Uses the same helper the state update uses, so the log cannot report a different
-       number of boots than the state actually counted - which is how a log comes to
-       disagree with the machine while staying internally consistent. #>
-    $monotonicMoved = Test-BootUpdateMonotonicBootMoved -Prior $priorMonotonicBootId -Current $currentMonotonicBootId
-    $newBootObserved = $priorBootSessionId -and (
-        (-not (Test-BootUpdateSameBootSession -Left $priorBootSessionId -Right $currentBootSessionId)) -or $monotonicMoved)
+    <# One call, and the log reports what that call decided. The previous shape re-derived
+       the decision here from raw timestamps the caller had gathered itself, which is how a
+       log came to disagree with the machine while staying internally consistent. #>
+    $bootObservation = Update-BootUpdateBootSession -State $state
+    $state = $bootObservation.State
+    $newBootObserved = $bootObservation.NewBoot
     if ($newBootObserved) {
-        Write-Log "Observed a new Windows boot session; completed reboot count is now $($state.RebootCount)." -Visibility Verbose
+        Write-Log "Observed a new Windows boot session ($($bootObservation.Reason)); completed reboot count is now $($state.RebootCount)." -Visibility Verbose
     }
     $currentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
     $null = Update-BootUpdateResumeIdentity -State $state `

@@ -30,6 +30,8 @@ BeforeAll {
         'ConvertTo-BootUpdateTimestampString',
         'Test-BootUpdateSameBootSession',
         'Test-BootUpdateMonotonicBootMoved',
+        'Update-BootUpdateBootSession',
+        'Get-BootUpdateBootReading',
         'Update-BootUpdateStateForBootSession',
         'Get-BootUpdateLaunchContract',
         'Test-PostUpdateHealth',
@@ -3788,5 +3790,130 @@ Describe 'The dated watchdog trigger is actually armed' {
         $text | Should -Match 'Get-BootUpdateRetryTriggerTime -RetryAt \$RetryAt -RetrySoon \(\[bool\]\$RetrySoon\)'
         $text | Should -Not -Match '\$RetryAt\.HasValue'
         $text | Should -Match "MSFT_TaskTimeTrigger"
+    }
+}
+
+Describe 'One call decides whether this pass followed a reboot' {
+    <# -jjyx. The boot-session cluster produced the same defect class twice - a persisted
+       timestamp compared without normalisation - and both times the cause was the shape of
+       the interface, not the logic. Callers gathered three readings through three getters,
+       handed raw timestamps to the state update, and then RE-DERIVED the new-boot decision
+       at the logging site from those same raw values. The invariant "normalise a persisted
+       timestamp before comparing it" lived in the caller's head, and the interface let a new
+       signal bypass the normaliser, which is exactly what happened.
+
+       Now the caller passes state and consumes an observation. It never sees a timestamp, so
+       it cannot mishandle one. #>
+
+    BeforeAll {
+        function New-Reading {
+            param([string]$SessionId, $Uptime = 600, $Monotonic = $null)
+            [pscustomobject]@{ SessionId = $SessionId; UptimeSeconds = $Uptime; MonotonicBootId = $Monotonic }
+        }
+    }
+
+    It 'reports no new boot on the first pass a machine ever takes' {
+        $state = New-BootUpdateStateV2
+        $boot = ([datetime]::UtcNow).ToString('o')
+        $observation = Update-BootUpdateBootSession -State $state -Reading (New-Reading -SessionId $boot -Monotonic $boot)
+
+        $observation.NewBoot | Should -BeFalse -Because 'there is nothing to have moved away from yet'
+        $observation.Reason | Should -BeNullOrEmpty
+        $observation.RebootCounted | Should -BeFalse
+        $observation.State.LastBootSessionId | Should -Be $boot
+    }
+
+    It 'names the signal that decided a reboot happened' {
+        $first = [datetime]::UtcNow
+        $state = (Update-BootUpdateBootSession -State (New-BootUpdateStateV2) `
+            -Reading (New-Reading -SessionId $first.ToString('o') -Monotonic $first.ToString('o'))).State
+        $state.Phase = 'Rebooting'
+
+        $second = $first.AddHours(3)
+        $observation = Update-BootUpdateBootSession -State $state `
+            -Reading (New-Reading -SessionId $second.ToString('o') -Monotonic $second.ToString('o'))
+
+        $observation.NewBoot | Should -BeTrue
+        $observation.Reason | Should -Be 'identity'
+        $observation.RebootCounted | Should -BeTrue
+        $observation.State.RebootCount | Should -Be 1
+    }
+
+    It 'attributes a fast restart inside the identity tolerance to the monotonic signal' {
+        <# The whole reason the monotonic reading exists: 67 and 58 seconds apart is inside
+           the 120-second identity window, so identity alone would call it the same boot. #>
+        $first = [datetime]::UtcNow
+        $state = (Update-BootUpdateBootSession -State (New-BootUpdateStateV2) `
+            -Reading (New-Reading -SessionId $first.ToString('o') -Monotonic $first.ToString('o'))).State
+        $state.Phase = 'Rebooting'
+
+        $fast = $first.AddSeconds(67)
+        $observation = Update-BootUpdateBootSession -State $state `
+            -Reading (New-Reading -SessionId $fast.ToString('o') -Monotonic $fast.ToString('o'))
+
+        $observation.NewBoot | Should -BeTrue
+        $observation.Reason | Should -Be 'monotonic' -Because 'identity could not see it, and the log should say which signal did'
+        $observation.State.RebootCount | Should -Be 1
+    }
+
+    It 'does not charge a reboot the updater never asked for to the budget' {
+        $first = [datetime]::UtcNow
+        $state = (Update-BootUpdateBootSession -State (New-BootUpdateStateV2) `
+            -Reading (New-Reading -SessionId $first.ToString('o') -Monotonic $first.ToString('o'))).State
+        $state.Phase = 'Running'   # a crash-and-restart, not a planned reboot
+
+        $observation = Update-BootUpdateBootSession -State $state `
+            -Reading (New-Reading -SessionId $first.AddHours(2).ToString('o') -Monotonic $first.AddHours(2).ToString('o'))
+
+        $observation.NewBoot | Should -BeTrue
+        $observation.RebootCounted | Should -BeFalse -Because 'the increment is gated on the phase, and that gate is what kept the count truthful'
+        $observation.State.RebootCount | Should -Be 0
+    }
+
+    It 'survives the state file without the caller normalising anything' {
+        <# The defect class itself. Round-trip the state through real JSON, which rehydrates
+           every ISO-8601 string as a [datetime], and pass the SAME boot instant again. A
+           caller that had to normalise would get this wrong; a caller that never sees the
+           timestamp cannot. #>
+        $boot = [datetime]::UtcNow.AddMinutes(-40)
+        $state = (Update-BootUpdateBootSession -State (New-BootUpdateStateV2) `
+            -Reading (New-Reading -SessionId $boot.ToString('o') -Monotonic $boot.ToString('o'))).State
+        $state.ConsecutiveRetryCount = 3
+
+        $reloaded = $state | ConvertTo-Json -Depth 8 | ConvertFrom-Json
+        $reloaded.LastBootSessionId | Should -BeOfType [datetime] -Because 'this is the rehydration that caused the defect twice'
+
+        $observation = Update-BootUpdateBootSession -State $reloaded `
+            -Reading (New-Reading -SessionId $boot.AddSeconds(1).ToString('o') -Monotonic $boot.AddSeconds(1).ToString('o'))
+
+        $observation.NewBoot | Should -BeFalse -Because 'one second of jitter is not a restart, whatever the local offset is'
+        $observation.State.ConsecutiveRetryCount | Should -Be 3 -Because 'a same-boot pass must not reset the retry budget'
+    }
+
+    It 'takes the reading itself when the caller does not supply one' {
+        $reading = Get-BootUpdateBootReading
+        foreach ($field in 'SessionId','UptimeSeconds','MonotonicBootId') {
+            $reading.PSObject.Properties.Name | Should -Contain $field
+        }
+        $reading.SessionId | Should -Not -BeNullOrEmpty
+    }
+
+    It 'leaves the cycle nothing to re-derive' {
+        <# The specific shape being retired: the logging site used to recompute the decision
+           from raw timestamps it had gathered itself, which is how a log came to disagree
+           with the machine while staying internally consistent. #>
+        $text = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
+        $text | Should -Match '\$bootObservation = Update-BootUpdateBootSession -State \$state'
+        $text | Should -Match '\$newBootObserved = \$bootObservation\.NewBoot'
+        $text | Should -Not -Match '\$monotonicMoved = Test-BootUpdateMonotonicBootMoved'
+        $text | Should -Not -Match 'Update-BootUpdateStateForBootSession'
+        $text | Should -Not -Match '\$currentBootSessionId = Get-BootUpdateBootSessionId'
+    }
+
+    It 'keeps the compatibility shim free of decisions of its own' {
+        $shim = Get-FunctionText $invokeAst 'Update-BootUpdateStateForBootSession'
+        $shim | Should -Match 'Update-BootUpdateBootSession'
+        $shim | Should -Not -Match 'Test-BootUpdateSameBootSession'
+        $shim | Should -Not -Match 'RebootCount'
     }
 }
