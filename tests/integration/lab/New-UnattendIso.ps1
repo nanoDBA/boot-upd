@@ -14,7 +14,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$SourceDirectory = 'C:\HyperV\unattend',
+    [string]$SourceDirectory = (Join-Path $PSScriptRoot 'unattend'),
     [string]$Path            = 'C:\HyperV\ISO\unattend.iso',
     [string]$VolumeName      = 'UNATTEND'
 )
@@ -51,11 +51,26 @@ if (-not (Test-Path -LiteralPath $xml)) { throw "No autounattend.xml in $SourceD
 <# The tracked answer file is a template. The guest password is supplied at build time from
    BOOTUPD_LAB_PASSWORD and never committed: this repository is public, and a disposable
    credential in tracked content is still a credential in tracked content. #>
-if (-not $env:BOOTUPD_LAB_PASSWORD) { throw 'Set BOOTUPD_LAB_PASSWORD before building the unattend ISO.' }
+. (Join-Path $PSScriptRoot 'LabCredential.ps1')
+$labPassword = Get-BootUpdLabPassword
+if (-not $labPassword) {
+    throw 'No lab guest password available. Store one with: . ./LabCredential.ps1; Set-BootUpdLabPassword -Generate'
+}
 $rendered = Join-Path ([IO.Path]::GetTempPath()) ('unattend-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $rendered -Force | Out-Null
 try {
-    $body = (Get-Content -LiteralPath $xml -Raw).Replace('__LAB_PASSWORD__', $env:BOOTUPD_LAB_PASSWORD)
+    <# The source must be the TEMPLATE, never a previous render. This guard exists because its
+       absence cost a guest: the source directory had accumulated a rendered answer file, so the
+       substitution below found nothing to replace and silently shipped an ISO carrying an OLDER
+       password than the one just resolved. The ISO was internally consistent, matched the copy
+       on disk, and matched nothing in the VM that had been installed from an earlier render. The
+       only way back into that guest was to rebuild it. A missing placeholder is a build error,
+       not a no-op. #>
+    $template = Get-Content -LiteralPath $xml -Raw
+    if ($template -notmatch '__LAB_PASSWORD__') {
+        throw "$xml contains no __LAB_PASSWORD__ placeholder, so it is a rendered answer file rather than the template. Point -SourceDirectory at the tracked template."
+    }
+    $body = $template.Replace('__LAB_PASSWORD__', $labPassword)
     if ($body -match '__LAB_PASSWORD__') { throw 'Password placeholder was not substituted.' }
     Set-Content -LiteralPath (Join-Path $rendered 'autounattend.xml') -Value $body -Encoding UTF8
     $SourceDirectory = $rendered

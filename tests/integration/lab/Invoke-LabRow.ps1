@@ -30,7 +30,7 @@ param(
     [string]$EvidenceRoot = 'C:\HyperV\evidence',
     [int]$ArmReboots      = 0,
     [string]$GuestUser    = 'updtest',
-    [string]$GuestPassword = $env:BOOTUPD_LAB_PASSWORD,
+    [string]$GuestPassword,
     [int]$TimeoutMinutes  = 60,
     [switch]$SkipSync,
     [switch]$SystemContext,
@@ -46,7 +46,11 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-if (-not $GuestPassword) { throw 'Set BOOTUPD_LAB_PASSWORD (the disposable guest password) before running lab scripts.' }
+. (Join-Path $PSScriptRoot 'LabCredential.ps1')
+if (-not $GuestPassword) { $GuestPassword = Get-BootUpdLabPassword }
+if (-not $GuestPassword) {
+    throw 'No lab guest password available. Store one with: . ./LabCredential.ps1; Set-BootUpdLabPassword -Generate'
+}
 $cred = New-Object System.Management.Automation.PSCredential($GuestUser,
         (ConvertTo-SecureString $GuestPassword -AsPlainText -Force))
 $evidenceDir = Join-Path $EvidenceRoot ("{0}-{1}-{2}" -f $Row, $VMName, (Get-Date -Format 'yyyyMMdd-HHmmss'))
