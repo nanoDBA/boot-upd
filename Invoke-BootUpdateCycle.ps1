@@ -1895,6 +1895,7 @@ function New-BootUpdateStateV2 {
         WingetAggressiveRepairSignatures = @()
         WingetQuarantines       = @()
         ResumeUser            = $null
+        ResumeUserSid         = $null
         Summary               = [pscustomobject]@{
             Winget = 0; Chocolatey = 0; WindowsUpdate = 0; Pip = 0; Npm = 0; Office365 = 0
             PowerShellModules = 0; Scoop = 0; DotnetTools = 0; Vscode = 0
@@ -1956,7 +1957,7 @@ function Update-BootUpdateStateSchema {
 
     $props = $State.PSObject.Properties.Name
     <# Add-if-missing: crash recovery, new phase flags, network-check cache #>
-    foreach ($f in @('LastPhaseStarted','LastPhaseTimestamp','StagedNextPhase','LastPreflightNetworkOk','LastPreflightNetworkAt','LastRebootSignals','LastBootSessionId','ResumeUser','LimitReachedAt','LimitReason')) {
+    foreach ($f in @('LastPhaseStarted','LastPhaseTimestamp','StagedNextPhase','LastPreflightNetworkOk','LastPreflightNetworkAt','LastRebootSignals','LastBootSessionId','ResumeUser','ResumeUserSid','LimitReachedAt','LimitReason')) {
         if ($props -notcontains $f) { $State | Add-Member -NotePropertyName $f -NotePropertyValue $null -Force }
     }
     if ($props -notcontains 'LimitRebootSignals') { $State | Add-Member -NotePropertyName 'LimitRebootSignals' -NotePropertyValue @() -Force }
@@ -5250,6 +5251,52 @@ function ConvertTo-BootUpdatePrincipalSid {
     try { return ([System.Security.Principal.NTAccount]$candidate).Translate([System.Security.Principal.SecurityIdentifier]).Value } catch { return $null }
 }
 
+function Update-BootUpdateResumeIdentity {
+    <# Discover the account the resume task should run as, and record it on the state.
+
+       This is a function rather than inline cycle code for one reason: the SID half of it
+       was dead for a whole release and nothing noticed. $State.ResumeUserSid was assigned
+       inside an empty catch while neither the state constructor nor the schema normaliser
+       declared the property, so the assignment threw on every run, the catch swallowed it,
+       and Resolve-BootUpdateResumeAccount never received a -PreferredSid. The unit tests
+       called the resolver directly with a SID and passed throughout. Only a test that
+       walks constructor -> discovery -> resolver can catch that class of defect, and it
+       can only walk it if the discovery is callable.
+
+       The two lookups are parameters so a test can drive the headless path - no console
+       user, LogonUI holding the '.\name' form plus a SID - without a headless machine. #>
+    param(
+        [Parameter(Mandatory)][pscustomobject]$State,
+        [AllowNull()][string]$IdentityName,
+        [AllowNull()][string]$IdentitySid,
+        [scriptblock]$ConsoleUserProvider = {
+            try { (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).UserName } catch { $null }
+        },
+        [scriptblock]$LastLogonProvider = {
+            try {
+                $key = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\LogonUI' -ErrorAction Stop
+                [pscustomobject]@{ Name = $key.LastLoggedOnSAMUser; Sid = $key.LastLoggedOnUserSID }
+            } catch { [pscustomobject]@{ Name = $null; Sid = $null } }
+        }
+    )
+
+    if ($IdentitySid -ne 'S-1-5-18') { $State.ResumeUser = $IdentityName; return $State }
+    if ($State.ResumeUser) { return $State }
+
+    $State.ResumeUser = & $ConsoleUserProvider
+    if ($State.ResumeUser) { return $State }
+
+    <# LogonUI records the SID beside the name. Prefer it: the name it writes is the
+       '.\user' form, which Task Scheduler cannot resolve, and the SID also covers the
+       AzureAD\ and MicrosoftAccount\ forms that no string expansion would fix. #>
+    $last = & $LastLogonProvider
+    if ($last) {
+        $State.ResumeUser    = $last.Name
+        $State.ResumeUserSid = $last.Sid
+    }
+    return $State
+}
+
 function Resolve-BootUpdateResumeAccount {
     <# Turn a discovered account name into one Task Scheduler will accept, or nothing.
 
@@ -6676,19 +6723,10 @@ function Invoke-BootUpdateCycle {
         Write-Log "Observed a new Windows boot session; completed reboot count is now $($state.RebootCount)." -Visibility Verbose
     }
     $currentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-    if ($currentIdentity.User.Value -ne 'S-1-5-18') { $state.ResumeUser = $currentIdentity.Name }
-    elseif (-not $state.ResumeUser) {
-        try { $state.ResumeUser = (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).UserName } catch { }
-        if (-not $state.ResumeUser) {
-            try { $state.ResumeUser = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\LogonUI' -Name LastLoggedOnSAMUser -ErrorAction Stop).LastLoggedOnSAMUser } catch { }
-            <# LogonUI records the SID beside the name. Prefer it: the name it writes is the
-               '.\user' form, which Task Scheduler cannot resolve, and the SID also covers the
-               AzureAD\ and MicrosoftAccount\ forms that no string expansion would fix. #>
-            try { $state.ResumeUserSid = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\LogonUI' -Name LastLoggedOnUserSID -ErrorAction Stop).LastLoggedOnUserSID } catch { }
-        }
-    }
+    $null = Update-BootUpdateResumeIdentity -State $state `
+        -IdentityName $currentIdentity.Name -IdentitySid $currentIdentity.User.Value
     $script:ResumeUser = $state.ResumeUser
-    $script:ResumeUserSid = if ($state.PSObject.Properties.Name -contains 'ResumeUserSid') { $state.ResumeUserSid } else { $null }
+    $script:ResumeUserSid = $state.ResumeUserSid
     $script:CurrentState = $state
     $script:ExplicitRebootRequests.Clear()
     foreach ($request in @($state.ExplicitRebootRequests)) { $script:ExplicitRebootRequests.Add($request) }

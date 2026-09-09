@@ -63,6 +63,9 @@ BeforeAll {
           'Get-ProcessTreeActivity',
           'Get-BootUpdateUptimeSeconds',
           'Get-BootUpdateMonotonicBootId',
+          'New-BootUpdateStateV2',
+          'Update-BootUpdateStateSchema',
+          'Update-BootUpdateResumeIdentity',
           'Resolve-BootUpdateResumeAccount',
           'Update-BootUpdateUserIdentityWait',
           'ConvertTo-BootUpdatePrincipalSid',
@@ -2920,5 +2923,72 @@ Describe 'Boot instant survives the state file' {
 
         Test-BootUpdateMonotonicBootMoved -Prior $asDateTime -Current $boot.AddSeconds(81).ToString('o') |
             Should -BeTrue -Because '81 seconds is a real restart'
+    }
+}
+
+Describe 'Resume identity discovery through the state object' {
+    <# -35qb.1. These tests exist because the direct-call tests below could not see the
+       defect: Resolve-BootUpdateResumeAccount was always correct, and the SID never
+       reached it. The chain that matters is constructor -> discovery -> resolver, so
+       that is the chain these walk. #>
+
+    BeforeAll {
+        Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 6 -Scope Script -Force
+    }
+
+    It 'declares ResumeUserSid on a freshly constructed state' {
+        <# The whole defect in one assertion. A [pscustomobject] throws on assignment to an
+           undeclared property, and the discovery assigned this one inside an empty catch,
+           so an undeclared property meant a permanently null SID and no symptom. #>
+        (New-BootUpdateStateV2).PSObject.Properties.Name | Should -Contain 'ResumeUserSid'
+    }
+
+    It 'adds ResumeUserSid to a state written before the property existed' {
+        $legacy = New-BootUpdateStateV2
+        $legacy.PSObject.Properties.Remove('ResumeUserSid')
+        $legacy.PSObject.Properties.Name | Should -Not -Contain 'ResumeUserSid'
+
+        Update-BootUpdateStateSchema -State $legacy
+
+        $legacy.PSObject.Properties.Name | Should -Contain 'ResumeUserSid' -Because 'the add-if-missing normaliser is the other half of the declaration'
+    }
+
+    It 'records the LogonUI SID beside the name when nobody is signed in' {
+        $state = New-BootUpdateStateV2
+        $null = Update-BootUpdateResumeIdentity -State $state `
+            -IdentityName 'NT AUTHORITY\SYSTEM' -IdentitySid 'S-1-5-18' `
+            -ConsoleUserProvider { $null } `
+            -LastLogonProvider { [pscustomobject]@{ Name = '.\updtest'; Sid = 'S-1-5-21-1-2-3-1001' } }
+
+        $state.ResumeUser    | Should -Be '.\updtest'
+        $state.ResumeUserSid | Should -Be 'S-1-5-21-1-2-3-1001'
+    }
+
+    It 'hands the discovered SID to the resolver, which prefers it over the unusable name' {
+        <# The '.\name' form is outside Task Scheduler's input grammar, so on a machine
+           where only that name is known the SID is the only thing that resolves. This is
+           the AzureAD\ and MicrosoftAccount\ case too, and it was dead in v2.5.78. #>
+        $mySid = ([System.Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
+        $state = New-BootUpdateStateV2
+        $null = Update-BootUpdateResumeIdentity -State $state `
+            -IdentityName 'NT AUTHORITY\SYSTEM' -IdentitySid 'S-1-5-18' `
+            -ConsoleUserProvider { $null } `
+            -LastLogonProvider { [pscustomobject]@{ Name = '.\definitely_not_a_user_zzq'; Sid = $mySid } }
+
+        $state.ResumeUserSid | Should -Be $mySid
+
+        Resolve-BootUpdateResumeAccount -Account $state.ResumeUser -PreferredSid ([string]$state.ResumeUserSid) |
+            Should -Be $mySid -Because 'the resolver can only prefer a SID the discovery actually recorded'
+    }
+
+    It 'takes the running identity directly when a user is signed in' {
+        $state = New-BootUpdateStateV2
+        $null = Update-BootUpdateResumeIdentity -State $state `
+            -IdentityName 'LABHOST\alice' -IdentitySid 'S-1-5-21-1-2-3-500' `
+            -ConsoleUserProvider { throw 'the console lookup must not run for an interactive identity' } `
+            -LastLogonProvider  { throw 'the LogonUI lookup must not run for an interactive identity' }
+
+        $state.ResumeUser    | Should -Be 'LABHOST\alice'
+        $state.ResumeUserSid | Should -BeNullOrEmpty -Because 'no SID is recorded when the name is already the running identity'
     }
 }

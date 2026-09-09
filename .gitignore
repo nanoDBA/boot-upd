@@ -31,3 +31,6 @@ upd.cmd.bak
 .dolt/
 *.db
 .beads-credential-key
+
+# Agent worktrees (transient, created by Claude Code)
+.claude/worktrees/
