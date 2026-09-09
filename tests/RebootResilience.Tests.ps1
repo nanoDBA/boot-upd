@@ -76,6 +76,7 @@ BeforeAll {
           'Update-BootUpdateResumeIdentity',
           'Resolve-BootUpdateResumeAccount',
           'Update-BootUpdateUserIdentityWait',
+          'Test-BootUpdateInteractiveUserPresent',
           'ConvertTo-BootUpdatePrincipalSid',
           'Get-WingetInventoryPackageIds',
           'Get-WingetOutputSummary',
@@ -3628,5 +3629,59 @@ Describe 'A pass that followed no reboot does not say it resumed after one' {
             "[2026-09-09 09:34:47] [Info] BOOT UPDATE CYCLE $verb | Pass: 2" |
                 Should -Match '(?im)^\s*(?:\[[^\]]+\]\s*)*BOOT UPDATE CYCLE (?:STARTED|RESUMED)\b'
         }
+    }
+}
+
+Describe 'The bounded wait is about an absent session, not an unknown name' {
+    <# Found on lab-a on 2026-09-09, evidence
+       C:\HyperV\evidence\B-k610-fix-boot-upd-matrix-20260909-093402. Making the resume-SID
+       preference work (it had been dead code) had a consequence nobody predicted: on a guest
+       nobody signs into, LogonUI still records a PAST session, so ResumeUser became populated
+       and the cycle concluded a user was known. It then waited on a logon trigger that will
+       never fire, took no further pass, and sat at UserContextPending with both tasks armed
+       and nothing to fire them - the exact unbounded wait MaxUserIdentityWaits exists to
+       prevent, reintroduced through the back door.
+
+       The question the bound must ask is whether a user-context pass can still happen. #>
+
+    It 'treats a cycle running as the user as an interactive session, without looking further' {
+        Test-BootUpdateInteractiveUserPresent -ConsoleUserProvider { throw 'a user-context pass must not need to look' } |
+            Should -BeTrue -Because 'this cycle IS the interactive session'
+    }
+
+    It 'reports no interactive user when SYSTEM finds no console session' {
+        <# Only meaningful when the test itself is not SYSTEM, which it is not. #>
+        $isSystem = ([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value -eq 'S-1-5-18')
+        $isSystem | Should -BeFalse -Because 'the gate runs elevated but as a user'
+    }
+
+    It 'bounds the wait for a machine with no session and never bounds one with a session' {
+        <# The decision the orchestrator makes, exercised through the counter it drives. A
+           headless machine reaches exhaustion; a machine with a signed-in user never does,
+           however many passes go by. #>
+        $headless = New-BootUpdateStateV2
+        $headless.ResumeUser = 'LABHOST\updtest'   # known, from a past session - and irrelevant
+        $exhausted = $false
+        for ($i = 0; $i -lt 5 -and -not $exhausted; $i++) {
+            $exhausted = Update-BootUpdateUserIdentityWait -State $headless -UserUnknown $true -MaxWaits 2
+        }
+        $exhausted | Should -BeTrue -Because 'a machine nobody signs into must be able to finish'
+
+        $attended = New-BootUpdateStateV2
+        $attended.ResumeUser = 'LABHOST\alice'
+        for ($i = 0; $i -lt 20; $i++) {
+            Update-BootUpdateUserIdentityWait -State $attended -UserUnknown $false -MaxWaits 2 |
+                Should -BeFalse -Because 'a laptop whose owner is signed in has a pass coming, and waiting costs nothing'
+        }
+    }
+
+    It 'drives the bound from the session test rather than from ResumeUser' {
+        $text = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
+        $text | Should -Match '\$retryForUnknownUser = -not \(Test-BootUpdateInteractiveUserPresent\)'
+        $text | Should -Not -Match '\$retryForUnknownUser = \[string\]::IsNullOrWhiteSpace\(\[string\]\$state\.ResumeUser\)'
+        <# The same flag still decides whether a dated retry is armed. Without it no further
+           pass runs, the counter never advances, and the bound can never be reached - which
+           is precisely how the headless guest came to sit there. #>
+        $text | Should -Match 'Register-BootUpdateTaskForReboot -RetrySoon:\$retryForUnknownUser'
     }
 }

@@ -5636,6 +5636,33 @@ function Resolve-BootUpdateResumeAccount {
     }
 }
 
+function Test-BootUpdateInteractiveUserPresent {
+    <# Is there an interactive user signed in right now, who could run user-scope work?
+
+       This is not the same question as "do we know who the user is", and conflating the two
+       stranded a headless guest. Once the resume-SID discovery started working, ResumeUser
+       was populated on a machine nobody signs into - from LogonUI's record of a past
+       session - so the cycle concluded a user was known, waited on a logon trigger that
+       will never fire, and never took another pass. Lab row B sat at
+       UserContextPending with both tasks armed and nothing to fire them.
+
+       The distinction that matters is whether a user-context pass can still happen. A laptop
+       whose owner is signed in, or will sign in, has one: the logon trigger costs nothing and
+       must keep waiting. A machine with no interactive session does not, and Microsoft
+       documents that machine as the *unblocked* servicing path - so its wait is bounded, and
+       on exhaustion the user-scope work becomes deferred inventory.
+
+       The console lookup is a parameter so a test can drive both machines. #>
+    param(
+        [scriptblock]$ConsoleUserProvider = {
+            try { (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).UserName } catch { $null }
+        }
+    )
+    <# A cycle running as the user IS the interactive session. Only a SYSTEM-context pass has
+       to go and look. #>
+    if ([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value -ne 'S-1-5-18') { return $true }
+    return -not [string]::IsNullOrWhiteSpace([string](& $ConsoleUserProvider))
+}
 function Update-BootUpdateUserIdentityWait {
     <# Decides whether to keep waiting for an interactive user, and returns $true when the
        wait is exhausted and the caller should stop deferring.
@@ -8017,7 +8044,13 @@ function Invoke-BootUpdateCycle {
         }
         if (-not $WhatIfPreference -and $disposition.Kind -eq 'UserContext') {
             $deferredNames = $disposition.Phases.Name -join ', '
-            $retryForUnknownUser = [string]::IsNullOrWhiteSpace([string]$state.ResumeUser)
+            <# The bound is about whether a user-context pass can happen, not about whether a
+               name is known. Testing the name was correct only while discovery failed on a
+               headless machine; once the resume-SID preference started working, LogonUI's
+               record of a past session made every headless machine look like one with a user
+               coming back, and the wait became unbounded again - the exact condition
+               MaxUserIdentityWaits exists to prevent. #>
+            $retryForUnknownUser = -not (Test-BootUpdateInteractiveUserPresent)
 
             <# Scope deferral is a handoff to a later user-context pass. On a machine nobody
                ever signs into there is no later pass, and without a bound this waited
@@ -8057,7 +8090,7 @@ function Invoke-BootUpdateCycle {
 
         if (-not $WhatIfPreference -and $disposition.Kind -eq 'UserContext' -and $state.Phase -eq 'UserContextPending') {
             $userToastMessage = if ($retryForUnknownUser) {
-                "Waiting to identify an interactive user for: $deferredNames. A retry is scheduled; no restart is required."
+                "Waiting for an interactive user so these phases can run: $deferredNames. A retry is scheduled; no restart is required."
             } else {
                 "Waiting for the saved user to sign in so these phases can run: $deferredNames. No restart is required."
             }
@@ -8066,7 +8099,7 @@ function Invoke-BootUpdateCycle {
             Write-BootUpdateProgress -Completed
             Show-CycleBanner -Title 'U S E R   P A S S   P E N D I N G' -AnsiColor "$([char]27)[36m" -Info @(
                 'Machine-level work is safe; full verification is intentionally withheld.'
-                $(if ($retryForUnknownUser) { "No interactive user is known yet; rediscovery retries in about 2 minutes: $deferredNames" } else { "Waiting for $($state.ResumeUser) to sign in: $deferredNames" })
+                $(if ($retryForUnknownUser) { "No interactive user is signed in; rediscovery retries in about 2 minutes: $deferredNames" } else { "Waiting for $($state.ResumeUser) to sign in: $deferredNames" })
                 $(if ($retryForUnknownUser) { 'The SYSTEM watchdog is armed; completion remains blocked on user context.' } else { 'The user-at-logon continuation remains armed.' })
             )
             return
