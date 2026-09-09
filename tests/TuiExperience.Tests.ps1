@@ -300,6 +300,8 @@ Describe 'Animated progress behavior' {
             'Wait-BootUpdateUiInterval',
             'Wait-BootUpdateJobsWithProgress',
             'Get-ProcessTreeActivity',
+            'Test-BootUpdateInstallerMutexHeld',
+            'Wait-BootUpdateInstallerMutex',
             'Wait-ProcessWithIdleTimeout',
             'Invoke-PackageManagerWithTimeout',
             'Invoke-BootUpdateBackgroundOperation'
