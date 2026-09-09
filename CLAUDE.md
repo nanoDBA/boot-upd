@@ -28,3 +28,17 @@
 - Use project skills `/test-gates` and `/reboot-resilience-review` when applicable.
 - Store durable project knowledge with `./tools/Invoke-Beads.ps1 remember`; Claude auto-memory is supplementary, not authoritative.
 - Use `/memory` to confirm this file, its `AGENTS.md` import, and applicable `.claude/rules/` files loaded.
+
+## Agent skills
+
+### Issue tracker
+
+Issues live in `bd` (beads) on the shared Dolt server, database `boot_upd`, driven through `./tools/Invoke-Beads.ps1` — never in GitHub Issues. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five canonical roles, each label string equal to its name. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `CONTEXT.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.
