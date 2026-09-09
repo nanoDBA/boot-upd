@@ -8176,14 +8176,14 @@ function Invoke-BootUpdateCycle {
                         [pscustomobject]@{
                             Kind   = 'ReofferedAfterSuccess'
                             Count  = 1
-                            Detail = ("{0} was installed successfully {1} time(s) in this boot session (Windows Update result code 2, most recently {2}Z) and is still offered by the final scan. Recorded as an environmental re-offer, not retried." -f `
+                            Detail = ("{0} was installed successfully {1} time(s) during this run (Windows Update result code 2, most recently {2}Z) and is still offered by the final scan. Recorded as an environmental re-offer, not retried." -f `
                                       $name, $_.Installs, ([datetime]$_.LastSuccess).ToString('yyyy-MM-dd HH:mm:ss'))
                         }
                     }
                 )
                 Set-BootUpdateState -State $state
                 foreach ($record in $reoffered) {
-                    Write-Log ("Windows Update re-offer after success: {0} installed successfully {1} time(s) since this boot (result code 2, latest {2}Z), still applicable on the final scan. Recorded as deferred inventory rather than retried." -f `
+                    Write-Log ("Windows Update re-offer after success: {0} installed successfully {1} time(s) during this run (result code 2, latest {2}Z), still applicable on the final scan. Recorded as deferred inventory rather than retried." -f `
                                $(if ($record.KB) { $record.KB } else { $record.Title }), $record.Installs, ([datetime]$record.LastSuccess).ToString('yyyy-MM-dd HH:mm:ss')) -Level Warn
                 }
                 Write-Log "Windows Update convergence qualified: $($reoffered.Count) update(s) re-offered after a successful install remain; no other update is applicable."

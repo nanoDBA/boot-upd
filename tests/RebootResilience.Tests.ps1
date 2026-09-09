@@ -3695,7 +3695,7 @@ Describe 'An update the machine says it installed and offers again is inventory,
     It 'produces a qualified claim from that inventory, not an all-clear' {
         $state = New-BootUpdateStateV2
         Add-BootUpdateDeferredInventory -State $state -Provider 'WindowsUpdate' -Scope 'machine' -Records @(
-            [pscustomobject]@{ Kind = 'ReofferedAfterSuccess'; Count = 1; Detail = 'KB5007651 was installed successfully 5 time(s) in this boot session.' }
+            [pscustomobject]@{ Kind = 'ReofferedAfterSuccess'; Count = 1; Detail = 'KB5007651 was installed successfully 5 time(s) during this run.' }
         )
         $inventory = @(Get-BootUpdateDeferredInventory -State $state)
         $inventory.Count | Should -Be 1
@@ -4088,5 +4088,25 @@ Describe 'An installer mutex that cannot be examined is not an absent one' {
         ([regex]::Matches($text, 'InstallerMutexHeld = \(-not \$mutexClear\)')).Count |
             Should -Be 2 -Because 'a later 1618 should be attributable to this orphan rather than guessed at'
         $text | Should -Not -Match '\$null = Wait-BootUpdateInstallerMutex'
+    }
+}
+
+Describe 'The re-offer message says the window it actually used' {
+    <# Row B on the shipping build logged "installed successfully 2 time(s) since this boot"
+       on a pass where one of those two installs had happened in the PREVIOUS boot - the
+       count came from the run-scoped window while the words still described the boot-scoped
+       one. Small, and exactly the kind of thing this release exists to stop: a sentence the
+       binary does not support. #>
+
+    It 'describes the run, not the boot, in both the log line and the inventory record' {
+        $text = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
+        $start = $text.IndexOf('$wuConvergence = Test-WindowsUpdateConvergence')
+        $start | Should -BeGreaterThan 0
+        $block = $text.Substring($start, $text.IndexOf('$incompletePhases = @($enabledPhases', $start) - $start)
+
+        $block | Should -Match 'installed successfully \{1\} time\(s\) during this run'
+        $block | Should -Match 'Windows Update re-offer after success: \{0\} installed successfully \{1\} time\(s\) during this run'
+        $block | Should -Not -Match 'in this boot session'
+        $block | Should -Not -Match 'since this boot'
     }
 }
