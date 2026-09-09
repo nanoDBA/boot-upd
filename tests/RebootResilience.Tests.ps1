@@ -1019,9 +1019,26 @@ Describe 'Bounded Windows Update service readiness' {
     It 'keeps global preflight read-only and shows elapsed progress' {
         $preflight = Get-FunctionText $invokeAst 'Test-PreFlightChecks'
         $preflight | Should -Not -Match 'Start-Service'
-        $preflight | Should -Match 'bounded recovery is deferred to the Windows Update phase'
+        $preflight | Should -Match 'Windows Update phase'
         $preflight | Should -Match 'elapsed.*TotalSeconds'
         $preflight | Should -Match 'Write-BootUpdateProgress'
+    }
+
+    It 'treats a stopped Windows Update service as normal and warns only when it is Disabled' {
+        <# wuauserv ships demand-start and trigger-registered; Microsoft's service guidance
+           lists it as Manual, and the WUA COM API starts it on the first method call. So
+           Stopped is the resting state of essentially every idle Windows 10/11 machine.
+           Warning on it made all of them look degraded and buried Disabled, which is the
+           one state that genuinely blocks servicing. #>
+        $preflight = Get-FunctionText $invokeAst 'Test-PreFlightChecks'
+        $preflight | Should -Match "StartType -eq 'Disabled'"
+        $preflight | Should -Match 'normal idle state'
+        <# The only -Level Warn in the service block must be the Disabled branch. A regression
+           here is silent: the run still works, it just cries wolf on every healthy machine. #>
+        $serviceBlock = [regex]::Match($preflight, '(?s)Get-Service wuauserv.*?catch \{[^}]*\}').Value
+        $serviceBlock | Should -Not -BeNullOrEmpty
+        ([regex]::Matches($serviceBlock, '-Level Warn')).Count |
+            Should -Be 2 -Because 'one warning for Disabled, one for a failed observation, and none for a resting service'
     }
 
     It 'bounds escalated component recovery and records remediation only after verified recovery' {

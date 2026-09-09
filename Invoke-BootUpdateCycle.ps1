@@ -5305,6 +5305,7 @@ function Register-BootUpdateTaskForReboot {
         "-File `"$scriptPath`"", '-Force'
         "-MaxIterations $($script:MaxIterations)"
         "-MaxRetryPasses $($script:MaxRetryPasses)"
+        "-MaxUserIdentityWaits $($script:MaxUserIdentityWaits)"
         "-PackageTimeoutMinutes $($script:PackageTimeoutMinutes)"
         "-RebootDelaySec $($script:RebootDelaySec)"
         "-OutputMode $($script:OutputMode)"
