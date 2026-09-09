@@ -46,7 +46,7 @@ Published launcher upgrade:  PASS     (from v2.5.43)
 Live bootstrap:              PASS     (row F - but see the qualification below)
 Provider integration:        NOT RUN
 Multi-reboot convergence:    PARTIAL  (rows A and B PASS against this build; C, D, E, F, G below)
-Release assets:              NOT RUN at the time of writing
+Release assets:              PASS     (20: 10 scripts + 10 SHA-256 sidecars)
 ```
 
 The gate line is PARTIAL, not PASS, because a summary line may say PASS only when every row it summarises is PASS. Rows A and B both pass; rows D and G are partial, and rows C, E and F did not run against this build.
@@ -66,7 +66,7 @@ Reporting follows the rule now written down in `docs/TESTING.md`: PASS only when
 Two things about the gates themselves, stated rather than smoothed over:
 
 - The unit gate **failed once at 1 of 477** during this release and passed on four subsequent full runs. `Invoke-TestGates.ps1` threw a bare count and discarded the results, so the failing test cannot be named. It now reports them, so the next intermittent failure is diagnosable. Whether that one failure was a real defect is **not known**.
-- **Release assets** are checked immediately after tagging (20 expected: 10 scripts and 10 SHA-256 sidecars), and the compatibility-installer hash pinned in `README.md` is carried forward from v2.5.78 rather than re-derived — `Install-UpdCompat.ps1` is unchanged, so it should hash identically, but that is confirmed by the published-launcher gate after the release exists, not before.
+- **Release assets** were verified after tagging: the release is not a draft, carries 20 assets (10 scripts and 10 SHA-256 sidecars), and targets the pushed commit. The compatibility-installer hash pinned in `README.md` was carried forward from v2.5.78 rather than re-derived, and has now been checked against the published asset by downloading it: `67662B3B02252FF6DE045FCDF28FB74D8DEB6FDA8080C46B1DAFC7BFBE54ABE3`, matching.
 
 No live update cycle was run on the maintainer's own machine. Every reboot, package install and scheduled task in this validation happened on a disposable guest.
 
