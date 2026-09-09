@@ -3553,6 +3553,41 @@ Describe 'An update the machine says it installed and offers again is inventory,
         $records.Count | Should -Be 0
     }
 
+    It 'treats an Unspecified-kind history date as the UTC it already is' {
+        <# Caught in row B's own log: an install that happened at 14:12:42Z was reported as
+           18:12:42Z, the local offset added twice. IUpdateHistoryEntry::Date is documented
+           UTC but arrives from COM with DateTimeKind Unspecified, and a blind
+           ToUniversalTime() shifts it. The printed timestamp was the visible symptom; the
+           real hazard is that the same shift lets a success from up to one offset BEFORE
+           the last boot pass a since-boot test, and suppress work that is genuinely
+           outstanding. #>
+        $installedUtc = [datetime]::new(2026, 9, 9, 14, 12, 42, [System.DateTimeKind]::Unspecified)
+        $records = @(Get-WindowsUpdateReofferedAfterSuccess -Applicable @($script:Kb5007651) `
+            -History @((New-HistoryEntry -Title $script:Kb5007651 -At $installedUtc)) `
+            -SinceUtc $script:Boot)
+
+        $records.Count | Should -Be 1
+        $records[0].LastSuccess.ToString('yyyy-MM-dd HH:mm:ss') | Should -Be '2026-09-09 14:12:42' -Because 'the reported moment must be the one the machine recorded'
+        $records[0].LastSuccess.Kind | Should -Be ([System.DateTimeKind]::Utc)
+    }
+
+    It 'does not let the local offset drag a pre-boot success across the boot line' {
+        <# One minute before the boot, tagged Unspecified. Under the old blind conversion an
+           offset-hours shift would have carried it past SinceUtc and excused an update
+           nobody had installed since the restart. #>
+        $justBeforeBoot = [datetime]::SpecifyKind($script:Boot.AddMinutes(-1), [System.DateTimeKind]::Unspecified)
+        @(Get-WindowsUpdateReofferedAfterSuccess -Applicable @($script:Kb5007651) `
+            -History @((New-HistoryEntry -Title $script:Kb5007651 -At $justBeforeBoot)) `
+            -SinceUtc $script:Boot).Count | Should -Be 0
+    }
+
+    It 'still accepts a genuinely Local-kind moment by converting it' {
+        $localNow = [datetime]::SpecifyKind($script:Boot.AddMinutes(30).ToLocalTime(), [System.DateTimeKind]::Local)
+        @(Get-WindowsUpdateReofferedAfterSuccess -Applicable @($script:Kb5007651) `
+            -History @((New-HistoryEntry -Title $script:Kb5007651 -At $localNow)) `
+            -SinceUtc $script:Boot).Count | Should -Be 1
+    }
+
     It 'reports nothing when the history is unreadable' {
         @(Get-WindowsUpdateReofferedAfterSuccess -Applicable @($script:Kb5007651) -History @() -SinceUtc $script:Boot).Count |
             Should -Be 0 -Because 'no history is no evidence; the update stays outstanding and retryable'

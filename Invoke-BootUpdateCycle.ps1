@@ -4331,7 +4331,13 @@ function Get-WindowsUpdateInstallHistory {
             [pscustomobject]@{
                 Title       = [string]$_.Title
                 ResultCode  = [int]$_.ResultCode
-                InstalledAt = [datetime]$_.Date
+                <# IUpdateHistoryEntry::Date is documented as UTC, but it arrives from COM
+                   with DateTimeKind Unspecified, so any later ToUniversalTime() would add
+                   the local offset a second time. Row B logged an install as 18:12:42Z that
+                   really happened at 14:12:42Z, and the same shift would have let a success
+                   from up to one offset BEFORE the last boot count as "installed in this
+                   boot" - suppressing real work. Stamp the kind at the source. #>
+                InstalledAt = [datetime]::SpecifyKind([datetime]$_.Date, [System.DateTimeKind]::Utc)
             }
         })
     } catch {
@@ -4372,8 +4378,18 @@ function Get-WindowsUpdateReofferedAfterSuccess {
         [object[]]$History = @(),
         [datetime]$SinceUtc = [datetime]::MinValue
     )
+    <# Normalise by KIND, not by calling ToUniversalTime() blindly. A value that is already
+       UTC but tagged Unspecified would otherwise be shifted by the local offset, which is
+       how a pre-boot success could pass a since-boot test. #>
+    $asUtc = {
+        param($Value)
+        $moment = [datetime]$Value
+        if ($moment.Kind -eq [System.DateTimeKind]::Local) { return $moment.ToUniversalTime() }
+        return [datetime]::SpecifyKind($moment, [System.DateTimeKind]::Utc)
+    }
+    $since = & $asUtc $SinceUtc
     $succeeded = @($History | Where-Object { $_ -and [int]$_.ResultCode -eq 2 -and
-        ([datetime]$_.InstalledAt).ToUniversalTime() -ge $SinceUtc.ToUniversalTime() })
+        (& $asUtc $_.InstalledAt) -ge $since })
     $records = foreach ($title in @($Applicable | Where-Object { $_ })) {
         $installs = @($succeeded | Where-Object { [string]$_.Title -eq [string]$title })
         if (-not $installs.Count) { continue }
@@ -4383,7 +4399,7 @@ function Get-WindowsUpdateReofferedAfterSuccess {
             Title       = [string]$title
             KB          = $kb
             Installs    = $installs.Count
-            LastSuccess = ([datetime]$latest.InstalledAt).ToUniversalTime()
+            LastSuccess = & $asUtc $latest.InstalledAt
         }
     }
     return @($records)
