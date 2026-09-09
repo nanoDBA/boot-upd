@@ -2668,27 +2668,20 @@ Describe 'Fast reboot accounting' {
 Describe 'Resume account resolution' {
     <# Regression cover for -2jsd, found by VM matrix row B. With nobody signed in,
        resume-user discovery falls through to LogonUI's LastLoggedOnSAMUser, which returns
-       the '.
-ame' form. Task Scheduler cannot map that to a SID, so Register-ScheduledTask
+       the '.\name' form. Task Scheduler cannot map that to a SID, so Register-ScheduledTask
        threw a terminating error, the cycle died right after pre-flight, and no continuation
        task was registered at all - a headless machine could never resume. #>
 
-    It 'expands the .
-ame form LogonUI actually returns' {
-        $resolved = Resolve-BootUpdateResumeAccount -Account ".\$env:USERNAME"
-        $resolved | Should -Be "$env:COMPUTERNAME\$env:USERNAME"
+    It 'resolves every account form Windows might hand back to the same identity' {
+        <# The three shapes that reach this function: the '.\name' form LogonUI writes, a
+           bare name, and an already-qualified name. All must land on the same principal.
+           They resolve to a SID rather than a name because Task Scheduler stores a SID
+           regardless, and the SID sidesteps the name grammar that rejects '.\name'. #>
+        $expected = ([System.Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
+        Resolve-BootUpdateResumeAccount -Account ".\$env:USERNAME"                  | Should -Be $expected
+        Resolve-BootUpdateResumeAccount -Account $env:USERNAME                      | Should -Be $expected
+        Resolve-BootUpdateResumeAccount -Account "$env:COMPUTERNAME\$env:USERNAME"  | Should -Be $expected
     }
-
-    It 'qualifies a bare account name with the computer name' {
-        Resolve-BootUpdateResumeAccount -Account $env:USERNAME |
-            Should -Be "$env:COMPUTERNAME\$env:USERNAME"
-    }
-
-    It 'passes an already qualified account through unchanged' {
-        $qualified = "$env:COMPUTERNAME\$env:USERNAME"
-        Resolve-BootUpdateResumeAccount -Account $qualified | Should -Be $qualified
-    }
-
     It 'returns nothing for an account that cannot be resolved, rather than throwing' {
         <# The caller falls back to the SYSTEM-only resume chain on $null. Throwing here is
            what killed the cycle outright, which is strictly worse than a SYSTEM-only
@@ -2756,5 +2749,36 @@ Describe 'Bounded wait for an interactive user' {
         }
         $state.UserIdentityWaitCount | Should -Be 2
         Update-BootUpdateUserIdentityWait -State $state -UserUnknown $true -MaxWaits 5 | Should -BeFalse
+    }
+}
+
+Describe 'Resume account prefers the recorded SID' {
+    <# LogonUI records LastLoggedOnUserSID beside LastLoggedOnSAMUser. The name it writes is
+       the '.\user' form, which is outside the documented input grammar of LookupAccountName
+       and fails with ERROR_NONE_MAPPED. The SID also covers AzureAD\ and MicrosoftAccount\
+       forms that no string expansion would fix, and Task Scheduler normalises a resolvable
+       name to a SID on write anyway. #>
+
+    It 'returns the SID when one is recorded, ignoring an unusable name' {
+        $mySid = ([System.Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
+        Resolve-BootUpdateResumeAccount -Account '.\definitely_not_a_user_zzq' -PreferredSid $mySid |
+            Should -Be $mySid
+    }
+
+    It 'falls back to the name when the recorded SID is unusable' {
+        Resolve-BootUpdateResumeAccount -Account $env:USERNAME -PreferredSid 'not-a-sid' |
+            Should -Not -BeNullOrEmpty
+    }
+
+    It 'resolves a name to a SID rather than returning the name' {
+        <# Task Scheduler stores a SID regardless; returning one keeps the value stable across
+           an account rename and sidesteps the name grammar entirely. #>
+        Resolve-BootUpdateResumeAccount -Account ".\$env:USERNAME" |
+            Should -Match '^S-1-5-'
+    }
+
+    It 'still yields nothing when neither the SID nor the name resolves' {
+        Resolve-BootUpdateResumeAccount -Account '.\nosuchuser_zzq' -PreferredSid 'S-1-5-21-0-0-0-9999' |
+            Should -BeNullOrEmpty
     }
 }

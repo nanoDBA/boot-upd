@@ -2236,10 +2236,21 @@ function Test-PreFlightChecks {
        service must not hold Winget, Chocolatey, or other independent providers
        hostage. The WU phase owns a separately bounded recovery attempt. #>
     Show-PreflightStep -Status 'Observing Windows Update readiness' -Percent 85
+    <# Stopped is the RESTING state, not a fault. wuauserv ships demand-start and
+       trigger-registered; Microsoft's own service guidance lists it as Manual, and the
+       Windows Update Agent COM API starts it on the first method call. Warning about a
+       stopped service made every idle Windows 10/11 machine look degraded and buried the
+       one state that genuinely blocks servicing. Only Disabled is a blocker, and only that
+       is worth a warning here. #>
     try {
         $svc = Get-Service wuauserv -ErrorAction Stop
-        if ($svc.Status -eq 'Running') { Write-Log 'WU service: Running' }
-        else { Write-Log "WU service: $($svc.Status); bounded recovery is deferred to the Windows Update phase." -Level Warn }
+        if ($svc.StartType -eq 'Disabled') {
+            Write-Log 'WU service: Disabled by configuration; the Windows Update phase cannot start it and will report the block.' -Level Warn
+        } elseif ($svc.Status -eq 'Running') {
+            Write-Log 'WU service: Running'
+        } else {
+            Write-Log "WU service: $($svc.Status) (start type $($svc.StartType)); this is the normal idle state and the phase starts it on demand."
+        }
     } catch { Write-Log "WU service observation failed; the Windows Update phase will perform bounded recovery: $_" -Level Warn }
 
     <# Battery #>
@@ -5209,17 +5220,37 @@ function Resolve-BootUpdateResumeAccount {
        Returns $null when the account cannot be resolved, so the caller can fall back to
        the SYSTEM-only branch. A machine with no resolvable user must still get its SYSTEM
        continuation rather than no continuation at all. #>
-    param([AllowNull()][string]$Account)
+    param([AllowNull()][string]$Account, [AllowNull()][string]$PreferredSid)
+
+    <# Prefer the SID Windows already recorded beside the name. LogonUI writes
+       LastLoggedOnUserSID next to LastLoggedOnSAMUser, and Task Scheduler normalises any
+       resolvable name to a SID on write anyway, so passing the SID skips the name grammar
+       entirely. That matters beyond the '.\' case: an Entra-joined machine yields
+       'AzureAD\user' and a Microsoft account yields 'MicrosoftAccount\user@example.com',
+       neither of which this expansion would fix, and both of which would otherwise
+       degrade to a SYSTEM-only chain with no user continuation at all. #>
+    if ($PreferredSid) {
+        try {
+            $sid = [System.Security.Principal.SecurityIdentifier]::new($PreferredSid)
+            $null = $sid.Translate([System.Security.Principal.NTAccount])
+            return $sid.Value
+        } catch {
+            Write-Log "Recorded resume SID '$PreferredSid' does not resolve; falling back to the account name." -Level Warn
+        }
+    }
 
     if ([string]::IsNullOrWhiteSpace($Account)) { return $null }
     $candidate = $Account.Trim()
-    # '.\name' and bare 'name' both mean a local account on this machine.
+    <# '.\name' and bare 'name' both mean a local account here. '.\name' is not merely
+       undocumented for Task Scheduler: it is outside the input grammar of the
+       LookupAccountName call underneath, which documents domain\user, DNS and UPN forms
+       and never the dot. It fails with ERROR_NONE_MAPPED (1332). #>
     if ($candidate -like '.\*') { $candidate = "$env:COMPUTERNAME\" + $candidate.Substring(2) }
     elseif ($candidate -notmatch '[\\@]') { $candidate = "$env:COMPUTERNAME\$candidate" }
 
     try {
-        $null = ([System.Security.Principal.NTAccount]$candidate).Translate([System.Security.Principal.SecurityIdentifier])
-        return $candidate
+        $resolved = ([System.Security.Principal.NTAccount]$candidate).Translate([System.Security.Principal.SecurityIdentifier])
+        return $resolved.Value
     } catch {
         Write-Log "Resume account '$Account' does not resolve to a security identifier; continuing with the SYSTEM-only resume chain." -Level Warn
         return $null
@@ -5344,7 +5375,7 @@ function Register-BootUpdateTaskForReboot {
     <# Never hand a raw discovered name to Task Scheduler. An unresolvable one throws a
        terminating error that kills the cycle before any continuation exists; resolving to
        $null here degrades to the SYSTEM-only branch below instead. #>
-    $resumeUser = Resolve-BootUpdateResumeAccount -Account $resumeUserRaw
+    $resumeUser = Resolve-BootUpdateResumeAccount -Account $resumeUserRaw -PreferredSid ([string]$script:ResumeUserSid)
     if ($resumeUser) {
         $currentUser = $resumeUser
         $userTrigger   = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
@@ -6611,9 +6642,14 @@ function Invoke-BootUpdateCycle {
         try { $state.ResumeUser = (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).UserName } catch { }
         if (-not $state.ResumeUser) {
             try { $state.ResumeUser = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\LogonUI' -Name LastLoggedOnSAMUser -ErrorAction Stop).LastLoggedOnSAMUser } catch { }
+            <# LogonUI records the SID beside the name. Prefer it: the name it writes is the
+               '.\user' form, which Task Scheduler cannot resolve, and the SID also covers the
+               AzureAD\ and MicrosoftAccount\ forms that no string expansion would fix. #>
+            try { $state.ResumeUserSid = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\LogonUI' -Name LastLoggedOnUserSID -ErrorAction Stop).LastLoggedOnUserSID } catch { }
         }
     }
     $script:ResumeUser = $state.ResumeUser
+    $script:ResumeUserSid = if ($state.PSObject.Properties.Name -contains 'ResumeUserSid') { $state.ResumeUserSid } else { $null }
     $script:CurrentState = $state
     $script:ExplicitRebootRequests.Clear()
     foreach ($request in @($state.ExplicitRebootRequests)) { $script:ExplicitRebootRequests.Add($request) }
