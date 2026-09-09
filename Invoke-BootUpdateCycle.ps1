@@ -3053,6 +3053,75 @@ function Get-ProcessTreeActivity {
     return [pscustomobject]@{ TotalCpuTime = [timespan]::FromMilliseconds($totalCpuMs); ProcessCount = $procCount; HandleCount = $handles }
 }
 
+function Test-BootUpdateInstallerMutexHeld {
+    <# Is a Windows Installer transaction in progress right now?
+
+       Exit code 1618 is Windows Installer saying "another installation is already in
+       progress", and that exclusion is arbitrated by the Global\_MSIExecute mutex. Asking
+       the mutex is therefore the exact question, where "is msiexec.exe running" is only a
+       correlate: msiexec runs as a service process for reasons unrelated to an active
+       transaction, so waiting on the process name would block on nothing.
+
+       The name is a parameter so tests can drive both answers without touching the real
+       machine-wide mutex, which a test has no business creating. #>
+    param([string]$MutexName = 'Global\_MSIExecute')
+    $mutex = $null
+    try {
+        $mutex = [System.Threading.Mutex]::OpenExisting($MutexName)
+    } catch {
+        <# Not present at all: no transaction has claimed it. #>
+        return $false
+    }
+    try {
+        <# Zero-timeout acquire, then release immediately. Holding it for the length of one
+           call cannot starve a real installer, and it is the only way to distinguish
+           "exists" from "held". #>
+        $acquired = $false
+        try { $acquired = $mutex.WaitOne(0, $false) }
+        catch [System.Threading.AbandonedMutexException] {
+            <# The holder died without releasing - which is precisely the orphan case this
+               exists for. The wait is over: nothing is installing. #>
+            $acquired = $true
+        }
+        if ($acquired) { try { $mutex.ReleaseMutex() } catch { } ; return $false }
+        return $true
+    } finally { $mutex.Dispose() }
+}
+
+function Wait-BootUpdateInstallerMutex {
+    <# Block until no Windows Installer transaction is in progress, or the bound expires.
+
+       Remove-ProcessTree kills the provider and its descendants, but msiexec.exe is
+       parented to services.exe, so an MSI-backed package that gets timed out leaves its
+       installer running out of tree. Observed 2026-09-06: a killed Acrobat Reader install
+       left msiexec PID 41352 alive for 28 minutes, and six machine-scope packages in the
+       next passes failed with 0x652 = 1618 against the updater's own orphan, costing three
+       iterations and 39.6 minutes. Killing harder is not the answer - tearing down an MSI
+       transaction mid-write is how a machine ends up with a half-installed product - so
+       the cycle waits for the transaction it orphaned instead of racing it.
+
+       Bounded, and reports what it did either way: a wait that can run forever is not a
+       recovery, and a caller that proceeds anyway must be able to say the mutex was still
+       held. #>
+    param(
+        [double]$TimeoutMinutes = 10,
+        [double]$PollSeconds = 5,
+        [string]$MutexName = 'Global\_MSIExecute'
+    )
+    if (-not (Test-BootUpdateInstallerMutexHeld -MutexName $MutexName)) { return $true }
+    $deadline = [datetime]::UtcNow.AddMinutes($TimeoutMinutes)
+    Write-Log "A Windows Installer transaction is still in progress after the kill; waiting up to $TimeoutMinutes min for it rather than colliding with it (exit 1618)." -Level Warn
+    while ([datetime]::UtcNow -lt $deadline) {
+        Wait-BootUpdateUiInterval -Seconds $PollSeconds -Activity 'INSTALLER//WAIT' `
+            -Status 'Waiting for an orphaned Windows Installer transaction to finish' -PercentComplete 99
+        if (-not (Test-BootUpdateInstallerMutexHeld -MutexName $MutexName)) {
+            Write-Log 'The orphaned Windows Installer transaction finished; continuing.' -Level Info
+            return $true
+        }
+    }
+    Write-Log "A Windows Installer transaction was still in progress after $TimeoutMinutes min. Continuing; packages in this pass may report 1618." -Level Warn
+    return $false
+}
 function Wait-ProcessWithIdleTimeout {
     param(
         [Parameter(Mandatory)][System.Diagnostics.Process]$Process,
@@ -3117,6 +3186,8 @@ function Wait-ProcessWithIdleTimeout {
             $tree = Get-ProcessTreeActivity -ParentPid $Process.Id
             Write-Log "  Tree at kill: $($tree.ProcessCount) processes, CPU=$([math]::Round($tree.TotalCpuTime.TotalSeconds,1))s, handles=$($tree.HandleCount)" -Level Warn
             Remove-ProcessTree -RootPid $Process.Id
+            <# The kill covers the tree; msiexec is not in it. #>
+            $null = Wait-BootUpdateInstallerMutex
             return @{ Reason = 'HardTimeout'; Elapsed = $elapsed; FinalCpuTime = $tree.TotalCpuTime; ExitCode = $null }
         }
         $activity = Get-ProcessTreeActivity -ParentPid $Process.Id; $finalCpu = $activity.TotalCpuTime
@@ -3141,6 +3212,8 @@ function Wait-ProcessWithIdleTimeout {
             Write-Log "IDLE TIMEOUT: PID $($Process.Id) idle $([math]::Round($idleFor.TotalMinutes,1))m (threshold: ${IdleTimeoutMinutes}m), final CPU=$([math]::Round($activity.TotalCpuTime.TotalSeconds,1))s. Killing." -Level Error
             Write-Log "  Tree at kill: $($activity.ProcessCount) processes, handles=$($activity.HandleCount)" -Level Warn
             Remove-ProcessTree -RootPid $Process.Id
+            <# The kill covers the tree; msiexec is not in it. #>
+            $null = Wait-BootUpdateInstallerMutex
             return @{ Reason = 'IdleTimeout'; Elapsed = $elapsed; FinalCpuTime = $finalCpu; ExitCode = $null }
         }
         $progressStatus = "$Status | CPU $([math]::Round($activity.TotalCpuTime.TotalSeconds,1))s | $($activity.ProcessCount) proc | idle $([math]::Round($idleFor.TotalMinutes,1))m | elapsed $([math]::Round($elapsed.TotalMinutes,1))m"

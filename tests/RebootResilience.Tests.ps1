@@ -67,6 +67,8 @@ BeforeAll {
           'Add-BootUpdatePendingCleanupRecord',
           'Update-BootUpdatePendingFileRenameSnapshot',
           'Get-ConfirmedPendingReboot',
+          'Test-BootUpdateInstallerMutexHeld',
+          'Wait-BootUpdateInstallerMutex',
           'New-BootUpdateStateV2',
           'Update-BootUpdateStateSchema',
           'Update-BootUpdateResumeIdentity',
@@ -3322,5 +3324,126 @@ Describe 'An explicit 3010 records pending-file state instead of skipping it' {
         $null = Get-ConfirmedPendingReboot -Context 'after updates'
         $script:ProbeCount  | Should -Be 2
         $script:SettleWaits | Should -Be 1
+    }
+}
+
+Describe 'A killed package tree does not race the installer it orphaned' {
+    <# -ynvn. Remove-ProcessTree kills the provider and its descendants, but msiexec.exe is
+       parented to services.exe and is not in that tree. Observed 2026-09-06: a killed
+       Acrobat Reader install left msiexec PID 41352 alive for 28 minutes and six
+       machine-scope packages in the following passes failed 0x652 = 1618 against the
+       updater's own orphan - three iterations, 39.6 minutes. Killing harder is not the
+       answer; tearing down an MSI transaction mid-write is how a machine ends up with a
+       half-installed product. The cycle waits for the transaction instead.
+
+       These tests drive a private mutex rather than Global\_MSIExecute. A test has no
+       business creating the machine-wide Windows Installer mutex: doing so would make
+       every real installer on the host believe an installation was in progress. #>
+
+    BeforeAll {
+        function New-TestMutexName { 'Local\boot-upd-test-{0}' -f [guid]::NewGuid().ToString('N') }
+
+        <# Held in a separate thread job, because a mutex is reentrant for its owning
+           thread: acquiring it on this thread would report free and the test would prove
+           nothing. The job signals through a file so the assertion cannot run before the
+           mutex is actually held. #>
+        function Start-MutexHolder {
+            param([string]$Name, [string]$SignalPath, [int]$HoldSeconds = 30)
+            $job = Start-ThreadJob -ArgumentList $Name, $SignalPath, $HoldSeconds -ScriptBlock {
+                param($Name, $SignalPath, $HoldSeconds)
+                $mutex = [System.Threading.Mutex]::new($false, $Name)
+                $null = $mutex.WaitOne()
+                Set-Content -LiteralPath $SignalPath -Value 'held'
+                $deadline = (Get-Date).AddSeconds($HoldSeconds)
+                while ((Get-Date) -lt $deadline -and (Test-Path -LiteralPath $SignalPath)) { Start-Sleep -Milliseconds 100 }
+                $mutex.ReleaseMutex(); $mutex.Dispose()
+            }
+            $waited = [Diagnostics.Stopwatch]::StartNew()
+            while (-not (Test-Path -LiteralPath $SignalPath) -and $waited.Elapsed.TotalSeconds -lt 15) { Start-Sleep -Milliseconds 50 }
+            return $job
+        }
+        function Stop-MutexHolder {
+            param($Job, [string]$SignalPath)
+            Remove-Item -LiteralPath $SignalPath -Force -ErrorAction SilentlyContinue
+            $null = Wait-Job $Job -Timeout 15
+            Remove-Job $Job -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    BeforeEach {
+        $script:UiWaits = 0
+        function Wait-BootUpdateUiInterval { param($Seconds,$Activity,$Status,$PercentComplete) $script:UiWaits++ }
+        $script:Logged = [System.Collections.Generic.List[object]]::new()
+        function Write-Log { param([string]$Message,[string]$Level,[string]$Visibility) $script:Logged.Add([pscustomobject]@{ Message=$Message; Level=$Level }) }
+    }
+
+    It 'reports no transaction when the mutex does not exist' {
+        Test-BootUpdateInstallerMutexHeld -MutexName (New-TestMutexName) | Should -BeFalse
+    }
+
+    It 'reports no transaction for a mutex that exists but is free' {
+        $name = New-TestMutexName
+        $mutex = [System.Threading.Mutex]::new($false, $name)
+        try { Test-BootUpdateInstallerMutexHeld -MutexName $name | Should -BeFalse -Because 'existing is not the same as held' }
+        finally { $mutex.Dispose() }
+    }
+
+    It 'reports a transaction in progress while the mutex is held elsewhere' {
+        $name = New-TestMutexName
+        $signal = Join-Path ([IO.Path]::GetTempPath()) ("mutex-held-{0}.txt" -f [guid]::NewGuid().ToString('N'))
+        $job = Start-MutexHolder -Name $name -SignalPath $signal
+        try {
+            Test-Path -LiteralPath $signal | Should -BeTrue -Because 'the holder must actually hold it before this asserts anything'
+            Test-BootUpdateInstallerMutexHeld -MutexName $name | Should -BeTrue
+        } finally { Stop-MutexHolder -Job $job -SignalPath $signal }
+    }
+
+    It 'returns at once and says nothing when no transaction is in progress' {
+        Wait-BootUpdateInstallerMutex -MutexName (New-TestMutexName) -TimeoutMinutes 1 -PollSeconds 0.2 | Should -BeTrue
+        $script:UiWaits | Should -Be 0 -Because 'the ordinary path must not pay for this check'
+        $script:Logged.Count | Should -Be 0
+    }
+
+    It 'waits, bounded, and admits it when the transaction outlives the bound' {
+        $name = New-TestMutexName
+        $signal = Join-Path ([IO.Path]::GetTempPath()) ("mutex-held-{0}.txt" -f [guid]::NewGuid().ToString('N'))
+        $job = Start-MutexHolder -Name $name -SignalPath $signal
+        try {
+            Test-Path -LiteralPath $signal | Should -BeTrue
+            Wait-BootUpdateInstallerMutex -MutexName $name -TimeoutMinutes (3/60) -PollSeconds 0.2 |
+                Should -BeFalse -Because 'a wait that can run forever is not a recovery'
+            $script:UiWaits | Should -BeGreaterThan 0
+            @($script:Logged | Where-Object { $_.Message -match 'still in progress after' -and $_.Level -eq 'Warn' }).Count |
+                Should -BeGreaterThan 0 -Because 'a caller that proceeds anyway must be able to say the transaction was still held'
+        } finally { Stop-MutexHolder -Job $job -SignalPath $signal }
+    }
+
+    It 'returns as soon as the orphaned transaction finishes' {
+        $name = New-TestMutexName
+        $signal = Join-Path ([IO.Path]::GetTempPath()) ("mutex-held-{0}.txt" -f [guid]::NewGuid().ToString('N'))
+        $job = Start-MutexHolder -Name $name -SignalPath $signal -HoldSeconds 2
+        try {
+            Test-Path -LiteralPath $signal | Should -BeTrue
+            Wait-BootUpdateInstallerMutex -MutexName $name -TimeoutMinutes 1 -PollSeconds 0.2 |
+                Should -BeTrue -Because 'the point is to resume the moment the machine is free, not to sleep out a fixed delay'
+            @($script:Logged | Where-Object { $_.Message -match 'finished; continuing' }).Count | Should -Be 1
+        } finally { Stop-MutexHolder -Job $job -SignalPath $signal }
+    }
+
+    It 'waits for the orphan on both timeout kill paths, after the tree kill' {
+        <# The kill and the wait are inline in Wait-ProcessWithIdleTimeout, so the ordering
+           invariant is pinned against the function's own text the way this file already
+           pins orchestrator-inline invariants. Order matters: waiting before the kill would
+           wait on the transaction the cycle is about to terminate. #>
+        $text = Get-FunctionText $invokeAst 'Wait-ProcessWithIdleTimeout'
+        ([regex]::Matches($text, 'Wait-BootUpdateInstallerMutex')).Count | Should -Be 2
+        foreach ($reason in @('HardTimeout','IdleTimeout')) {
+            $at = $text.IndexOf("Reason = '$reason'")
+            $at | Should -BeGreaterThan 0
+            $kill = $text.LastIndexOf('Remove-ProcessTree -RootPid $Process.Id', $at)
+            $wait = $text.LastIndexOf('Wait-BootUpdateInstallerMutex', $at)
+            $kill | Should -BeGreaterThan 0
+            $wait | Should -BeGreaterThan $kill -Because 'the wait is for what the kill left behind'
+        }
     }
 }
