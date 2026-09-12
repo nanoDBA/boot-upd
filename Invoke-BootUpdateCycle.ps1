@@ -386,7 +386,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 6 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.79' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.80' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 Set-Variable -Name 'RebootSignalSettleSeconds' -Value 20 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 $script:ExplicitRebootRequests = [System.Collections.Generic.List[object]]::new()
 $script:LastPendingFileRenameOperations = @()
@@ -2209,22 +2209,21 @@ function Test-CrashRecovery {
         PowerShellModules='PowerShellModulesDone'; Scoop='ScoopDone'; DotnetTools='DotnetToolsDone'; Vscode='VscodeDone'
         Defender='DefenderDone'; DriverFirmware='DriverFirmwareDone'; Wsl='WslDone'; Containers='ContainersDone'
     }
-    <# 'ParallelCohort' is a sentinel written when the five-phase parallel cohort starts.
-       Crash recovery for this group is handled per-phase (each has its own *Done flag);
-       the cohort re-launches only phases where Done=false, so no special recovery is needed.
-       Task C: deliberately not charged here either — a killed cohort already re-runs via
-       per-phase Done flags, and charging per incomplete phase would burn several retries
-       for one dead pass. #>
-    if ($State.LastPhaseStarted -eq 'ParallelCohort' -or $State.LastPhaseStarted -eq 'CohortDone') {
-        Write-Log "Crash recovery: previous run was in parallel cohort — individual phase flags will gate re-execution." -Level Warn
+    <# 'ParallelCohort' is one durable sentinel for the whole cohort. A killed cohort must
+       consume one retry for the resumed pass, while the individual *Done flags continue to
+       decide which providers rerun. CohortDone is the completed sentinel and remains exempt. #>
+    if ($State.LastPhaseStarted -eq 'CohortDone' -or $State.Phase -eq 'CohortDone') {
         return $false
     }
-    $flagName = $phaseToFlag[$State.LastPhaseStarted]
-    if (-not $flagName) {
+    $isParallelCohort = $State.LastPhaseStarted -eq 'ParallelCohort'
+    $flagName = if ($isParallelCohort) { $null } else { $phaseToFlag[$State.LastPhaseStarted] }
+    if (-not $isParallelCohort -and -not $flagName) {
         Write-Log "Crash recovery: unknown phase '$($State.LastPhaseStarted)' in state file — ignoring." -Level Warn
         return $false
     }
-    $isDone = if ($flagName -and ($State.PSObject.Properties.Name -contains $flagName)) { [bool]$State.$flagName } else { $false }
+    $isDone = if ($isParallelCohort) { $false }
+              elseif ($State.PSObject.Properties.Name -contains $flagName) { [bool]$State.$flagName }
+              else { $false }
     if (-not $isDone) {
         $time = if ($State.LastPhaseTimestamp) { try { ([datetime]$State.LastPhaseTimestamp).ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss') } catch { $State.LastPhaseTimestamp } } else { '(unknown)' }
         <# An unfinished phase has three possible histories and only one of them is a crash.
@@ -2251,10 +2250,21 @@ function Test-CrashRecovery {
                 Write-Log "Previous pass stopped at a safety limit during [$($State.LastPhaseStarted)] at [$time] and the limit was raised; nothing crashed. Re-running that phase." -Level Info
             }
             default {
-                Write-Log "Previous run crashed during [$($State.LastPhaseStarted)] at [$time]. Restarting that phase." -Level Warn
+                $alreadyChargedThisPass = @($State.UnobservedStops | Where-Object {
+                    [int]$_.Iteration -eq [int]$State.Iteration -and
+                    [string]$_.Phase -eq [string]$State.LastPhaseStarted
+                }).Count -gt 0
+                if ($alreadyChargedThisPass) {
+                    Write-Log "Crash recovery for [$($State.LastPhaseStarted)] was already charged in pass $($State.Iteration); keeping the existing recovery record." -Visibility Verbose
+                    return $true
+                }
+                $restartText = if ($isParallelCohort) { 'Restarting only unfinished cohort phases.' } else { 'Restarting that phase.' }
+                Write-Log "Previous run crashed during [$($State.LastPhaseStarted)] at [$time]. $restartText" -Level Warn
                 <# Task C: an unobserved stop charges the retry budget exactly once for this
-                   resumed pass. Not a reboot (RebootCount untouched) and not a deliberate
-                   stop or identity-rediscovery wait (both excluded by the switch above). #>
+                   resumed pass. The persisted Phase+Iteration record makes this idempotent
+                   if recovery is evaluated again in the same pass. Not a reboot (RebootCount
+                   untouched) and not a deliberate stop or identity-rediscovery wait (both
+                   excluded by the switch above). #>
                 if (-not $WhatIfPreference) {
                     $State.ConsecutiveRetryCount = [int]$State.ConsecutiveRetryCount + 1
                     $State.UnobservedStops = @(@($State.UnobservedStops) + [pscustomobject]@{

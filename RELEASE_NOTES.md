@@ -1,12 +1,12 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.79
-**Release Date:** 2026-09-09
+**Current Version:** v2.5.80
+**Release Date:** 2026-09-12
 **Status:** STABLE
 
 ---
 
-## Unreleased
+## v2.5.80 (2026-09-12)
 
 Closes the gap v2.5.79's "Known limitations" named: a cycle killed mid-pass on a machine that
 neither reboots nor logs on again was not resumed until the next logon or boot (`-35qb.10`,
@@ -20,7 +20,7 @@ found by matrix row G on 2026-09-09).
   before the first update phase — both continuation tasks now also carry a repeating trigger
   that starts a watchdog probe every `WatchdogIntervalMinutes` (default 15, floor 2, no off
   switch). A probe that finds the cycle's mutex held exits at once, unchanged; one that finds it
-  free or abandoned becomes the recovery pass. This closes `-35qb.10`.
+  free or abandoned becomes the recovery pass. This closes [#69](https://github.com/nanoDBA/boot-upd/issues/69) (Beads `-35qb.10`).
 
 ### Changed
 
@@ -48,47 +48,33 @@ found by matrix row G on 2026-09-09).
   placed at the install directory by hand would reject that argument and the resume chain would
   not run. Roll back with `Deploy-BootUpdateCycle.ps1`, which re-registers the tasks.
 
+### Additional fixes
+
+- **Empty cleanup is no longer labeled persistent when both observations are empty.** [#53](https://github.com/nanoDBA/boot-upd/issues/53) records the exporter defect; only equal nonempty fingerprints establish persistence. Empty-to-empty is false; missing or skipped observations remain unknown.
+- **The lab CI credential boundary is explicit.** [#66](https://github.com/nanoDBA/boot-upd/issues/66) records the analyzer correction: required plaintext-to-secure-string conversion is centralized with narrow function-scoped compatibility exceptions.
+- **Parallel-phase interruptions consume the watchdog retry budget.** Release review found that the parallel-cohort sentinel bypassed crash accounting, allowing repeated same-boot interruptions to retry indefinitely. [#70](https://github.com/nanoDBA/boot-upd/issues/70) tracks the correction: charge one recovery for the interrupted pass, retain completed provider flags, disclose the stop, and use the existing retry-limit handoff.
+
+### Known limitations
+
+- Interruption during final health and convergence verification, after the parallel cohort has finished, does not yet charge the recovery budget. [#71](https://github.com/nanoDBA/boot-upd/issues/71) tracks a durable checkpoint for that window; the parallel-cohort fix does not cover it.
+
 ### Validation
 
 ```text
-Unit/process behavior:       PASS     (494 tests, 0 failed)
-User/SYSTEM boundary:        PASS
-Published launcher upgrade:  PASS     (from v2.5.43)
-Live bootstrap:              NOT RUN
-Provider integration:        NOT RUN
-Multi-reboot convergence:    PASS     (two rows below; the wider matrix was not re-run)
-Release assets:              NOT RUN  (nothing published)
+Unit/process behavior:       PASS     (498 tests, 0 failures or skips; clean CI for cd34699)
+User/SYSTEM boundary:         PASS
+Published launcher upgrade:   PASS
+Live bootstrap:               NOT RUN  (pending publication)
+Provider integration:         NOT RUN
+Multi-reboot convergence:     PARTIAL  (rows A and G PASS; row B PARTIAL with deferred inventory; wider rows NOT RUN)
+Release assets:               NOT RUN  (pending publication)
 ```
 
-Both gates were run from an elevated PowerShell 7 console on the development machine on
-2026-09-12 against the final working tree. The unit suite mocks Task Scheduler and so cannot
-validate the trigger shape itself; that comes from the two lab rows below and from a throwaway
-task registered and removed on the development machine, which read back as
-`MSFT_TaskTimeTrigger`, `Interval PT15M`, `Duration P3650D`.
+The 498-test result is the prior clean CI run for commit `cd34699`. The A/B/G rows below ran before the final version bump and parallel-cohort accounting correction; they establish their tested paths, not the newly found cohort edge case. Candidate quality checks and that regression are reported separately before publication. Live bootstrap and asset checks follow publication preparation. Broader provider coverage and the wider VM matrix remain NOT RUN.
 
-- **Positive row** — kill after promotion, no armed reboot, interactive user, lab-a. **PASS.**
-  `G-watchdog-resume-boot-upd-matrix-20260912-005213`. The Deploy host process was killed on
-  `Chocolatey - DONE`, during Windows Update, with Winget and Chocolatey already promoted. The
-  watchdog trigger had been armed at 00:58:51 for every 15 minutes; the probe started pass 2 at
-  01:15:35, *15 minutes 52 seconds* after the kill, and logged *"Previous run crashed during
-  [WindowsUpdate]"* then *"Recovery pass 1 of 5 after an unobserved stop in WindowsUpdate."* Only
-  Windows Update re-ran. The cycle converged at 01:18:44 with the disclosure line in the completion
-  log, `RebootsClaimed 0 = RebootsObservedOS 0`, no state file, no continuation tasks. The
-  harness's `CbsPending` read true: the guest shows the CBS `RebootPending` key was written at
-  01:19:05 by Windows' own update agent staging a package, 21 seconds after completion and after
-  both final probes were clean. It is not reboot evidence left by the cycle; the same reading was
-  true on the pre-change row G from the same checkpoint.
-- **Negative row** — healthy cycle, `-WatchdogIntervalMinutes 2`, one armed reboot, lab-b.
-  **PASS.** `W-watchdog-2min-noduplicate-lab-b-20260912-005213`. Eight *"this watchdog probe is
-  exiting without changes"* lines at the two-minute cadence; every phase started exactly once; no
-  recovery pass charged; the restart-path re-arm logged *"Resume chain verified … (3 retries,
-  2-minute interval)."* with no watchdog note, so the deliberate stop carried no repetition.
-  `RebootsClaimed 1 = RebootsObservedOS 1`, no state file, no continuation tasks, no pending CBS.
-
-Not re-run against this change: rows A, B, D, F and the PowerShell 5.1 bootstrap. The change
-touches only the in-flight arm of the resume chain and crash-resume accounting; the two rows above
-exercise both. Treat the rest of the matrix as **NOT RUN** for this change until a release runs it.
-
+- **Row A — interactive continuation, September 12. PASS.** Four user-context passes across three observed reboots; reboot accounting matched the OS evidence, the final Windows Update scope was empty, health checks passed, and state, continuation tasks and cleanup evidence were clear. Evidence: `vm-runs-retry2/A-sep12-boot-upd-matrix-20260912-111434`.
+- **Row B — headless SYSTEM continuation, September 12. PARTIAL.** Five SYSTEM passes and two observed reboots completed the cycle with no interactive user. Winget, Scoop and VS Code user work remained deferred, and the Windows Update re-offer was retained as deferred inventory rather than retried; the row therefore does not claim full provider convergence. This is a truthful partial result.
+- **Row G — killed-process recovery, September 12. PASS.** The intended Deploy process was killed after promotion; the scheduler records recovery PID 5148 and a separate SYSTEM fallback PID 4784 that respected the mutex. The recovered cycle completed with zero reboots, empty Windows Update assessment, passing health checks, and no remaining state or continuation tasks.
 ## v2.5.79 (2026-09-09)
 
 Truthfulness release. v2.5.78 fixed the headless servicing path and shipped a note claiming a capability the binary did not have; running the matrix against two guests found that claim was one of several. Six of the fixes below are cases where the updater said something that was not so — a dead preference described as active, a deliberate withhold logged as a crash, a reboot announced that never happened, a watchdog documented in a comment and never armed — and one is a fix that reopened an old defect the moment it started working.

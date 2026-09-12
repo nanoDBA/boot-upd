@@ -3433,7 +3433,10 @@ Describe 'A withheld phase is not reported as a crash' {
         }
     }
 
-    BeforeEach { $script:CrashLog.Clear() }
+    BeforeEach {
+        $script:CrashLog.Clear()
+        $script:MaxRetryPasses = 5
+    }
 
 
     It 'names a deliberately withheld verification as withheld, not as a crash' {
@@ -3475,11 +3478,84 @@ Describe 'A withheld phase is not reported as a crash' {
         $state = New-UnfinishedPhaseState -Phase 'WindowsUpdate'
         Test-CrashRecovery -State $state | Should -BeTrue
         $state.ConsecutiveRetryCount | Should -Be 1
+        $state.RebootCount | Should -Be 0 -Because 'watchdog recovery consumes the retry budget, not the reboot budget'
         $state.UnobservedStops.Count | Should -Be 1
         $state.UnobservedStops[0].Phase | Should -Be 'WindowsUpdate'
         $entry = $script:CrashLog[-1]
         $entry.Message | Should -Match 'Recovery pass 1 of 5 after an unobserved stop in WindowsUpdate\.'
         $entry.Level   | Should -Be 'Warn'
+    }
+
+    It 'charges and discloses one stopped parallel-cohort pass without changing provider completion flags' {
+        $state = New-BootUpdateStateV2
+        $state.Iteration = 2
+        $state.Phase = 'ParallelCohort'
+        $state.LastPhaseStarted = 'ParallelCohort'
+        $state.LastPhaseTimestamp = (Get-Date).AddMinutes(-3).ToString('o')
+        $state.PipDone = $true
+        $state.NpmDone = $false
+
+        Test-CrashRecovery -State $state | Should -BeTrue
+
+        $state.ConsecutiveRetryCount | Should -Be 1
+        $state.UnobservedStops.Count | Should -Be 1
+        $state.UnobservedStops[0].Phase | Should -Be 'ParallelCohort'
+        $state.UnobservedStops[0].Iteration | Should -Be 2
+        $state.PipDone | Should -BeTrue -Because 'completed cohort providers must remain gated off on recovery'
+        $state.NpmDone | Should -BeFalse -Because 'unfinished cohort providers must remain eligible to rerun'
+        @($script:CrashLog | Where-Object { $_.Message -match 'Recovery pass 1 of 5 after an unobserved stop in ParallelCohort\.' }).Count |
+            Should -Be 1
+    }
+
+    It 'does not charge a parallel-cohort recovery twice in the same resumed pass' {
+        $state = New-BootUpdateStateV2
+        $state.Iteration = 3
+        $state.Phase = 'ParallelCohort'
+        $state.LastPhaseStarted = 'ParallelCohort'
+
+        Test-CrashRecovery -State $state | Should -BeTrue
+        Test-CrashRecovery -State $state | Should -BeTrue
+
+        $state.ConsecutiveRetryCount | Should -Be 1
+        $state.UnobservedStops.Count | Should -Be 1
+        @($script:CrashLog | Where-Object { $_.Message -match '^Recovery pass ' }).Count | Should -Be 1
+    }
+
+    It 'preserves every deliberate-stop exemption for a parallel cohort checkpoint' {
+        foreach ($phase in @('RetryPending','UserContextPending','Rebooting','ResumeAfterLimit','CohortDone')) {
+            $state = New-BootUpdateStateV2
+            $state.Iteration = 3
+            $state.Phase = $phase
+            $state.LastPhaseStarted = 'ParallelCohort'
+
+            $expectedRecovery = $phase -ne 'CohortDone'
+            (Test-CrashRecovery -State $state) | Should -Be $expectedRecovery -Because "$phase is a deliberate terminal disposition"
+            $state.ConsecutiveRetryCount | Should -Be 0 -Because "$phase must not consume the retry budget"
+            $state.UnobservedStops.Count | Should -Be 0 -Because "$phase must not be disclosed as an unobserved stop"
+        }
+    }
+
+    It 'hands a stopped parallel cohort to the existing retry-limit stop' {
+        $script:MaxRetryPasses = 2
+        $script:UnregisterCalls = 0
+        $state = New-BootUpdateStateV2
+        $state.Iteration = 4
+        $state.ConsecutiveRetryCount = 1
+        $state.Phase = 'ParallelCohort'
+        $state.LastPhaseStarted = 'ParallelCohort'
+
+        $before = [int]$state.ConsecutiveRetryCount
+        Test-CrashRecovery -State $state | Should -BeTrue
+        $charged = [int]$state.ConsecutiveRetryCount -gt $before
+        $stopped = if ($charged) {
+            Stop-BootUpdateAtRetryLimit -State $state -IncompletePhases @($state.LastPhaseStarted)
+        } else { $false }
+
+        $charged | Should -BeTrue
+        $stopped | Should -BeTrue
+        $state.Phase | Should -Be 'RetryLimitReached'
+        $state.LimitReason | Should -Match 'Same-boot recovery limit 2 reached; incomplete phases: ParallelCohort'
+        $script:UnregisterCalls | Should -Be 1
     }
 
     It 'does not charge the retry budget for a deliberately withheld pass' {
