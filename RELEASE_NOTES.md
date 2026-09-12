@@ -57,24 +57,28 @@ found by matrix row G on 2026-09-09).
 ### Known limitations
 
 - Interruption during final health and convergence verification, after the parallel cohort has finished, does not yet charge the recovery budget. [#71](https://github.com/nanoDBA/boot-upd/issues/71) tracks a durable checkpoint for that window; the parallel-cohort fix does not cover it.
+- Optional phase hooks may be rejected by the trust check under the standard directory permissions, even when broad groups have only read access. [#72](https://github.com/nanoDBA/boot-upd/issues/72) tracks this permission-mask false positive.
 
 ### Validation
 
 ```text
-Unit/process behavior:       PASS     (498 tests, 0 failures or skips; clean CI for cd34699)
+Unit/process behavior:       PASS     (502 tests, 0 failures or skips; clean CI for 98f72e2)
 User/SYSTEM boundary:         PASS
 Published launcher upgrade:   PASS
 Live bootstrap:               NOT RUN  (pending publication)
+Parallel-cohort recovery:     PASS     (two interruptions; bounded safety stop, not convergence)
 Provider integration:         NOT RUN
 Multi-reboot convergence:     PARTIAL  (rows A and G PASS; row B PARTIAL with deferred inventory; wider rows NOT RUN)
 Release assets:               NOT RUN  (pending publication)
 ```
 
-The 498-test result is the prior clean CI run for commit `cd34699`. The A/B/G rows below ran before the final version bump and parallel-cohort accounting correction; they establish their tested paths, not the newly found cohort edge case. Candidate quality checks and that regression are reported separately before publication. Live bootstrap and asset checks follow publication preparation. Broader provider coverage and the wider VM matrix remain NOT RUN.
+[Candidate CI](https://github.com/nanoDBA/boot-upd/actions/runs/34706622534) passed 502 tests, PowerShell parsing, analyzer checks, user/SYSTEM exclusion, and the published-launcher upgrade gate at commit `98f72e2`. Four new behavioral regressions cover the parallel-cohort accounting correction. The A/B/G rows below ran before that correction and the version bump; they establish their tested paths, not the new cohort edge case. Live bootstrap and asset checks follow publication preparation. Broader provider coverage and the wider VM matrix remain NOT RUN.
 
 - **Row A — interactive continuation, September 12. PASS.** Four user-context passes across three observed reboots; reboot accounting matched the OS evidence, the final Windows Update scope was empty, health checks passed, and state, continuation tasks and cleanup evidence were clear. Evidence: `vm-runs-retry2/A-sep12-boot-upd-matrix-20260912-111434`.
 - **Row B — headless SYSTEM continuation, September 12. PARTIAL.** Five SYSTEM passes and two observed reboots completed the cycle with no interactive user. Winget, Scoop and VS Code user work remained deferred, and the Windows Update re-offer was retained as deferred inventory rather than retried; the row therefore does not claim full provider convergence. This is a truthful partial result.
 - **Row G — killed-process recovery, September 12. PASS.** The intended Deploy process was killed after promotion; the scheduler records recovery PID 5148 and a separate SYSTEM fallback PID 4784 that respected the mutex. The recovered cycle completed with zero reboots, empty Windows Update assessment, passing health checks, and no remaining state or continuation tasks.
+
+- **Row H — bounded parallel-cohort recovery, September 12. PASS for recovery; convergence intentionally stopped.** The exact candidate orchestrator ran directly from its installed path. An admin-only fixture directory avoided the separate hook-permission defect (#72); a trusted hook held the cohort entry before provider jobs started. Two distinct processes were killed at persisted cohort checkpoints with retry counts zero and one. Time-triggered continuations charged exactly two recoveries; the third pass retained `RetryLimitReached` state, exited with code 3, and removed both continuation tasks. Boot timestamps normalized to the same UTC instant and the reboot count remained zero. Scheduler exit-code encoding was independently calibrated. This tests cohort-entry interruption, not termination inside an active provider. Details and fixture limitations: [September 12 evidence report](docs/diagnostics-20260912.md).
 ## v2.5.79 (2026-09-09)
 
 Truthfulness release. v2.5.78 fixed the headless servicing path and shipped a note claiming a capability the binary did not have; running the matrix against two guests found that claim was one of several. Six of the fixes below are cases where the updater said something that was not so — a dead preference described as active, a deliberate withhold logged as a crash, a reboot announced that never happened, a watchdog documented in a comment and never armed — and one is a fix that reopened an old defect the moment it started working.

@@ -227,3 +227,21 @@ the active checkout was not relocated.
 
 Raw diagnostics, guest identities and unsanitized local evidence are not
 published in this repository.
+
+## Release follow-up: v2.5.80
+
+The later release review found and corrected an additional watchdog-accounting gap: an interrupted `ParallelCohort` checkpoint previously bypassed the retry budget. Commit `98f72e2` charges one recovery per resumed pass, preserves completed provider flags, records the unobserved stop, and reaches the existing retry-limit handoff. Four new behavioral regressions passed; clean CI passed all 502 tests with zero failures/skips, parsing, analyzer checks, user/SYSTEM exclusion, and the published-launcher upgrade gate.
+
+The targeted H acceptance used candidate orchestrator SHA256 `22808f6cd3da71116f0db4ecaddc12526d766cec20fb991444329934aa31a201` and evidence directory `cohort-release/evidence/H-cohort-retry-limit-boot-upd-matrix-20260912-134042`.
+
+- The installed production orchestrator ran directly, with an admin-only fixture directory and a trusted `BeforeDefender` hook holding the persisted cohort entry before provider jobs started. No released script was modified for this final row.
+- Two kills were confirmed, on iterations 1 and 2 with retry counts 0 and 1. Distinct checkpoint markers and process IDs, pre-kill state receipts, and death confirmations establish both injections.
+- Scheduler time-trigger records map the two subsequent continuation instances to their processes. Iterations 2 and 3 each recorded one `ParallelCohort` unobserved stop. The third pass retained `RetryLimitReached` state, retry count 2, reboot count 0, and removed both continuation tasks; 227 other scheduled tasks provided a positive enumeration control. No completion claim was made.
+- The original automated assessment falsely rejected boot equality because one timestamp representation was UTC and another was local time. All four readings normalize exactly to `2026-09-12T17:40:48.500Z`; there was no additional OS boot event.
+- Scheduler event 201 encoded the final status as `2147942403` (`0x80070003`). An independent scheduled native `exit 3` control returned `LastTaskResult=3` and the same event encoding. The original assessment and raw XML are retained; the corrected interpretation does not alter the underlying evidence.
+
+Result: **PASS for bounded cohort recovery and safety-stop cleanup; PARTIAL for convergence by design.** This row interrupts the cohort-entry checkpoint, not an active provider process. Earlier A/B/G coverage retains its original build and scope qualifications.
+
+Earlier H attempts were fixture failures and are not counted as interruption coverage: incorrect temporary harness placement/arguments, potentially interfering checkpoint reads, an absent installed hook, the production hook trust false positive, and a PowerShell 5 parser used against PowerShell 7 syntax. Two uninjected attempts completed normal candidate cycles. The final fixture verifies the installed hook with the production trust resolver under PowerShell 7, requires a running injector before launch, archives stale logs, captures scheduler records after a baseline record ID, and only reads state during the deliberate hook hold.
+
+Remaining issues are synchronized in central Beads and GitHub: prerequisite download bounds (#65), unattended lab readiness (#67), final-verification interruption accounting (#71), and read-only permission grants incorrectly rejected by hook trust (#72). The latter two remain known limitations; this release does not claim to fix them.
