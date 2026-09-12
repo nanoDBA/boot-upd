@@ -37,6 +37,13 @@ function Initialize-BootUpdLabCredentialModule {
     Import-Module BetterCredentials -ErrorAction Stop
 }
 
+function ConvertTo-BootUpdLabSecureString {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingConvertToSecureStringWithPlainText', '', Justification = 'Legacy environment, ISO, and autologon inputs are already plaintext; convert immediately to a SecureString without logging.')]
+    param([Parameter(Mandatory)][string]$Value)
+
+    ConvertTo-SecureString $Value -AsPlainText -Force
+}
+
 function Get-BootUpdLabPassword {
     <# Returns the plain password, or $null when nothing is stored. Order: the environment
        variable first as a deliberate override, then Credential Manager. #>
@@ -65,6 +72,7 @@ function Set-BootUpdLabPassword {
        the chain this password travels: an unattend XML document, a PowerShell string, and a
        net user command line. A password that is strong but unquotable fails the build in a
        way that looks like a Windows problem. #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingUsernameAndPasswordParams', '', Justification = 'Public lab credential interface preserves the existing Password, UserName, and Generate parameters for credential provisioning.')]
     [CmdletBinding()]
     param(
         [string]$Password,
@@ -85,7 +93,7 @@ function Set-BootUpdLabPassword {
 
     Initialize-BootUpdLabCredentialModule
     $credential = [System.Management.Automation.PSCredential]::new(
-        $UserName, (ConvertTo-SecureString $Password -AsPlainText -Force))
+        $UserName, (ConvertTo-BootUpdLabSecureString $Password))
     BetterCredentials\Set-Credential -Credential $credential -Target $Target -Type Generic -Persistence LocalComputer | Out-Null
     return $Password
 }

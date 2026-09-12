@@ -59,7 +59,7 @@ if (-not $GuestPassword) {
     throw 'No lab guest password available. Store one with: . ./LabCredential.ps1; Set-BootUpdLabPassword -Generate'
 }
 $cred = New-Object System.Management.Automation.PSCredential($GuestUser,
-        (ConvertTo-SecureString $GuestPassword -AsPlainText -Force))
+        (ConvertTo-BootUpdLabSecureString $GuestPassword))
 $evidenceDir = Join-Path $EvidenceRoot ("{0}-{1}-{2}" -f $Row, $VMName, (Get-Date -Format 'yyyyMMdd-HHmmss'))
 New-Item -ItemType Directory -Path $evidenceDir -Force | Out-Null
 function Say { param($m) Write-Host ("[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $m) -ForegroundColor Cyan }

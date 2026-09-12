@@ -44,7 +44,7 @@ if (-not $GuestPassword) {
     throw 'No lab guest password available. Store one with: . ./LabCredential.ps1; Set-BootUpdLabPassword -Generate'
 }
 $cred = [System.Management.Automation.PSCredential]::new($GuestUser,
-        (ConvertTo-SecureString $GuestPassword -AsPlainText -Force))
+        (ConvertTo-BootUpdLabSecureString $GuestPassword))
 function Say { param($m) Write-Host ("[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $m) -ForegroundColor Cyan }
 
 if (-not (Get-VMCheckpoint -VMName $VMName -Name $From -ErrorAction SilentlyContinue)) {

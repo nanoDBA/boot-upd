@@ -102,7 +102,7 @@ if ($diskGb -lt 0.25) {
 Say "Setup writing (disk ${diskGb}GB); waiting for the auto-logon desktop"
 
 $cred = New-Object System.Management.Automation.PSCredential($GuestUser,
-        (ConvertTo-SecureString $GuestPassword -AsPlainText -Force))
+        (ConvertTo-BootUpdLabSecureString $GuestPassword))
 $deadline = (Get-Date).AddMinutes($InstallTimeoutMinutes)
 $ready = $false
 while ((Get-Date) -lt $deadline) {
