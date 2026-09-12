@@ -30,7 +30,8 @@ Before releasing changes to checkpointing, tasks, reboot detection, mutexes, pro
 - interactive-user continuation, no-user-login SYSTEM fallback, and both triggers becoming eligible;
 - two or more reboots, a canceled delayed restart, a failed restart command, and a delayed reboot signal;
 - local profiles plus OneDrive-redirected module paths;
-- killed-process recovery during checkpoint creation and immediately after state promotion.
+- killed-process recovery during checkpoint creation and immediately after state promotion;
+- a cycle killed mid-pass on a machine that neither reboots nor logs on again is resumed by the watchdog probe within the configured interval, and a healthy long-running pass is not double-run by probes (run with a short interval).
 
 Capture the updater log, every checkpoint revision, task definitions and results, boot identifiers, effective identities, provider exit/reboot evidence, and the final cleanup inventory. A scenario passes only when every enabled phase converges, no reboot evidence remains after settling, health checks pass, and both tasks and active state are absent.
 

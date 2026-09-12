@@ -55,6 +55,15 @@ param(
        the continuation waits on a logon trigger instead and costs nothing. At the two-minute
        rediscovery interval the default is roughly twenty minutes. #>
     [ValidateRange(1,500)][int]$MaxUserIdentityWaits = 10,
+    <# While a cycle is in flight, Task Scheduler starts a watchdog probe on both
+       continuation tasks every N minutes (repeating -Once trigger, added only to the
+       resume-checkpoint arm — see Register-BootUpdateTaskForReboot -InFlightWatchdog).
+       A probe that finds Global\BootUpdateCycle held exits at once, unchanged
+       (Enter-BootUpdateMutex); one that finds it free or abandoned becomes the actual
+       recovery pass, so a silent crash is never unobserved for longer than this. No
+       off switch is offered on purpose: an in-flight cycle with no watchdog armed is
+       exactly the failure mode this closes. Floor of 2 is enforced at script scope. #>
+    [int]$WatchdogIntervalMinutes = 15,
     [int]$PackageTimeoutMinutes = 30,
     [int]$RebootDelaySec = 0,
     [switch]$SkipPip,
@@ -283,6 +292,21 @@ $script:RebootDelaySec        = $RebootDelaySec
 $script:MaxIterations         = $MaxIterations
 $script:MaxRetryPasses        = $MaxRetryPasses
 $script:MaxUserIdentityWaits  = $MaxUserIdentityWaits
+<# Floor enforced silently here (Write-Log isn't defined yet at this point in the script);
+   Invoke-BootUpdateCycle logs the clamp, if any, as its first action. #>
+$script:WatchdogIntervalMinutesClamped = $false
+$script:WatchdogIntervalMinutes = $WatchdogIntervalMinutes
+if ($script:WatchdogIntervalMinutes -lt 2) {
+    $script:WatchdogIntervalMinutesClamped = $true
+    $script:WatchdogIntervalMinutes = 2
+}
+<# Ceiling: one day. Task Scheduler rejects a repetition interval above 31 days, and the
+   registration at the resume checkpoint is not something to let fail on a typo. #>
+$script:WatchdogIntervalMinutesClampedHigh = $false
+if ($script:WatchdogIntervalMinutes -gt 1440) {
+    $script:WatchdogIntervalMinutesClampedHigh = $true
+    $script:WatchdogIntervalMinutes = 1440
+}
 <# Widest observed same-boot LastBootUpTime jitter, with headroom. Far below the
    shortest realistic boot-to-boot interval, so it cannot mask a genuine restart. #>
 $script:BootSessionToleranceSeconds = 120
@@ -1855,6 +1879,19 @@ function Get-BootUpdateDeferredInventorySummary {
     return ($parts -join '; ')
 }
 
+function Get-BootUpdateUnobservedStopsSummary {
+    <# Task C: renders the UnobservedStops list for humans — which phase(s) stopped
+       without reporting during this session and how many times each was resumed by a
+       watchdog probe. Returns nothing for an empty list, same contract as
+       Get-BootUpdateDeferredInventorySummary, so callers can treat the result as the
+       "is there anything to disclose" signal. #>
+    param([object[]]$Records = @())
+    $present = @($Records | Where-Object { $null -ne $_ })
+    if ($present.Count -eq 0) { return $null }
+    $parts = @($present | Group-Object Phase | Sort-Object Name | ForEach-Object { "$($_.Name) x$($_.Count)" })
+    return ($parts -join ', ')
+}
+
 function Get-BootUpdateCompletionNotification {
     <# Builds the completion toast. Per ADR-0003 a cycle carrying outstanding work still
        completed, so this is never an Error — nothing failed. But it is not an unqualified
@@ -1970,6 +2007,11 @@ function New-BootUpdateStateV2 {
         ConsecutiveRetryCount = 0
         LastBootSessionId     = $null
         WindowsUpdateZeroEvidence = $null
+        <# Task C: each unobserved stop (a crash-shaped resume charged against the retry
+           budget — see Test-CrashRecovery) as { Phase, Iteration, ObservedAt }. Surfaced in
+           the completion summary and the manual-attention repair plan so a truthful pass
+           still discloses that it was resumed by a watchdog probe rather than reporting in. #>
+        UnobservedStops        = @()
         ExplicitRebootRequests = @()
         WingetAggressiveRepairSignatures = @()
         WingetQuarantines       = @()
@@ -2047,6 +2089,8 @@ function Update-BootUpdateStateSchema {
     if ($props -notcontains 'WingetQuarantines') { $State | Add-Member -NotePropertyName 'WingetQuarantines' -NotePropertyValue @() -Force }
     if ($props -notcontains 'DeferredInventory') { $State | Add-Member -NotePropertyName 'DeferredInventory' -NotePropertyValue @() -Force }
     else { $State.DeferredInventory = @($State.DeferredInventory | Where-Object { $null -ne $_ }) }
+    if ($props -notcontains 'UnobservedStops') { $State | Add-Member -NotePropertyName 'UnobservedStops' -NotePropertyValue @() -Force }
+    else { $State.UnobservedStops = @($State.UnobservedStops | Where-Object { $null -ne $_ }) }
     if ($props -notcontains 'WindowsUpdateZeroEvidence') { $State | Add-Member -NotePropertyName 'WindowsUpdateZeroEvidence' -NotePropertyValue $null -Force }
     foreach ($f in @('WindowsUpdateDone','AwsToolingDone','PowerShellModulesDone','ScoopDone','DotnetToolsDone','VscodeDone','DefenderDone','DriverFirmwareDone','WslDone','ContainersDone')) {
         if ($props -notcontains $f) { $State | Add-Member -NotePropertyName $f -NotePropertyValue $false -Force }
@@ -2151,6 +2195,12 @@ function Clear-BootUpdateState {
 }
 
 function Test-CrashRecovery {
+    <# Returns $true/$false exactly as before (a phase was left unfinished, for any of
+       three reasons) — tests/RebootResilience.Tests.ps1 asserts on this with Should
+       -BeTrue/-BeFalse, which requires an actual boolean, not merely a truthy value.
+       Task C's budget charge is a side effect on $State (ConsecutiveRetryCount,
+       UnobservedStops) rather than a return-shape change; the caller detects whether a
+       charge happened by comparing ConsecutiveRetryCount before and after the call. #>
     param([Parameter(Mandatory)][pscustomobject]$State)
     if ([string]::IsNullOrWhiteSpace($State.LastPhaseStarted)) { return $false }
     $phaseToFlag = @{
@@ -2161,7 +2211,10 @@ function Test-CrashRecovery {
     }
     <# 'ParallelCohort' is a sentinel written when the five-phase parallel cohort starts.
        Crash recovery for this group is handled per-phase (each has its own *Done flag);
-       the cohort re-launches only phases where Done=false, so no special recovery is needed. #>
+       the cohort re-launches only phases where Done=false, so no special recovery is needed.
+       Task C: deliberately not charged here either — a killed cohort already re-runs via
+       per-phase Done flags, and charging per incomplete phase would burn several retries
+       for one dead pass. #>
     if ($State.LastPhaseStarted -eq 'ParallelCohort' -or $State.LastPhaseStarted -eq 'CohortDone') {
         Write-Log "Crash recovery: previous run was in parallel cohort — individual phase flags will gate re-execution." -Level Warn
         return $false
@@ -2191,8 +2244,26 @@ function Test-CrashRecovery {
             'Rebooting' {
                 Write-Log "Previous pass restarted Windows during [$($State.LastPhaseStarted)] at [$time]; nothing crashed. Re-running that phase." -Level Info
             }
+            'ResumeAfterLimit' {
+                <# An operator raised a reached budget and re-ran. The phase is unfinished
+                   because the previous pass stopped at the limit on purpose, not because it
+                   died; charging here would spend the newly granted retry before it ran. #>
+                Write-Log "Previous pass stopped at a safety limit during [$($State.LastPhaseStarted)] at [$time] and the limit was raised; nothing crashed. Re-running that phase." -Level Info
+            }
             default {
                 Write-Log "Previous run crashed during [$($State.LastPhaseStarted)] at [$time]. Restarting that phase." -Level Warn
+                <# Task C: an unobserved stop charges the retry budget exactly once for this
+                   resumed pass. Not a reboot (RebootCount untouched) and not a deliberate
+                   stop or identity-rediscovery wait (both excluded by the switch above). #>
+                if (-not $WhatIfPreference) {
+                    $State.ConsecutiveRetryCount = [int]$State.ConsecutiveRetryCount + 1
+                    $State.UnobservedStops = @(@($State.UnobservedStops) + [pscustomobject]@{
+                        Phase      = $State.LastPhaseStarted
+                        Iteration  = [int]$State.Iteration
+                        ObservedAt = [datetime]::UtcNow.ToString('o')
+                    })
+                    Write-Log "Recovery pass $($State.ConsecutiveRetryCount) of $($script:MaxRetryPasses) after an unobserved stop in $($State.LastPhaseStarted)." -Level Warn
+                }
             }
         }
         return $true
@@ -2957,10 +3028,12 @@ function Stop-BootUpdateForManualAttention {
         }
     }
     $disposition = if ($disarmed) { 'Automatic continuation tasks were removed and verified absent.' } else { 'WARNING: continuation-task removal failed; remove both BootUpdateCycle tasks manually.' }
+    $unobservedStopsSummary = Get-BootUpdateUnobservedStopsSummary -Records @($State.UnobservedStops)
     $plan = $null
     try {
         $plan = Write-BootUpdateRepairPlan -Items $repairItems `
-            -DeferredInventory @(Get-BootUpdateDeferredInventory -State $State)
+            -DeferredInventory @(Get-BootUpdateDeferredInventory -State $State) `
+            -UnobservedStops @($State.UnobservedStops)
     } catch {
         Write-Log "Manual repair-plan handoff failed after retries were stopped: $_" -Level Error
     }
@@ -2970,6 +3043,7 @@ function Stop-BootUpdateForManualAttention {
         'Automatic retries stopped because the same non-transient failure repeated.'
         "Incomplete phase(s): $names"
         $(if ($details) { "Failures: $details" } else { 'See the diagnostic log for the exact provider failure.' })
+        $(if ($unobservedStopsSummary) { "[NOTE] A pass stopped without reporting and was resumed by a watchdog probe: $unobservedStopsSummary" })
         $(if ($plan) {
             if ($plan.ClipboardCopied) { "Repair plan (path copied to clipboard): $($plan.Path)" }
             else { "Repair plan: $($plan.Path) (clipboard unavailable; copy this path manually)" }
@@ -3023,7 +3097,7 @@ function Set-BootUpdateClipboardText {
 }
 
 function Write-BootUpdateRepairPlan {
-    param([object[]]$Items = @(), [object[]]$DeferredInventory = @())
+    param([object[]]$Items = @(), [object[]]$DeferredInventory = @(), [object[]]$UnobservedStops = @())
     if (-not $Items.Count) { return $null }
     $path = Join-Path $script:InstallDir 'BootUpdateCycle-repair-plan.txt'
     $lines = [Collections.Generic.List[string]]::new()
@@ -3048,6 +3122,16 @@ function Write-BootUpdateRepairPlan {
         $lines.Add('These could not be attempted, so they are not counted as updated and need no retry:')
         $lines.Add("  $deferredSummary")
         $lines.Add('They did not cause this stop and no command below addresses them.')
+        $lines.Add('')
+    }
+    <# Task C: an unobserved stop is disclosure, not diagnosis — the pass that hit it
+       still resumed and is accounted for above by IncompletePhases/Items. State it as a
+       fact, same as the deferred-inventory block, and stay above the copy/paste block. #>
+    $unobservedStopsSummary = Get-BootUpdateUnobservedStopsSummary -Records $UnobservedStops
+    if (-not [string]::IsNullOrWhiteSpace($unobservedStopsSummary)) {
+        $lines.Add('Also noted — a pass stopped without reporting')
+        $lines.Add('Task Scheduler''s watchdog probe found the cycle silent and resumed it; this is not a failure by itself:')
+        $lines.Add("  $unobservedStopsSummary")
         $lines.Add('')
     }
     $lines.Add('COPY/PASTE BLOCK — ELEVATED COMMAND PROMPT')
@@ -5896,7 +5980,12 @@ function Register-BootUpdateTaskForReboot {
         <# [AllowNull()][object], not [Nullable[datetime]]: the binder converts the latter to
            a plain System.DateTime, which is why the HasValue guard here was dead for every
            release that shipped it. Get-BootUpdateRetryTriggerTime null-tests instead. #>
-        [AllowNull()][object]$RetryAt = $null
+        [AllowNull()][object]$RetryAt = $null,
+        <# Task B: only the resume-checkpoint arm (before update phases) passes this. Adds a
+           repeating -Once trigger to each registered task so an in-flight cycle that dies
+           without ever reporting still gets probed periodically; see Enter-BootUpdateMutex
+           for why a probe that finds the mutex held is a normal, silent no-op. #>
+        [switch]$InFlightWatchdog
     )
     $taskName = 'BootUpdateCycle'
     $pwshPath = (Get-Command pwsh -EA SilentlyContinue).Source
@@ -5908,6 +5997,7 @@ function Register-BootUpdateTaskForReboot {
         "-MaxIterations $($script:MaxIterations)"
         "-MaxRetryPasses $($script:MaxRetryPasses)"
         "-MaxUserIdentityWaits $($script:MaxUserIdentityWaits)"
+        "-WatchdogIntervalMinutes $($script:WatchdogIntervalMinutes)"
         "-PackageTimeoutMinutes $($script:PackageTimeoutMinutes)"
         "-RebootDelaySec $($script:RebootDelaySec)"
         "-OutputMode $($script:OutputMode)"
@@ -5964,6 +6054,23 @@ function Register-BootUpdateTaskForReboot {
        enough for the primary to acquire the cross-context guard first. #>
     $fallbackRetryTrigger = if ($retryTime) { New-ScheduledTaskTrigger -Once -At $retryTime.AddMinutes(3) } else { $null }
 
+    <# Task B: in-flight watchdog. A repeating -Once trigger, offset the same 3 minutes
+       between primary and fallback as the retry triggers above, for the same reason.
+       3650 days (not [TimeSpan]::MaxValue) for RepetitionDuration: it renders as a clean
+       ISO-8601 duration ("P3650D") that Task Scheduler is documented to accept, where
+       MaxValue serializes to a degenerate near-max value; ten years outlives any real
+       gap between updater runs. #>
+    $watchdogTrigger = if ($InFlightWatchdog) {
+        New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes($script:WatchdogIntervalMinutes) `
+            -RepetitionInterval (New-TimeSpan -Minutes $script:WatchdogIntervalMinutes) `
+            -RepetitionDuration (New-TimeSpan -Days 3650)
+    } else { $null }
+    $fallbackWatchdogTrigger = if ($InFlightWatchdog) {
+        New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes($script:WatchdogIntervalMinutes + 3) `
+            -RepetitionInterval (New-TimeSpan -Minutes $script:WatchdogIntervalMinutes) `
+            -RepetitionDuration (New-TimeSpan -Days 3650)
+    } else { $null }
+
     <# ARSO user-context resume (2ql): reboots use `shutdown /g`, so where ARSO is
        available winlogon signs the user back in — the primary task then triggers at
        that logon and runs in USER context, so user-scoped phases (winget user scope,
@@ -5984,33 +6091,36 @@ function Register-BootUpdateTaskForReboot {
         $userTrigger   = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
         $userPrincipal = New-ScheduledTaskPrincipal -UserId $currentUser -LogonType Interactive -RunLevel Highest
         $userTriggers = if ($retryTrigger) { @($userTrigger, $retryTrigger) } else { @($userTrigger) }
+        if ($watchdogTrigger) { $userTriggers = @($userTriggers) + $watchdogTrigger }
         Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $userTriggers -Principal $userPrincipal -Settings $settings `
             -Description 'Boot update loop: patches everything, reboots until clean. (user context via ARSO)' -Force -ErrorAction Stop | Out-Null
         $registeredTaskNames.Add($taskName)
         $expectedPrincipal[$taskName] = $currentUser
-        $expectedTriggerTypes[$taskName] = @('MSFT_TaskLogonTrigger') + $(if ($retryTrigger) { 'MSFT_TaskTimeTrigger' } else { @() })
+        $expectedTriggerTypes[$taskName] = @('MSFT_TaskLogonTrigger') + $(if ($retryTrigger -or $watchdogTrigger) { 'MSFT_TaskTimeTrigger' } else { @() })
         $arsoText = if (Test-ArsoAvailable) { 'ARSO or interactive logon' } else { 'next interactive logon' }
         Write-Log "Scheduled task registered: $taskName ($currentUser at logon — $arsoText)"
 
         $fbTrigger = New-ScheduledTaskTrigger -AtStartup
         $fbTrigger.Delay = 'PT3M'
         $fallbackTriggers = if ($fallbackRetryTrigger) { @($fbTrigger, $fallbackRetryTrigger) } else { @($fbTrigger) }
+        if ($fallbackWatchdogTrigger) { $fallbackTriggers = @($fallbackTriggers) + $fallbackWatchdogTrigger }
         $fbPrincipal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
         Register-ScheduledTask -TaskName 'BootUpdateCycleFallback' -Action $action -Trigger $fallbackTriggers -Principal $fbPrincipal -Settings $settings `
             -Description 'Boot update loop fallback: runs as SYSTEM if ARSO sign-on does not occur.' -Force -ErrorAction Stop | Out-Null
         $registeredTaskNames.Add('BootUpdateCycleFallback')
         $expectedPrincipal['BootUpdateCycleFallback'] = 'SYSTEM'
-        $expectedTriggerTypes['BootUpdateCycleFallback'] = @('MSFT_TaskBootTrigger') + $(if ($retryTrigger) { 'MSFT_TaskTimeTrigger' } else { @() })
+        $expectedTriggerTypes['BootUpdateCycleFallback'] = @('MSFT_TaskBootTrigger') + $(if ($retryTrigger -or $watchdogTrigger) { 'MSFT_TaskTimeTrigger' } else { @() })
         Write-Log 'Scheduled task registered: BootUpdateCycleFallback (SYSTEM at startup +3min, mutex-arbitrated)'
     } else {
         $trigger  = New-ScheduledTaskTrigger -AtStartup
         $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
         $systemTriggers = if ($retryTrigger) { @($trigger, $retryTrigger) } else { @($trigger) }
+        if ($watchdogTrigger) { $systemTriggers = @($systemTriggers) + $watchdogTrigger }
         Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $systemTriggers -Principal $principal -Settings $settings `
             -Description 'Boot update loop: patches everything, reboots until clean.' -Force -ErrorAction Stop | Out-Null
         $registeredTaskNames.Add($taskName)
         $expectedPrincipal[$taskName] = 'SYSTEM'
-        $expectedTriggerTypes[$taskName] = @('MSFT_TaskBootTrigger') + $(if ($retryTrigger) { 'MSFT_TaskTimeTrigger' } else { @() })
+        $expectedTriggerTypes[$taskName] = @('MSFT_TaskBootTrigger') + $(if ($retryTrigger -or $watchdogTrigger) { 'MSFT_TaskTimeTrigger' } else { @() })
         Write-Log "Scheduled task registered: $taskName (SYSTEM at startup — ARSO unavailable)"
     }
 
@@ -6051,8 +6161,21 @@ function Register-BootUpdateTaskForReboot {
             $bootTrigger = @($task.Triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskBootTrigger' }) | Select-Object -First 1
             if (-not $bootTrigger -or $bootTrigger.Delay -ne 'PT3M') { throw "Resume task '$registeredName' is missing the three-minute startup delay." }
         }
+        <# Task B: fail closed on repetition in either direction. A probe that silently
+           stops repeating is as dangerous as a deliberate stop that starts repeating. #>
+        $actualRepetitionIntervals = @($task.Triggers | Where-Object { $_.Repetition -and -not [string]::IsNullOrEmpty($_.Repetition.Interval) } |
+            ForEach-Object { [System.Xml.XmlConvert]::ToTimeSpan($_.Repetition.Interval) })
+        if ($InFlightWatchdog) {
+            $expectedRepetitionInterval = New-TimeSpan -Minutes $script:WatchdogIntervalMinutes
+            if ($actualRepetitionIntervals -notcontains $expectedRepetitionInterval) {
+                throw "Resume task '$registeredName' is missing the in-flight watchdog repetition trigger (expected every $($script:WatchdogIntervalMinutes) minute(s))."
+            }
+        } elseif ($actualRepetitionIntervals.Count -gt 0) {
+            throw "Resume task '$registeredName' unexpectedly carries a repeating trigger; deliberate stops must never repeat."
+        }
     }
-    Write-Log "Resume chain verified: $($registeredTaskNames -join ', ') (3 retries, 2-minute interval)."
+    $watchdogNote = if ($InFlightWatchdog) { "; watchdog probe every $($script:WatchdogIntervalMinutes) minute(s)" } else { '' }
+    Write-Log "Resume chain verified: $($registeredTaskNames -join ', ') (3 retries, 2-minute interval)$watchdogNote."
     return $registeredTaskNames.ToArray()
 }
 
@@ -7131,7 +7254,7 @@ function Apply-RemoteConfig {
         'SkipDefender', 'SkipBitLocker', 'SkipRestorePoint', 'SkipHealthCheck',
         'IncludeDriverUpdates', 'IncludeFirmwareUpdates',
         'UpdateWsl', 'UpdateContainers', 'AllowMetered', 'DisableSelfUpdate',
-        'StagedRollout', 'AggressiveRepair', 'OutputMode'
+        'StagedRollout', 'AggressiveRepair', 'OutputMode', 'WatchdogIntervalMinutes'
     )
 
     $overridden = [System.Collections.Generic.List[string]]::new()
@@ -7151,6 +7274,11 @@ function Apply-RemoteConfig {
         }
 
         try {
+            if ($key -eq 'WatchdogIntervalMinutes') {
+                <# Same floor and ceiling as the parameter path; a remote value bypasses the
+                   script-scope clamp above, so apply it here. #>
+                $remoteVal = [Math]::Min(1440, [Math]::Max(2, [int]$remoteVal))
+            }
             Set-Variable -Name $key -Value $remoteVal -Scope Script -Force -ErrorAction Stop
             $overridden.Add($key)
         } catch {
@@ -7211,6 +7339,12 @@ function Get-BootUpdateLaunchContract {
 }
 
 function Invoke-BootUpdateCycle {
+    if ($script:WatchdogIntervalMinutesClamped) {
+        Write-Log "WatchdogIntervalMinutes was below the 2-minute floor; clamped to 2." -Level Warn
+    }
+    if ($script:WatchdogIntervalMinutesClampedHigh) {
+        Write-Log "WatchdogIntervalMinutes was above the 1440-minute ceiling; clamped to 1440." -Level Warn
+    }
     Invoke-LogRotation
 
     $state = Get-BootUpdateState
@@ -7331,8 +7465,8 @@ function Invoke-BootUpdateCycle {
        pre-registration is what makes that surprise reboot resumable. Completion
        removes both tasks, and the mutex prevents a scheduled collision. #>
     if (-not $WhatIfPreference) {
-        $null = Register-BootUpdateTaskForReboot
-        Write-Log 'Resume checkpoint armed before update phases.' -Visibility Verbose
+        $null = Register-BootUpdateTaskForReboot -InFlightWatchdog
+        Write-Log "Resume checkpoint armed before update phases; watchdog probe every $($script:WatchdogIntervalMinutes) minutes." -Visibility Verbose
     }
 
     <# A pending reboot is a phase barrier. Do not feed MSI/CBS/package work into a
@@ -7366,8 +7500,22 @@ function Invoke-BootUpdateCycle {
         Write-Log 'No pending reboots at start of iteration'
     }
 
-    <# Crash recovery #>
+    <# Crash recovery. Task C: an unobserved stop charges ConsecutiveRetryCount inside
+       Test-CrashRecovery as a side effect on $state; Test-CrashRecovery's own return
+       stays a plain bool (tests assert on it with -BeTrue/-BeFalse), so detect the
+       charge here by comparing the count before and after, then evaluate
+       Stop-BootUpdateAtRetryLimit on the same code path the other increments use, so a
+       cycle that keeps dying silently still stops at the limit with the existing
+       manual-attention handoff. #>
+    $retryCountBeforeCrashCheck = [int]$state.ConsecutiveRetryCount
     $null = Test-CrashRecovery -State $state
+    if (-not $WhatIfPreference -and [int]$state.ConsecutiveRetryCount -gt $retryCountBeforeCrashCheck) {
+        Set-BootUpdateState -State $state
+        if (Stop-BootUpdateAtRetryLimit -State $state -IncompletePhases @($state.LastPhaseStarted)) {
+            Write-BootUpdateProgress -Completed
+            exit 3
+        }
+    }
 
     <# PreCycle hook — runs after pre-flight passes and max-iterations check, before the first phase.
        Not called on aborted paths (metered/pre-flight abort) or mutex-collision exits. #>
@@ -8139,6 +8287,11 @@ function Invoke-BootUpdateCycle {
                     }
                 }
                 $nextPhase = $remainingPhases[0]
+                <# Mark the withhold as deliberate. Without this the target's Done flag is
+                   false with Phase still naming it, which Test-CrashRecovery reads as a
+                   crash: a false "crashed" line, a false unobserved-stop disclosure, and a
+                   second retry charge on top of the staged one above. #>
+                $state.Phase = 'RetryPending'
                 $state.StagedNextPhase = $nextPhase.Name
                 Set-BootUpdateState -State $state
                 Write-Log "Staged rollout: $($remainingPhases.Count) phase(s) remaining. A near-term checkpoint will run [$($nextPhase.Name)]." -Level Info
@@ -8315,6 +8468,13 @@ function Invoke-BootUpdateCycle {
         $deferredInventory = @(Get-BootUpdateDeferredInventory -State $state)
         $deferredSummary = Get-BootUpdateDeferredInventorySummary -Records $deferredInventory
         $hasDeferredInventory = -not $WhatIfPreference -and -not [string]::IsNullOrWhiteSpace($deferredSummary)
+        <# Task C: disclosure only — this does not change the convergence claim itself
+           (Get-BootUpdateCompletionClaim/Qualifiers below are untouched). The pass that hit
+           an unobserved stop already resumed and its phase(s) already verified normally;
+           this just states, truthfully, that a watchdog probe was the one that resumed it. #>
+        $unobservedStops = @($state.UnobservedStops)
+        $unobservedStopsSummary = Get-BootUpdateUnobservedStopsSummary -Records $unobservedStops
+        $hasUnobservedStops = -not [string]::IsNullOrWhiteSpace($unobservedStopsSummary)
 
         <# Console: styled completion banner #>
         $healthIsGreen = $null -ne $healthCheck -and $healthCheck.AllHealthy
@@ -8347,6 +8507,9 @@ function Invoke-BootUpdateCycle {
         if ($hasCleanupAdvisory) {
             Write-Log "Non-blocking housekeeping remains: $cleanupDisplaySummary. Updates converged and no restart is required; restarting later may finish it." -Level Warn
             Write-Log "Pending-file cleanup categories: $cleanupCategories" -Visibility Debug
+        }
+        if ($hasUnobservedStops) {
+            Write-Log "A pass stopped without reporting during this session and was resumed by a watchdog probe: $unobservedStopsSummary. Every phase above still verified normally; this is disclosure, not a qualifier on convergence." -Level Warn
         }
         Write-Log "Info: View trends with: Show-BootUpdateHistory.ps1 -Format Graph"
 
@@ -8404,6 +8567,10 @@ function Invoke-BootUpdateCycle {
                 '[WHY] The provider could not upgrade them in place; they are not failures and no retry is queued'
             }
             if ($hasCleanupAdvisory) { "[~] Housekeeping remains: $cleanupDisplaySummary; restarting later is optional" }
+            if ($hasUnobservedStops) {
+                "[NOTE] A pass stopped without reporting and was resumed by a watchdog probe: $unobservedStopsSummary"
+                '[WHY] Every phase above still verified normally; this does not change the result, only how it got there'
+            }
             $healthLine
             if (-not $WhatIfPreference) { '[OK] Resume tasks retired; no retry is queued' }
             "$durMin min | $($state.Iteration) iteration(s) | $reboots completed reboot(s)"
@@ -8486,7 +8653,7 @@ function Enter-BootUpdateMutex {
         } elseif (Test-LegacySelfUpdateHandoff) {
             Write-Log 'Self-update: inheriting mutex handoff from an older updater.' -Level Info
         } else {
-            Write-Log 'Another BootUpdateCycle instance is already running (mutex held). Exiting.' -Level Warn
+            Write-Log 'Another BootUpdateCycle instance is already running (mutex held); this watchdog probe is exiting without changes.' -Level Info
             $script:BootUpdateMutex.Dispose()
             $script:BootUpdateMutex = $null
             return $false

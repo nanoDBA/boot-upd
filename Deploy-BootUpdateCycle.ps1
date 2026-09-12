@@ -15,6 +15,7 @@ param(
     [ValidateRange(1,50)][int]$MaxIterations,
     [ValidateRange(1,50)][int]$MaxRetryPasses,
     [ValidateRange(1,500)][int]$MaxUserIdentityWaits,
+    [ValidateRange(2,1440)][int]$WatchdogIntervalMinutes,
     [ValidateRange(1,1440)][int]$PackageTimeoutMinutes,
     [switch]$StagedRollout,
     [switch]$AggressiveRepair,
@@ -94,6 +95,7 @@ $Config = @{
     MaxIterations         = 5       # Safety valve for reboot loops
     MaxRetryPasses        = 5       # Consecutive same-boot recovery failures
     MaxUserIdentityWaits  = 10      # Rediscovery attempts before concluding no user will sign in
+    WatchdogIntervalMinutes = 15    # Minutes between watchdog probes while a cycle is in flight (floor 2, no off switch)
     PackageTimeoutMin     = 30      # Minutes before killing a hung package manager (hard timeout)
                                     # Smart idle detection kills stuck processes after 5 min of no CPU
     RebootDelaySec        = 0       # Seconds before forced reboot (0 = immediate, /f = force-close apps, no abort)
@@ -130,6 +132,7 @@ if ($PSBoundParameters.ContainsKey('OutputMode')) { $Config.OutputMode = $Output
 if ($PSBoundParameters.ContainsKey('MaxIterations')) { $Config.MaxIterations = $MaxIterations }
 if ($PSBoundParameters.ContainsKey('MaxRetryPasses')) { $Config.MaxRetryPasses = $MaxRetryPasses }
 if ($PSBoundParameters.ContainsKey('MaxUserIdentityWaits')) { $Config.MaxUserIdentityWaits = $MaxUserIdentityWaits }
+if ($PSBoundParameters.ContainsKey('WatchdogIntervalMinutes')) { $Config.WatchdogIntervalMinutes = $WatchdogIntervalMinutes }
 if ($PSBoundParameters.ContainsKey('PackageTimeoutMinutes')) { $Config.PackageTimeoutMin = $PackageTimeoutMinutes }
 foreach ($name in @('StagedRollout','AggressiveRepair','IncludeDriverUpdates','IncludeFirmwareUpdates','UpdateWsl','UpdateContainers','AllowMetered','SkipPip','SkipNpm','SkipOffice365','SkipPowerShellModules','SkipScoop','SkipVscode','SkipDefender','SkipHealthCheck','SkipBitLocker','DisableSelfUpdate')) {
     if ($PSBoundParameters.ContainsKey($name)) { $Config[$name] = $true }
@@ -501,6 +504,7 @@ $invokeArgs = @{
     MaxIterations        = $Config.MaxIterations
     MaxRetryPasses       = $Config.MaxRetryPasses
     MaxUserIdentityWaits = $Config.MaxUserIdentityWaits
+    WatchdogIntervalMinutes = $Config.WatchdogIntervalMinutes
     PackageTimeoutMinutes = $Config.PackageTimeoutMin
     RebootDelaySec       = $Config.RebootDelaySec
     OutputMode           = $Config.OutputMode
@@ -711,6 +715,7 @@ function Register-ScheduledTaskNow {
         "-MaxIterations $($Config.MaxIterations)"
         "-MaxRetryPasses $($Config.MaxRetryPasses)"
         "-MaxUserIdentityWaits $($Config.MaxUserIdentityWaits)"
+        "-WatchdogIntervalMinutes $($Config.WatchdogIntervalMinutes)"
         "-PackageTimeoutMinutes $($Config.PackageTimeoutMin)"
         "-RebootDelaySec $($Config.RebootDelaySec)"
         "-OutputMode $($Config.OutputMode)"

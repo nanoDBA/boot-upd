@@ -6,6 +6,89 @@
 
 ---
 
+## Unreleased
+
+Closes the gap v2.5.79's "Known limitations" named: a cycle killed mid-pass on a machine that
+neither reboots nor logs on again was not resumed until the next logon or boot (`-35qb.10`,
+found by matrix row G on 2026-09-09).
+
+### Fixed
+
+- **A cycle killed mid-pass on a machine that neither reboots nor logs on again was never
+  resumed.** Every trigger in the resume chain was boot- or logon-scoped, so a pass that died
+  in between sat idle indefinitely. While a cycle is in flight — armed at the resume checkpoint
+  before the first update phase — both continuation tasks now also carry a repeating trigger
+  that starts a watchdog probe every `WatchdogIntervalMinutes` (default 15, floor 2, no off
+  switch). A probe that finds the cycle's mutex held exits at once, unchanged; one that finds it
+  free or abandoned becomes the recovery pass. This closes `-35qb.10`.
+
+### Changed
+
+- **New `-WatchdogIntervalMinutes` parameter** on `Invoke-BootUpdateCycle.ps1` and
+  `Deploy-BootUpdateCycle.ps1` (default 15, floor 2 with a logged clamp), passed through in
+  continuation-task arguments.
+- **A pass resumed after an unobserved stop is now a recovery pass**, charging the retry budget
+  once and recorded in state as `UnobservedStops`. It is disclosed in the completion banner/log
+  and in the repair plan, without changing the convergence claim.
+- **Registration verification fails closed in both directions**: a deliberate stop (retry-pending,
+  waiting on a user logon, the restart path) must never carry the repeating trigger, and an
+  in-flight checkpoint must carry it — either mismatch throws.
+- **The mutex-held log line changed from a Warn "Exiting" to an Info line** describing a watchdog
+  probe exiting without changes, since a probe finding the mutex held is now an expected, routine
+  outcome rather than a collision worth a warning.
+- **A staged-rollout withhold is now marked as deliberate.** Before this, the pass after a staged
+  target left incomplete logged *"Previous run crashed"* although nothing had; with the new
+  accounting it would also have disclosed a false unobserved stop and charged a second retry.
+- **An operator resume after a raised limit is not charged.** The pass that follows raising
+  `-MaxRetryPasses` or `-MaxIterations` re-runs the unfinished phase without spending the retry
+  it was just granted.
+- **`WatchdogIntervalMinutes` is accepted from remote configuration**, with the same floor and a
+  1440-minute ceiling applied on every path.
+- **Downgrade note.** Continuation tasks now pass `-WatchdogIntervalMinutes`; an older orchestrator
+  placed at the install directory by hand would reject that argument and the resume chain would
+  not run. Roll back with `Deploy-BootUpdateCycle.ps1`, which re-registers the tasks.
+
+### Validation
+
+```text
+Unit/process behavior:       PASS     (494 tests, 0 failed)
+User/SYSTEM boundary:        PASS
+Published launcher upgrade:  PASS     (from v2.5.43)
+Live bootstrap:              NOT RUN
+Provider integration:        NOT RUN
+Multi-reboot convergence:    PASS     (two rows below; the wider matrix was not re-run)
+Release assets:              NOT RUN  (nothing published)
+```
+
+Both gates were run from an elevated PowerShell 7 console on the development machine on
+2026-09-12 against the final working tree. The unit suite mocks Task Scheduler and so cannot
+validate the trigger shape itself; that comes from the two lab rows below and from a throwaway
+task registered and removed on the development machine, which read back as
+`MSFT_TaskTimeTrigger`, `Interval PT15M`, `Duration P3650D`.
+
+- **Positive row** — kill after promotion, no armed reboot, interactive user, lab-a. **PASS.**
+  `G-watchdog-resume-boot-upd-matrix-20260912-005213`. The Deploy host process was killed on
+  `Chocolatey - DONE`, during Windows Update, with Winget and Chocolatey already promoted. The
+  watchdog trigger had been armed at 00:58:51 for every 15 minutes; the probe started pass 2 at
+  01:15:35, *15 minutes 52 seconds* after the kill, and logged *"Previous run crashed during
+  [WindowsUpdate]"* then *"Recovery pass 1 of 5 after an unobserved stop in WindowsUpdate."* Only
+  Windows Update re-ran. The cycle converged at 01:18:44 with the disclosure line in the completion
+  log, `RebootsClaimed 0 = RebootsObservedOS 0`, no state file, no continuation tasks. The
+  harness's `CbsPending` read true: the guest shows the CBS `RebootPending` key was written at
+  01:19:05 by Windows' own update agent staging a package, 21 seconds after completion and after
+  both final probes were clean. It is not reboot evidence left by the cycle; the same reading was
+  true on the pre-change row G from the same checkpoint.
+- **Negative row** — healthy cycle, `-WatchdogIntervalMinutes 2`, one armed reboot, lab-b.
+  **PASS.** `W-watchdog-2min-noduplicate-lab-b-20260912-005213`. Eight *"this watchdog probe is
+  exiting without changes"* lines at the two-minute cadence; every phase started exactly once; no
+  recovery pass charged; the restart-path re-arm logged *"Resume chain verified … (3 retries,
+  2-minute interval)."* with no watchdog note, so the deliberate stop carried no repetition.
+  `RebootsClaimed 1 = RebootsObservedOS 1`, no state file, no continuation tasks, no pending CBS.
+
+Not re-run against this change: rows A, B, D, F and the PowerShell 5.1 bootstrap. The change
+touches only the in-flight arm of the resume chain and crash-resume accounting; the two rows above
+exercise both. Treat the rest of the matrix as **NOT RUN** for this change until a release runs it.
+
 ## v2.5.79 (2026-09-09)
 
 Truthfulness release. v2.5.78 fixed the headless servicing path and shipped a note claiming a capability the binary did not have; running the matrix against two guests found that claim was one of several. Six of the fixes below are cases where the updater said something that was not so — a dead preference described as active, a deliberate withhold logged as a crash, a reboot announced that never happened, a watchdog documented in a comment and never armed — and one is a fix that reopened an old defect the moment it started working.

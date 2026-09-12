@@ -318,6 +318,16 @@ Notifications distinguish four outcomes instead of using one generic toast: upda
 another pass scheduled with no restart, user-context work waiting for sign-in, and restart required with automatic
 continuation. They are shown only in an interactive user session; SYSTEM resume work never attempts a desktop toast.
 
+### Watchdog probe
+
+The resume chain otherwise only fires at boot or logon, which leaves a gap: a pass killed on a
+machine that neither reboots nor signs in again would never be resumed. While a cycle is in flight,
+both continuation tasks also carry a repeating trigger that starts a watchdog probe every
+`WatchdogIntervalMinutes` (default 15, floor 2, no off switch). A probe that finds the cycle's mutex
+held exits at once, unchanged; one that finds it free or abandoned becomes the recovery pass. Any
+pass resumed this way charges the retry budget once and is disclosed in the completion summary and
+repair plan without changing the convergence claim.
+
 ### Reliability lineage
 
 The reboot design intentionally borrows proven boundaries instead of treating every registry
@@ -520,6 +530,7 @@ Edit the `$Config` block in `Deploy-BootUpdateCycle.ps1`:
 $Config = @{
     MaxIterations         = 5       # Maximum completed reboot cycles
     MaxRetryPasses        = 5       # Consecutive failed recovery passes per boot
+    WatchdogIntervalMinutes = 15    # Minutes between in-flight watchdog probes (floor 2, no off switch)
     PackageTimeoutMin     = 30      # Hard timeout per package manager
     RebootDelaySec        = 120     # Countdown before reboot (0 = immediate)
     SkipPip               = $false

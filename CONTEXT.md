@@ -8,11 +8,13 @@ Domain glossary for Boot Update Cycle. Terms only — no implementation detail, 
 
 **Pass** — a single execution of the updater within a cycle. A pass ends by converging, requesting a reboot, queuing a recovery pass, or stopping.
 
-**Recovery pass** — a pass queued because the previous one left work incomplete. Distinct from a pass that resumes after a reboot: no restart happened, the updater simply tries again.
+**Recovery pass** — a pass queued because the previous one left work incomplete, whether by its own report or by stopping without one. Distinct from a pass that resumes after a reboot: no restart happened, the updater simply tries again. A pass that resumes a cycle whose previous pass was killed is a recovery pass: the cycle did not observe a failure, but the work is incomplete all the same, and the retry budget is the bound that stops a cycle dying for an unknown reason from looping forever.
 
 **Retry budget** — how many consecutive recovery passes a cycle may spend before it stops and asks for a human. Consumed by recovery passes, reset by a genuine reboot. Exists so that a failure the updater cannot fix cannot loop forever.
 
-**Resume chain** — the set of scheduled triggers that guarantee a later pass will run — at boot, at logon, and at a dated moment — so that no pass is the cycle's last by accident. A cycle whose resume chain has a gap can stall without failing, which is worse than failing: nothing reports it.
+**Resume chain** — the set of scheduled triggers that guarantee a later pass will run — at boot, at logon, at a dated moment, and on a timer while a pass is in flight — so that no pass is the cycle's last by accident. A cycle whose resume chain has a gap can stall without failing, which is worse than failing: nothing reports it. A pass killed on a machine that neither reboots nor logs on again is the in-flight gap; the watchdog probe is what covers it.
+
+**Watchdog probe** — a pass started on a timer while a cycle is in flight, whose first act is to ask whether the cycle is still alive. If it is, the probe exits having changed nothing. If it is not, the probe becomes the recovery pass. A cycle is alive when its guard is held; liveness is never inferred from observing processes or from how recently something was written, because those readings can be absent for reasons that have nothing to do with the cycle.
 
 **Boot session** — the identity of the machine's current boot. Two observations belong to the same boot session when they fall inside a tolerance window, not when they are byte-identical, because the underlying clock reading drifts within a single boot.
 

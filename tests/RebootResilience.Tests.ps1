@@ -108,6 +108,7 @@ BeforeAll {
           'Add-BootUpdateDeferredInventory',
           'Get-BootUpdateDeferredInventory',
           'Get-BootUpdateDeferredInventorySummary',
+          'Get-BootUpdateUnobservedStopsSummary',
           'Get-BootUpdateCompletionNotification'
     )) {
         . ([scriptblock]::Create((Get-FunctionText $invokeAst $functionName)))
@@ -1253,6 +1254,251 @@ Describe 'Durable resume chain' {
         foreach ($switchName in @('SkipBitLocker','AllowMetered','DisableSelfUpdate','UpdateWsl','UpdateContainers','AggressiveRepair')) {
             $text | Should -Match ([regex]::Escape("-$switchName"))
         }
+    }
+}
+
+Describe 'In-flight watchdog scheduling' {
+    <# Task B: an in-flight cycle that dies silently (no crash-shape resumable state, no
+       reporting) previously had nothing waking a continuation task until the next reboot
+       or interactive logon. -InFlightWatchdog adds a repeating -Once trigger so Task
+       Scheduler probes both continuation tasks every WatchdogIntervalMinutes; a probe that
+       finds the mutex held exits at once (Enter-BootUpdateMutex), one that finds it free
+       becomes the actual recovery pass.
+
+       Unlike every other Register-BootUpdateTaskForReboot test in this file, these call the
+       real function (added to the loader list above) with Register-ScheduledTask and
+       Get-ScheduledTask mocked, because the property being locked in — the shape of the
+       Repetition sub-object Task Scheduler attaches to a trigger, and the read-back
+       verification that inspects it — cannot be observed from source text alone.
+       New-ScheduledTaskTrigger/-Action/-Principal/-Settings are left real: they only build
+       in-memory CIM objects and never touch the Task Scheduler service, so nothing here
+       registers a real task.
+
+       Register-BootUpdateTaskForReboot is loaded here, not through the shared
+       function-loader allowlist at the top of the file: that loader dot-sources function
+       text via [scriptblock]::Create, which leaves $PSScriptRoot empty, and this function's
+       first line is `Join-Path $PSScriptRoot 'Invoke-BootUpdateCycle.ps1'` —
+       Join-Path rejects an empty Path outright. Writing the extracted text to a real
+       temporary .ps1 file and dot-sourcing that file gives the function a real,
+       non-empty $PSScriptRoot, same as it has in production. #>
+    BeforeAll {
+        <# Test-ArsoAvailable is a real dependency (registry reads only, EA Ignore — safe to
+           run for real) that isn't in the shared loader list; load it the ordinary way. #>
+        . ([scriptblock]::Create((Get-FunctionText $invokeAst 'Test-ArsoAvailable')))
+        $watchdogFunctionPath = Join-Path $TestDrive 'Register-BootUpdateTaskForReboot.ps1'
+        Set-Content -LiteralPath $watchdogFunctionPath -Value (Get-FunctionText $invokeAst 'Register-BootUpdateTaskForReboot') -Encoding utf8
+        . $watchdogFunctionPath
+    }
+
+    BeforeEach {
+        $script:CapturedTasks = @{}
+        Mock Write-Log { }
+        Mock Resolve-BootUpdateResumeAccount { 'CONTOSO\updtest' }
+        Mock Register-ScheduledTask {
+            $script:CapturedTasks[$TaskName] = [pscustomobject]@{
+                TaskName  = $TaskName
+                Trigger   = $Trigger
+                Action    = $Action
+                Principal = $Principal
+                Settings  = $Settings
+            }
+        }
+        Mock Get-ScheduledTask {
+            $captured = $script:CapturedTasks[$TaskName]
+            [pscustomobject]@{
+                TaskName  = $TaskName
+                State     = 'Ready'
+                Principal = [pscustomobject]@{ UserId = $captured.Principal.UserId }
+                Settings  = [pscustomobject]@{ RestartCount = $captured.Settings.RestartCount }
+                Actions   = @([pscustomobject]@{ Execute = $captured.Action.Execute; Arguments = $captured.Action.Arguments; WorkingDirectory = $captured.Action.WorkingDirectory })
+                Triggers  = @($captured.Trigger)
+            }
+        }
+
+        foreach ($name in @('SkipPip','SkipNpm','SkipOffice365','SkipAwsTooling','SkipPowerShellModules','SkipScoop','SkipDotnetTools','SkipVscode','SkipDefender','IncludeDriverUpdates','IncludeFirmwareUpdates','UpdateWsl','UpdateContainers','SkipRestorePoint','SkipHealthCheck','SkipBitLocker','AllowMetered','DisableSelfUpdate','StagedRollout','AggressiveRepair')) {
+            Set-Variable -Scope Script -Name $name -Value $false
+        }
+        $script:OutputMode = 'Normal'
+        $script:IncludePatterns = @()
+        $script:ExcludePatterns = @()
+        $script:NotifyEmail = $null
+        $script:SmtpServer = $null
+        $script:MaintenanceWindowStart = -1
+        $script:MaintenanceWindowEnd = -1
+        $script:ConfigUrl = $null
+        $script:PreCycleScript = $null
+        $script:PostCycleScript = $null
+        $script:HooksConfig = $null
+        $script:NotificationLevel = 'Full'
+        $script:MaxIterations = 20
+        $script:MaxRetryPasses = 3
+        $script:MaxUserIdentityWaits = 10
+        $script:PackageTimeoutMinutes = 30
+        $script:RebootDelaySec = 0
+        $script:ResumeUser = $null
+        $script:ResumeUserSid = $null
+        $script:WatchdogIntervalMinutes = 15
+    }
+
+    It 'arms a PT15M repeating trigger on both tasks, the fallback offset three minutes after the primary' {
+        Mock Get-Date { [datetime]'2026-09-12T00:00:00' }
+
+        Register-BootUpdateTaskForReboot -InFlightWatchdog
+
+        $primaryWatchdog = @($script:CapturedTasks['BootUpdateCycle'].Trigger |
+            Where-Object { $_.Repetition -and -not [string]::IsNullOrEmpty($_.Repetition.Interval) }) | Select-Object -First 1
+        $fallbackWatchdog = @($script:CapturedTasks['BootUpdateCycleFallback'].Trigger |
+            Where-Object { $_.Repetition -and -not [string]::IsNullOrEmpty($_.Repetition.Interval) }) | Select-Object -First 1
+
+        $primaryWatchdog | Should -Not -BeNullOrEmpty
+        $fallbackWatchdog | Should -Not -BeNullOrEmpty
+        $primaryWatchdog.CimClass.CimClassName | Should -Be 'MSFT_TaskTimeTrigger'
+        $primaryWatchdog.Repetition.Interval | Should -Be 'PT15M'
+        $fallbackWatchdog.Repetition.Interval | Should -Be 'PT15M'
+        ([datetime]$fallbackWatchdog.StartBoundary - [datetime]$primaryWatchdog.StartBoundary) | Should -Be (New-TimeSpan -Minutes 3)
+    }
+
+    It 'passes -WatchdogIntervalMinutes 15 in the registered task arguments by default' {
+        Register-BootUpdateTaskForReboot -InFlightWatchdog
+
+        $script:CapturedTasks['BootUpdateCycle'].Action.Arguments | Should -Match '-WatchdogIntervalMinutes 15'
+        $script:CapturedTasks['BootUpdateCycleFallback'].Action.Arguments | Should -Match '-WatchdogIntervalMinutes 15'
+    }
+
+    It 'passes the configured watchdog interval, and repeats the trigger at that interval, when it differs from the default' {
+        $script:WatchdogIntervalMinutes = 5
+
+        Register-BootUpdateTaskForReboot -InFlightWatchdog
+
+        $script:CapturedTasks['BootUpdateCycle'].Action.Arguments | Should -Match '-WatchdogIntervalMinutes 5'
+        $watchdogTrigger = @($script:CapturedTasks['BootUpdateCycle'].Trigger |
+            Where-Object { $_.Repetition -and -not [string]::IsNullOrEmpty($_.Repetition.Interval) }) | Select-Object -First 1
+        $watchdogTrigger.Repetition.Interval | Should -Be 'PT5M'
+    }
+
+    It 'registers no repeating trigger on a plain call' {
+        { Register-BootUpdateTaskForReboot } | Should -Not -Throw
+
+        $allTriggers = @($script:CapturedTasks.Values | ForEach-Object { $_.Trigger })
+        @($allTriggers | Where-Object { $_.Repetition -and -not [string]::IsNullOrEmpty($_.Repetition.Interval) }) | Should -BeNullOrEmpty
+    }
+
+    It 'registers no repeating trigger with -RetrySoon' {
+        { Register-BootUpdateTaskForReboot -RetrySoon } | Should -Not -Throw
+
+        $allTriggers = @($script:CapturedTasks.Values | ForEach-Object { $_.Trigger })
+        @($allTriggers | Where-Object { $_.Repetition -and -not [string]::IsNullOrEmpty($_.Repetition.Interval) }) | Should -BeNullOrEmpty
+    }
+
+    It 'registers no repeating trigger with -RetryAt' {
+        { Register-BootUpdateTaskForReboot -RetryAt ((Get-Date).AddMinutes(10)) } | Should -Not -Throw
+
+        $allTriggers = @($script:CapturedTasks.Values | ForEach-Object { $_.Trigger })
+        @($allTriggers | Where-Object { $_.Repetition -and -not [string]::IsNullOrEmpty($_.Repetition.Interval) }) | Should -BeNullOrEmpty
+    }
+
+    It 'fails closed: throws mentioning watchdog when the read-back task lacks the repeating trigger it requested' {
+        <# Simulate Task Scheduler dropping repetition off the time trigger rather than the
+           trigger vanishing outright: keep a MSFT_TaskTimeTrigger at the same StartBoundary
+           (so the earlier "missing trigger type" check still passes) but strip its
+           Repetition.Interval, so only the watchdog-specific check downstream can catch it. #>
+        Mock Get-ScheduledTask {
+            $captured = $script:CapturedTasks[$TaskName]
+            $triggersRepeatStripped = @($captured.Trigger | ForEach-Object {
+                if ($_.Repetition -and -not [string]::IsNullOrEmpty($_.Repetition.Interval)) {
+                    New-ScheduledTaskTrigger -Once -At ([datetime]$_.StartBoundary)
+                } else {
+                    $_
+                }
+            })
+            [pscustomobject]@{
+                TaskName  = $TaskName
+                State     = 'Ready'
+                Principal = [pscustomobject]@{ UserId = $captured.Principal.UserId }
+                Settings  = [pscustomobject]@{ RestartCount = $captured.Settings.RestartCount }
+                Actions   = @([pscustomobject]@{ Execute = $captured.Action.Execute; Arguments = $captured.Action.Arguments; WorkingDirectory = $captured.Action.WorkingDirectory })
+                Triggers  = $triggersRepeatStripped
+            }
+        }
+
+        { Register-BootUpdateTaskForReboot -InFlightWatchdog } | Should -Throw '*watchdog*'
+    }
+
+    It 'fails closed: throws mentioning that deliberate stops must never repeat when a read-back trigger unexpectedly repeats' {
+        $strayRepeatingTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) `
+            -RepetitionInterval (New-TimeSpan -Minutes 2) -RepetitionDuration (New-TimeSpan -Days 1)
+        Mock Get-ScheduledTask {
+            $captured = $script:CapturedTasks[$TaskName]
+            [pscustomobject]@{
+                TaskName  = $TaskName
+                State     = 'Ready'
+                Principal = [pscustomobject]@{ UserId = $captured.Principal.UserId }
+                Settings  = [pscustomobject]@{ RestartCount = $captured.Settings.RestartCount }
+                Actions   = @([pscustomobject]@{ Execute = $captured.Action.Execute; Arguments = $captured.Action.Arguments; WorkingDirectory = $captured.Action.WorkingDirectory })
+                Triggers  = @($captured.Trigger) + $strayRepeatingTrigger
+            }
+        }
+
+        { Register-BootUpdateTaskForReboot } | Should -Throw '*deliberate stops must never repeat*'
+    }
+
+    It 'passes -InFlightWatchdog from exactly one call site in Invoke-BootUpdateCycle.ps1, the resume-checkpoint arm' {
+        <# Distinguish the real invocation from prose that mentions the switch (the parameter
+           comment says "see Register-BootUpdateTaskForReboot -InFlightWatchdog") by requiring
+           call shape: the command at the start of a statement line, with or without an
+           assignment, and the switch anywhere later on that line. A second arm written as
+           `-InFlightWatchdog:$true` or without `$null =` is still counted. #>
+        $callPattern = '(?m)^\s*(?:\$\w+\s*=\s*)?Register-BootUpdateTaskForReboot\b[^\r\n]*-InFlightWatchdog'
+        ([regex]::Matches($invokeSource, $callPattern)).Count | Should -Be 1
+
+        $cycleText = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
+        $callIndex = $cycleText.IndexOf('$null = Register-BootUpdateTaskForReboot -InFlightWatchdog')
+        $armedLogIndex = $cycleText.IndexOf('Resume checkpoint armed before update phases')
+        $callIndex | Should -BeGreaterThan 0
+        $armedLogIndex | Should -BeGreaterThan $callIndex
+        ($armedLogIndex - $callIndex) | Should -BeLessThan 200 -Because 'the arm call and its log line belong to the same resume-checkpoint step'
+    }
+
+    It 'clamps a sub-floor WatchdogIntervalMinutes to 2 at script scope (source shape — the clamp runs at parameter-binding time, before any function exists to load)' {
+        <# $script:WatchdogIntervalMinutesClamped is set outside every function, in the plain
+           script body that runs once at parameter binding. The function-loader allowlist
+           only extracts function text via Get-FunctionText, so this clamp is never reachable
+           by calling a loaded function — it has to be asserted as source shape instead. #>
+        $invokeSource | Should -Match '\$script:WatchdogIntervalMinutesClamped = \$false'
+        $invokeSource | Should -Match '\$script:WatchdogIntervalMinutes = \$WatchdogIntervalMinutes'
+        $invokeSource | Should -Match 'if \(\$script:WatchdogIntervalMinutes -lt 2\)'
+        $invokeSource | Should -Match '\$script:WatchdogIntervalMinutesClamped = \$true'
+        $invokeSource | Should -Match '\$script:WatchdogIntervalMinutes = 2'
+        $invokeSource | Should -Match 'WatchdogIntervalMinutes was below the 2-minute floor; clamped to 2'
+    }
+
+    It 'arms the watchdog at whatever floor-clamped value ends up in script scope' {
+        <# Complements the source-shape test above: proves the loaded
+           Register-BootUpdateTaskForReboot correctly consumes whatever
+           $script:WatchdogIntervalMinutes already holds by the time it runs — i.e. the
+           already-clamped value of 2, standing in for an input that was below the floor. #>
+        $script:WatchdogIntervalMinutes = 2
+
+        Register-BootUpdateTaskForReboot -InFlightWatchdog
+
+        $script:CapturedTasks['BootUpdateCycle'].Action.Arguments | Should -Match '-WatchdogIntervalMinutes 2\b'
+        $watchdogTrigger = @($script:CapturedTasks['BootUpdateCycle'].Trigger |
+            Where-Object { $_.Repetition -and -not [string]::IsNullOrEmpty($_.Repetition.Interval) }) | Select-Object -First 1
+        $watchdogTrigger.Repetition.Interval | Should -Be 'PT2M'
+    }
+}
+
+Describe 'A watchdog probe backs off silently when it finds the mutex held' {
+    It 'logs the held-mutex exit at Info level, naming it as a watchdog probe rather than a warning' {
+        <# Before Task B, any collision on the held mutex — deliberate second instance or a
+           watchdog probe — logged the same Warn-level "Exiting" line. Now that a probe
+           finding the mutex held is the expected, silent common case (it runs every
+           WatchdogIntervalMinutes for the life of an in-flight cycle), that specific message
+           is Info, not Warn, and says so explicitly. #>
+        $text = Get-FunctionText $invokeAst 'Enter-BootUpdateMutex'
+        $text | Should -Match ([regex]::Escape("this watchdog probe is exiting without changes"))
+        $text | Should -Match "Write-Log 'Another BootUpdateCycle instance is already running \(mutex held\); this watchdog probe is exiting without changes\.' -Level Info"
+        $text | Should -Not -Match "already running \(mutex held\)\. Exiting\.' -Level Warn"
     }
 }
 
@@ -3172,6 +3418,7 @@ Describe 'A withheld phase is not reported as a crash' {
 
     BeforeAll {
         $script:CrashLog = [System.Collections.Generic.List[object]]::new()
+        $script:MaxRetryPasses = 5
         function Write-Log { param([string]$Message, [string]$Level, [string]$Visibility)
             $script:CrashLog.Add([pscustomobject]@{ Message = $Message; Level = $Level })
         }
@@ -3212,11 +3459,56 @@ Describe 'A withheld phase is not reported as a crash' {
 
     It 'still reports a real crash as a crash' {
         <# Phase left mid-run with no terminal disposition: the process died. This is the
-           case the message was written for and it must keep its warning. #>
+           case the message was written for and it must keep its warning. Task C adds a
+           second, later log line (the recovery-pass count), so the crash line is no
+           longer necessarily the last entry - find it instead of indexing. #>
         Test-CrashRecovery -State (New-UnfinishedPhaseState -Phase 'WindowsUpdate') | Should -BeTrue
+        $crashEntry = @($script:CrashLog | Where-Object { $_.Message -match 'Previous run crashed during \[WindowsUpdate\]' })
+        $crashEntry.Count | Should -Be 1
+        $crashEntry[0].Level | Should -Be 'Warn'
+    }
+
+    It 'charges the retry budget exactly once for an unobserved stop and reports the recovery pass' {
+        <# Task C: a genuine crash is the only branch here that charges ConsecutiveRetryCount
+           and records UnobservedStops; the deliberate-stop and planned-restart branches
+           above must never reach this. #>
+        $state = New-UnfinishedPhaseState -Phase 'WindowsUpdate'
+        Test-CrashRecovery -State $state | Should -BeTrue
+        $state.ConsecutiveRetryCount | Should -Be 1
+        $state.UnobservedStops.Count | Should -Be 1
+        $state.UnobservedStops[0].Phase | Should -Be 'WindowsUpdate'
         $entry = $script:CrashLog[-1]
-        $entry.Message | Should -Match 'Previous run crashed during \[WindowsUpdate\]'
+        $entry.Message | Should -Match 'Recovery pass 1 of 5 after an unobserved stop in WindowsUpdate\.'
         $entry.Level   | Should -Be 'Warn'
+    }
+
+    It 'does not charge the retry budget for a deliberately withheld pass' {
+        $state = New-UnfinishedPhaseState -Phase 'RetryPending'
+        Test-CrashRecovery -State $state | Should -BeTrue
+        $state.ConsecutiveRetryCount | Should -Be 0
+        $state.UnobservedStops.Count | Should -Be 0
+    }
+
+    It 'does not charge the retry budget when an operator raised a reached limit and resumed' {
+        <# ResumeAfterLimit is written when a reached budget is raised. Charging here would
+           spend the newly granted retry before it ran, so the raise bought nothing. #>
+        $state = New-UnfinishedPhaseState -Phase 'ResumeAfterLimit'
+        Test-CrashRecovery -State $state | Should -BeTrue
+        $state.ConsecutiveRetryCount | Should -Be 0
+        $state.UnobservedStops.Count | Should -Be 0
+        $script:CrashLog[-1].Message | Should -Match 'limit was raised; nothing crashed'
+    }
+
+    It 'marks a staged-rollout withhold as deliberate so the next pass does not read it as a crash' {
+        <# The staged arm leaves the target incomplete on purpose. Without Phase=RetryPending
+           the next pass would log a crash, disclose an unobserved stop, and charge a second
+           retry on top of the staged one. #>
+        $cycle = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
+        $stagedArm = $cycle.IndexOf('$state.StagedNextPhase = $nextPhase.Name')
+        $stagedArm | Should -BeGreaterThan 0
+        $marker = $cycle.LastIndexOf("`$state.Phase = 'RetryPending'", $stagedArm)
+        $marker | Should -BeGreaterThan 0
+        ($stagedArm - $marker) | Should -BeLessThan 600
     }
 
     It 'says nothing at all about a phase that finished' {
