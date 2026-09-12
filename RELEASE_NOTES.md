@@ -65,14 +65,14 @@ found by matrix row G on 2026-09-09).
 Unit/process behavior:       PASS     (502 tests, 0 failures or skips; clean CI for 98f72e2)
 User/SYSTEM boundary:         PASS
 Published launcher upgrade:   PASS
-Live bootstrap:               NOT RUN  (pending publication)
+Live bootstrap:               PASS     (fresh install and legacy repair from the public release)
 Parallel-cohort recovery:     PASS     (two interruptions; bounded safety stop, not convergence)
 Provider integration:         NOT RUN
 Multi-reboot convergence:     PARTIAL  (rows A and G PASS; row B PARTIAL with deferred inventory; wider rows NOT RUN)
-Release assets:               NOT RUN  (pending publication)
+Release assets:               PASS     (10 scripts + 10 SHA256 sidecars; uploaded bytes verified)
 ```
 
-[Candidate CI](https://github.com/nanoDBA/boot-upd/actions/runs/34706622534) passed 502 tests, PowerShell parsing, analyzer checks, user/SYSTEM exclusion, and the published-launcher upgrade gate at commit `98f72e2`. Four new behavioral regressions cover the parallel-cohort accounting correction. The A/B/G rows below ran before that correction and the version bump; they establish their tested paths, not the new cohort edge case. Live bootstrap and asset checks follow publication preparation. Broader provider coverage and the wider VM matrix remain NOT RUN.
+[Candidate CI](https://github.com/nanoDBA/boot-upd/actions/runs/34706622534) passed 502 tests, PowerShell parsing, analyzer checks, user/SYSTEM exclusion, and the published-launcher upgrade gate at commit `98f72e2`. Four new behavioral regressions cover the parallel-cohort accounting correction. The A/B/G rows below ran before that correction and the version bump; they establish their tested paths, not the new cohort edge case. [Live bootstrap VM checks](https://github.com/nanoDBA/boot-upd/actions/runs/34709679151) passed for fresh install and legacy repair against the public release. All 20 release assets were downloaded and verified before publication, and v2.5.80 was confirmed as the latest public release. Broader provider coverage and the wider VM matrix remain NOT RUN.
 
 - **Row A — interactive continuation, September 12. PASS.** Four user-context passes across three observed reboots; reboot accounting matched the OS evidence, the final Windows Update scope was empty, health checks passed, and state, continuation tasks and cleanup evidence were clear. Evidence: `vm-runs-retry2/A-sep12-boot-upd-matrix-20260912-111434`.
 - **Row B — headless SYSTEM continuation, September 12. PARTIAL.** Five SYSTEM passes and two observed reboots completed the cycle with no interactive user. Winget, Scoop and VS Code user work remained deferred, and the Windows Update re-offer was retained as deferred inventory rather than retried; the row therefore does not claim full provider convergence. This is a truthful partial result.
