@@ -288,7 +288,9 @@ function Get-BootUpdateDiagnosticCleanupEvidence {
     if ($beforeRecord -and $afterRecord -and
         $observed -contains [string]$beforeRecord.Observation -and
         $observed -contains [string]$afterRecord.Observation) {
-        $persistent = ((& $signature $beforeRecord) -eq (& $signature $afterRecord))
+        $beforeSignature = & $signature $beforeRecord
+        $afterSignature  = & $signature $afterRecord
+        $persistent = (($beforeSignature -eq $afterSignature) -and $beforeSignature -ne '|')
     }
 
     return [pscustomobject]@{

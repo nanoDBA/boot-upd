@@ -333,6 +333,14 @@ Describe 'Pending-file cleanup is read from evidence, not from the absence of a 
         (Get-BootUpdateDiagnosticCleanupEvidence -Text $text).Persistent | Should -BeTrue
     }
 
+    It 'reports Persistent false when both observed endpoints are empty' {
+        $text = ConvertTo-SidecarText @(
+            (New-CleanupRecord -Context 'before mutation' -Observation 'observed-empty'),
+            (New-CleanupRecord -Context 'after updates'   -Observation 'observed-empty')
+        )
+        (Get-BootUpdateDiagnosticCleanupEvidence -Text $text).Persistent | Should -BeFalse
+    }
+
     It 'says a suppressed duplicate was suppressed, and still compares it' {
         <# The duplicate guard stays in the log, but it no longer decides what is known. #>
         $text = ConvertTo-SidecarText @(
@@ -373,7 +381,7 @@ Describe 'Pending-file cleanup is read from evidence, not from the absence of a 
         $summary = Get-BootUpdateDiagnosticCleanupEvidence -Text $text
         $summary.SessionId | Should -Be 'current-session'
         $summary.BeforeMutationState | Should -Be 'observed-empty'
-        $summary.Persistent | Should -BeTrue
+        $summary.Persistent | Should -BeFalse
     }
 
     It 'falls back to log parsing for a bundle that predates the sidecar, and labels it' {
