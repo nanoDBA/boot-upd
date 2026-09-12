@@ -12,6 +12,8 @@ Domain glossary for Boot Update Cycle. Terms only — no implementation detail, 
 
 **Retry budget** — how many consecutive recovery passes a cycle may spend before it stops and asks for a human. Consumed by recovery passes, reset by a genuine reboot. Exists so that a failure the updater cannot fix cannot loop forever.
 
+**Resume chain** — the set of scheduled triggers that guarantee a later pass will run — at boot, at logon, and at a dated moment — so that no pass is the cycle's last by accident. A cycle whose resume chain has a gap can stall without failing, which is worse than failing: nothing reports it.
+
 **Boot session** — the identity of the machine's current boot. Two observations belong to the same boot session when they fall inside a tolerance window, not when they are byte-identical, because the underlying clock reading drifts within a single boot.
 
 **Convergence** — every enabled phase reporting success against evidence, with no restart pending. A claim of convergence is a factual assertion about the machine, never an optimistic default.
@@ -28,9 +30,9 @@ Domain glossary for Boot Update Cycle. Terms only — no implementation detail, 
 
 **Terminal failure** — an incomplete phase whose cause is proven not to be transient, so retrying cannot help. It stops the cycle immediately and demands manual attention rather than consuming the whole retry budget. Proof is repetition: the identical failure signature observed across consecutive passes.
 
-**Deferred inventory** — outstanding work the updater could not attempt: a package pinned by the operator, one whose installed version cannot be determined, one the provider refuses to upgrade in place, or one under quarantine. Never counted as a verified update and never treated as retry fuel. It does not make a phase fail, but it does prevent an unqualified claim of convergence — the cycle completes and reports qualified convergence instead.
+**Deferred inventory** — outstanding work the updater cannot bring to a verified state from here: a package pinned by the operator, one whose installed version cannot be determined, one the provider refuses to upgrade in place, one under quarantine, user-scope work on a machine with no interactive session, or an update the machine reports as installed and then offers again. What unites them is the consequence, not the cause. Never counted as a verified update and never treated as retry fuel. It does not make a phase fail, but it does prevent an unqualified claim of convergence — the cycle completes and reports qualified convergence instead.
 
-**Scope deferral** — a phase whose machine-scope work is done but whose user-scope work cannot run here, because the pass is executing as SYSTEM and only a logged-in user can complete it. Distinct from deferred inventory: the work is attemptable, just not from this identity, so the cycle hands it to a later user-context pass rather than recording it as outstanding.
+**Scope deferral** — a phase whose machine-scope work is done but whose user-scope work cannot run here, because the pass is executing as SYSTEM and only a logged-in user can complete it. Distinct from deferred inventory: the work is attemptable, just not from this identity, so the cycle hands it to a later user-context pass rather than recording it as outstanding. Bounded: if no interactive session appears within the configured number of rediscovery attempts, the deferral ends and the work becomes deferred inventory.
 
 **Quarantine** — a reversible, durable block placed on a single package so it stops being attempted, persisting until lifted. Quarantine is an action the updater takes against the package manager; deferred inventory is the status that action produces. They are orthogonal, not alternatives: a quarantined package is deferred inventory for as long as it stays quarantined. A quarantine lifts either by explicit human action or on its own, when the failure signature changes because the cause was fixed upstream.
 
