@@ -37,6 +37,7 @@ BeforeAll {
     $initializerSource = Get-Content -LiteralPath $initializerPath -Raw
 
     . ([scriptblock]::Create((Get-FunctionText -Ast $invokeAst -Name 'Resolve-BootUpdateTrustedFile')))
+    . ([scriptblock]::Create((Get-FunctionText -Ast $invokeAst -Name 'Set-BootUpdateInstallDirectoryAcl')))
 }
 
 Describe 'Fail-closed self-update integrity' {
@@ -141,5 +142,109 @@ Describe 'Elevated hook trust boundary' {
         $text | Should -Match 'while \(\$true\)'
         $text | Should -Match 'S-1-5-11'
         $text | Should -Match 'trustedOwnerSids'
+    }
+}
+
+# Discovery-time (not BeforeAll) so the -Skip conditions below can see it: Pester
+# evaluates -Skip while building the test tree, before any BeforeAll has run.
+$script:isElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).
+    IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+Describe 'Trusted file write-mask honors real ACLs' -Tag 'RequiresAdmin' {
+    # Regression coverage for the read-only-rejected-as-broad-write defect (bd #72):
+    # the write mask must test actual mutation rights, not the read/execute bits that
+    # Modify and FullControl also carry. These tests build genuine directory ACLs with
+    # Set-Acl (no Get-Acl mocking) so the real FileSystemRights bit patterns are exercised.
+    BeforeAll {
+        $administratorsSid = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+        $usersSid = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-545')
+    }
+
+    BeforeEach {
+        $testRoot = Join-Path ([IO.Path]::GetTempPath()) ('BootUpdateAcl-' + [guid]::NewGuid().ToString('N'))
+        $null = New-Item -ItemType Directory -Path $testRoot -Force
+        $hookPath = Join-Path $testRoot 'hook.ps1'
+        Set-Content -LiteralPath $hookPath -Value '# trusted test hook' -Encoding utf8
+
+        if ($script:isElevated) {
+            $acl = Get-Acl -LiteralPath $testRoot
+            $acl.SetAccessRuleProtection($true, $false)
+            foreach ($rule in @($acl.Access)) { $null = $acl.RemoveAccessRule($rule) }
+            $acl.SetOwner($administratorsSid)
+            $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+                $administratorsSid, [Security.AccessControl.FileSystemRights]::FullControl,
+                [Security.AccessControl.AccessControlType]::Allow
+            ))
+            Set-Acl -LiteralPath $testRoot -AclObject $acl
+        }
+    }
+
+    AfterEach {
+        Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'accepts a read-only broad grant (BUILTIN\Users ReadAndExecute)' -Skip:(-not $script:isElevated) {
+        $acl = Get-Acl -LiteralPath $testRoot
+        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+            $usersSid, [Security.AccessControl.FileSystemRights]::ReadAndExecute,
+            [Security.AccessControl.AccessControlType]::Allow
+        ))
+        Set-Acl -LiteralPath $testRoot -AclObject $acl
+
+        Resolve-BootUpdateTrustedFile -Path $hookPath -TrustRoot $testRoot `
+            -AllowedExtension @('.ps1') | Should -Be (Resolve-Path $hookPath).Path
+    }
+
+    It 'rejects a writable broad grant (BUILTIN\Users Modify)' -Skip:(-not $script:isElevated) {
+        $acl = Get-Acl -LiteralPath $testRoot
+        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+            $usersSid, [Security.AccessControl.FileSystemRights]::Modify,
+            [Security.AccessControl.AccessControlType]::Allow
+        ))
+        Set-Acl -LiteralPath $testRoot -AclObject $acl
+
+        Resolve-BootUpdateTrustedFile -Path $hookPath -TrustRoot $testRoot `
+            -AllowedExtension @('.ps1') | Should -BeNullOrEmpty
+    }
+
+    It 'rejects a writable broad grant (BUILTIN\Users WriteData alone)' -Skip:(-not $script:isElevated) {
+        $acl = Get-Acl -LiteralPath $testRoot
+        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+            $usersSid, [Security.AccessControl.FileSystemRights]::WriteData,
+            [Security.AccessControl.AccessControlType]::Allow
+        ))
+        Set-Acl -LiteralPath $testRoot -AclObject $acl
+
+        Resolve-BootUpdateTrustedFile -Path $hookPath -TrustRoot $testRoot `
+            -AllowedExtension @('.ps1') | Should -BeNullOrEmpty
+    }
+
+    It 'rejects a writable broad grant (BUILTIN\Users FullControl)' -Skip:(-not $script:isElevated) {
+        $acl = Get-Acl -LiteralPath $testRoot
+        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+            $usersSid, [Security.AccessControl.FileSystemRights]::FullControl,
+            [Security.AccessControl.AccessControlType]::Allow
+        ))
+        Set-Acl -LiteralPath $testRoot -AclObject $acl
+
+        Resolve-BootUpdateTrustedFile -Path $hookPath -TrustRoot $testRoot `
+            -AllowedExtension @('.ps1') | Should -BeNullOrEmpty
+    }
+
+    It 'accepts the exact grant Set-BootUpdateInstallDirectoryAcl produces on the trust root' -Skip:(-not $script:isElevated) {
+        Set-BootUpdateInstallDirectoryAcl -Path $testRoot
+        Set-Content -LiteralPath $hookPath -Value '# trusted test hook' -Encoding utf8
+
+        Resolve-BootUpdateTrustedFile -Path $hookPath -TrustRoot $testRoot `
+            -AllowedExtension @('.ps1') | Should -Be (Resolve-Path $hookPath).Path
+    }
+
+    It 'accepts a trusted SYSTEM owner with no broad write ACE' -Skip:(-not $script:isElevated) {
+        $acl = Get-Acl -LiteralPath $testRoot
+        $acl.SetOwner([Security.Principal.SecurityIdentifier]::new('S-1-5-18'))
+        Set-Acl -LiteralPath $testRoot -AclObject $acl
+
+        Resolve-BootUpdateTrustedFile -Path $hookPath -TrustRoot $testRoot `
+            -AllowedExtension @('.ps1') | Should -Be (Resolve-Path $hookPath).Path
     }
 }
