@@ -6,6 +6,66 @@
 
 ---
 
+## Unreleased
+
+Five defects from the 2026-09-14 laptop diagnostics and the September lab runs, each
+implemented and unit-tested in an isolated worktree and merged on 2026-09-15.
+
+### Fixed
+
+- **A laptop sleeping mid-phase no longer has its healthy provider killed on wake.** Provider
+  timeouts measured elapsed time with the wall clock, so a suspend counted against the idle
+  and hard limits; on 2026-09-13/14 one laptop saw four "hard timeout" kills 1-2 s after wake,
+  each preceded by a 50-158 minute heartbeat gap. A poll-to-poll gap far beyond the cadence is
+  now treated as suspension and walked out of both clocks, logged once as *"System was
+  suspended for N min during <phase>; not charged to the timeout."* (`-xglj`).
+- **Boot identity alone no longer declares a new boot when the monotonic reading says the
+  same boot.** The same laptop twice logged *"new Windows boot session (identity)"* within
+  two minutes of the previous pass, resetting the same-boot retry budget each time. When a
+  prior and current monotonic reading both exist and agree, an identity move is logged as
+  clock jitter with both deltas; legacy state without a monotonic reading behaves as before.
+  The observation line now carries `Δidentity` and `Δmonotonic` in seconds (`-vhcm`).
+- **A portable package Winget refuses to replace because it was modified is deferred
+  inventory, not a terminal failure.** *"Unable to remove Portable package as it has been
+  modified"* stopped a cycle for manual attention twice in one afternoon. It is now recorded
+  as `PortableModified` with the override command, does not enter the failure signature, and
+  the cycle converges qualified. An empty machine-scope inventory (*"No installed package
+  found matching input criteria"*) after a user-scope success is no longer read as
+  unparseable (`-qjkh`).
+- **A trusted per-phase hook is no longer rejected because BUILTIN\Users can read the trust
+  root.** The write mask OR-ed composite rights that include read bits; it now tests the
+  specific mutation rights only, with real-ACL tests for read-only and writable broad grants
+  (`-egwn`).
+- **A pass that dies during final verification after the cohort is now charged and named.**
+  The state carries a `FinalVerification` intent after `CohortDone`, so a crash there counts
+  as an unobserved stop, re-runs only the final checks, and leaves provider flags and the
+  reboot budget untouched (`-z72k`).
+
+### Validation
+
+```text
+Unit/process behavior:       PASS     (525 tests, 0 failed)
+User/SYSTEM boundary:        PASS
+Published launcher upgrade:  PASS     (from v2.5.43)
+Live bootstrap:              NOT RUN
+Provider integration:        NOT RUN
+Multi-reboot convergence:    PASS     (row A only; see below)
+Release assets:              NOT RUN  (nothing published)
+```
+
+Gates were run from an elevated PowerShell 7 console on 2026-09-15 against the merged tree.
+
+- **Row A** - interactive user, three armed reboots, lab-a. **PASS.** `A-wave2-boot-upd-matrix-20260914-234151`.
+  Four passes, converged in 9.9 minutes with 2 verified updates, `RebootsClaimed 3 =
+  RebootsObservedOS 3`, no state file, no continuation tasks, no pending CBS. Two of the three
+  boots fell inside the 120-second identity window and were detected by the monotonic signal;
+  the observation line now shows both deltas (*"identity delta=85s, monotonic delta=85s"*).
+  No jitter suppression fired on this guest, as expected: the jitter path needs a laptop that
+  suspends, and is covered by unit tests only.
+
+Not re-run for this change: rows B, D, F and the PowerShell 5.1 bootstrap. Treat them as
+**NOT RUN** until a release runs the matrix.
+
 ## v2.5.80 (2026-09-12)
 
 Closes the gap v2.5.79's "Known limitations" named: a cycle killed mid-pass on a machine that

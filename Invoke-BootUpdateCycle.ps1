@@ -7481,7 +7481,7 @@ function Invoke-BootUpdateCycle {
     if ($newBootObserved) {
         $identityDeltaText = if ($null -ne $bootObservation.DeltaIdentitySeconds) { "$($bootObservation.DeltaIdentitySeconds)s" } else { 'n/a' }
         $monotonicDeltaText = if ($null -ne $bootObservation.DeltaMonotonicSeconds) { "$($bootObservation.DeltaMonotonicSeconds)s" } else { 'n/a' }
-        Write-Log "Observed a new Windows boot session ($($bootObservation.Reason), Δidentity=$identityDeltaText, Δmonotonic=$monotonicDeltaText); completed reboot count is now $($state.RebootCount)." -Visibility Verbose
+        Write-Log "Observed a new Windows boot session ($($bootObservation.Reason), identity delta=$identityDeltaText, monotonic delta=$monotonicDeltaText); completed reboot count is now $($state.RebootCount)." -Visibility Verbose
     }
     $currentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
     $null = Update-BootUpdateResumeIdentity -State $state `

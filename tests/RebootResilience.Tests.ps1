@@ -4735,7 +4735,7 @@ Describe 'Identity alone does not outrank an agreeing monotonic reading' {
         $text = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
         $text | Should -Match ([regex]::Escape('$bootObservation.DeltaIdentitySeconds'))
         $text | Should -Match ([regex]::Escape('$bootObservation.DeltaMonotonicSeconds'))
-        $text | Should -Match ([regex]::Escape('Observed a new Windows boot session ($($bootObservation.Reason), ') + '.identity=\$identityDeltaText, .monotonic=\$monotonicDeltaText\); completed reboot count is now')
+        $text | Should -Match ([regex]::Escape('Observed a new Windows boot session ($($bootObservation.Reason), ') + 'identity delta=\$identityDeltaText, monotonic delta=\$monotonicDeltaText\); completed reboot count is now')
     }
 }
 
