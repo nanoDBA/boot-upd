@@ -3558,6 +3558,77 @@ Describe 'A withheld phase is not reported as a crash' {
         $script:UnregisterCalls | Should -Be 1
     }
 
+    It 'charges and discloses one stopped final-verification pass without touching provider flags or the reboot budget' {
+        <# bd -z72k. A death during the post-cohort health check, reboot probes, or Windows
+           Update convergence scan leaves Phase='CohortDone' (the cohort checkpoint's
+           completed sentinel) with LastPhaseStarted='FinalVerification' (this checkpoint's
+           in-flight marker) - a shape Test-CrashRecovery must charge, not wave through as
+           an already-finished cohort. #>
+        $state = New-BootUpdateStateV2
+        $state.Iteration = 5
+        $state.Phase = 'CohortDone'
+        $state.LastPhaseStarted = 'FinalVerification'
+        $state.LastPhaseTimestamp = (Get-Date).AddMinutes(-2).ToString('o')
+        $state.WingetDone = $true
+        $state.WindowsUpdateDone = $true
+        $state.RebootCount = 3
+
+        Test-CrashRecovery -State $state | Should -BeTrue
+
+        $state.ConsecutiveRetryCount | Should -Be 1
+        $state.UnobservedStops.Count | Should -Be 1
+        $state.UnobservedStops[0].Phase | Should -Be 'FinalVerification'
+        $state.WingetDone | Should -BeTrue -Because 'a final-verification recovery must not re-run providers that already completed'
+        $state.WindowsUpdateDone | Should -BeTrue -Because 'a final-verification recovery must not re-run providers that already completed'
+        $state.RebootCount | Should -Be 3 -Because 'an unobserved stop spends retry budget, never the completed reboot budget'
+        @($script:CrashLog | Where-Object { $_.Message -match '^Previous run stopped during final verification at .* re-running the final checks\.$' }).Count |
+            Should -Be 1
+    }
+
+    It 'does not charge a final-verification recovery twice in the same resumed pass' {
+        $state = New-BootUpdateStateV2
+        $state.Iteration = 5
+        $state.Phase = 'CohortDone'
+        $state.LastPhaseStarted = 'FinalVerification'
+
+        Test-CrashRecovery -State $state | Should -BeTrue
+        Test-CrashRecovery -State $state | Should -BeTrue
+
+        $state.ConsecutiveRetryCount | Should -Be 1
+        $state.UnobservedStops.Count | Should -Be 1
+    }
+
+    It 'does not charge a deliberate stop during final verification' {
+        <# RetryPending/UserContextPending/Rebooting/ResumeAfterLimit are all reached only
+           by the caller choosing to stop; none of them may leave LastPhaseStarted
+           'FinalVerification' charged as though the process had died. #>
+        foreach ($phase in @('RetryPending','UserContextPending','Rebooting','ResumeAfterLimit')) {
+            $state = New-BootUpdateStateV2
+            $state.Iteration = 6
+            $state.Phase = $phase
+            $state.LastPhaseStarted = 'FinalVerification'
+
+            Test-CrashRecovery -State $state | Should -BeTrue -Because "$phase is a deliberate terminal disposition"
+            $state.ConsecutiveRetryCount | Should -Be 0 -Because "$phase must not consume the retry budget"
+            $state.UnobservedStops.Count | Should -Be 0 -Because "$phase must not be disclosed as an unobserved stop"
+        }
+    }
+
+    It 'persists the final-verification marker after the cohort checkpoint and before the health check runs' {
+        <# bd -z72k. The marker must land between the cohort's own 'CohortDone' checkpoint
+           write and the first final-verification step (the health check), or a death in
+           between reaches the gap this fix closes. #>
+        $cycle = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
+        $cohortCheckpoint = $cycle.IndexOf("`$state.Phase = 'CohortDone'")
+        $cohortCheckpoint | Should -BeGreaterThan 0
+        $marker = $cycle.IndexOf("`$state.LastPhaseStarted = 'FinalVerification'", $cohortCheckpoint)
+        $marker | Should -BeGreaterThan $cohortCheckpoint
+        $healthCheck = $cycle.IndexOf('$healthCheck = if ($script:SkipHealthCheck)', $marker)
+        $healthCheck | Should -BeGreaterThan $marker
+        ($healthCheck - $marker) | Should -BeLessThan 700
+        $cycle.Substring($marker, $healthCheck - $marker) | Should -Not -Match '\$state\.Phase\s*=' -Because 'Phase must stay CohortDone; only LastPhaseStarted/LastPhaseTimestamp move'
+    }
+
     It 'does not charge the retry budget for a deliberately withheld pass' {
         $state = New-UnfinishedPhaseState -Phase 'RetryPending'
         Test-CrashRecovery -State $state | Should -BeTrue
