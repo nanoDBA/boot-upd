@@ -177,7 +177,9 @@ upd update                       Refresh the checksummed launcher bundle and exi
 upd aws                          Update/repair AWS CLI v2 and AWS.Tools
 upd logs                         Export a sanitized diagnostic ZIP to the Desktop
 upd repair                       Recover missing/corrupt launcher and core files
-upd bootstrap                    Install/verify PowerShell 7, then show help
+upd bootstrap                    Install PowerShell 7 if missing, or upgrade it to the latest
+                                  stable release (Winget, or the signed MSI where Winget is
+                                  absent), then show help
 upd version                      Show the bundled version
 upd status                       Show resume tasks and checkpoint state
 upd uq                           Remove every recorded Winget quarantine pin
@@ -230,7 +232,9 @@ Microsoft Authenticode-validated MSI on older Windows Server systems, then relau
 the PS7 updater. Help and version remain read-only; preview/plan/status commands ask
 the user to run `upd bootstrap` rather than silently installing anything. The updater
 itself remains PowerShell 7-only so `Start-ThreadJob` and `ForEach-Object -Parallel`
-execution are preserved.
+execution are preserved. On Winget-less machines such as Windows Server 2016, the
+installed PowerShell 7 engine is upgraded only when you run `upd bootstrap`; there is
+no in-cycle step for it yet.
 
 Run `upd help` for the complete list, including provider opt-ins, skip switches,
 timeouts, iteration limits, health/BitLocker controls, include/exclude filters, and

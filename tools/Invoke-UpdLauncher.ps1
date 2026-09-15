@@ -583,7 +583,11 @@ switch ($Command.ToLowerInvariant()) {
         exit 0
     }
     'version' { Write-Host "Boot Update Cycle v$(Get-UpdVersion)"; exit 0 }
-    'bootstrap' { Write-Host "PowerShell $($PSVersionTable.PSVersion) runtime ready: $((Get-Process -Id $PID).Path)" -ForegroundColor Green; exit 0 }
+    'bootstrap' {
+        Write-Host "PowerShell $($PSVersionTable.PSVersion) runtime ready: $((Get-Process -Id $PID).Path)" -ForegroundColor Green
+        & $ps7BootstrapPath -Upgrade
+        exit 0
+    }
     'status' { Show-UpdStatus; exit 0 }
     'plan' {
         [pscustomobject](Get-UpdDeployParameters) | Format-List
