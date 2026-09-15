@@ -22,6 +22,7 @@ BeforeAll {
     $null = Get-ParsedScript $invokePath
     $argumentBootstrapAst = Get-ParsedScript $argumentBootstrapPath
     $compatInstallerAst = Get-ParsedScript $compatInstallerPath
+    $ps7BootstrapAst = Get-ParsedScript $ps7BootstrapPath
     $launcherSource = Get-Content -LiteralPath $launcherPath -Raw
     $deploySource = Get-Content -LiteralPath $deployPath -Raw
     $invokeSource = Get-Content -LiteralPath $invokePath -Raw
@@ -30,6 +31,20 @@ BeforeAll {
     $argumentBootstrapSource = Get-Content -LiteralPath $argumentBootstrapPath -Raw
     $compatInstallerSource = Get-Content -LiteralPath $compatInstallerPath -Raw
     $cmdSource = Get-Content -LiteralPath $cmdPath -Raw
+
+    function Get-FunctionText {
+        param([Parameter(Mandatory)]$Ast, [Parameter(Mandatory)][string]$Name)
+        $function = $Ast.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $Name
+        },$true)
+        $function | Should -Not -BeNullOrEmpty
+        return $function.Extent.Text
+    }
+
+    foreach ($name in @('Get-PowerShell7LatestStableVersion','Get-PowerShell7UpgradeDecision')) {
+        . ([scriptblock]::Create((Get-FunctionText -Ast $ps7BootstrapAst -Name $name)))
+    }
 
     function Invoke-UpdCommand {
         param([Parameter(Mandatory)][string]$Arguments)
@@ -673,6 +688,90 @@ exit 0
         $invokeSource | Should -Match 'Start-ThreadJob'
         $invokeSource | Should -Match 'ForEach-Object -Parallel'
         $invokeSource | Should -Match 'Join-Path \$env:ProgramFiles ''PowerShell\\7\\pwsh\.exe'''
+    }
+}
+
+Describe 'upd bootstrap upgrades an installed PowerShell 7' {
+    It 'never downgrades and only reports an upgrade when installed is behind latest' {
+        (Get-PowerShell7UpgradeDecision -InstalledVersion '7.4.5' -LatestVersion '7.4.6').NeedsUpgrade | Should -BeTrue
+        (Get-PowerShell7UpgradeDecision -InstalledVersion '7.4.6' -LatestVersion '7.4.6').NeedsUpgrade | Should -BeFalse
+        (Get-PowerShell7UpgradeDecision -InstalledVersion '7.4.6' -LatestVersion '7.4.6').Message |
+            Should -Be 'PowerShell 7.4.6 is already the latest stable release.'
+        (Get-PowerShell7UpgradeDecision -InstalledVersion '7.5.0' -LatestVersion '7.4.6').NeedsUpgrade | Should -BeFalse
+    }
+
+    It 'skips draft and prerelease GitHub releases when finding the latest stable MSI' {
+        Mock -CommandName Invoke-RestMethod -MockWith {
+            @(
+                [pscustomobject]@{ draft=$false; prerelease=$true; tag_name='v7.4.7-preview.1'; assets=@(
+                    [pscustomobject]@{ name='PowerShell-7.4.7-preview.1-win-x64.msi'; browser_download_url='https://example.invalid/preview.msi' }
+                ) }
+                [pscustomobject]@{ draft=$true; prerelease=$false; tag_name='v7.4.6'; assets=@(
+                    [pscustomobject]@{ name='PowerShell-7.4.6-win-x64.msi'; browser_download_url='https://example.invalid/draft.msi' }
+                ) }
+                [pscustomobject]@{ draft=$false; prerelease=$false; tag_name='v7.4.5'; assets=@(
+                    [pscustomobject]@{ name='PowerShell-7.4.5-win-x64.msi'; browser_download_url='https://example.invalid/stable.msi' }
+                ) }
+            )
+        }
+        $latest = Get-PowerShell7LatestStableVersion -Architecture 'x64'
+        $latest.Version | Should -Be ([version]'7.4.5')
+        $latest.Asset.name | Should -Be 'PowerShell-7.4.5-win-x64.msi'
+    }
+
+    It 'skips a stable release that lacks a matching architecture MSI asset' {
+        Mock -CommandName Invoke-RestMethod -MockWith {
+            @(
+                [pscustomobject]@{ draft=$false; prerelease=$false; tag_name='v7.4.6'; assets=@(
+                    [pscustomobject]@{ name='PowerShell-7.4.6-win-arm64.msi'; browser_download_url='https://example.invalid/arm64.msi' }
+                ) }
+                [pscustomobject]@{ draft=$false; prerelease=$false; tag_name='v7.4.5'; assets=@(
+                    [pscustomobject]@{ name='PowerShell-7.4.5-win-x64.msi'; browser_download_url='https://example.invalid/x64.msi' }
+                ) }
+            )
+        }
+        (Get-PowerShell7LatestStableVersion -Architecture 'x64').Version | Should -Be ([version]'7.4.5')
+    }
+
+    It 'keeps the byte-for-byte early exit when -Upgrade is absent' {
+        $ps7BootstrapSource | Should -Match '\[switch\]\$Upgrade'
+        $ps7BootstrapSource | Should -Match '\$existing = Get-PowerShell7Path\r?\nif \(\$existing -and -not \$Upgrade\) \{ Write-Output \$existing; exit 0 \}'
+    }
+
+    It 'never takes a prerelease and never downgrades, per the release-check source' {
+        $ps7BootstrapSource | Should -Match 'release\.draft -or \$release\.prerelease'
+        $ps7BootstrapSource | Should -Match '\$InstalledVersion -ge \$LatestVersion'
+    }
+
+    It 'fails open when the GitHub release check cannot be reached' {
+        $ps7BootstrapSource | Should -Match 'Write-Warning "Could not check the latest PowerShell release: \$\(\$_\.Exception\.Message\)"'
+        $ps7BootstrapSource | Should -Match '(?s)catch \{\s*Write-Warning "Could not check the latest PowerShell release:.*?exit 0\s*\}'
+    }
+
+    It 'reuses the elevation relaunch and carries -Upgrade across it' {
+        $ps7BootstrapSource | Should -Match "if \(\`$Upgrade\) \{ \`$arguments \+= ' -Upgrade' \}"
+        $ps7BootstrapSource.IndexOf("if (`$Upgrade) { `$arguments += ' -Upgrade' }") |
+            Should -BeGreaterThan $ps7BootstrapSource.IndexOf('-Elevated" -f $PSCommandPath')
+    }
+
+    It 'reuses one MSI installer function from both the fresh-install and upgrade routes' {
+        ($ps7BootstrapSource | Select-String -Pattern 'Install-PowerShell7FromMsi' -AllMatches).Matches.Count |
+            Should -BeGreaterOrEqual 3
+        $ps7BootstrapSource | Should -Match 'function Install-PowerShell7FromMsi'
+    }
+
+    It 'reports a pending restart only when the MSI route itself required one' {
+        $ps7BootstrapSource | Should -Match "PowerShell \`$installedVersion -> \`$newVersion installed\."
+        $ps7BootstrapSource | Should -Match 'A restart is pending before the new version is fully in place\.'
+        $ps7BootstrapSource | Should -Match '\$msiExitCode -eq 3010'
+    }
+
+    It 'invokes the bootstrap script with -Upgrade from the launcher''s bootstrap command' {
+        $bootstrapCommand = [regex]::Match($launcherSource, "(?s)'bootstrap'\s*\{.*?\n    \}")
+        $bootstrapCommand.Success | Should -BeTrue
+        $bootstrapCommand.Value | Should -Match 'runtime ready'
+        $bootstrapCommand.Value | Should -Match '&\s*\$ps7BootstrapPath\s+-Upgrade'
+        $bootstrapCommand.Value | Should -Match 'exit 0'
     }
 }
 

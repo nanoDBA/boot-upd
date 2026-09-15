@@ -41,6 +41,16 @@ implemented and unit-tested in an isolated worktree and merged on 2026-09-15.
   as an unobserved stop, re-runs only the final checks, and leaves provider flags and the
   reboot budget untouched (`-z72k`).
 
+### Added
+
+- **`upd bootstrap` now upgrades an already-installed PowerShell 7 to the latest stable
+  release, not just verifies it exists.** Machines without Winget — Windows Server 2016
+  chief among them — had no path to a newer engine short of a manual MSI. `upd bootstrap`
+  compares the running `pwsh.exe` against the latest non-prerelease GitHub release, upgrades
+  through Winget when present or the same signed-MSI route the fresh install already uses
+  otherwise, and never downgrades. An unreachable GitHub API is a warning, not a failure:
+  bootstrap still exits 0 so the launcher keeps working offline.
+
 ### Validation
 
 ```text
