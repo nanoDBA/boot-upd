@@ -3324,11 +3324,24 @@ function Wait-ProcessWithIdleTimeout {
         [string]$ActivityName = 'Package manager',
         [string]$Status = 'Operation is running',
         [double]$IdleTimeoutMinutes = 5, [double]$HardTimeoutMinutes = 60,
-        [ValidateRange(0.2,30)][double]$PollIntervalSeconds = 1
+        [ValidateRange(0.2,30)][double]$PollIntervalSeconds = 1,
+        <# Clock seam for tests only: a scriptblock returning the current UTC time, so a
+           suspend/resume gap can be injected without an actual 50-minute sleep. Production
+           callers must not set this. #>
+        [Parameter(DontShow)][scriptblock]$Clock = { [datetime]::UtcNow }
     )
-    $startTime = [datetime]::UtcNow; $lastCpuIncrease = $startTime; $lastCpuTime = [timespan]::Zero; $finalCpu = [timespan]::Zero
+    $startTime = & $Clock; $lastCpuIncrease = $startTime; $lastCpuTime = [timespan]::Zero; $finalCpu = [timespan]::Zero
+    $lastPollTime = $startTime
     $unobservedTree = $false
     $hardLimit = [timespan]::FromMinutes($HardTimeoutMinutes); $idleLimit = [timespan]::FromMinutes($IdleTimeoutMinutes)
+    <# System sleep freezes this loop without freezing the wall clock: a laptop that
+       suspends mid-poll wakes to find the gap since its last poll charged in full against
+       both the idle and hard timeouts, killing a provider that was healthy right up to
+       suspension (2026-09-14 diagnostics: four kills, 1-2s after wake, each preceded by a
+       heartbeat gap far longer than the poll cadence). A gap that dwarfs the cadence is
+       suspension, not idle-ness or hung work, so it is walked back out of both clocks
+       instead of being charged to them. #>
+    $suspendGapThresholdSeconds = 30
 
     function Remove-ProcessTree { param([int]$RootPid)
         $rootProcess = Get-Process -Id $RootPid -EA SilentlyContinue
@@ -3371,12 +3384,20 @@ function Wait-ProcessWithIdleTimeout {
 
     while ($true) {
         $Process.Refresh()
+        $now = & $Clock
+        $pollGap = $now - $lastPollTime
+        if ($pollGap.TotalSeconds -gt $suspendGapThresholdSeconds) {
+            $startTime = $startTime.Add($pollGap)
+            $lastCpuIncrease = $lastCpuIncrease.Add($pollGap)
+            Write-Log ("System was suspended for {0:N1} min during {1}; not charged to the timeout." -f $pollGap.TotalMinutes, $Status) -Level Warn
+        }
+        $lastPollTime = $now
         if ($Process.HasExited) {
-            $elapsed = [datetime]::UtcNow - $startTime
+            $elapsed = $now - $startTime
             Write-Log "Process PID $($Process.Id) exited normally ($([math]::Round($elapsed.TotalMinutes,1))m)" -Visibility Debug
             return @{ Reason = 'Completed'; Elapsed = $elapsed; FinalCpuTime = $finalCpu; ExitCode = $Process.ExitCode }
         }
-        $elapsed = [datetime]::UtcNow - $startTime
+        $elapsed = $now - $startTime
         if ($elapsed -ge $hardLimit) {
             Write-Log "HARD TIMEOUT: PID $($Process.Id) exceeded $HardTimeoutMinutes min. Killing." -Level Error
             $tree = Get-ProcessTreeActivity -ParentPid $Process.Id
@@ -3399,12 +3420,12 @@ function Wait-ProcessWithIdleTimeout {
                 $unobservedTree = $true
                 Write-Log "  Process tree for PID $($Process.Id) is not observable; holding the idle clock and relying on the ${HardTimeoutMinutes}m hard timeout." -Level Warn
             }
-            $lastCpuIncrease = [datetime]::UtcNow
+            $lastCpuIncrease = $now
         } else {
             $unobservedTree = $false
-            if ($activity.TotalCpuTime -gt $lastCpuTime) { $lastCpuTime = $activity.TotalCpuTime; $lastCpuIncrease = [datetime]::UtcNow }
+            if ($activity.TotalCpuTime -gt $lastCpuTime) { $lastCpuTime = $activity.TotalCpuTime; $lastCpuIncrease = $now }
         }
-        $idleFor = [datetime]::UtcNow - $lastCpuIncrease
+        $idleFor = $now - $lastCpuIncrease
         if ($idleFor -ge $idleLimit) {
             Write-Log "IDLE TIMEOUT: PID $($Process.Id) idle $([math]::Round($idleFor.TotalMinutes,1))m (threshold: ${IdleTimeoutMinutes}m), final CPU=$([math]::Round($activity.TotalCpuTime.TotalSeconds,1))s. Killing." -Level Error
             Write-Log "  Tree at kill: $($activity.ProcessCount) processes, handles=$($activity.HandleCount)" -Level Warn
