@@ -2258,17 +2258,22 @@ function Test-CrashRecovery {
     }
     <# 'ParallelCohort' is one durable sentinel for the whole cohort. A killed cohort must
        consume one retry for the resumed pass, while the individual *Done flags continue to
-       decide which providers rerun. CohortDone is the completed sentinel and remains exempt. #>
-    if ($State.LastPhaseStarted -eq 'CohortDone' -or $State.Phase -eq 'CohortDone') {
+       decide which providers rerun. CohortDone is the completed sentinel and remains exempt
+       — except when LastPhaseStarted is 'FinalVerification': the caller sets that with
+       Phase still 'CohortDone' while the post-cohort health check, reboot probes, and
+       Windows Update convergence scan run, and a death in that window must be seen, not
+       waved through as "cohort already finished". #>
+    $isFinalVerification = $State.LastPhaseStarted -eq 'FinalVerification'
+    if (-not $isFinalVerification -and ($State.LastPhaseStarted -eq 'CohortDone' -or $State.Phase -eq 'CohortDone')) {
         return $false
     }
     $isParallelCohort = $State.LastPhaseStarted -eq 'ParallelCohort'
-    $flagName = if ($isParallelCohort) { $null } else { $phaseToFlag[$State.LastPhaseStarted] }
-    if (-not $isParallelCohort -and -not $flagName) {
+    $flagName = if ($isParallelCohort -or $isFinalVerification) { $null } else { $phaseToFlag[$State.LastPhaseStarted] }
+    if (-not $isParallelCohort -and -not $isFinalVerification -and -not $flagName) {
         Write-Log "Crash recovery: unknown phase '$($State.LastPhaseStarted)' in state file — ignoring." -Level Warn
         return $false
     }
-    $isDone = if ($isParallelCohort) { $false }
+    $isDone = if ($isParallelCohort -or $isFinalVerification) { $false }
               elseif ($State.PSObject.Properties.Name -contains $flagName) { [bool]$State.$flagName }
               else { $false }
     if (-not $isDone) {
@@ -2305,8 +2310,12 @@ function Test-CrashRecovery {
                     Write-Log "Crash recovery for [$($State.LastPhaseStarted)] was already charged in pass $($State.Iteration); keeping the existing recovery record." -Visibility Verbose
                     return $true
                 }
-                $restartText = if ($isParallelCohort) { 'Restarting only unfinished cohort phases.' } else { 'Restarting that phase.' }
-                Write-Log "Previous run crashed during [$($State.LastPhaseStarted)] at [$time]. $restartText" -Level Warn
+                if ($isFinalVerification) {
+                    Write-Log "Previous run stopped during final verification at [$time]; re-running the final checks." -Level Warn
+                } else {
+                    $restartText = if ($isParallelCohort) { 'Restarting only unfinished cohort phases.' } else { 'Restarting that phase.' }
+                    Write-Log "Previous run crashed during [$($State.LastPhaseStarted)] at [$time]. $restartText" -Level Warn
+                }
                 <# Task C: an unobserved stop charges the retry budget exactly once for this
                    resumed pass. The persisted Phase+Iteration record makes this idempotent
                    if recovery is evaluated again in the same pass. Not a reboot (RebootCount
@@ -8266,6 +8275,22 @@ function Invoke-BootUpdateCycle {
             Write-Log '--- Parallel cohort: all phases already done or skipped ---'
         }
     }  <# end if (-not $script:StagedRollout) #>
+
+    if (-not $script:StagedRollout) {
+        <# bd -z72k: the health check, reboot probes, and Windows Update convergence scan
+           below can be interrupted just like any provider phase. Without an explicit
+           marker, a death here leaves Phase='CohortDone' with LastPhaseStarted empty (the
+           cohort's own checkpoint above cleared it), which Test-CrashRecovery reads as
+           "nothing was in flight" — no budget charge, no disclosure of what was
+           interrupted. Persist intent before these checks start; Phase stays 'CohortDone'
+           so completed provider flags and the completed reboot budget are untouched. Every
+           exit from here either advances LastPhaseStarted/Phase deliberately (RetryPending,
+           UserContextPending, Rebooting via the reboot checkpoint's -ClearPhaseIntent)
+           or reaches the terminal Clear-BootUpdateState that removes this file entirely. #>
+        $state.LastPhaseStarted = 'FinalVerification'
+        $state.LastPhaseTimestamp = (Get-Date).ToUniversalTime().ToString('o')
+        Set-BootUpdateState -State $state
+    }
 
     <# ---- Post-update health check ---- #>
     $healthCheck = if ($script:SkipHealthCheck) { $null } else { Test-PostUpdateHealth }
