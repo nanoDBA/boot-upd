@@ -1,6 +1,6 @@
 #requires -Version 5.1
 [CmdletBinding()]
-param([switch]$Elevated, [switch]$Upgrade)
+param([switch]$Elevated, [switch]$Upgrade, [switch]$CheckOnly)
 
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -93,17 +93,36 @@ function Install-PowerShell7FromMsi {
         try { Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $msiPath -Headers $headers -UseBasicParsing }
         finally { $ProgressPreference = $oldProgress }
 
+        <# Explicit path: when Windows PowerShell 5.1 is started from pwsh it inherits pwsh's
+           PSModulePath and cannot autoload its own Microsoft.PowerShell.Security, which is
+           exactly how the launcher's bootstrap command starts this script. #>
+        Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Security') -ErrorAction Stop
         $signature = Get-AuthenticodeSignature -FilePath $msiPath
         if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch '(?i)(^|,\s*)O=Microsoft Corporation(,|$)') {
             throw "PowerShell MSI publisher verification failed: $($signature.Status) $($signature.SignerCertificate.Subject)"
         }
         Write-Host "Verified Microsoft publisher signature on $($asset.name)." -ForegroundColor Green
-        $arguments = @('/i', ('"{0}"' -f $msiPath), '/qn', '/norestart', 'USE_MU=1', 'ENABLE_MU=1')
+        <# MSIRESTARTMANAGERCONTROL=Disable: an in-place upgrade must not let Restart Manager
+           close the running pwsh.exe, because on a machine that already has PowerShell 7 that
+           process is the launcher hosting this very upgrade. Observed on lab-b 2026-09-15:
+           Restart Manager closed pwsh mid-transaction, cmd.exe asked "Terminate batch job",
+           the client died, and the guest was left with no pwsh.exe at all (MSI 1316/1603).
+           With Restart Manager off, files in use are replaced at the next restart and msiexec
+           reports 3010, which the caller surfaces as a pending restart. #>
+        $msiLog = Join-Path ([IO.Path]::GetTempPath()) 'boot-upd-PowerShell-msi.log'
+        $arguments = @('/i', ('"{0}"' -f $msiPath), '/qn', '/norestart', '/l*v', ('"{0}"' -f $msiLog),
+                       'USE_MU=1', 'ENABLE_MU=1', 'MSIRESTARTMANAGERCONTROL=Disable')
         $installer = Start-Process -FilePath msiexec.exe -ArgumentList $arguments -Wait -PassThru
-        if ($installer.ExitCode -notin @(0,3010)) { throw "PowerShell MSI installation failed with exit code $($installer.ExitCode)." }
+        if ($installer.ExitCode -notin @(0,3010)) { throw "PowerShell MSI installation failed with exit code $($installer.ExitCode). Installer log: $msiLog" }
+        Remove-Item -LiteralPath $tempDirectory -Recurse -Force -ErrorAction SilentlyContinue
         $exitCode = $installer.ExitCode
     } finally {
-        Remove-Item -LiteralPath $tempDirectory -Recurse -Force -ErrorAction SilentlyContinue
+        <# Deliberately NOT deleting the package here. When this script hosts an in-place
+           upgrade, Restart Manager shuts down pwsh.exe and the console Ctrl+C that carries
+           unwinds this try/finally while msiexec is still mid-transaction; a finally that
+           removed the temp directory deleted the source MSI under the installer, which then
+           failed SecureRepair with 1316/1603 and left the machine with no pwsh.exe at all
+           (lab-b, 2026-09-15). The package is removed after a successful exit code instead. #>
     }
     return $exitCode
 }
@@ -115,6 +134,7 @@ if (-not (Test-Administrator)) {
     $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $arguments = '-NoLogo -NoProfile -ExecutionPolicy Bypass -File "{0}" -Elevated' -f $PSCommandPath
     if ($Upgrade) { $arguments += ' -Upgrade' }
+    if ($CheckOnly) { $arguments += ' -CheckOnly' }
     $process = Start-Process -FilePath $windowsPowerShell -Verb RunAs -Wait -PassThru -ArgumentList $arguments
     exit $process.ExitCode
 }
@@ -133,6 +153,13 @@ if ($existing -and $Upgrade) {
     if (-not $decision.NeedsUpgrade) {
         Write-Host $decision.Message -ForegroundColor Green
         exit 0
+    }
+    if ($CheckOnly) {
+        <# Exit 100: an upgrade is available. The launcher uses this to hand the real upgrade
+           to a detached host, because the installer closes every pwsh.exe, including the one
+           running the launcher. #>
+        Write-Host "PowerShell $installedVersion is behind the latest stable release $($latest.Version)." -ForegroundColor Yellow
+        exit 100
     }
 
     Write-Host "Upgrading PowerShell $installedVersion to $($latest.Version)..." -ForegroundColor Cyan

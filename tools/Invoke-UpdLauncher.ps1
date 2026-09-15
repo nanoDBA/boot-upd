@@ -585,7 +585,23 @@ switch ($Command.ToLowerInvariant()) {
     'version' { Write-Host "Boot Update Cycle v$(Get-UpdVersion)"; exit 0 }
     'bootstrap' {
         Write-Host "PowerShell $($PSVersionTable.PSVersion) runtime ready: $((Get-Process -Id $PID).Path)" -ForegroundColor Green
-        & $ps7BootstrapPath -Upgrade
+        <# Two steps, both under Windows PowerShell 5.1 rather than in this process: the
+           installer replaces the pwsh.exe this launcher runs on, and Restart Manager closes
+           every pwsh.exe (and Ctrl+Cs its console) while doing so. Step 1 is a fast check that
+           runs synchronously and reports. Step 2, only when the check returns 100, hands the
+           real upgrade to a detached, hidden host whose output goes to a log file, then this
+           launcher exits before the installer starts closing PowerShell. #>
+        $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $check = Start-Process -FilePath $windowsPowerShell -Wait -PassThru -NoNewWindow `
+            -ArgumentList @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $ps7BootstrapPath), '-Upgrade', '-CheckOnly')
+        if ($check.ExitCode -ne 100) { exit $check.ExitCode }
+        $upgradeLog = Join-Path ([IO.Path]::GetTempPath()) 'boot-upd-pwsh-upgrade.log'
+        Remove-Item -LiteralPath $upgradeLog -Force -ErrorAction SilentlyContinue
+        $null = Start-Process -FilePath $windowsPowerShell -WindowStyle Hidden -PassThru `
+            -RedirectStandardOutput $upgradeLog `
+            -ArgumentList @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $ps7BootstrapPath), '-Upgrade')
+        Write-Host 'Upgrading PowerShell 7 in the background. The installer closes every running PowerShell 7 window,' -ForegroundColor Yellow
+        Write-Host "including this one; progress and the result are written to $upgradeLog. Run 'upd version' afterwards." -ForegroundColor Yellow
         exit 0
     }
     'status' { Show-UpdStatus; exit 0 }

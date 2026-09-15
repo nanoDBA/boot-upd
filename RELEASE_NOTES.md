@@ -50,11 +50,20 @@ implemented and unit-tested in an isolated worktree and merged on 2026-09-15.
   through Winget when present or the same signed-MSI route the fresh install already uses
   otherwise, and never downgrades. An unreachable GitHub API is a warning, not a failure:
   bootstrap still exits 0 so the launcher keeps working offline.
+  The upgrade itself runs detached from the launcher, under Windows PowerShell 5.1 in a hidden
+  host that logs to `%TEMP%\boot-upd-pwsh-upgrade.log`, because the installer closes every
+  running `pwsh.exe`, the launcher's own included. The first attempt hosted the MSI inside the
+  launcher and lost the source package mid-transaction when Restart Manager's shutdown unwound
+  a `finally` that cleaned the temp directory; the installer then failed with 1316/1603 and
+  left the guest with no `pwsh.exe`. The package is now removed only after a successful exit
+  code, and Restart Manager is kept out of the install (`MSIRESTARTMANAGERCONTROL=Disable`).
+  Verified on lab-b (no Winget): `upd bootstrap` took 7.6.5 to 7.6.6, MSI event 11707
+  "Installation completed successfully", `pwsh -v` 7.6.6 afterwards.
 
 ### Validation
 
 ```text
-Unit/process behavior:       PASS     (525 tests, 0 failed)
+Unit/process behavior:       PASS     (536 tests, 0 failed)
 User/SYSTEM boundary:        PASS
 Published launcher upgrade:  PASS     (from v2.5.43)
 Live bootstrap:              NOT RUN

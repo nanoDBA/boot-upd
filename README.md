@@ -233,7 +233,7 @@ the PS7 updater. Help and version remain read-only; preview/plan/status commands
 the user to run `upd bootstrap` rather than silently installing anything. The updater
 itself remains PowerShell 7-only so `Start-ThreadJob` and `ForEach-Object -Parallel`
 execution are preserved. On Winget-less machines such as Windows Server 2016, the
-installed PowerShell 7 engine is upgraded only when you run `upd bootstrap`; there is
+installed PowerShell 7 engine is upgraded only when you run `upd bootstrap`; there is The upgrade runs in the background because the installer closes every running PowerShell 7 window, the launcher's own included; the result is written to `%TEMP%\boot-upd-pwsh-upgrade.log` and `upd version` shows the new engine afterwards.
 no in-cycle step for it yet.
 
 Run `upd help` for the complete list, including provider opt-ins, skip switches,

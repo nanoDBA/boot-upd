@@ -760,6 +760,20 @@ Describe 'upd bootstrap upgrades an installed PowerShell 7' {
         $ps7BootstrapSource | Should -Match 'function Install-PowerShell7FromMsi'
     }
 
+    It 'keeps Restart Manager out of the in-place MSI upgrade and logs the installer verbosely' {
+        $ps7BootstrapSource | Should -Match 'MSIRESTARTMANAGERCONTROL=Disable'
+        $ps7BootstrapSource | Should -Match 'Import-Module \(Join-Path \$PSHOME ''Modules\\Microsoft\.PowerShell\.Security''\)'
+        $ps7BootstrapSource | Should -Match "'/l\*v'"
+        $ps7BootstrapSource | Should -Match 'Installer log: \$msiLog'
+        <# The package must outlive the transaction: no Remove-Item of the temp directory
+           inside the finally block, only after a successful exit code. #>
+        ([regex]::Matches($ps7BootstrapSource, 'Remove-Item -LiteralPath \$tempDirectory')).Count | Should -Be 1
+        $ps7BootstrapSource | Should -Match '(?s)ExitCode -notin @\(0,3010\)[^\n]*\n\s*Remove-Item -LiteralPath \$tempDirectory'
+        $ps7BootstrapSource | Should -Match 'Deliberately NOT deleting the package here'
+        $ps7BootstrapSource | Should -Match 'if \(\$CheckOnly\) \{'
+        $ps7BootstrapSource | Should -Match 'exit 100'
+    }
+
     It 'reports a pending restart only when the MSI route itself required one' {
         $ps7BootstrapSource | Should -Match "PowerShell \`$installedVersion -> \`$newVersion installed\."
         $ps7BootstrapSource | Should -Match 'A restart is pending before the new version is fully in place\.'
@@ -770,8 +784,13 @@ Describe 'upd bootstrap upgrades an installed PowerShell 7' {
         $bootstrapCommand = [regex]::Match($launcherSource, "(?s)'bootstrap'\s*\{.*?\n    \}")
         $bootstrapCommand.Success | Should -BeTrue
         $bootstrapCommand.Value | Should -Match 'runtime ready'
-        $bootstrapCommand.Value | Should -Match '&\s*\$ps7BootstrapPath\s+-Upgrade'
-        $bootstrapCommand.Value | Should -Match 'exit 0'
+        $bootstrapCommand.Value | Should -Match 'WindowsPowerShell\\v1\.0\\powershell\.exe'
+        $bootstrapCommand.Value | Should -Match "'-Upgrade', '-CheckOnly'"
+        $bootstrapCommand.Value | Should -Match 'if \(\$check\.ExitCode -ne 100\) \{ exit \$check\.ExitCode \}'
+        $bootstrapCommand.Value | Should -Match '-WindowStyle Hidden'
+        $bootstrapCommand.Value | Should -Match '-RedirectStandardOutput \$upgradeLog'
+        $bootstrapCommand.Value | Should -Not -Match '&\s*\$ps7BootstrapPath'
+        $bootstrapCommand.Value | Should -Not -Match '-Wait[^\r\n]*-Upgrade''\)\s*$'
     }
 }
 
