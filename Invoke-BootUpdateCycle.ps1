@@ -1044,6 +1044,20 @@ function Get-WingetInventoryPackageIds {
         }
     }
     if ($headerIndex -lt 0) {
+        <# `winget list --upgrade-available` prints this sentence, with no table at all,
+           when the scope genuinely has nothing upgradeable -- e.g. everything else was
+           already resolved as deferred inventory (pinned, scope-blocked, portable-modified)
+           in the other scope. That is a legitimate empty inventory, not a parse failure;
+           treating it as unparseable made a normal "nothing left to do" outcome fail closed
+           and refuse the dedup check downstream. #>
+        if (@($normalized | Where-Object { $_ -match '^No installed package found matching input criteria' }).Count -gt 0) {
+            return [pscustomobject]@{
+                HeaderRecognized = $true
+                PackageIds = @()
+                MalformedRows = 0
+                Reason = ''
+            }
+        }
         return [pscustomobject]@{
             HeaderRecognized = $false
             PackageIds = @()
@@ -1095,6 +1109,7 @@ function Get-WingetOutputSummary {
     $failures = [Collections.Generic.List[object]]::new()
     $staleAbsent = [Collections.Generic.List[object]]::new()
     $scopeBlocked = [Collections.Generic.List[object]]::new()
+    $portableModified = [Collections.Generic.List[object]]::new()
     $successfulIds = [Collections.Generic.List[string]]::new()
     foreach ($rawLine in $Lines) {
         # Winget may indent records or leave ANSI/VT control sequences even with
@@ -1125,6 +1140,13 @@ function Get-WingetOutputSummary {
             $scopeBlocked.Add([pscustomobject]@{
                 Name=$currentName; Id=$currentId; ObservedVersion=$currentVersion
             })
+        } elseif ($line -match '^Unable to remove Portable package as it has been modified') {
+            <# Winget refuses to overwrite a portable package whose installed files were
+               changed after install; forcing past that check is an operator decision
+               (--force), not something a retry from the same command can resolve. #>
+            $portableModified.Add([pscustomobject]@{
+                Name=$currentName; Id=$currentId; ObservedVersion=$currentVersion
+            })
         } elseif ($line -match '^(\d+) package\(s\) have pins') {
             $pinned = [int]$Matches[1]
         } elseif ($line -match '^(\d+) package\(s\) have version numbers that cannot be determined') {
@@ -1140,10 +1162,11 @@ function Get-WingetOutputSummary {
         TechnologyBlocked=$technologyBlocked; NoApplicable=$noApplicable; Failures=$failures.ToArray()
         StaleAbsent=$staleAbsent.ToArray()
         ScopeBlocked=$scopeBlocked.ToArray()
+        PortableModified=$portableModified.ToArray()
         SuccessfulIds=$successfulIds.ToArray()
         Recognized=($attempted -gt 0 -or $updated -gt 0 -or $pinned -gt 0 -or $unknown -gt 0 -or
             $technologyBlocked -gt 0 -or $noApplicable -or $failures.Count -gt 0 -or $staleAbsent.Count -gt 0 -or
-            $scopeBlocked.Count -gt 0)
+            $scopeBlocked.Count -gt 0 -or $portableModified.Count -gt 0)
     }
 }
 
@@ -1165,8 +1188,9 @@ function Test-WingetExitReconciled {
        message with an unconditional [Error] partial-failure log. #>
     $staleCount = @($Summary.StaleAbsent).Count
     $scopeBlockedCount = @($Summary.ScopeBlocked).Count
+    $portableModifiedCount = @($Summary.PortableModified).Count
     $deferredCount = [int]$Summary.Pinned + [int]$Summary.Unknown + [int]$Summary.TechnologyBlocked
-    $accounted = $staleCount + $scopeBlockedCount + $deferredCount
+    $accounted = $staleCount + $scopeBlockedCount + $portableModifiedCount + $deferredCount
     return ($accounted -gt 0 -and @($Summary.Failures).Count -eq 0 -and
         [int]$Summary.Attempted -gt 0 -and
         ([int]$Summary.Updated + $accounted) -ge [int]$Summary.Attempted)
@@ -1505,7 +1529,8 @@ function Write-WingetScopeSummary {
         $level = if ($summary.Failures.Count -gt 0) { 'Warn' } else { 'Info' }
         $staleSuffix = if ($stalePresentation.Unresolved) { ", $($stalePresentation.Unresolved) stale record(s) need attention" } else { '' }
         $blockedSuffix = if ($summary.ScopeBlocked.Count) { ", $($summary.ScopeBlocked.Count) blocked by elevation scope" } else { '' }
-        Write-Log "Winget ${Scope}: $($summary.Attempted) attempted, $($summary.Updated) updated, $($summary.Failures.Count) failed$staleSuffix$blockedSuffix." -Level $level
+        $modifiedSuffix = if ($summary.PortableModified.Count) { ", $($summary.PortableModified.Count) portable package(s) modified" } else { '' }
+        Write-Log "Winget ${Scope}: $($summary.Attempted) attempted, $($summary.Updated) updated, $($summary.Failures.Count) failed$staleSuffix$blockedSuffix$modifiedSuffix." -Level $level
     } else {
         Write-Log "Winget ${Scope}: provider finished without recognizable English summary output; raw transcript retained for verification." -Level Warn
     }
@@ -1521,11 +1546,20 @@ function Write-WingetScopeSummary {
             Write-Log "[machine] Or reinstall machine-scope so elevated runs can manage it: winget install --id $($blocked.Id) -e --scope machine --source winget --accept-source-agreements --accept-package-agreements" -Level Warn
         }
     }
+    foreach ($modified in $summary.PortableModified) {
+        $identity = if ($modified.Id) { "$($modified.Name) [$($modified.Id)]" } else { [string]$modified.Name }
+        Write-Log "[MODIFIED] $identity is a portable package Winget will not remove because it was modified after install, so this run defers it rather than retrying." -Level Warn
+        if ($modified.Id -match '^[A-Za-z0-9][A-Za-z0-9._+-]*$') {
+            Write-Log "[user] Override: winget upgrade --id $($modified.Id) -e --force --accept-source-agreements --accept-package-agreements" -Level Warn
+            Write-Log 'Or uninstall and reinstall it' -Level Warn
+        }
+    }
     $notes = @()
     if ($summary.Pinned) { $notes += "$($summary.Pinned) pinned" }
     if ($summary.Unknown) { $notes += "$($summary.Unknown) unknown-version" }
     if ($summary.TechnologyBlocked) { $notes += "$($summary.TechnologyBlocked) install-technology blocked" }
     if ($summary.ScopeBlocked.Count) { $notes += "$($summary.ScopeBlocked.Count) elevation-scope blocked" }
+    if ($summary.PortableModified.Count) { $notes += "$($summary.PortableModified.Count) portable-modified" }
     if ($notes.Count) { Write-Log "Winget ${Scope}: deferred inventory — $($notes -join ', ')." -Level Warn }
     <# Record the observation in cycle state so the pass that finishes the cycle can qualify
        its completion claim (ADR-0003). This runs on every canonical scope summary, so a
@@ -1547,6 +1581,7 @@ function Write-WingetScopeSummary {
             if ($summary.Unknown)          { [pscustomobject]@{ Kind = 'UnknownVersion'; Count = [int]$summary.Unknown } }
             if ($summary.TechnologyBlocked){ [pscustomobject]@{ Kind = 'TechnologyBlocked'; Count = [int]$summary.TechnologyBlocked } }
             if ($summary.ScopeBlocked.Count) { [pscustomobject]@{ Kind = 'ScopeBlocked'; Count = @($summary.ScopeBlocked).Count } }
+            if ($summary.PortableModified.Count) { [pscustomobject]@{ Kind = 'PortableModified'; Count = @($summary.PortableModified).Count } }
         )
         Add-BootUpdateDeferredInventory -State $script:CurrentState -Provider 'Winget' -Scope $Scope -Records $deferredRecords
     }

@@ -581,6 +581,84 @@ Describe 'Concise provider diagnostics' {
         Should -Invoke Write-Log -Times 0 -Exactly -ParameterFilter { $Message -match '^\[(user|machine)\]' }
     }
 
+    It 'classifies a modified portable package as deferred inventory, not a failure' {
+        $summary = Get-WingetOutputSummary -Lines @(
+            '(1/1) Found FFmpeg for yt-dlp [yt-dlp.FFmpeg] Version N-125875-g5d4d3bdc61-20260731',
+            'Starting package install...',
+            'Unable to remove Portable package as it has been modified; to override this check use --force'
+        )
+
+        $summary.Attempted | Should -Be 1
+        $summary.Updated | Should -Be 0
+        $summary.Failures | Should -BeNullOrEmpty
+        $summary.PortableModified.Count | Should -Be 1
+        $summary.PortableModified[0].Id | Should -Be 'yt-dlp.FFmpeg'
+        $summary.Recognized | Should -BeTrue
+    }
+
+    It 'reconciles the aggregate exit when every attempted package is portable-modified' {
+        $summary = Get-WingetOutputSummary -Lines @(
+            '(1/1) Found FFmpeg for yt-dlp [yt-dlp.FFmpeg] Version N-125875-g5d4d3bdc61-20260731',
+            'Unable to remove Portable package as it has been modified; to override this check use --force'
+        )
+        Test-WingetExitReconciled -Summary $summary -ExitCode -1978335188 | Should -BeTrue
+    }
+
+    It 'does not reconcile an unexplained 0x8A15002C exit' {
+        $summary = Get-WingetOutputSummary -Lines @(
+            '(1/1) Found Example App [Example.App] Version 2.0',
+            'No applicable output for this package.'
+        )
+        Test-WingetExitReconciled -Summary $summary -ExitCode -1978335188 | Should -BeFalse
+    }
+
+    It 'logs portable-modified remediation, records deferred inventory, and does not fail the phase' {
+        $script:CurrentWingetFailures = [Collections.Generic.List[object]]::new()
+        $script:WingetResolvedAbsentPath = Join-Path $TestDrive 'resolved-absent-portable-modified.json'
+        $state = New-BootUpdateStateV2
+        $script:CurrentState = $state
+        Mock Write-ProviderTranscript { }
+        Mock Write-Log { }
+        $lines = @(
+            '(1/1) Found FFmpeg for yt-dlp [yt-dlp.FFmpeg] Version N-125875-g5d4d3bdc61-20260731',
+            'Starting package install...',
+            'Unable to remove Portable package as it has been modified; to override this check use --force'
+        )
+
+        $summary = Write-WingetScopeSummary -Scope user -Lines $lines -ExitCode -1978335188
+
+        $summary.ExitReconciled | Should -BeTrue
+        $script:CurrentWingetFailures.Count | Should -Be 0
+        Should -Invoke Write-Log -Times 1 -Exactly -ParameterFilter {
+            $Message -match '^\[MODIFIED\].*yt-dlp\.FFmpeg.*defers it rather than retrying'
+        }
+        Should -Invoke Write-Log -Times 1 -Exactly -ParameterFilter {
+            $Message -eq '[user] Override: winget upgrade --id yt-dlp.FFmpeg -e --force --accept-source-agreements --accept-package-agreements'
+        }
+        Should -Invoke Write-Log -Times 1 -Exactly -ParameterFilter { $Message -eq 'Or uninstall and reinstall it' }
+        Should -Invoke Write-Log -Times 0 -ParameterFilter { $Message -match 'partial failure, retry required' }
+
+        $classification = Complete-WingetFailureClassification -State $state -Failures $script:CurrentWingetFailures.ToArray() -ExecutionFailures @()
+        $classification.Signature | Should -BeNullOrEmpty
+        $classification.TerminalFailure | Should -BeFalse
+
+        $recorded = @(Get-BootUpdateDeferredInventory -State $state)
+        $recorded.Count | Should -Be 1
+        $recorded[0].Kind | Should -Be 'PortableModified'
+        $recorded[0].Provider | Should -Be 'Winget'
+        $recorded[0].Scope | Should -Be 'user'
+    }
+
+    It 'recognizes an empty upgrade-available inventory instead of failing closed' {
+        $inventory = Get-WingetInventoryPackageIds -Lines @(
+            'No installed package found matching input criteria.'
+        )
+
+        $inventory.HeaderRecognized | Should -BeTrue
+        $inventory.PackageIds | Should -BeNullOrEmpty
+        $inventory.MalformedRows | Should -Be 0
+    }
+
     It 'uses targeted machine inventory to avoid retrying a user-scope success' {
         $winget = Get-FunctionText $invokeAst 'Update-WingetPackages'
         $winget | Should -Match 'successfulPackageIds'
