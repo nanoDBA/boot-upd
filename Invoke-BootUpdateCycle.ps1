@@ -1672,6 +1672,27 @@ function Test-BootUpdateMonotonicBootMoved {
     return ([math]::Abs(($currentInstant - $priorInstant).TotalSeconds) -gt $ToleranceSeconds)
 }
 
+function Get-BootUpdateTimestampDeltaSeconds {
+    <# Absolute seconds between two persisted timestamps, normalised the same way the
+       identity and monotonic comparisons are. Exists so a log line can report how far a
+       signal moved without re-deriving its own parse of a persisted timestamp - the exact
+       duplication that let a new signal bypass the normaliser twice before. Returns $null
+       when either side is missing or unparseable, which also doubles as "no reading". #>
+    param(
+        [AllowNull()]$Left,
+        [AllowNull()]$Right
+    )
+    $leftText = ConvertTo-BootUpdateTimestampString -Value $Left
+    $rightText = ConvertTo-BootUpdateTimestampString -Value $Right
+    if ([string]::IsNullOrWhiteSpace($leftText) -or [string]::IsNullOrWhiteSpace($rightText)) { return $null }
+    $leftInstant = [datetimeoffset]::MinValue
+    $rightInstant = [datetimeoffset]::MinValue
+    $styles = [System.Globalization.DateTimeStyles]::RoundtripKind
+    if (-not [datetimeoffset]::TryParse($leftText, [cultureinfo]::InvariantCulture, $styles, [ref]$leftInstant)) { return $null }
+    if (-not [datetimeoffset]::TryParse($rightText, [cultureinfo]::InvariantCulture, $styles, [ref]$rightInstant)) { return $null }
+    return [math]::Round([math]::Abs(($rightInstant - $leftInstant).TotalSeconds), 0)
+}
+
 function Get-BootUpdateBootReading {
     <# The three readings that identify a boot, taken together.
 
@@ -1704,7 +1725,8 @@ function Update-BootUpdateBootSession {
        rewritten every pass), the Phase-gated reboot increment, and the retry-budget reset.
        Callers consume the observation and cannot mishandle a timestamp they never see.
 
-       Returns: NewBoot, Reason (identity | monotonic | $null), RebootCounted, State. #>
+       Returns: NewBoot, Reason (identity | monotonic | $null), RebootCounted, State,
+       DeltaIdentitySeconds, DeltaMonotonicSeconds. #>
     param(
         [Parameter(Mandatory)][pscustomobject]$State,
         <# A reading, for tests; omitted in production, where the real one is taken here. #>
@@ -1718,18 +1740,35 @@ function Update-BootUpdateBootSession {
 
     $priorBootSessionId = ConvertTo-BootUpdateTimestampString -Value $State.LastBootSessionId
     $identityMoved = -not (Test-BootUpdateSameBootSession -Left $priorBootSessionId -Right $currentSessionId)
+    $identityDeltaSeconds = Get-BootUpdateTimestampDeltaSeconds -Left $priorBootSessionId -Right $currentSessionId
 
     <# The monotonic boot instant is stable to well under a second within one boot and jumps
        by the downtime across one, so a few seconds of tolerance separates jitter from a fast
-       restart that the 120-second window would swallow. Additive only: it can add a detected
-       reboot, never suppress the jitter protection the wider window provides. #>
+       restart that the 120-second window would swallow. It used to be additive only - able to
+       add a detected reboot, never suppress identity - but a laptop resuming from sleep can
+       shift LastBootUpTime past the 120-second window with no real reboot at all (row seen on
+       the laptop: two "new boot session" declarations 93s and 107s after the previous pass,
+       both immediately following a long suspend or a two-minute retry trigger). When a prior
+       AND a current monotonic reading both exist and agree on the same boot, that outranks a
+       lone identity move. Without a prior monotonic reading (old state files, first pass after
+       an upgrade) there is nothing to outrank identity with, so identity alone still decides,
+       exactly as before. #>
     $priorMonotonic = if ($State.PSObject.Properties.Name -contains 'LastMonotonicBootId') { $State.LastMonotonicBootId } else { $null }
+    $monotonicDeltaSeconds = Get-BootUpdateTimestampDeltaSeconds -Left $priorMonotonic -Right $currentMonotonicId
+    $hasMonotonicReading = $null -ne $monotonicDeltaSeconds
     $monotonicMoved = Test-BootUpdateMonotonicBootMoved -Prior $priorMonotonic -Current $currentMonotonicId -ToleranceSeconds $MonotonicToleranceSeconds
 
-    $sameSession = -not ($identityMoved -or $monotonicMoved)
+    <# Identity moved, but the one signal built not to jitter says this is still the same
+       boot: clock skew, not a restart. #>
+    $identityIsJitter = $identityMoved -and $hasMonotonicReading -and -not $monotonicMoved
+    if ($identityIsJitter) {
+        Write-Log "Boot identity moved by $identityDeltaSeconds s while the monotonic boot instant moved by $monotonicDeltaSeconds s; treating as clock jitter, not a reboot." -Level Warn
+    }
+
+    $sameSession = (-not $identityMoved -and -not $monotonicMoved) -or $identityIsJitter
     <# A first-ever pass has nothing to have moved away from, so it is not a new boot. #>
     $newBoot = [bool]$State.LastBootSessionId -and -not $sameSession
-    $reason = if (-not $newBoot) { $null } elseif ($identityMoved) { 'identity' } else { 'monotonic' }
+    $reason = if (-not $newBoot) { $null } elseif ($identityMoved -and -not $identityIsJitter) { 'identity' } else { 'monotonic' }
 
     $rebootCounted = $false
     if ($newBoot) {
@@ -1761,10 +1800,12 @@ function Update-BootUpdateBootSession {
         else { $State | Add-Member -NotePropertyName 'LastMonotonicBootId' -NotePropertyValue $currentMonotonicId -Force }
     }
     return [pscustomobject]@{
-        NewBoot       = $newBoot
-        Reason        = $reason
-        RebootCounted = $rebootCounted
-        State         = $State
+        NewBoot               = $newBoot
+        Reason                = $reason
+        RebootCounted         = $rebootCounted
+        State                 = $State
+        DeltaIdentitySeconds  = $identityDeltaSeconds
+        DeltaMonotonicSeconds = $monotonicDeltaSeconds
     }
 }
 
@@ -7367,7 +7408,9 @@ function Invoke-BootUpdateCycle {
     $state = $bootObservation.State
     $newBootObserved = $bootObservation.NewBoot
     if ($newBootObserved) {
-        Write-Log "Observed a new Windows boot session ($($bootObservation.Reason)); completed reboot count is now $($state.RebootCount)." -Visibility Verbose
+        $identityDeltaText = if ($null -ne $bootObservation.DeltaIdentitySeconds) { "$($bootObservation.DeltaIdentitySeconds)s" } else { 'n/a' }
+        $monotonicDeltaText = if ($null -ne $bootObservation.DeltaMonotonicSeconds) { "$($bootObservation.DeltaMonotonicSeconds)s" } else { 'n/a' }
+        Write-Log "Observed a new Windows boot session ($($bootObservation.Reason), Δidentity=$identityDeltaText, Δmonotonic=$monotonicDeltaText); completed reboot count is now $($state.RebootCount)." -Visibility Verbose
     }
     $currentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
     $null = Update-BootUpdateResumeIdentity -State $state `
