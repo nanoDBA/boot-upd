@@ -66,6 +66,7 @@ BeforeAll {
           'Format-NativeExitCode',
           'Get-InstallerExitSummary',
           'Get-ProcessTreeActivity',
+          'Wait-ProcessWithIdleTimeout',
           'Get-BootUpdateUptimeSeconds',
           'Get-BootUpdateMonotonicBootId',
           'Test-CrashRecovery',
@@ -4041,6 +4042,123 @@ Describe 'A killed package tree does not race the installer it orphaned' {
             $wait = $text.LastIndexOf('Wait-BootUpdateInstallerMutex', $at)
             $kill | Should -BeGreaterThan 0
             $wait | Should -BeGreaterThan $kill -Because 'the wait is for what the kill left behind'
+        }
+    }
+}
+
+Describe 'A suspended laptop does not have sleep charged to the provider timeout' {
+    <# -xglj, 2026-09-14 diagnostics. Wait-ProcessWithIdleTimeout measured elapsed as
+       UtcNow - startTime, so a laptop that slept mid-poll woke to find the whole sleep
+       charged to both the idle and hard clocks: a heartbeat at 21:41:04 read elapsed=17.2m,
+       and the very next line, at 22:31:25 (a 50-minute gap with no heartbeats in between),
+       was "HARD TIMEOUT: exceeded 30 min" against a provider that was mid-install and
+       healthy. A poll gap that dwarfs the cadence is suspension, not idle time or a hung
+       process, so it is walked back out of both clocks via the injected -Clock seam
+       instead of being charged to them.
+
+       These tests drive a real, disposable child process, because $Process is a concrete
+       System.Diagnostics.Process and HasExited cannot be faked. The process is a throwaway
+       'pwsh -Command Start-Sleep' — never the test's own process — so the timeout kill
+       path (Remove-ProcessTree) is safe to actually exercise. #>
+
+    BeforeAll {
+        $script:TestPwshPath = (Get-Command pwsh -ErrorAction SilentlyContinue)?.Source
+        if (-not $script:TestPwshPath) { $script:TestPwshPath = Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe' }
+
+        function Start-DisposableSleeper {
+            $si = [System.Diagnostics.ProcessStartInfo]@{
+                FileName = $script:TestPwshPath
+                Arguments = '-NoProfile -NonInteractive -Command "Start-Sleep -Seconds 600"'
+                UseShellExecute = $false; CreateNoWindow = $true
+            }
+            [System.Diagnostics.Process]::Start($si)
+        }
+
+        <# A scriptblock clock that advances by $StepSeconds per call, except on call
+           number $JumpAtCall (a one-off suspend gap of $JumpMinutes) and call number
+           $KillAtCall (kills $KillTarget synchronously so the very next Refresh() sees
+           HasExited, ending the test deterministically instead of racing real time). Call 1
+           always returns $Start unshifted - it is only used to seed $startTime. #>
+        function New-SteppingClock {
+            param(
+                [Parameter(Mandatory)][datetime]$Start,
+                [Parameter(Mandatory)][double]$StepSeconds,
+                [int]$JumpAtCall = -1,
+                [double]$JumpMinutes = 0,
+                [int]$KillAtCall = -1,
+                [System.Diagnostics.Process]$KillTarget
+            )
+            $state = @{ Calls = 0; Current = $Start }
+            return {
+                $state.Calls++
+                if ($state.Calls -eq $JumpAtCall) {
+                    $state.Current = $state.Current.AddMinutes($JumpMinutes)
+                } elseif ($state.Calls -gt 1) {
+                    $state.Current = $state.Current.AddSeconds($StepSeconds)
+                }
+                if ($state.Calls -eq $KillAtCall -and $KillTarget -and -not $KillTarget.HasExited) {
+                    $KillTarget.Kill($true)
+                    $null = $KillTarget.WaitForExit(5000)
+                }
+                return $state.Current
+            }.GetNewClosure()
+        }
+
+        $script:BaseClockTime = [datetime]::new(2026, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)
+    }
+
+    BeforeEach {
+        $script:Logged = [System.Collections.Generic.List[object]]::new()
+        function Write-Log { param([string]$Message, [string]$Level, [string]$Visibility) $script:Logged.Add([pscustomobject]@{ Message = $Message; Level = $Level }) }
+        function Wait-BootUpdateUiInterval { param($Seconds, $Activity, $Status, $PercentComplete) }
+        <# Constant CPU growth every call keeps the idle clock irrelevant to these tests -
+           the hard-timeout/suspend interaction is what is under test, not idle detection,
+           which ADR-0005's own case already covers. #>
+        $script:CpuSeconds = 0
+        function Get-ProcessTreeActivity { param($ParentPid) $script:CpuSeconds++; [pscustomobject]@{ TotalCpuTime = [timespan]::FromSeconds($script:CpuSeconds); ProcessCount = 1; HandleCount = 10 } }
+    }
+
+    It 'does not charge a 50-minute suspend gap at 17 minutes elapsed against a 30-minute hard timeout' {
+        $proc = Start-DisposableSleeper
+        try {
+            $clock = New-SteppingClock -Start $script:BaseClockTime -StepSeconds 29 -JumpAtCall 38 -JumpMinutes 50 -KillAtCall 41 -KillTarget $proc
+
+            $result = Wait-ProcessWithIdleTimeout -Process $proc -Status 'INSTALLER//WAIT test' `
+                -IdleTimeoutMinutes 5 -HardTimeoutMinutes 30 -PollIntervalSeconds 0.2 -Clock $clock
+
+            $result.Reason | Should -Be 'Completed' -Because 'the process was healthy the whole time; only the wall clock jumped'
+            $result.Elapsed.TotalMinutes | Should -BeGreaterThan 15
+            $result.Elapsed.TotalMinutes | Should -BeLessThan 30 -Because 'the 50-minute gap must not have been charged to the 30-minute hard limit'
+
+            @($script:Logged | Where-Object { $_.Message -match 'HARD TIMEOUT' }).Count | Should -Be 0
+            $suspendLogs = @($script:Logged | Where-Object { $_.Message -match '^System was suspended for' })
+            $suspendLogs.Count | Should -Be 1 -Because 'the gap must be logged exactly once, not once per poll'
+            $suspendLogs[0].Level | Should -Be 'Warn'
+            $suspendLogs[0].Message | Should -Match ([regex]::Escape('System was suspended for 50.0 min during INSTALLER//WAIT test; not charged to the timeout.'))
+        } finally {
+            if (-not $proc.HasExited) { try { $proc.Kill($true) } catch {} }
+            $proc.Dispose()
+        }
+    }
+
+    It 'still trips a 30-minute hard timeout on a genuine 31 minutes of polled time' {
+        $proc = Start-DisposableSleeper
+        try {
+            $clock = New-SteppingClock -Start $script:BaseClockTime -StepSeconds 29
+
+            $result = Wait-ProcessWithIdleTimeout -Process $proc -Status 'INSTALLER//WAIT test' `
+                -IdleTimeoutMinutes 999 -HardTimeoutMinutes 30 -PollIntervalSeconds 0.2 -Clock $clock
+
+            $result.Reason | Should -Be 'HardTimeout' -Because 'this is genuinely-elapsed polled time, not a suspend gap'
+            $result.Elapsed.TotalMinutes | Should -BeGreaterThan 30
+            $result.Elapsed.TotalMinutes | Should -BeLessThan 32
+
+            @($script:Logged | Where-Object { $_.Message -match '^System was suspended for' }).Count |
+                Should -Be 0 -Because 'no poll gap here exceeded the cadence; nothing should be misread as suspension'
+            @($script:Logged | Where-Object { $_.Message -match 'HARD TIMEOUT' }).Count | Should -Be 1
+        } finally {
+            if (-not $proc.HasExited) { try { $proc.Kill($true) } catch {} }
+            $proc.Dispose()
         }
     }
 }
