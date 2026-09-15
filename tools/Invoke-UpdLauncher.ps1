@@ -596,12 +596,13 @@ switch ($Command.ToLowerInvariant()) {
             -ArgumentList @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $ps7BootstrapPath), '-Upgrade', '-CheckOnly')
         if ($check.ExitCode -ne 100) { exit $check.ExitCode }
         $upgradeLog = Join-Path ([IO.Path]::GetTempPath()) 'boot-upd-pwsh-upgrade.log'
-        Remove-Item -LiteralPath $upgradeLog -Force -ErrorAction SilentlyContinue
+        $upgradeErrorLog = Join-Path ([IO.Path]::GetTempPath()) 'boot-upd-pwsh-upgrade.err.log'
+        Remove-Item -LiteralPath $upgradeLog, $upgradeErrorLog -Force -ErrorAction SilentlyContinue
         $null = Start-Process -FilePath $windowsPowerShell -WindowStyle Hidden -PassThru `
-            -RedirectStandardOutput $upgradeLog `
+            -RedirectStandardOutput $upgradeLog -RedirectStandardError $upgradeErrorLog `
             -ArgumentList @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $ps7BootstrapPath), '-Upgrade')
         Write-Host 'Upgrading PowerShell 7 in the background. The installer closes every running PowerShell 7 window,' -ForegroundColor Yellow
-        Write-Host "including this one; progress and the result are written to $upgradeLog. Run 'upd version' afterwards." -ForegroundColor Yellow
+        Write-Host "including this one; progress and the result are written to $upgradeLog (errors to $upgradeErrorLog). Run 'upd version' afterwards." -ForegroundColor Yellow
         exit 0
     }
     'status' { Show-UpdStatus; exit 0 }

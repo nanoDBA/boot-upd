@@ -392,7 +392,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 6 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.80' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.81' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 Set-Variable -Name 'RebootSignalSettleSeconds' -Value 20 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 $script:ExplicitRebootRequests = [System.Collections.Generic.List[object]]::new()
 $script:LastPendingFileRenameOperations = @()
@@ -1050,12 +1050,17 @@ function Get-WingetInventoryPackageIds {
            in the other scope. That is a legitimate empty inventory, not a parse failure;
            treating it as unparseable made a normal "nothing left to do" outcome fail closed
            and refuse the dedup check downstream. #>
-        if (@($normalized | Where-Object { $_ -match '^No installed package found matching input criteria' }).Count -gt 0) {
+        $saysEmpty = @($normalized | Where-Object { $_ -match '^No installed package found matching input criteria' }).Count -gt 0
+        $hasTable = @($normalized | Where-Object { $_ -match '^-{10,}$' }).Count -gt 0
+        if ($saysEmpty -and -not $hasTable) {
+            <# Distinct from a parsed header: this is Winget's own negative statement, and it
+               only counts when nothing else in the transcript looks like a table. #>
             return [pscustomobject]@{
                 HeaderRecognized = $true
+                EmptyInventory = $true
                 PackageIds = @()
                 MalformedRows = 0
-                Reason = ''
+                Reason = 'EmptyInventory'
             }
         }
         return [pscustomobject]@{
@@ -1550,8 +1555,10 @@ function Write-WingetScopeSummary {
         $identity = if ($modified.Id) { "$($modified.Name) [$($modified.Id)]" } else { [string]$modified.Name }
         Write-Log "[MODIFIED] $identity is a portable package Winget will not remove because it was modified after install, so this run defers it rather than retrying." -Level Warn
         if ($modified.Id -match '^[A-Za-z0-9][A-Za-z0-9._+-]*$') {
-            Write-Log "[user] Override: winget upgrade --id $($modified.Id) -e --force --accept-source-agreements --accept-package-agreements" -Level Warn
-            Write-Log 'Or uninstall and reinstall it' -Level Warn
+            Write-Log "[user] Reinstall it cleanly: winget uninstall --id $($modified.Id) -e; winget install --id $($modified.Id) -e --source winget --accept-source-agreements --accept-package-agreements" -Level Warn
+            Write-Log "[user] Or keep the modified files and bypass Winget's check (its integrity guard, not ours): winget upgrade --id $($modified.Id) -e --force --accept-source-agreements --accept-package-agreements" -Level Warn
+        } else {
+            Write-Log "[user] Reinstall it cleanly with winget uninstall and winget install for the package named '$([string]$modified.Name)'; its id did not parse as a Winget identifier." -Level Warn
         }
     }
     $notes = @()
@@ -1803,7 +1810,18 @@ function Update-BootUpdateBootSession {
        boot: clock skew, not a restart. #>
     $identityIsJitter = $identityMoved -and $hasMonotonicReading -and -not $monotonicMoved
     if ($identityIsJitter) {
-        Write-Log "Boot identity moved by $identityDeltaSeconds s while the monotonic boot instant moved by $monotonicDeltaSeconds s; treating as clock jitter, not a reboot." -Level Warn
+        <# LastBootSessionId stays anchored on the jitter path, so every later pass of this
+           boot sees the same identity delta. Warn once per distinct delta; repeats are
+           Verbose so the log does not read as a fresh warning on every pass. #>
+        $priorJitter = if ($State.PSObject.Properties.Name -contains 'LastIdentityJitterSeconds') { $State.LastIdentityJitterSeconds } else { $null }
+        $jitterMessage = "Boot identity moved by $identityDeltaSeconds s while the monotonic boot instant moved by $monotonicDeltaSeconds s; treating as clock jitter, not a reboot."
+        if ($null -ne $priorJitter -and [math]::Abs([double]$priorJitter - [double]$identityDeltaSeconds) -le 5) {
+            Write-Log "$jitterMessage (unchanged since the previous pass)" -Visibility Verbose
+        } else {
+            Write-Log $jitterMessage -Level Warn
+        }
+        if ($State.PSObject.Properties.Name -contains 'LastIdentityJitterSeconds') { $State.LastIdentityJitterSeconds = $identityDeltaSeconds }
+        else { $State | Add-Member -NotePropertyName 'LastIdentityJitterSeconds' -NotePropertyValue $identityDeltaSeconds -Force }
     }
 
     $sameSession = (-not $identityMoved -and -not $monotonicMoved) -or $identityIsJitter
@@ -3529,6 +3547,10 @@ function Wait-ProcessWithIdleTimeout {
         $progressStatus = "$Status | CPU $([math]::Round($activity.TotalCpuTime.TotalSeconds,1))s | $($activity.ProcessCount) proc | idle $([math]::Round($idleFor.TotalMinutes,1))m | elapsed $([math]::Round($elapsed.TotalMinutes,1))m"
         $percent = [math]::Min(99, [math]::Floor(($elapsed.TotalSeconds / $hardLimit.TotalSeconds) * 100))
         Write-Log "  heartbeat: CPU=$([math]::Round($activity.TotalCpuTime.TotalSeconds,1))s procs=$($activity.ProcessCount) idle=$([math]::Round($idleFor.TotalMinutes,1))m elapsed=$([math]::Round($elapsed.TotalMinutes,1))m" -Visibility Debug
+        <# Stamp after the probe, not before it: the gap measured at the top of the next poll
+           must span only the wait, so a stalled CIM enumeration (the wedged-machine case the
+           hard timeout exists for) is charged as elapsed time rather than forgiven as sleep. #>
+        $lastPollTime = & $Clock
         Wait-BootUpdateUiInterval -Seconds $PollIntervalSeconds -Activity $ActivityName -Status $progressStatus -PercentComplete $percent
     }
 }
@@ -8344,7 +8366,7 @@ function Invoke-BootUpdateCycle {
            UserContextPending, Rebooting via the reboot checkpoint's -ClearPhaseIntent)
            or reaches the terminal Clear-BootUpdateState that removes this file entirely. #>
         $state.LastPhaseStarted = 'FinalVerification'
-        $state.LastPhaseTimestamp = (Get-Date).ToUniversalTime().ToString('o')
+        $state.LastPhaseTimestamp = Get-Date -Format 'o'
         Set-BootUpdateState -State $state
     }
 

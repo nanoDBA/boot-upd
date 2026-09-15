@@ -6,7 +6,7 @@
 
 ---
 
-## Unreleased
+## v2.5.81 (2026-09-15)
 
 Five defects from the 2026-09-14 laptop diagnostics and the September lab runs, each
 implemented and unit-tested in an isolated worktree and merged on 2026-09-15.
@@ -63,16 +63,27 @@ implemented and unit-tested in an isolated worktree and merged on 2026-09-15.
 ### Validation
 
 ```text
-Unit/process behavior:       PASS     (536 tests, 0 failed)
+Unit/process behavior:       PASS     (537 tests, 0 failed)
 User/SYSTEM boundary:        PASS
 Published launcher upgrade:  PASS     (from v2.5.43)
-Live bootstrap:              NOT RUN
+Live bootstrap:              NOT RUN  (README one-liner on a hosted VM)
+PowerShell 7 engine upgrade: PASS     (lab-b, no Winget, 7.6.5 -> 7.6.6; see below)
 Provider integration:        NOT RUN
-Multi-reboot convergence:    PASS     (row A only; see below)
-Release assets:              NOT RUN  (nothing published)
+Multi-reboot convergence:    PARTIAL  (rows A, B, F on this build; see below)
+Release assets:              PENDING
 ```
 
-Gates were run from an elevated PowerShell 7 console on 2026-09-15 against the merged tree.
+Gates were run from an elevated PowerShell 7 console on 2026-09-15 against the final tree.
+The unit suite's six trusted-file ACL tests run only from an elevated console; from a
+non-elevated one they skip and the count is lower.
+
+- **PowerShell 7 engine upgrade** - lab-b, no Winget, PowerShell 7.6.5 installed. **PASS.**
+  `upd bootstrap` reported 7.6.5 behind 7.6.6, handed off, and the detached host upgraded it:
+  MSI event 11707 "Installation completed successfully", `pwsh -v` 7.6.6, no restart needed.
+  Manual check, not a harness row; the harness has no row shape for it yet.
+- **Watchdog rows** (kill-and-resume, short-interval no-double-run): **NOT RUN** on this
+  build. They ran on 2026-09-12 for v2.5.80 and nothing in this release touches the trigger
+  or the probe.
 
 - **Row A** - interactive user, three armed reboots, lab-a. **PASS.** `A-wave2-boot-upd-matrix-20260914-234151`.
   Four passes, converged in 9.9 minutes with 2 verified updates, `RebootsClaimed 3 =

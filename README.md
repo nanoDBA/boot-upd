@@ -219,7 +219,7 @@ has exited**. It verifies the installer against the hash embedded below, then th
 verifies and transactionally replaces the complete release bundle before forwarding `aws`:
 
 ```powershell
-$u='https://github.com/nanoDBA/boot-upd/releases/download/v2.5.80/Install-UpdCompat.ps1'; $f=Join-Path $env:TEMP 'Install-UpdCompat-v2.5.80.ps1'; Invoke-WebRequest $u -OutFile $f; if((Get-FileHash $f -Algorithm SHA256).Hash -ne '67662B3B02252FF6DE045FCDF28FB74D8DEB6FDA8080C46B1DAFC7BFBE54ABE3'){throw 'Compatibility installer hash mismatch'}; & $f -CommandArguments aws
+$u='https://github.com/nanoDBA/boot-upd/releases/download/v2.5.81/Install-UpdCompat.ps1'; $f=Join-Path $env:TEMP 'Install-UpdCompat-v2.5.81.ps1'; Invoke-WebRequest $u -OutFile $f; if((Get-FileHash $f -Algorithm SHA256).Hash -ne '67662B3B02252FF6DE045FCDF28FB74D8DEB6FDA8080C46B1DAFC7BFBE54ABE3'){throw 'Compatibility installer hash mismatch'}; & $f -CommandArguments aws
 ```
 
 This is the one-time chicken-and-egg escape hatch. It resolves the first `upd.cmd` on PATH,
@@ -233,8 +233,11 @@ the PS7 updater. Help and version remain read-only; preview/plan/status commands
 the user to run `upd bootstrap` rather than silently installing anything. The updater
 itself remains PowerShell 7-only so `Start-ThreadJob` and `ForEach-Object -Parallel`
 execution are preserved. On Winget-less machines such as Windows Server 2016, the
-installed PowerShell 7 engine is upgraded only when you run `upd bootstrap`; there is The upgrade runs in the background because the installer closes every running PowerShell 7 window, the launcher's own included; the result is written to `%TEMP%\boot-upd-pwsh-upgrade.log` and `upd version` shows the new engine afterwards.
-no in-cycle step for it yet.
+installed PowerShell 7 engine is upgraded only when you run `upd bootstrap`; there is
+no in-cycle step for it yet. The upgrade runs in the background because the installer
+closes every running PowerShell 7 window, the launcher's own included; the result is
+written to `%TEMP%\boot-upd-pwsh-upgrade.log` (errors to the `.err.log` sibling) and
+`upd version` shows the new engine afterwards.
 
 Run `upd help` for the complete list, including provider opt-ins, skip switches,
 timeouts, iteration limits, health/BitLocker controls, include/exclude filters, and

@@ -117,20 +117,21 @@ function Install-PowerShell7FromMsi {
         Remove-Item -LiteralPath $tempDirectory -Recurse -Force -ErrorAction SilentlyContinue
         $exitCode = $installer.ExitCode
     } finally {
-        <# Deliberately NOT deleting the package here. When this script hosts an in-place
-           upgrade, Restart Manager shuts down pwsh.exe and the console Ctrl+C that carries
-           unwinds this try/finally while msiexec is still mid-transaction; a finally that
-           removed the temp directory deleted the source MSI under the installer, which then
-           failed SecureRepair with 1316/1603 and left the machine with no pwsh.exe at all
-           (lab-b, 2026-09-15). The package is removed after a successful exit code instead. #>
+        if ($installer) { $installer.Dispose() }
     }
+    <# Deliberately NOT deleting the package here. When this script hosts an in-place
+       upgrade, Restart Manager shuts down pwsh.exe and the console Ctrl+C that carries
+       unwinds this try/finally while msiexec is still mid-transaction; a finally that
+       removed the temp directory deleted the source MSI under the installer, which then
+       failed SecureRepair with 1316/1603 and left the machine with no pwsh.exe at all
+       (lab-b, 2026-09-15). The package is removed after a successful exit code instead. #>
     return $exitCode
 }
 
 $existing = Get-PowerShell7Path
 if ($existing -and -not $Upgrade) { Write-Output $existing; exit 0 }
 
-if (-not (Test-Administrator)) {
+if (-not (Test-Administrator) -and -not $CheckOnly) {
     $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $arguments = '-NoLogo -NoProfile -ExecutionPolicy Bypass -File "{0}" -Elevated' -f $PSCommandPath
     if ($Upgrade) { $arguments += ' -Upgrade' }
@@ -171,6 +172,8 @@ if ($existing -and $Upgrade) {
             '--silent','--accept-package-agreements','--accept-source-agreements','--disable-interactivity'
         )
         & $winget.Source @wingetArguments
+        $wingetExit = $LASTEXITCODE
+        if ($wingetExit -ne 0) { Write-Warning "winget upgrade returned $wingetExit; verifying the installed version before claiming anything." }
     } else {
         $msiExitCode = Install-PowerShell7FromMsi -Architecture $architecture
     }
@@ -178,6 +181,11 @@ if ($existing -and $Upgrade) {
     $newInstalled = Get-PowerShell7Path
     if (-not $newInstalled) { throw 'PowerShell 7 upgrade completed but pwsh.exe could not be located.' }
     $newVersion = Get-PowerShell7InstalledVersion -PwshPath $newInstalled
+    if ($newVersion -le $installedVersion -and $msiExitCode -ne 3010) {
+        <# No evidence of a change: say so and fail, rather than print an upgrade that did not happen. #>
+        Write-Warning "PowerShell is still $newVersion after the upgrade attempt; no version change was verified."
+        exit 1
+    }
     Write-Host "PowerShell $installedVersion -> $newVersion installed." -ForegroundColor Green
     if ($msiExitCode -eq 3010) {
         Write-Host 'A restart is pending before the new version is fully in place.' -ForegroundColor Yellow

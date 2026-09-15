@@ -761,6 +761,9 @@ Describe 'upd bootstrap upgrades an installed PowerShell 7' {
     }
 
     It 'keeps Restart Manager out of the in-place MSI upgrade and logs the installer verbosely' {
+        <# Source shape by necessity (ADR-0005 style): the assertion is about the msiexec
+           command line and the package lifetime, which a behavioural test could only see by
+           running msiexec. #>
         $ps7BootstrapSource | Should -Match 'MSIRESTARTMANAGERCONTROL=Disable'
         $ps7BootstrapSource | Should -Match 'Import-Module \(Join-Path \$PSHOME ''Modules\\Microsoft\.PowerShell\.Security''\)'
         $ps7BootstrapSource | Should -Match "'/l\*v'"
@@ -775,6 +778,7 @@ Describe 'upd bootstrap upgrades an installed PowerShell 7' {
     }
 
     It 'reports a pending restart only when the MSI route itself required one' {
+        <# Source shape by necessity: the 3010 branch is reachable only after a real msiexec. #>
         $ps7BootstrapSource | Should -Match "PowerShell \`$installedVersion -> \`$newVersion installed\."
         $ps7BootstrapSource | Should -Match 'A restart is pending before the new version is fully in place\.'
         $ps7BootstrapSource | Should -Match '\$msiExitCode -eq 3010'
@@ -788,7 +792,7 @@ Describe 'upd bootstrap upgrades an installed PowerShell 7' {
         $bootstrapCommand.Value | Should -Match "'-Upgrade', '-CheckOnly'"
         $bootstrapCommand.Value | Should -Match 'if \(\$check\.ExitCode -ne 100\) \{ exit \$check\.ExitCode \}'
         $bootstrapCommand.Value | Should -Match '-WindowStyle Hidden'
-        $bootstrapCommand.Value | Should -Match '-RedirectStandardOutput \$upgradeLog'
+        $bootstrapCommand.Value | Should -Match '-RedirectStandardOutput \$upgradeLog -RedirectStandardError \$upgradeErrorLog'
         $bootstrapCommand.Value | Should -Not -Match '&\s*\$ps7BootstrapPath'
         $bootstrapCommand.Value | Should -Not -Match '-Wait[^\r\n]*-Upgrade''\)\s*$'
     }

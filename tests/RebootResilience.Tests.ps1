@@ -634,9 +634,11 @@ Describe 'Concise provider diagnostics' {
             $Message -match '^\[MODIFIED\].*yt-dlp\.FFmpeg.*defers it rather than retrying'
         }
         Should -Invoke Write-Log -Times 1 -Exactly -ParameterFilter {
-            $Message -eq '[user] Override: winget upgrade --id yt-dlp.FFmpeg -e --force --accept-source-agreements --accept-package-agreements'
+            $Message -eq '[user] Reinstall it cleanly: winget uninstall --id yt-dlp.FFmpeg -e; winget install --id yt-dlp.FFmpeg -e --source winget --accept-source-agreements --accept-package-agreements'
         }
-        Should -Invoke Write-Log -Times 1 -Exactly -ParameterFilter { $Message -eq 'Or uninstall and reinstall it' }
+        Should -Invoke Write-Log -Times 1 -Exactly -ParameterFilter {
+            $Message -eq "[user] Or keep the modified files and bypass Winget's check (its integrity guard, not ours): winget upgrade --id yt-dlp.FFmpeg -e --force --accept-source-agreements --accept-package-agreements"
+        }
         Should -Invoke Write-Log -Times 0 -ParameterFilter { $Message -match 'partial failure, retry required' }
 
         $classification = Complete-WingetFailureClassification -State $state -Failures $script:CurrentWingetFailures.ToArray() -ExecutionFailures @()
@@ -4121,7 +4123,7 @@ Describe 'A suspended laptop does not have sleep charged to the provider timeout
     It 'does not charge a 50-minute suspend gap at 17 minutes elapsed against a 30-minute hard timeout' {
         $proc = Start-DisposableSleeper
         try {
-            $clock = New-SteppingClock -Start $script:BaseClockTime -StepSeconds 29 -JumpAtCall 38 -JumpMinutes 50 -KillAtCall 41 -KillTarget $proc
+            $clock = New-SteppingClock -Start $script:BaseClockTime -StepSeconds 29 -JumpAtCall 38 -JumpMinutes 50 -KillAtCall 43 -KillTarget $proc
 
             $result = Wait-ProcessWithIdleTimeout -Process $proc -Status 'INSTALLER//WAIT test' `
                 -IdleTimeoutMinutes 5 -HardTimeoutMinutes 30 -PollIntervalSeconds 0.2 -Clock $clock
@@ -4666,6 +4668,28 @@ Describe 'Identity alone does not outrank an agreeing monotonic reading' {
         Should -Invoke Write-Log -Times 1 -Exactly -ParameterFilter {
             $Level -eq 'Warn' -and $Message -match 'Boot identity moved by 3012 s while the monotonic boot instant moved by 2 s; treating as clock jitter, not a reboot\.'
         }
+    }
+
+    It 'treats an identity move as clock jitter after the state has been through a JSON round-trip' {
+        <# powershell-updater-safety: a persisted timestamp must survive ConvertTo-Json /
+           ConvertFrom-Json before it is compared; string-literal tests cannot see that class
+           of defect. #>
+        Mock Write-Log { }
+        $first = [datetime]::UtcNow
+        $state = (Update-BootUpdateBootSession -State (New-BootUpdateStateV2) `
+            -Reading (New-Reading -SessionId $first.ToString('o') -Monotonic $first.ToString('o'))).State
+        $state.ConsecutiveRetryCount = 2
+        $state = Update-BootUpdateStateSchema -State ($state | ConvertTo-Json -Depth 6 | ConvertFrom-Json)
+
+        $second = $first.AddSeconds(3012)
+        $monotonicSecond = $first.AddSeconds(2)
+        $observation = Update-BootUpdateBootSession -State $state `
+            -Reading (New-Reading -SessionId $second.ToString('o') -Monotonic $monotonicSecond.ToString('o'))
+
+        $observation.NewBoot | Should -BeFalse -Because 'the rehydrated monotonic reading still says same boot'
+        $observation.State.ConsecutiveRetryCount | Should -Be 2
+        $observation.DeltaIdentitySeconds | Should -Be 3012
+        $observation.DeltaMonotonicSeconds | Should -Be 2
     }
 
     It 'still declares a new boot when both identity and the monotonic reading move' {
