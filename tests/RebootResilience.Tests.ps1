@@ -30,6 +30,7 @@ BeforeAll {
         'ConvertTo-BootUpdateTimestampString',
         'Test-BootUpdateSameBootSession',
         'Test-BootUpdateMonotonicBootMoved',
+        'Get-BootUpdateTimestampDeltaSeconds',
         'Update-BootUpdateBootSession',
         'Get-BootUpdateBootReading',
         'Update-BootUpdateStateForBootSession',
@@ -4357,6 +4358,117 @@ Describe 'One call decides whether this pass followed a reboot' {
         $shim | Should -Match 'Update-BootUpdateBootSession'
         $shim | Should -Not -Match 'Test-BootUpdateSameBootSession'
         $shim | Should -Not -Match 'RebootCount'
+    }
+}
+
+Describe 'Identity alone does not outrank an agreeing monotonic reading' {
+    <# -vhcm. A laptop resuming from sleep can shift LastBootUpTime by 90+ seconds with no
+       real reboot: two "new boot session" declarations were logged 93s and 107s after the
+       previous pass, one right after a 50-minute sleep and one matching a two-minute retry
+       trigger to the second. Both wrongly reset ConsecutiveRetryCount and
+       WindowsUpdateZeroEvidence. When a prior AND a current monotonic reading both exist and
+       agree on the same boot, that now outranks a lone identity move; without a prior
+       monotonic reading, identity alone still decides, exactly as before. #>
+
+    BeforeAll {
+        function New-Reading {
+            param([string]$SessionId, $Uptime = 600, $Monotonic = $null)
+            [pscustomobject]@{ SessionId = $SessionId; UptimeSeconds = $Uptime; MonotonicBootId = $Monotonic }
+        }
+    }
+
+    It 'treats an identity move as clock jitter when the monotonic reading says same boot' {
+        Mock Write-Log { }
+        $first = [datetime]::UtcNow
+        $state = (Update-BootUpdateBootSession -State (New-BootUpdateStateV2) `
+            -Reading (New-Reading -SessionId $first.ToString('o') -Monotonic $first.ToString('o'))).State
+        $state.ConsecutiveRetryCount = 3
+        $state.WindowsUpdateZeroEvidence = 'seen'
+
+        <# Identity moves 3012s (past the 120s tolerance); the monotonic instant moves only
+           2s (well inside the 15s tolerance) - clock skew, not a reboot. #>
+        $second = $first.AddSeconds(3012)
+        $monotonicSecond = $first.AddSeconds(2)
+        $observation = Update-BootUpdateBootSession -State $state `
+            -Reading (New-Reading -SessionId $second.ToString('o') -Monotonic $monotonicSecond.ToString('o'))
+
+        $observation.NewBoot | Should -BeFalse -Because 'the monotonic reading says this is still the same boot'
+        $observation.Reason | Should -BeNullOrEmpty
+        $observation.State.ConsecutiveRetryCount | Should -Be 3 -Because 'the retry budget must survive clock jitter'
+        $observation.State.WindowsUpdateZeroEvidence | Should -Be 'seen'
+        Should -Invoke Write-Log -Times 1 -Exactly -ParameterFilter {
+            $Level -eq 'Warn' -and $Message -match 'Boot identity moved by 3012 s while the monotonic boot instant moved by 2 s; treating as clock jitter, not a reboot\.'
+        }
+    }
+
+    It 'still declares a new boot when both identity and the monotonic reading move' {
+        $first = [datetime]::UtcNow
+        $state = (Update-BootUpdateBootSession -State (New-BootUpdateStateV2) `
+            -Reading (New-Reading -SessionId $first.ToString('o') -Monotonic $first.ToString('o'))).State
+
+        $second = $first.AddHours(3)
+        $observation = Update-BootUpdateBootSession -State $state `
+            -Reading (New-Reading -SessionId $second.ToString('o') -Monotonic $second.ToString('o'))
+
+        $observation.NewBoot | Should -BeTrue
+        $observation.Reason | Should -Be 'identity'
+        $observation.DeltaIdentitySeconds | Should -Be 10800
+        $observation.DeltaMonotonicSeconds | Should -Be 10800
+    }
+
+    It 'still declares a new boot on the monotonic signal alone when identity stays put' {
+        $first = [datetime]::UtcNow
+        $state = (Update-BootUpdateBootSession -State (New-BootUpdateStateV2) `
+            -Reading (New-Reading -SessionId $first.ToString('o') -Monotonic $first.ToString('o'))).State
+
+        $fast = $first.AddSeconds(67)
+        $observation = Update-BootUpdateBootSession -State $state `
+            -Reading (New-Reading -SessionId $fast.ToString('o') -Monotonic $fast.ToString('o'))
+
+        $observation.NewBoot | Should -BeTrue
+        $observation.Reason | Should -Be 'monotonic'
+    }
+
+    It 'still declares a new boot on identity alone when there is no prior monotonic reading' {
+        <# Old state files and the first pass after an upgrade have nothing persisted at
+           LastMonotonicBootId. Legacy behaviour must stand: identity alone decides. #>
+        Mock Write-Log { }
+        $first = [datetime]::UtcNow
+        $state = (Update-BootUpdateBootSession -State (New-BootUpdateStateV2) `
+            -Reading (New-Reading -SessionId $first.ToString('o'))).State
+        $state.PSObject.Properties.Name | Should -Not -Contain 'LastMonotonicBootId'
+        $state.ConsecutiveRetryCount = 3
+
+        $second = $first.AddHours(3)
+        $observation = Update-BootUpdateBootSession -State $state `
+            -Reading (New-Reading -SessionId $second.ToString('o'))
+
+        $observation.NewBoot | Should -BeTrue -Because 'legacy behaviour: no prior monotonic reading means identity alone still decides'
+        $observation.Reason | Should -Be 'identity'
+        $observation.State.ConsecutiveRetryCount | Should -Be 0
+        Should -Invoke Write-Log -Times 0 -ParameterFilter { $Message -match 'treating as clock jitter' }
+    }
+
+    It 'reports both deltas on the observation object when a new boot is declared' {
+        $first = [datetime]::UtcNow
+        $state = (Update-BootUpdateBootSession -State (New-BootUpdateStateV2) `
+            -Reading (New-Reading -SessionId $first.ToString('o') -Monotonic $first.ToString('o'))).State
+
+        $second = $first.AddSeconds(3012)
+        $observation = Update-BootUpdateBootSession -State $state `
+            -Reading (New-Reading -SessionId $second.ToString('o') -Monotonic $second.ToString('o'))
+
+        $observation.DeltaIdentitySeconds | Should -Be 3012
+        $observation.DeltaMonotonicSeconds | Should -Be 3012
+    }
+
+    It 'logs both deltas on the new-boot observation line in Invoke-BootUpdateCycle' {
+        <# Assert against the production source rather than re-invoking the whole cycle
+           function, which has side effects far beyond the boot-session decision. #>
+        $text = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
+        $text | Should -Match ([regex]::Escape('$bootObservation.DeltaIdentitySeconds'))
+        $text | Should -Match ([regex]::Escape('$bootObservation.DeltaMonotonicSeconds'))
+        $text | Should -Match ([regex]::Escape('Observed a new Windows boot session ($($bootObservation.Reason), ') + '.identity=\$identityDeltaText, .monotonic=\$monotonicDeltaText\); completed reboot count is now')
     }
 }
 
