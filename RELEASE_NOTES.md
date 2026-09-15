@@ -69,11 +69,11 @@ Published launcher upgrade:  PASS     (from v2.5.43)
 Live bootstrap:              NOT RUN  (README one-liner on a hosted VM)
 PowerShell 7 engine upgrade: PASS     (lab-b, no Winget, 7.6.5 -> 7.6.6; see below)
 Provider integration:        NOT RUN
-Multi-reboot convergence:    PARTIAL  (rows A, B, F on this build; see below)
-Release assets:              PENDING
+Multi-reboot convergence:    PARTIAL  (A PASS, B PARTIAL, F PASS; watchdog rows NOT RUN)
+Release assets:              PASS     (20 assets with SHA256 sidecars)
 ```
 
-Gates were run from an elevated PowerShell 7 console on 2026-09-15 against the final tree.
+Gates were run from an elevated PowerShell 7 console on 2026-09-15 against the final tree, and the three rows below ran against the same tree.
 The unit suite's six trusted-file ACL tests run only from an elevated console; from a
 non-elevated one they skip and the count is lower.
 
@@ -85,16 +85,28 @@ non-elevated one they skip and the count is lower.
   build. They ran on 2026-09-12 for v2.5.80 and nothing in this release touches the trigger
   or the probe.
 
-- **Row A** - interactive user, three armed reboots, lab-a. **PASS.** `A-wave2-boot-upd-matrix-20260914-234151`.
-  Four passes, converged in 9.9 minutes with 2 verified updates, `RebootsClaimed 3 =
-  RebootsObservedOS 3`, no state file, no continuation tasks, no pending CBS. Two of the three
-  boots fell inside the 120-second identity window and were detected by the monotonic signal;
-  the observation line now shows both deltas (*"identity delta=85s, monotonic delta=85s"*).
-  No jitter suppression fired on this guest, as expected: the jitter path needs a laptop that
-  suspends, and is covered by unit tests only.
+- **Row A** - interactive user, three armed reboots, lab-a. **PASS.**
+  `A-v2581-release-boot-upd-matrix-20260915-143619`. Four passes, converged in 11.8 minutes
+  with 2 verified updates, `RebootsClaimed 3 = RebootsObservedOS 3`, no state file, no
+  continuation tasks, no pending CBS. Two of the three boots fell inside the 120-second
+  identity window and were caught by the monotonic signal; the observation line shows both
+  deltas (*"identity delta=108s, monotonic delta=107s"*). No jitter suppression fired, as
+  expected on a guest that does not suspend.
+- **Row B** - headless, SYSTEM fallback, one armed reboot, lab-b. **PARTIAL.**
+  `B-v2581-final-lab-b-20260915-134435`. Five passes, converged in 31.2 minutes with a
+  qualified claim (user-scope work deferred after two rediscovery attempts, one re-offered
+  Windows Update), `RebootsClaimed 2 = RebootsObservedOS 2`, no state file, no continuation
+  tasks. PARTIAL rather than PASS because the harness read the CBS `RebootPending` key at
+  collection after the updater's own two-probe settle was clean; on 2026-09-12 the same
+  post-completion reading was traced to Windows' own update agent staging a package, but that
+  was not re-established for this run.
+- **Row F** - PowerShell 5.1-only bootstrap through `upd.cmd`, lab-b. **PASS.**
+  `F-v2581-final-lab-b-20260915-142045`. The launcher installed PowerShell 7.6.6 from the
+  signed MSI through the refactored install function and the cycle converged in one pass
+  with a cleanup advisory, no state file, no continuation tasks, no pending CBS.
 
-Not re-run for this change: rows B, D, F and the PowerShell 5.1 bootstrap. Treat them as
-**NOT RUN** until a release runs the matrix.
+Not run for this release: row D (failed restart command) and the hosted-VM live bootstrap.
+Treat them as **NOT RUN**.
 
 ## v2.5.80 (2026-09-12)
 
