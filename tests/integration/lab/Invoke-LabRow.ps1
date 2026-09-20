@@ -52,6 +52,15 @@ param(
     [ValidateSet('deploy','upd')][string]$Launcher = 'deploy'
 )
 
+function Test-LabCompletionEvidence {
+    param(
+        [int]$Passes,
+        [int]$CompletionRecords,
+        [int]$TasksRemaining,
+        [bool]$StateFileExists
+    )
+    return ($Passes -ge 1 -and $CompletionRecords -ge 1 -and $TasksRemaining -eq 0 -and -not $StateFileExists)
+}
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'LabCredential.ps1')
 if (-not $GuestPassword) { $GuestPassword = Get-BootUpdLabPassword }
@@ -296,6 +305,7 @@ while ((Get-Date) -lt $deadline) {
                    after the updater had finished saying everything it had to say. #>
                 Terminal = @($lines | Where-Object { $_ -match '(recovery limit|Reboot limit) .*reached' }).Count
                 Tasks    = @(Get-ScheduledTask -TaskName 'BootUpdateCycle*' -ErrorAction SilentlyContinue).Count
+                StateFileExists = Test-Path 'C:\ProgramData\BootUpdateCycle\BootUpdateCycle.state.json'
                 <# consent.exe is the UAC consent dialog itself, so counting it counts real prompts rather than inferring them from a log. #>
                 Consent  = @(Get-Process consent -ErrorAction SilentlyContinue).Count
                 Pwsh     = Test-Path 'C:\Program Files\PowerShell\7\pwsh.exe'
@@ -328,7 +338,7 @@ while ((Get-Date) -lt $deadline) {
         <# Requiring a pass as well as a completion line is belt and braces after the scalar
            bug above: a cycle cannot complete before it has started, so a claim of completion
            with zero observed passes is a harness fault, not a result. #>
-        if ($r.Complete -ge 1 -and $r.Passes -ge 1 -and $r.Tasks -eq 0) { $complete = $true; Say "cycle complete after $($r.Passes) pass(es)"; break }
+        if (Test-LabCompletionEvidence -Passes $r.Passes -CompletionRecords $r.Complete -TasksRemaining $r.Tasks -StateFileExists $r.StateFileExists) { $complete = $true; Say "cycle complete after $($r.Passes) pass(es)"; break }
         if ($r.Terminal -ge 1 -and $r.Tasks -eq 0) { Say "cycle stopped itself at a limit after $($r.Passes) pass(es)"; break }
     } catch { Add-Timeline (("{0} unreachable (rebooting)" -f (Get-Date -Format 'HH:mm:ss'))) }
     <# Poll fast while waiting to inject: a restart countdown is measured in seconds, so a
@@ -336,6 +346,7 @@ while ((Get-Date) -lt $deadline) {
     Start-Sleep -Seconds $(if ($injectArmed -and -not $injectAttempted) { 3 } else { 40 })
 }
 
+# The completion-intent log precedes task/state retirement. Require both cleanup facts.
 Say 'collecting evidence'
 $evidence = Invoke-Command -VMName $VMName -Credential $cred -ScriptBlock {
     $log = 'C:\ProgramData\BootUpdateCycle\BootUpdateCycle.log'
@@ -344,9 +355,15 @@ $evidence = Invoke-Command -VMName $VMName -Credential $cred -ScriptBlock {
     # independent check the updater's log cannot provide about itself.
     $boots = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 6005 } -MaxEvents 40 -ErrorAction SilentlyContinue |
                Select-Object -ExpandProperty TimeCreated)
+    $activeStateJson = try { [IO.File]::ReadAllText('C:\ProgramData\BootUpdateCycle\BootUpdateCycle.state.json') } catch [IO.FileNotFoundException] { $null } catch [IO.DirectoryNotFoundException] { $null }
     [pscustomobject]@{
         Log             = $lines
+        CollectedAtUtc  = [datetime]::UtcNow.ToString('o')
         OsBootTimes     = $boots
+        CandidateSourceHash = (Get-FileHash 'C:\Lab\boot-upd\Invoke-BootUpdateCycle.ps1' -Algorithm SHA256).Hash
+        InstalledOrchestratorHash = if (Test-Path 'C:\ProgramData\BootUpdateCycle\Invoke-BootUpdateCycle.ps1') { (Get-FileHash 'C:\ProgramData\BootUpdateCycle\Invoke-BootUpdateCycle.ps1' -Algorithm SHA256).Hash } else { $null }
+        ActiveStateJson = $activeStateJson
+        UpdaterProcesses = @(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'Invoke-BootUpdateCycle|Deploy-BootUpdateCycle|Invoke-UpdLauncher' } | Select-Object ProcessId,ParentProcessId,Name)
         StateFileExists = Test-Path 'C:\ProgramData\BootUpdateCycle\BootUpdateCycle.state.json'
         TasksRemaining  = @(Get-ScheduledTask -TaskName 'BootUpdateCycle*' -ErrorAction SilentlyContinue).Count
         CbsPending      = Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
@@ -359,6 +376,8 @@ $evidence = Invoke-Command -VMName $VMName -Credential $cred -ScriptBlock {
     }
 }
 
+if ($evidence.ActiveStateJson) { $evidence.ActiveStateJson | Set-Content (Join-Path $evidenceDir 'active-state.json') }
+ConvertTo-Json -InputObject @($evidence.UpdaterProcesses) -Depth 3 | Set-Content (Join-Path $evidenceDir 'updater-processes.json')
 $evidence.Log | Set-Content (Join-Path $evidenceDir 'BootUpdateCycle.log')
 if ($evidence.DeployOutput.Count) { $evidence.DeployOutput | Set-Content (Join-Path $evidenceDir 'deploy-output.txt') }
 & 'C:\HyperV\Get-VmScreen.ps1' -VMName $VMName -Path (Join-Path $evidenceDir 'console.png') | Out-Null
@@ -372,13 +391,10 @@ if ($evidence.DeployOutput.Count) { $evidence.DeployOutput | Set-Content (Join-P
    file left. A reader checking the summary against a release note claiming a pass would have
    found them contradicting each other, which is the exact pattern this release exists to
    stop. The collected evidence is the more reliable witness, so it decides. #>
-if (-not $complete) {
-    $completedInLog = @($evidence.Log | Where-Object { $_ -match 'BOOT UPDATE CYCLE COMPLETE' }).Count -ge 1
-    if ($completedInLog -and $evidence.TasksRemaining -eq 0) {
-        $complete = $true
-        Say 'cycle had already completed when the monitor stopped watching; taking that from the evidence'
-    }
-}
+$complete = Test-LabCompletionEvidence `
+    -Passes @($evidence.Log | Where-Object { $_ -match 'BOOT UPDATE CYCLE (STARTED|RESUMED)' }).Count `
+    -CompletionRecords @($evidence.Log | Where-Object { $_ -match 'BOOT UPDATE CYCLE COMPLETE' }).Count `
+    -TasksRemaining $evidence.TasksRemaining -StateFileExists $evidence.StateFileExists
 
 $startLine = @($evidence.Log) | Where-Object { $_ -match 'BOOT UPDATE CYCLE STARTED' } | Select-Object -First 1
 $sessionStart = if ($startLine -match '\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]') { [datetime]$Matches[1] } else { (Get-Date).AddHours(-2) }
@@ -408,6 +424,9 @@ $summary = [pscustomobject]@{
     RebootsClaimed   = $claimed
     RebootsObservedOS = $bootsDuringRun.Count
     RebootAccountingAgrees = if ($null -eq $claimed) { $null } else { $claimed -eq $bootsDuringRun.Count }
+    CollectedAtUtc   = $evidence.CollectedAtUtc
+    CandidateSourceHash = $evidence.CandidateSourceHash
+    InstalledOrchestratorHash = $evidence.InstalledOrchestratorHash
     StateFileRemains = $evidence.StateFileExists
     TasksRemaining   = $evidence.TasksRemaining
     CbsPending       = $evidence.CbsPending

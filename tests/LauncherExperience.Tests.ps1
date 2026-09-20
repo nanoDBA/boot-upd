@@ -94,11 +94,12 @@ Describe 'Safe fun and planning commands' {
     }
 
     It 'prints a rich plan without elevation, deployment, tasks, or reboots' {
-        $result = Invoke-UpdCommand 'plan --delay 120 --drivers --firmware --wsl --containers --allow-metered --restore-point --dotnet-tools --aws-tooling --skip-office365 --output-mode Verbose --max-iterations 7 --timeout 45 --exclude Teams,OneDrive --include Git'
+        $result = Invoke-UpdCommand 'plan --delay 120 --drivers --firmware --wsl --containers --allow-metered --restore-point --dotnet-tools --aws-tooling --skip-office365 --skip-ssms --output-mode Verbose --max-iterations 7 --timeout 45 --exclude Teams,OneDrive --include Git'
         $result.ExitCode | Should -Be 0
         $result.Text | Should -Match 'RebootDelaySec\s+: 120'
         $result.Text | Should -Match 'IncludeDriverUpdates\s+: True'
         $result.Text | Should -Match 'EnableDotnetTools\s+: True'
+        $result.Text | Should -Match 'SkipSsms\s+: True'
         $result.Text | Should -Match 'OutputMode\s+: Verbose'
         $result.Text | Should -Match 'PLAN ONLY.*no elevation.*reboots'
     }
@@ -804,7 +805,7 @@ Describe 'Typed run option forwarding' {
             'OutputMode','MaxIterations','PackageTimeoutMinutes','StagedRollout','AggressiveRepair',
             'IncludeDriverUpdates','IncludeFirmwareUpdates','UpdateWsl','UpdateContainers',
             'AllowMetered','EnableRestorePoint','EnableDotnetTools','EnableAwsTooling',
-            'SkipDefender','SkipBitLocker','DisableSelfUpdate','ExcludePatterns','IncludePatterns'
+            'SkipSsms','SkipDefender','SkipBitLocker','DisableSelfUpdate','ExcludePatterns','IncludePatterns'
         )) {
             $deploySource | Should -Match ([regex]::Escape("`$$parameter"))
         }
@@ -813,11 +814,18 @@ Describe 'Typed run option forwarding' {
     It 'keeps structured pattern arrays and new switches in both direct and scheduled paths' {
         $deploySource | Should -Match 'IncludePatternsBase64'
         $deploySource | Should -Match 'ExcludePatternsBase64'
-        foreach ($name in @('SkipDefender','IncludeDriverUpdates','UpdateWsl','UpdateContainers','AllowMetered','SkipBitLocker','DisableSelfUpdate','AggressiveRepair')) {
+        foreach ($name in @('SkipSsms','SkipDefender','IncludeDriverUpdates','UpdateWsl','UpdateContainers','AllowMetered','SkipBitLocker','DisableSelfUpdate','AggressiveRepair')) {
             $deploySource | Should -Match ([regex]::Escape("Config.$name"))
         }
         $deploySource | Should -Match '-not \$Config\.DisableSelfUpdate'
         $deploySource | Should -Match '\$remoteVer -ge \$currentVer'
         $launcherSource | Should -Match "Alias\('ar','aggressive-repair'\)"
+        $launcherSource | Should -Match "Alias\('no-ssms','skip-ssms'\)"
+    }
+
+    It 'honors an explicit false SkipSsms deployment value instead of treating its presence as true' {
+        $deploySource | Should -Match 'PSBoundParameters\.ContainsKey\(''SkipSsms''\).*Config\.SkipSsms\s*=\s*\[bool\]\$SkipSsms'
+        $deploySource | Should -Not -Match 'foreach \(\$name in @\([^)]*''SkipSsms'''
+        (Get-FunctionText -Ast $launcherAst -Name 'Get-UpdDeployParameters') | Should -Match "SkipSsms='SkipSsms'"
     }
 }

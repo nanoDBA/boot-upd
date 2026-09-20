@@ -552,6 +552,7 @@ $Config = @{
     SkipPip               = $false
     SkipNpm               = $false
     SkipOffice365         = $false
+    SkipSsms              = $false
     SkipAwsTooling        = $true   # Off by default
     SkipPowerShellModules = $false
     SkipScoop             = $false
@@ -559,6 +560,9 @@ $Config = @{
     SkipVscode            = $false
 }
 ```
+
+`SkipSsms` skips only the native SSMS servicing phase. It does not exclude SSMS
+from Winget or Chocolatey, which may still service an SSMS package they manage.
 
 ### Notification webhook
 

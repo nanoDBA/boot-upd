@@ -69,6 +69,7 @@ param(
     [switch]$SkipPip,
     [switch]$SkipNpm,
     [switch]$SkipOffice365,
+    [switch]$SkipSsms,
     [switch]$SkipAwsTooling,
     [switch]$SkipPowerShellModules,
     [switch]$SkipScoop,
@@ -320,6 +321,7 @@ $script:AggressiveRepair      = [bool]$AggressiveRepair
 $script:SkipPip               = $SkipPip
 $script:SkipNpm               = $SkipNpm
 $script:SkipOffice365         = $SkipOffice365
+$script:SkipSsms              = $SkipSsms
 $script:SkipAwsTooling        = $SkipAwsTooling
 $script:SkipPowerShellModules = $SkipPowerShellModules
 $script:SkipScoop             = $SkipScoop
@@ -6515,6 +6517,8 @@ function Register-BootUpdateTaskForReboot {
     if ($script:SkipPip)              { $taskArgs += '-SkipPip' }
     if ($script:SkipNpm)              { $taskArgs += '-SkipNpm' }
     if ($script:SkipOffice365)        { $taskArgs += '-SkipOffice365' }
+    if ($script:SkipSsms)             { $taskArgs += '-SkipSsms' }
+    elseif ($script:ScriptBoundParams.ContainsKey('SkipSsms')) { $taskArgs += '-SkipSsms:$false' }
     if ($script:SkipAwsTooling)       { $taskArgs += '-SkipAwsTooling' }
     if ($script:SkipPowerShellModules){ $taskArgs += '-SkipPowerShellModules' }
     if ($script:SkipScoop)            { $taskArgs += '-SkipScoop' }
@@ -7656,6 +7660,7 @@ function Update-OrchestratorSelf {
         foreach ($p in $ScriptBoundParams.GetEnumerator()) {
             if ($p.Value -is [switch]) {
                 if ($p.Value.IsPresent) { $relaunchArgs.Add("-$($p.Key)") }
+                elseif ($p.Key -eq 'SkipSsms') { $relaunchArgs.Add('-SkipSsms:$false') }
             } elseif ($p.Value -is [string[]]) {
                 foreach ($v in $p.Value) { $relaunchArgs.Add("-$($p.Key)"); $relaunchArgs.Add($v) }
             } elseif ($p.Value -is [pscredential]) {
@@ -7762,7 +7767,7 @@ function Apply-RemoteConfig {
         'MaxIterations', 'MaxRetryPasses', 'RebootDelaySec', 'PackageTimeoutMinutes',
         'MaintenanceWindowStart', 'MaintenanceWindowEnd',
         'SkipPip', 'SkipNpm', 'SkipScoop', 'SkipDotnetTools', 'SkipVscode',
-        'SkipPowerShellModules', 'SkipOffice365', 'SkipAwsTooling',
+        'SkipPowerShellModules', 'SkipOffice365', 'SkipSsms', 'SkipAwsTooling',
         'SkipDefender', 'SkipBitLocker', 'SkipRestorePoint', 'SkipHealthCheck',
         'IncludeDriverUpdates', 'IncludeFirmwareUpdates',
         'UpdateWsl', 'UpdateContainers', 'AllowMetered', 'DisableSelfUpdate',
@@ -7835,6 +7840,7 @@ function Get-BootUpdateLaunchContract {
         if ($script:SkipPip)               { 'Pip' }
         if ($script:SkipNpm)               { 'Npm' }
         if ($script:SkipOffice365)         { 'Office365' }
+        if ($script:SkipSsms)              { 'SSMS' }
         if ($script:SkipAwsTooling)        { 'AWS' }
         if ($script:SkipPowerShellModules) { 'PowerShellModules' }
         if ($script:SkipScoop)             { 'Scoop' }
@@ -8092,7 +8098,7 @@ function Invoke-BootUpdateCycle {
     $allPhases = @(
         @{ Name='Winget';            Flag='WingetDone';            Key='Winget';            Skip=$false; Defer=$false; UserCompletionDeferred=$isSystemCtx;                  Action={ Update-WingetPackages } }
         @{ Name='Chocolatey';        Flag='ChocolateyDone';        Key='Chocolatey';        Skip=$false;                                                                       Action={ Update-ChocolateyPackages } }
-        @{ Name='Ssms';              Flag='SsmsDone';              Key='Ssms';              Skip=$false;                                                                       Action={ Update-SsmsInstances } }
+        @{ Name='Ssms';              Flag='SsmsDone';              Key='Ssms';              Skip=[bool]$SkipSsms;                                                             Action={ Update-SsmsInstances } }
         @{ Name='WindowsUpdate';     Flag='WindowsUpdateDone';     Key='WindowsUpdate';     Skip=$false;                                                                       Action={ Install-WindowsUpdates } }
         @{ Name='DriverFirmware';    Flag='DriverFirmwareDone';    Key='DriverFirmware';    Skip=(-not ($IncludeDriverUpdates -or $IncludeFirmwareUpdates));                    Action={ Install-DriverFirmwareUpdates } }
         @{ Name='AwsTooling';        Flag='AwsToolingDone';        Key=$null;               Skip=[bool]$SkipAwsTooling;                                                        Action={ $r = Repair-AwsTooling; @{ Success = $r; Count = 0 } } }
@@ -8749,14 +8755,62 @@ function Invoke-BootUpdateCycle {
         Set-BootUpdateState -State $state
     }
 
-    <# ---- Post-update reboot decision ---- #>
-    <# In WhatIf mode, always report clean — no reboot or task registration ever happens #>
+    <# ---- Final Windows Update convergence and post-update reboot decision ---- #>
+    <# The final Windows Update scan can take minutes, during which CBS may publish reboot
+       evidence after the initial settled probe. Reconcile before choosing the reboot branch,
+       then take a fresh settled probe so that late evidence uses the existing shared handoff.
+       In staged mode retain the pre-scan remaining set: a scan that reopens Windows Update
+       must take the ordinary bounded Retry disposition, never masquerade as staged progress. #>
+    $stagedRemainingBeforeWuConvergence = $null
     $pending = if ($WhatIfPreference) {
         <# -WhatIf skips the probe, which is correct, but the manifest must not read that as
            "probed and found nothing". Evidence artifacts are written under -WhatIf. #>
         Add-BootUpdatePendingCleanupRecord -Context 'after updates' -Observation 'phase-skipped' -Source 'whatif'
         @()
     } else { Get-ConfirmedPendingReboot -Context 'after updates' }
+    if (-not $WhatIfPreference -and -not $pending -and [bool]$state.WindowsUpdateDone) {
+        if ($script:StagedRollout) {
+            $stagedRemainingBeforeWuConvergence = @($allPhasesFlat | Where-Object {
+                (-not $_.Skip) -and (-not $_.UserCompletionDeferred) -and (-not [bool]$state.($_.Flag))
+            })
+        }
+        if (-not $script:StagedRollout -or $stagedRemainingBeforeWuConvergence.Count -eq 0) {
+            $wuConvergence = Test-WindowsUpdateConvergence
+            <# Filtered, not merely wrapped: @($null) has one element. #>
+            $reoffered = @($wuConvergence.Reoffered | Where-Object { $null -ne $_ })
+            if (-not $wuConvergence.Verified -or [int]$wuConvergence.Unexplained -gt 0) {
+                $state.WindowsUpdateDone = $false
+                Set-BootUpdateState -State $state
+                $why = if (-not $wuConvergence.Verified) { 'the final scan could not be verified' } else { "$([int]$wuConvergence.Unexplained) update(s) remain applicable" }
+                Write-Log "Windows Update convergence withheld: $why." -Level Warn
+            } elseif ($reoffered.Count -gt 0) {
+                <# A re-offer after this run's successful install is deferred inventory,
+                   not retry fuel; it still must not bypass the fresh reboot probe below. #>
+                Add-BootUpdateDeferredInventory -State $state -Provider 'WindowsUpdate' -Scope 'machine' -Records @(
+                    $reoffered | ForEach-Object {
+                        $name = if ($_.KB) { $_.KB } else { $_.Title }
+                        [pscustomobject]@{
+                            Kind   = 'ReofferedAfterSuccess'
+                            Count  = 1
+                            Detail = ("{0} was installed successfully {1} time(s) during this run (Windows Update result code 2, most recently {2}Z) and is still offered by the final scan. Recorded as an environmental re-offer, not retried." -f `
+                                      $name, $_.Installs, ([datetime]$_.LastSuccess).ToString('yyyy-MM-dd HH:mm:ss'))
+                        }
+                    }
+                )
+                Set-BootUpdateState -State $state
+                foreach ($record in $reoffered) {
+                    Write-Log ("Windows Update re-offer after success: {0} installed successfully {1} time(s) during this run (result code 2, latest {2}Z), still applicable on the final scan. Recorded as deferred inventory rather than retried." -f `
+                               $(if ($record.KB) { $record.KB } else { $record.Title }), $record.Installs, ([datetime]$record.LastSuccess).ToString('yyyy-MM-dd HH:mm:ss')) -Level Warn
+                }
+                Write-Log "Windows Update convergence qualified: $($reoffered.Count) update(s) re-offered after a successful install remain; no other update is applicable."
+            } else {
+                Add-BootUpdateDeferredInventory -State $state -Provider 'WindowsUpdate' -Scope 'machine' -Records @()
+                Set-BootUpdateState -State $state
+                Write-Log 'Windows Update convergence verified: zero applicable updates remain in the configured category scope.'
+            }
+            $pending = @(Get-ConfirmedPendingReboot -Context 'after Windows Update convergence')
+        }
+    }
     if ($pending) {
         Write-Log 'Pending reboot after updates: YES' -Level Warn
         $pending | ForEach-Object { Write-Log "  - $($_.Source): $($_.Detail)" -Level Warn }
@@ -8805,7 +8859,11 @@ function Invoke-BootUpdateCycle {
             <# Staged mode: check whether any enabled phases remain undone.
                If yes, stay registered and exit clean — next boot picks up the next phase.
                If no, fall through to normal cycle-complete cleanup. #>
-            $remainingPhases = @($allPhasesFlat | Where-Object { (-not $_.Skip) -and (-not $_.UserCompletionDeferred) -and (-not [bool]$state.($_.Flag)) })
+            $remainingPhases = @(if ($null -ne $stagedRemainingBeforeWuConvergence) {
+                $stagedRemainingBeforeWuConvergence
+            } else {
+                $allPhasesFlat | Where-Object { (-not $_.Skip) -and (-not $_.UserCompletionDeferred) -and (-not [bool]$state.($_.Flag)) }
+            })
             if ($remainingPhases.Count -gt 0) {
                 <# A successful staged pass advances to a different target and resets the
                    same-boot failure streak. Only a target that remains incomplete consumes
@@ -8837,49 +8895,6 @@ function Invoke-BootUpdateCycle {
                 return  <# Cycle not complete — exit without cleanup #>
             }
             Write-Log 'Staged rollout: all phases complete, no pending reboots — cycle done.' -Level Info
-        }
-
-        if (-not $WhatIfPreference -and [bool]$state.WindowsUpdateDone) {
-            $wuConvergence = Test-WindowsUpdateConvergence
-            <# Filtered, not merely wrapped: @($null) has one element. #>
-            $reoffered = @($wuConvergence.Reoffered | Where-Object { $null -ne $_ })
-            if (-not $wuConvergence.Verified -or [int]$wuConvergence.Unexplained -gt 0) {
-                $state.WindowsUpdateDone = $false
-                Set-BootUpdateState -State $state
-                $why = if (-not $wuConvergence.Verified) { 'the final scan could not be verified' } else { "$([int]$wuConvergence.Unexplained) update(s) remain applicable" }
-                Write-Log "Windows Update convergence withheld: $why." -Level Warn
-            } elseif ($reoffered.Count -gt 0) {
-                <# Every update still applicable is one Windows Update itself records as
-                   installed successfully in this boot, and is offering again. Retrying it is
-                   a loop the machine cannot exit - KB5007651 did exactly this for six passes
-                   and five successful installs while the Defender platform genuinely
-                   advanced. Record it as deferred inventory, do not count it as retry fuel,
-                   and qualify the completion claim rather than either claiming full
-                   convergence or retrying forever. #>
-                Add-BootUpdateDeferredInventory -State $state -Provider 'WindowsUpdate' -Scope 'machine' -Records @(
-                    $reoffered | ForEach-Object {
-                        $name = if ($_.KB) { $_.KB } else { $_.Title }
-                        [pscustomobject]@{
-                            Kind   = 'ReofferedAfterSuccess'
-                            Count  = 1
-                            Detail = ("{0} was installed successfully {1} time(s) during this run (Windows Update result code 2, most recently {2}Z) and is still offered by the final scan. Recorded as an environmental re-offer, not retried." -f `
-                                      $name, $_.Installs, ([datetime]$_.LastSuccess).ToString('yyyy-MM-dd HH:mm:ss'))
-                        }
-                    }
-                )
-                Set-BootUpdateState -State $state
-                foreach ($record in $reoffered) {
-                    Write-Log ("Windows Update re-offer after success: {0} installed successfully {1} time(s) during this run (result code 2, latest {2}Z), still applicable on the final scan. Recorded as deferred inventory rather than retried." -f `
-                               $(if ($record.KB) { $record.KB } else { $record.Title }), $record.Installs, ([datetime]$record.LastSuccess).ToString('yyyy-MM-dd HH:mm:ss')) -Level Warn
-                }
-                Write-Log "Windows Update convergence qualified: $($reoffered.Count) update(s) re-offered after a successful install remain; no other update is applicable."
-            } else {
-                <# A clean pass must retract a previous pass's observation, or resolved work
-                   would qualify the claim for the rest of the cycle. #>
-                Add-BootUpdateDeferredInventory -State $state -Provider 'WindowsUpdate' -Scope 'machine' -Records @()
-                Set-BootUpdateState -State $state
-                Write-Log 'Windows Update convergence verified: zero applicable updates remain in the configured category scope.'
-            }
         }
 
         <# A clean reboot probe is not a successful cycle if an enabled phase failed or

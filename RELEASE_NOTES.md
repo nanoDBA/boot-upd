@@ -18,6 +18,18 @@
   and unavailable channel metadata remain unfinished under the bounded retry policy;
   reboot requests survive checkpointing. Only observed version increases count as
   SSMS updates. Tracks [#73](https://github.com/nanoDBA/boot-upd/issues/73).
+- `-SkipSsms` (or `upd --skip-ssms`) disables the native SSMS phase. The setting,
+  including an explicit false value, survives deployment, self-update, and reboot
+  resume. Winget and Chocolatey retain their existing package-selection behavior.
+- Final Windows Update verification now refreshes settled reboot evidence after
+  its convergence scan. Late signals enter the existing bounded reboot and
+  checkpoint path instead of relying on a clean observation made before a lengthy
+  scan. Staged retry accounting is preserved.
+  Tracks [#75](https://github.com/nanoDBA/boot-upd/issues/75).
+- The VM lab collector waits for active state removal as well as continuation-task
+  removal before declaring completion. Its final snapshot independently decides
+  the result and retains unresolved state/process evidence.
+  Tracks [#74](https://github.com/nanoDBA/boot-upd/issues/74).
 
 ## v2.5.81 (2026-09-15)
 

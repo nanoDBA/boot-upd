@@ -23,6 +23,7 @@ param(
     [Alias('no-pip','skip-pip')][switch]$SkipPip,
     [Alias('no-npm','skip-npm')][switch]$SkipNpm,
     [Alias('no-o365','skip-office365')][switch]$SkipOffice365,
+    [Alias('no-ssms','skip-ssms')][switch]$SkipSsms,
     [Alias('no-psm','skip-power-shell-modules')][switch]$SkipPowerShellModules,
     [Alias('no-scoop','skip-scoop')][switch]$SkipScoop,
     [Alias('no-code','skip-vscode')][switch]$SkipVscode,
@@ -132,6 +133,7 @@ function Show-UpdHelp {
     --skip-pip                 Skip pip
     --skip-npm                 Skip npm
     --skip-office365           Skip Office Click-to-Run
+    --skip-ssms                Skip native SSMS updates
     --skip-power-shell-modules Skip PowerShell modules
     --skip-scoop               Skip Scoop
     --skip-vscode              Skip VS Code extensions
@@ -234,7 +236,7 @@ function Get-UpdDeployParameters {
         Staged='StagedRollout'; AggressiveRepair='AggressiveRepair'; Drivers='IncludeDriverUpdates'; Firmware='IncludeFirmwareUpdates'
         Wsl='UpdateWsl'; Containers='UpdateContainers'; AllowMetered='AllowMetered'
         RestorePoint='EnableRestorePoint'; DotnetTools='EnableDotnetTools'; AwsTooling='EnableAwsTooling'
-        SkipPip='SkipPip'; SkipNpm='SkipNpm'; SkipOffice365='SkipOffice365'
+        SkipPip='SkipPip'; SkipNpm='SkipNpm'; SkipOffice365='SkipOffice365'; SkipSsms='SkipSsms'
         SkipPowerShellModules='SkipPowerShellModules'; SkipScoop='SkipScoop'; SkipVscode='SkipVscode'
         SkipDefender='SkipDefender'; SkipHealthCheck='SkipHealthCheck'; SkipBitLocker='SkipBitLocker'
         DisableSelfUpdate='DisableSelfUpdate'

@@ -30,6 +30,7 @@ param(
     [switch]$SkipPip,
     [switch]$SkipNpm,
     [switch]$SkipOffice365,
+    [switch]$SkipSsms,
     [switch]$SkipPowerShellModules,
     [switch]$SkipScoop,
     [switch]$SkipVscode,
@@ -56,7 +57,7 @@ param(
     - First run MUST be direct — it's the only chance for user-scope!
 
     The update cycle:
-    - Winget, Chocolatey, Windows Update, pip, npm, Office 365,
+    - Winget, Chocolatey, native SSMS, Windows Update, pip, npm, Office 365,
       PowerShell modules, Scoop, dotnet tools, VS Code extensions
     - Reboots when updates require it, repeats until clean
     - Self-destructs when done
@@ -75,6 +76,7 @@ $Config = @{
     SkipPip               = $false  # Set $true to skip pip package updates
     SkipNpm               = $false  # Set $true to skip npm global package updates
     SkipOffice365         = $false  # Set $true to skip Office 365 Click-to-Run updates
+    SkipSsms              = $false  # Set $true to skip native SSMS 22 updates
     SkipAwsTooling        = $true   # Set $false to enable AWS CLI/module repair
     SkipPowerShellModules = $false  # Set $true to skip PowerShell module updates
     SkipScoop             = $false  # Set $true to skip Scoop package updates
@@ -137,6 +139,7 @@ if ($PSBoundParameters.ContainsKey('PackageTimeoutMinutes')) { $Config.PackageTi
 foreach ($name in @('StagedRollout','AggressiveRepair','IncludeDriverUpdates','IncludeFirmwareUpdates','UpdateWsl','UpdateContainers','AllowMetered','SkipPip','SkipNpm','SkipOffice365','SkipPowerShellModules','SkipScoop','SkipVscode','SkipDefender','SkipHealthCheck','SkipBitLocker','DisableSelfUpdate')) {
     if ($PSBoundParameters.ContainsKey($name)) { $Config[$name] = $true }
 }
+if ($PSBoundParameters.ContainsKey('SkipSsms')) { $Config.SkipSsms = [bool]$SkipSsms }
 if ($EnableRestorePoint) { $Config.SkipRestorePoint = $false }
 if ($EnableDotnetTools) { $Config.SkipDotnetTools = $false }
 if ($EnableAwsTooling) { $Config.SkipAwsTooling = $false }
@@ -511,6 +514,7 @@ $invokeArgs = @{
     SkipPip              = $Config.SkipPip
     SkipNpm              = $Config.SkipNpm
     SkipOffice365        = $Config.SkipOffice365
+    SkipSsms             = $Config.SkipSsms
     SkipAwsTooling       = $Config.SkipAwsTooling
     SkipPowerShellModules = $Config.SkipPowerShellModules
     SkipScoop            = $Config.SkipScoop
@@ -724,6 +728,7 @@ function Register-ScheduledTaskNow {
     if ($Config.AggressiveRepair)     { $taskArgs += '-AggressiveRepair' }
     if ($Config.SkipNpm)              { $taskArgs += '-SkipNpm' }
     if ($Config.SkipOffice365)        { $taskArgs += '-SkipOffice365' }
+    if ($Config.SkipSsms)             { $taskArgs += '-SkipSsms' }
     if ($Config.SkipAwsTooling)       { $taskArgs += '-SkipAwsTooling' }
     if ($Config.SkipPowerShellModules){ $taskArgs += '-SkipPowerShellModules' }
     if ($Config.SkipScoop)            { $taskArgs += '-SkipScoop' }

@@ -6,7 +6,8 @@ BeforeAll {
     foreach ($name in @('New-BootUpdateStateV2','Update-BootUpdateStateSchema',
         'ConvertTo-BootUpdateTimestampString','Test-CrashRecovery','Set-BootUpdateRebootCheckpoint',
         'ConvertTo-SsmsVersion','Get-SsmsPendingUpdate','Save-SsmsPendingUpdate',
-        'Confirm-SsmsPendingUpdate','Complete-SsmsUpdateAccounting','Reset-SsmsPendingVerification')) {
+        'Confirm-SsmsPendingUpdate','Complete-SsmsUpdateAccounting','Reset-SsmsPendingVerification',
+        'Apply-RemoteConfig')) {
         $node = $ast.Find({ param($n)
             $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name
         }, $true)
@@ -20,7 +21,7 @@ BeforeAll {
 }
 
 Describe 'SSMS durable phase lifecycle' {
-    BeforeEach { $script:CurrentState = New-BootUpdateStateV2 }
+    BeforeEach { $script:CurrentState = New-BootUpdateStateV2; $SkipSsms = $false }
     It 'invokes the native provider by default in the serial dispatch table after Chocolatey' {
         $assignment=$ast.Find({param($n)
             $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$allPhases'
@@ -37,6 +38,26 @@ Describe 'SSMS durable phase lifecycle' {
         $script:SsmsActionCalls=0
         (& $phase.Action).Count | Should -Be 1
         $script:SsmsActionCalls | Should -Be 1
+    }
+
+    It 'skips only native SSMS servicing when requested' {
+        $SkipSsms = $true
+        $assignment=$ast.Find({param($n)
+            $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$allPhases'
+        },$true)
+        $phase=@(& ([scriptblock]::Create($assignment.Right.Extent.Text)) | Where-Object Name -eq 'Ssms')[0]
+        $phase.Skip | Should -BeTrue
+        $phase.Action.ToString() | Should -Match 'Update-SsmsInstances'
+    }
+
+    It 'keeps an explicit SkipSsms false value ahead of remote configuration' {
+        $script:SkipSsms = $false
+        Apply-RemoteConfig -RemoteConfig ([pscustomobject]@{ SkipSsms = $true }) `
+            -UserBoundParams @{ SkipSsms = [switch]$false }
+        $script:SkipSsms | Should -BeFalse
+
+        Apply-RemoteConfig -RemoteConfig ([pscustomobject]@{ SkipSsms = $true }) -UserBoundParams @{}
+        $script:SkipSsms | Should -BeTrue
     }
     It 'migrates a published checkpoint and summary without skipping the new provider' {
         $old = New-BootUpdateStateV2

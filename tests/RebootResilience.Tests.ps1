@@ -143,7 +143,7 @@ Describe 'Concise provider diagnostics' {
         $script:OutputMode = 'Normal'
         $script:IncludePatterns = @()
         $script:ExcludePatterns = @()
-        foreach ($name in @('SkipPip','SkipNpm','SkipOffice365','SkipAwsTooling','SkipPowerShellModules','SkipScoop','SkipDotnetTools','SkipVscode','SkipDefender','SkipRestorePoint','SkipHealthCheck','SkipBitLocker')) {
+        foreach ($name in @('SkipPip','SkipNpm','SkipOffice365','SkipSsms','SkipAwsTooling','SkipPowerShellModules','SkipScoop','SkipDotnetTools','SkipVscode','SkipDefender','SkipRestorePoint','SkipHealthCheck','SkipBitLocker')) {
             Set-Variable -Scope Script -Name $name -Value $false
         }
         $Force = $true
@@ -1038,6 +1038,177 @@ Describe 'Delayed and explicit reboot evidence' {
         $text | Should -Match "Add-BootUpdatePendingCleanupRecord -Context 'after updates' -Observation 'phase-skipped'"
     }
 
+    It 'reprobes after the final Windows Update scan before the shared reboot handoff' {
+        <# A final scan is not instantaneous. CBS can publish its reboot marker while it
+           runs, so the clean settled probe taken before it must never decide completion.
+           Keep the second probe inside the existing $pending branch: this pins the late
+           signal to the ordinary checkpoint, retry budget, task registration, and restart
+           path instead of creating a parallel handoff with different semantics. #>
+        $text = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
+        $initialProbe = $text.IndexOf("Get-ConfirmedPendingReboot -Context 'after updates'")
+        $scan = $text.IndexOf('$wuConvergence = Test-WindowsUpdateConvergence', $initialProbe)
+        $freshProbe = $text.IndexOf("Get-ConfirmedPendingReboot -Context 'after Windows Update convergence'", $scan)
+        $handoff = $text.IndexOf('if ($pending) {', $freshProbe)
+        $notRequired = $text.IndexOf('Show-BootUpdateRestartStatus -State NotRequired', $handoff)
+
+        $initialProbe | Should -BeGreaterThan 0
+        $scan | Should -BeGreaterThan $initialProbe
+        $freshProbe | Should -BeGreaterThan $scan
+        $handoff | Should -BeGreaterThan $freshProbe
+        $notRequired | Should -BeGreaterThan $handoff -Because 'a late reboot signal must be handled before completion is considered'
+        ([regex]::Matches($text, '\$wuConvergence = Test-WindowsUpdateConvergence')).Count | Should -Be 1
+
+        $sharedHandoff = $text.Substring($handoff, $notRequired - $handoff)
+        $sharedHandoff | Should -Match 'Stop-BootUpdateAtRebootLimit'
+        $sharedHandoff | Should -Match 'Set-BootUpdateRebootCheckpoint'
+        $sharedHandoff | Should -Match 'Start-BootUpdateRestart'
+    }
+
+    It 'only scans after a clean eligible final state and preserves the staged pre-scan set' {
+        <# If the scan reopens Windows Update, the preserved pre-scan empty staged set lets
+           the normal completion disposition charge the existing retry path. Recomputing
+           after the scan would instead treat Windows Update as ordinary staged progress and
+           reset the bounded retry accounting. #>
+        $text = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
+        $initialProbe = $text.IndexOf("Get-ConfirmedPendingReboot -Context 'after updates'")
+        $scan = $text.IndexOf('$wuConvergence = Test-WindowsUpdateConvergence', $initialProbe)
+        $freshProbe = $text.IndexOf("Get-ConfirmedPendingReboot -Context 'after Windows Update convergence'", $scan)
+        $handoff = $text.IndexOf('if ($pending) {', $freshProbe)
+        $scanSection = $text.Substring($initialProbe, $handoff - $initialProbe)
+
+        $scanSection | Should -Match 'if \(-not \$WhatIfPreference -and -not \$pending -and \[bool\]\$state\.WindowsUpdateDone\)'
+        $scanSection | Should -Match '\$stagedRemainingBeforeWuConvergence = @\(\$allPhasesFlat \| Where-Object \{'
+        $scanSection | Should -Match '\(-not \$_\.Skip\) -and \(-not \$_\.UserCompletionDeferred\) -and \(-not \[bool\]\$state\.\(\$_\.Flag\)\)'
+        $scanSection | Should -Match '\$state\.WindowsUpdateDone = \$false'
+        $scanSection | Should -Match '\$pending = @\(Get-ConfirmedPendingReboot -Context ''after Windows Update convergence''\)'
+
+        $postHandoff = $text.Substring($handoff)
+        $postHandoff | Should -Match '\$remainingPhases = @\(if \(\$null -ne \$stagedRemainingBeforeWuConvergence\) \{'
+        $postHandoff | Should -Match '\$disposition = Resolve-BootUpdateCompletionDisposition -IncompletePhases \$incompletePhases'
+    }
+
+    It 'executes the moved final decision with a fresh CBS signal and staged snapshots' {
+        <# Extract the production AST instead of recreating its conditions in a test helper.
+           The final scan's real continuation is deliberately coupled to the existing reboot
+           body, so a late signal must reach that body exactly as an initial signal does. #>
+        $cycleAst = $invokeAst.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-BootUpdateCycle'
+        }, $true)
+        $reset = $cycleAst.Find({
+            param($node)
+            $node -is [Management.Automation.Language.AssignmentStatementAst] -and
+            $node.Left.Extent.Text -eq '$stagedRemainingBeforeWuConvergence'
+        }, $true)
+        $probe = $cycleAst.Find({
+            param($node)
+            $node -is [Management.Automation.Language.AssignmentStatementAst] -and
+            $node.Left.Extent.Text -eq '$pending' -and $node.Extent.Text -match "after updates"
+        }, $true)
+        $scan = $cycleAst.Find({
+            param($node)
+            $node -is [Management.Automation.Language.IfStatementAst] -and
+            $node.Extent.Text.StartsWith('if (-not $WhatIfPreference -and -not $pending -and [bool]$state.WindowsUpdateDone)')
+        }, $true)
+        $handoff = $cycleAst.Find({
+            param($node)
+            $node -is [Management.Automation.Language.IfStatementAst] -and
+            $node.Extent.StartOffset -gt $scan.Extent.EndOffset -and
+            $node.Clauses[0].Item1.Extent.Text -eq '$pending'
+        }, $true)
+        $remainingAssignment = $cycleAst.Find({
+            param($node)
+            $node -is [Management.Automation.Language.AssignmentStatementAst] -and
+            $node.Left.Extent.Text -eq '$remainingPhases' -and
+            $node.Extent.Text -match 'stagedRemainingBeforeWuConvergence'
+        }, $true)
+
+        @($reset, $probe, $scan, $handoff, $remainingAssignment) | Should -Not -Contain $null
+        $handoffOnly = "if (`$pending) $($handoff.Clauses[0].Item2.Extent.Text)"
+        $decision = [scriptblock]::Create((@($reset.Extent.Text, $probe.Extent.Text, $scan.Extent.Text, $handoffOnly) -join "`n"))
+        $remainingDecision = [scriptblock]::Create($remainingAssignment.Extent.Text)
+
+        Mock Write-Log { }
+        Mock Set-BootUpdateState { }
+        Mock Add-BootUpdateDeferredInventory { }
+        Mock Add-BootUpdatePendingCleanupRecord { }
+        Mock Get-ConfirmedPendingReboot {
+            param($Context)
+            [void]$script:FinalWuDecisionEvents.Add($Context)
+            if (($Context -eq 'after updates' -and $script:FinalWuInitialPending) -or
+                ($Context -eq 'after Windows Update convergence' -and $script:FinalWuLatePending)) {
+                [pscustomobject]@{ Source = 'CBS'; Detail = 'RebootPending appeared during final scan' }
+            }
+        }
+        Mock Test-WindowsUpdateConvergence {
+            [void]$script:FinalWuDecisionEvents.Add('scan')
+            [pscustomobject]@{ Verified = $script:FinalWuScanVerified; Unexplained = 0; Reoffered = @() }
+        }
+        Mock Stop-BootUpdateAtRebootLimit { $false }
+        Mock Stop-BootUpdateAtRetryLimit { $false }
+        Mock Set-BootUpdateRebootCheckpoint { $script:FinalWuCheckpointCalls++ }
+        function Show-BootUpdateRestartStatus { param($State) [void]$script:FinalWuRestartStates.Add($State) }
+        function Start-BootUpdateRestart { $script:FinalWuRestartCalls++ }
+
+        $cases = @(
+            @{ Name='late CBS'; Initial=$false; Late=$true;  Verified=$true;  Staged=$false; Remaining=$false; WhatIf=$false; Events=@('after updates','scan','after Windows Update convergence'); Pending=$true;  Done=$true  },
+            @{ Name='initial CBS'; Initial=$true;  Late=$false; Verified=$true;  Staged=$false; Remaining=$false; WhatIf=$false; Events=@('after updates'); Pending=$true;  Done=$true  },
+            @{ Name='failed scan late CBS'; Initial=$false; Late=$true; Verified=$false; Staged=$false; Remaining=$false; WhatIf=$false; Events=@('after updates','scan','after Windows Update convergence'); Pending=$true;  Done=$false },
+            @{ Name='staged unfinished'; Initial=$false; Late=$true; Verified=$true; Staged=$true; Remaining=$true; WhatIf=$false; Events=@('after updates'); Pending=$false; Done=$true },
+            @{ Name='staged reopened Windows Update'; Initial=$false; Late=$false; Verified=$false; Staged=$true; Remaining=$false; WhatIf=$false; Events=@('after updates','scan','after Windows Update convergence'); Pending=$false; Done=$false },
+            @{ Name='WhatIf'; Initial=$false; Late=$true; Verified=$true; Staged=$false; Remaining=$false; WhatIf=$true; Events=@(); Pending=$false; Done=$true }
+        )
+
+        foreach ($case in $cases) {
+            $script:FinalWuDecisionEvents = [Collections.Generic.List[string]]::new()
+            $script:FinalWuRestartStates = [Collections.Generic.List[string]]::new()
+            $script:FinalWuCheckpointCalls = 0
+            $script:FinalWuRestartCalls = 0
+            $script:FinalWuInitialPending = [bool]$case.Initial
+            $script:FinalWuLatePending = [bool]$case.Late
+            $script:FinalWuScanVerified = [bool]$case.Verified
+            $script:StagedRollout = [bool]$case.Staged
+            $WhatIfPreference = [bool]$case.WhatIf
+            $state = [pscustomobject]@{
+                WindowsUpdateDone = $true
+                SsmsDone = (-not [bool]$case.Remaining)
+                ConsecutiveRetryCount = 0
+                Iteration = 1
+                LastRebootSignals = $null
+            }
+            $allPhasesFlat = @(
+                @{ Name='WindowsUpdate'; Flag='WindowsUpdateDone'; Skip=$false; UserCompletionDeferred=$false },
+                @{ Name='Ssms'; Flag='SsmsDone'; Skip=$false; UserCompletionDeferred=$false }
+            )
+
+            . $decision
+
+            @($script:FinalWuDecisionEvents) | Should -Be @($case.Events) -Because $case.Name
+            [bool]$pending | Should -Be ([bool]$case.Pending) -Because $case.Name
+            [bool]$state.WindowsUpdateDone | Should -Be ([bool]$case.Done) -Because $case.Name
+            if ([bool]$case.Pending) {
+                $script:FinalWuCheckpointCalls | Should -Be 1 -Because "$($case.Name) must use the existing reboot checkpoint"
+                $script:FinalWuRestartCalls | Should -Be 1 -Because "$($case.Name) must use the existing restart handoff"
+                @($script:FinalWuRestartStates) | Should -Be @('Required')
+            } else {
+                $script:FinalWuCheckpointCalls | Should -Be 0 -Because $case.Name
+                $script:FinalWuRestartCalls | Should -Be 0 -Because $case.Name
+            }
+            if ($case.Name -eq 'staged reopened Windows Update') {
+                $stagedRemainingBeforeWuConvergence.Count | Should -Be 0 -Because 'the empty pre-scan set must survive the scan reopening Windows Update'
+            }
+        }
+
+        <# The actual assignment must preserve one hashtable phase object. Without the outer
+           array wrapper PowerShell enumerates it into keys, so Count becomes four and the
+           next phase has no Name. #>
+        $stagedRemainingBeforeWuConvergence = @(@{ Name='Ssms'; Flag='SsmsDone'; Skip=$false; UserCompletionDeferred=$false })
+        $allPhasesFlat = @()
+        . $remainingDecision
+        $remainingPhases.Count | Should -Be 1
+        $remainingPhases[0].Name | Should -Be 'Ssms'
+    }
+
     It 'also requires two clean probes before the first mutating phase' {
         $text = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
         $text | Should -Match '\$pending = @\(Get-ConfirmedPendingReboot -Context ''before mutation''\)'
@@ -1333,7 +1504,7 @@ Describe 'Durable resume chain' {
         $text = Get-FunctionText $invokeAst 'Register-BootUpdateTaskForReboot'
         $text | Should -Match 'ExcludePatternsBase64'
         $text | Should -Match 'IncludePatternsBase64'
-        foreach ($switchName in @('SkipBitLocker','AllowMetered','DisableSelfUpdate','UpdateWsl','UpdateContainers','AggressiveRepair')) {
+        foreach ($switchName in @('SkipSsms','SkipBitLocker','AllowMetered','DisableSelfUpdate','UpdateWsl','UpdateContainers','AggressiveRepair')) {
             $text | Should -Match ([regex]::Escape("-$switchName"))
         }
     }
@@ -1397,7 +1568,7 @@ Describe 'In-flight watchdog scheduling' {
             }
         }
 
-        foreach ($name in @('SkipPip','SkipNpm','SkipOffice365','SkipAwsTooling','SkipPowerShellModules','SkipScoop','SkipDotnetTools','SkipVscode','SkipDefender','IncludeDriverUpdates','IncludeFirmwareUpdates','UpdateWsl','UpdateContainers','SkipRestorePoint','SkipHealthCheck','SkipBitLocker','AllowMetered','DisableSelfUpdate','StagedRollout','AggressiveRepair')) {
+        foreach ($name in @('SkipPip','SkipNpm','SkipOffice365','SkipSsms','SkipAwsTooling','SkipPowerShellModules','SkipScoop','SkipDotnetTools','SkipVscode','SkipDefender','IncludeDriverUpdates','IncludeFirmwareUpdates','UpdateWsl','UpdateContainers','SkipRestorePoint','SkipHealthCheck','SkipBitLocker','AllowMetered','DisableSelfUpdate','StagedRollout','AggressiveRepair')) {
             Set-Variable -Scope Script -Name $name -Value $false
         }
         $script:OutputMode = 'Normal'
@@ -1420,6 +1591,7 @@ Describe 'In-flight watchdog scheduling' {
         $script:ResumeUser = $null
         $script:ResumeUserSid = $null
         $script:WatchdogIntervalMinutes = 15
+        $script:ScriptBoundParams = @{}
     }
 
     It 'arms a PT15M repeating trigger on both tasks, the fallback offset three minutes after the primary' {
@@ -1445,6 +1617,27 @@ Describe 'In-flight watchdog scheduling' {
 
         $script:CapturedTasks['BootUpdateCycle'].Action.Arguments | Should -Match '-WatchdogIntervalMinutes 15'
         $script:CapturedTasks['BootUpdateCycleFallback'].Action.Arguments | Should -Match '-WatchdogIntervalMinutes 15'
+    }
+
+    It 'forwards an SSMS skip on resume and omits it by default' {
+        Register-BootUpdateTaskForReboot
+        $script:CapturedTasks['BootUpdateCycle'].Action.Arguments | Should -Not -Match '(?<!\w)-SkipSsms\b'
+        $script:CapturedTasks['BootUpdateCycleFallback'].Action.Arguments | Should -Not -Match '(?<!\w)-SkipSsms\b'
+
+        $script:SkipSsms = $true
+        Register-BootUpdateTaskForReboot
+        $script:CapturedTasks['BootUpdateCycle'].Action.Arguments | Should -Match '(?<!\w)-SkipSsms\b'
+        $script:CapturedTasks['BootUpdateCycleFallback'].Action.Arguments | Should -Match '(?<!\w)-SkipSsms\b'
+    }
+
+    It 'retains an explicit native-SSMS false override across resume and self-update' {
+        $script:SkipSsms = $false
+        $script:ScriptBoundParams = @{ SkipSsms = [switch]$false }
+        Register-BootUpdateTaskForReboot
+        $script:CapturedTasks['BootUpdateCycle'].Action.Arguments | Should -Match '-SkipSsms:\$false'
+        $script:CapturedTasks['BootUpdateCycleFallback'].Action.Arguments | Should -Match '-SkipSsms:\$false'
+
+        (Get-FunctionText $invokeAst 'Update-OrchestratorSelf') | Should -Match 'p\.Key -eq ''SkipSsms''.*relaunchArgs\.Add\(''-SkipSsms:\$false''\)'
     }
 
     It 'passes the configured watchdog interval, and repeats the trigger at that interval, when it differs from the default' {
