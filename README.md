@@ -114,18 +114,27 @@ When the configured work, restart checks, service assessment, and terminal clean
 |-------|----------------|---------|-------|
 | 1 | **Winget** | On | User + machine scope; ARSO resumes user scope after reboot, with a delayed SYSTEM safety net |
 | 2 | **Chocolatey** | On | `choco upgrade all -y` |
-| 3 | **Windows Update** | On | Security, Critical, Definition updates (excludes SQL Server) |
-| 4 | **AWS Tooling** | Off | Optional CLI v2 + AWS.Tools repair |
-| 5 | **pip** | On | All outdated global packages |
-| 6 | **npm** | On | All global packages |
-| 7 | **Office 365** | On | Click-to-Run silent update |
-| 8 | **PowerShell Modules** | On | Installed modules via PSResourceGet when available, with compatible fallback behavior |
-| 9 | **Scoop** | On | User-scoped; skipped under SYSTEM |
-| 10 | **.NET Global Tools** | **Off** | High risk — can break SDK-dependent builds |
-| 11 | **VS Code Extensions** | On | User-scoped; skipped under SYSTEM |
-| 12 | **Microsoft Defender** | On | Signature refresh through `MpCmdRun.exe` |
-| 13 | **Drivers / firmware** | **Off** | Explicit opt-in with `-drv` / `-fw` |
-| 14 | **WSL / containers** | **Off** | Explicit opt-in; user-context work resumes at logon |
+| 3 | **SQL Server Management Studio 22** | On | Native Visual Studio Installer update for each existing instance, after package managers; preserves its configured channel and source |
+| 4 | **Windows Update** | On | Security, Critical, Definition updates (excludes SQL Server) |
+| 5 | **AWS Tooling** | Off | Optional CLI v2 + AWS.Tools repair |
+| 6 | **pip** | On | All outdated global packages |
+| 7 | **npm** | On | All global packages |
+| 8 | **Office 365** | On | Click-to-Run silent update |
+| 9 | **PowerShell Modules** | On | Installed modules via PSResourceGet when available, with compatible fallback behavior |
+| 10 | **Scoop** | On | User-scoped; skipped under SYSTEM |
+| 11 | **.NET Global Tools** | **Off** | High risk — can break SDK-dependent builds |
+| 12 | **VS Code Extensions** | On | User-scoped; skipped under SYSTEM |
+| 13 | **Microsoft Defender** | On | Signature refresh through `MpCmdRun.exe` |
+| 14 | **Drivers / firmware** | **Off** | Explicit opt-in with `-drv` / `-fw` |
+| 15 | **WSL / containers** | **Off** | Explicit opt-in; user-context work resumes at logon |
+
+SSMS 22 has its own servicing path, so a package manager reporting no updates is not
+the final SSMS check. The SSMS phase compares installed build versions with the
+configured channel manifest, updates only existing SSMS instances, and verifies fresh
+inventory afterward. It does not force SSMS to close. Busy installers, open SSMS,
+unreachable update sources, and unrecognized manifest formats leave the phase
+unfinished and use the cycle's bounded retry policy. Only a verified version increase
+counts as an SSMS update; a successful installer launch alone does not.
 
 ## Install details and compatibility
 

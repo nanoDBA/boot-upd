@@ -6,6 +6,19 @@
 
 ---
 
+## Unreleased
+
+### Fixed
+
+- Running `upd` now includes native servicing for existing SSMS 22 instances after
+  Winget and Chocolatey. The phase uses Visual Studio Installer with the instance's
+  existing update channel and source, without installing another SSMS instance or
+  forcing running applications to close. A fresh inventory must reach the validated
+  channel build before the phase can complete. Busy installers, failed verification,
+  and unavailable channel metadata remain unfinished under the bounded retry policy;
+  reboot requests survive checkpointing. Only observed version increases count as
+  SSMS updates. Tracks [#73](https://github.com/nanoDBA/boot-upd/issues/73).
+
 ## v2.5.81 (2026-09-15)
 
 Five defects from the 2026-09-14 laptop diagnostics and the September lab runs, each

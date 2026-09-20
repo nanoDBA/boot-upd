@@ -15,7 +15,7 @@
 .DESCRIPTION
     Each boot it:
     1. Runs pre-flight checks (disk, network, battery, conflicts)
-    2. Updates Winget (user + machine scope), Chocolatey, Windows Update
+    2. Updates Winget (user + machine scope), Chocolatey, SSMS, Windows Update
     3. Updates pip, npm, Office 365, PowerShell modules, Scoop, dotnet tools, VS Code extensions
     4. Reboots if any updates require it
     5. Cleans up and self-destructs when no pending reboots remain
@@ -392,7 +392,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 6 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.81' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.82' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 Set-Variable -Name 'RebootSignalSettleSeconds' -Value 20 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 $script:ExplicitRebootRequests = [System.Collections.Generic.List[object]]::new()
 $script:LastPendingFileRenameOperations = @()
@@ -1898,7 +1898,7 @@ function Set-BootUpdateRebootCheckpoint {
         [switch]$ClearPhaseIntent
     )
     $phaseFlags = @(
-        'WingetDone','ChocolateyDone','WindowsUpdateDone','AwsToolingDone','PipDone','NpmDone',
+        'WingetDone','ChocolateyDone','SsmsDone','WindowsUpdateDone','AwsToolingDone','PipDone','NpmDone',
         'Office365Done','PowerShellModulesDone','ScoopDone','DotnetToolsDone','VscodeDone',
         'DefenderDone','DriverFirmwareDone','WslDone','ContainersDone'
     )
@@ -2084,6 +2084,7 @@ function New-BootUpdateStateV2 {
         LastPhaseTimestamp     = $null
         WingetDone            = $false
         ChocolateyDone        = $false
+        SsmsDone              = $false
         WindowsUpdateDone     = $false
         AwsToolingDone        = $false
         PipDone               = $false
@@ -2113,12 +2114,13 @@ function New-BootUpdateStateV2 {
            still discloses that it was resumed by a watchdog probe rather than reporting in. #>
         UnobservedStops        = @()
         ExplicitRebootRequests = @()
+        SsmsPendingUpdates    = @()
         WingetAggressiveRepairSignatures = @()
         WingetQuarantines       = @()
         ResumeUser            = $null
         ResumeUserSid         = $null
         Summary               = [pscustomobject]@{
-            Winget = 0; Chocolatey = 0; WindowsUpdate = 0; Pip = 0; Npm = 0; Office365 = 0
+            Winget = 0; Chocolatey = 0; Ssms = 0; WindowsUpdate = 0; Pip = 0; Npm = 0; Office365 = 0
             PowerShellModules = 0; Scoop = 0; DotnetTools = 0; Vscode = 0
             Defender = 0; DriverFirmware = 0; Wsl = 0; Containers = 0
             HealthFailed = 0; ActionsTriggered = 0
@@ -2185,6 +2187,8 @@ function Update-BootUpdateStateSchema {
     if ($props -notcontains 'RebootCount') { $State | Add-Member -NotePropertyName 'RebootCount' -NotePropertyValue ([math]::Max(0, [int]$State.Iteration - 1)) -Force }
     if ($props -notcontains 'ConsecutiveRetryCount') { $State | Add-Member -NotePropertyName 'ConsecutiveRetryCount' -NotePropertyValue 0 -Force }
     if ($props -notcontains 'ExplicitRebootRequests') { $State | Add-Member -NotePropertyName 'ExplicitRebootRequests' -NotePropertyValue @() -Force }
+    if ($props -notcontains 'SsmsPendingUpdates') { $State | Add-Member -NotePropertyName 'SsmsPendingUpdates' -NotePropertyValue @() -Force }
+    else { $State.SsmsPendingUpdates = @($State.SsmsPendingUpdates | Where-Object { $null -ne $_ }) }
     if ($props -notcontains 'WingetAggressiveRepairSignatures') { $State | Add-Member -NotePropertyName 'WingetAggressiveRepairSignatures' -NotePropertyValue @() -Force }
     if ($props -notcontains 'WingetQuarantines') { $State | Add-Member -NotePropertyName 'WingetQuarantines' -NotePropertyValue @() -Force }
     if ($props -notcontains 'DeferredInventory') { $State | Add-Member -NotePropertyName 'DeferredInventory' -NotePropertyValue @() -Force }
@@ -2192,7 +2196,7 @@ function Update-BootUpdateStateSchema {
     if ($props -notcontains 'UnobservedStops') { $State | Add-Member -NotePropertyName 'UnobservedStops' -NotePropertyValue @() -Force }
     else { $State.UnobservedStops = @($State.UnobservedStops | Where-Object { $null -ne $_ }) }
     if ($props -notcontains 'WindowsUpdateZeroEvidence') { $State | Add-Member -NotePropertyName 'WindowsUpdateZeroEvidence' -NotePropertyValue $null -Force }
-    foreach ($f in @('WindowsUpdateDone','AwsToolingDone','PowerShellModulesDone','ScoopDone','DotnetToolsDone','VscodeDone','DefenderDone','DriverFirmwareDone','WslDone','ContainersDone')) {
+    foreach ($f in @('SsmsDone','WindowsUpdateDone','AwsToolingDone','PowerShellModulesDone','ScoopDone','DotnetToolsDone','VscodeDone','DefenderDone','DriverFirmwareDone','WslDone','ContainersDone')) {
         if ($props -notcontains $f) { $State | Add-Member -NotePropertyName $f -NotePropertyValue $false -Force }
     }
 
@@ -2209,7 +2213,7 @@ function Update-BootUpdateStateSchema {
     <# Normalise Summary #>
     if ($null -eq $State.Summary) {
         $State.Summary = [pscustomobject]@{
-            Winget = 0; Chocolatey = 0; WindowsUpdate = 0; Pip = 0; Npm = 0; Office365 = 0
+            Winget = 0; Chocolatey = 0; Ssms = 0; WindowsUpdate = 0; Pip = 0; Npm = 0; Office365 = 0
             PowerShellModules = 0; Scoop = 0; DotnetTools = 0; Vscode = 0
             Defender = 0; DriverFirmware = 0; Wsl = 0; Containers = 0
             HealthFailed = 0; ActionsTriggered = 0
@@ -2218,6 +2222,7 @@ function Update-BootUpdateStateSchema {
         $ht = $State.Summary
         $State.Summary = [pscustomobject]@{
             Winget = [int]($ht['Winget'] ?? 0); Chocolatey = [int]($ht['Chocolatey'] ?? 0)
+            Ssms = [int]($ht['Ssms'] ?? 0)
             WindowsUpdate = [int]($ht['WindowsUpdate'] ?? 0); Pip = [int]($ht['Pip'] ?? 0)
             Npm = [int]($ht['Npm'] ?? 0); Office365 = [int]($ht['Office365'] ?? 0)
             PowerShellModules = [int]($ht['PowerShellModules'] ?? 0); Scoop = [int]($ht['Scoop'] ?? 0)
@@ -2228,7 +2233,7 @@ function Update-BootUpdateStateSchema {
         }
     } else {
         $sp = $State.Summary.PSObject.Properties.Name
-        foreach ($k in @('PowerShellModules','Scoop','DotnetTools','Vscode','Defender','DriverFirmware','Wsl','Containers')) {
+        foreach ($k in @('Ssms','PowerShellModules','Scoop','DotnetTools','Vscode','Defender','DriverFirmware','Wsl','Containers')) {
             if ($sp -notcontains $k) { $State.Summary | Add-Member -NotePropertyName $k -NotePropertyValue 0 -Force }
         }
         if ($null -eq $State.Summary.HealthFailed) {
@@ -2304,7 +2309,7 @@ function Test-CrashRecovery {
     param([Parameter(Mandatory)][pscustomobject]$State)
     if ([string]::IsNullOrWhiteSpace($State.LastPhaseStarted)) { return $false }
     $phaseToFlag = @{
-        Winget='WingetDone'; Chocolatey='ChocolateyDone'; WindowsUpdate='WindowsUpdateDone'
+        Winget='WingetDone'; Chocolatey='ChocolateyDone'; Ssms='SsmsDone'; WindowsUpdate='WindowsUpdateDone'
         AwsTooling='AwsToolingDone'; Pip='PipDone'; Npm='NpmDone'; Office365='Office365Done'
         PowerShellModules='PowerShellModulesDone'; Scoop='ScoopDone'; DotnetTools='DotnetToolsDone'; Vscode='VscodeDone'
         Defender='DefenderDone'; DriverFirmware='DriverFirmwareDone'; Wsl='WslDone'; Containers='ContainersDone'
@@ -2399,12 +2404,12 @@ function Save-CycleHistory {
         Timestamp = Get-Date -Format 'o'
         Iterations = $State.Iteration
         DurationMinutes = [math]::Round($Duration.TotalMinutes, 1)
-        Winget = $s.Winget; Chocolatey = $s.Chocolatey; WindowsUpdate = $s.WindowsUpdate
+        Winget = $s.Winget; Chocolatey = $s.Chocolatey; Ssms = $s.Ssms; WindowsUpdate = $s.WindowsUpdate
         Pip = $s.Pip; Npm = $s.Npm; Office365 = $s.Office365
         PowerShellModules = $s.PowerShellModules; Scoop = $s.Scoop; DotnetTools = $s.DotnetTools; Vscode = $s.Vscode
         HealthFailed = if ($null -ne $s.HealthFailed) { [int]$s.HealthFailed } else { 0 }
         ActionsTriggered = if ($null -ne $s.ActionsTriggered) { [int]$s.ActionsTriggered } else { 0 }
-        Total = $s.Winget + $s.Chocolatey + $s.WindowsUpdate + $s.Pip + $s.Npm + $s.Office365 + $s.PowerShellModules + $s.Scoop + $s.DotnetTools + $s.Vscode
+        Total = $s.Winget + $s.Chocolatey + $s.Ssms + $s.WindowsUpdate + $s.Pip + $s.Npm + $s.Office365 + $s.PowerShellModules + $s.Scoop + $s.DotnetTools + $s.Vscode
     }
     $history = @()
     if (Test-Path $script:HistoryPath) {
@@ -4496,6 +4501,367 @@ function Get-WindowsUpdateInstallOutputSummary {
     return [pscustomobject]@{ Installed=$installed; PostSearchZero=$postSearchZero }
 }
 
+<#
+  SSMS native servicing helpers.  This file is deliberately kept free of script
+  initialization so it can be embedded in Invoke-BootUpdateCycle.ps1 and unit
+  tested in isolation.  The cycle supplies Write-Log and
+  Invoke-PackageManagerWithTimeout.
+#>
+
+function Write-SsmsUpdateLog {
+    param([Parameter(Mandatory)][string]$Message, [string]$Level = 'Info')
+    if (Get-Command Write-Log -ErrorAction SilentlyContinue) {
+        Write-Log "SSMS: $Message" -Level $Level
+    }
+}
+
+function ConvertTo-SsmsVersion {
+    param([AllowNull()][string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value) -or $Value -notmatch '^\d+(?:\.\d+){1,3}$') { return $null }
+    try { return [version]$Value } catch { return $null }
+}
+
+function Test-SsmsSafeProviderArgument {
+    param([AllowNull()][string]$Value)
+    <# Invoke-PackageManagerWithTimeout embeds its argument JSON in a single-quoted
+       child script.  Rejecting an apostrophe here keeps an installation path from
+       changing that child script until the common runner has a transport that does
+       not rely on that quoting boundary. #>
+    return -not [string]::IsNullOrWhiteSpace($Value) -and
+        $Value.IndexOf("'") -lt 0 -and $Value.IndexOf('"') -lt 0 -and
+        $Value -notmatch '[\r\n]'
+}
+
+function Get-SsmsVswherePath {
+    $candidate = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+    if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
+    return $null
+}
+
+function Test-SsmsInstallationHint {
+    $uninstallRoots = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+    )
+    foreach ($root in $uninstallRoots) {
+        foreach ($record in @(Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue | Get-ItemProperty -ErrorAction SilentlyContinue)) {
+            if ([string]$record.DisplayName -match '(?i)SQL Server Management Studio' -and
+                ([string]$record.DisplayName -match '(?i)\b22\b' -or [string]$record.DisplayVersion -match '^22\.')) { return $true }
+        }
+    }
+    return $false
+}
+
+function Get-SsmsInstances {
+    param([string]$VswherePath = (Get-SsmsVswherePath))
+
+    $sharedInstaller = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\setup.exe'
+    if (-not $VswherePath) {
+        $hint = (Test-Path -LiteralPath $sharedInstaller -PathType Leaf) -or (Test-SsmsInstallationHint)
+        if ($hint) {
+            return @{ Instances = @(); Absent = $false; Broken = $true; Detail = 'SSMS or Visual Studio Installer is present, but vswhere.exe is unavailable.' }
+        }
+        return @{ Instances = @(); Absent = $true; Broken = $false; Detail = 'No SSMS installation evidence found.' }
+    }
+
+    try {
+        $raw = & $VswherePath -all -prerelease -products '*' -format json -utf8 2>&1
+        if ($LASTEXITCODE -ne 0) { throw "vswhere exited ${LASTEXITCODE}: $($raw -join ' ')" }
+        $json = ($raw -join "`n").Trim()
+        if ($json -notmatch '(?s)^\s*\[.*\]\s*$') { throw 'vswhere returned a non-array JSON document.' }
+        $parsed = $json | ConvertFrom-Json -NoEnumerate -ErrorAction Stop
+        if ($parsed -isnot [array]) { throw 'vswhere returned a non-array JSON value.' }
+        $records = @($parsed)
+    } catch {
+        return @{ Instances = @(); Absent = $false; Broken = $true; Detail = "vswhere inventory failed: $($_.Exception.Message)" }
+    }
+
+    $instances = [Collections.Generic.List[object]]::new()
+    foreach ($record in $records) {
+        if ($null -eq $record -or [string]::IsNullOrWhiteSpace([string]$record.productId)) {
+            return @{ Instances=@(); Absent=$false; Broken=$true; Detail='vswhere returned a record without product identity.' }
+        }
+        if ([string]$record.productId -ine 'Microsoft.VisualStudio.Product.Ssms') { continue }
+        $path = [string]$record.installationPath
+        $versionText = [string]$record.installationVersion
+        $version = ConvertTo-SsmsVersion $versionText
+        $channelId = [string]$record.channelId
+        $channelUri = [string]$record.channelUri
+        if ([string]::IsNullOrWhiteSpace([string]$record.instanceId) -or [string]::IsNullOrWhiteSpace($path) -or -not $version -or [string]::IsNullOrWhiteSpace($channelId) -or [string]::IsNullOrWhiteSpace($channelUri)) {
+            return @{ Instances = @(); Absent = $false; Broken = $true; Detail = "SSMS instance metadata is incomplete for '$([string]$record.instanceId)'." }
+        }
+        $instances.Add([pscustomobject]@{
+            InstanceId = [string]$record.instanceId
+            InstallationPath = $path
+            InstallationVersion = $version
+            ChannelId = $channelId
+            ChannelUri = $channelUri
+            IsComplete = [bool]$record.isComplete
+            IsLaunchable = [bool]$record.isLaunchable
+            IsRebootRequired = [bool]$record.isRebootRequired
+        })
+    }
+    $duplicateIds = @($instances | Group-Object InstanceId | Where-Object Count -gt 1)
+    $duplicatePaths = @($instances | Group-Object InstallationPath | Where-Object Count -gt 1)
+    if ($duplicateIds.Count -gt 0 -or $duplicatePaths.Count -gt 0) {
+        return @{ Instances = @(); Absent = $false; Broken = $true; Detail = 'SSMS inventory contains duplicate instance identities or installation paths.' }
+    }
+    return @{ Instances = $instances.ToArray(); Absent = ($instances.Count -eq 0); Broken = $false; Detail = $null }
+}
+
+function Get-SsmsJsonDocument {
+    param([Parameter(Mandatory)][string]$Uri)
+    $parsed = $null
+    $content = $null
+    if ([Uri]::TryCreate($Uri, [UriKind]::Absolute, [ref]$parsed) -and $parsed.Scheme -eq 'https') {
+        $response = Invoke-WebRequest -Uri $parsed.AbsoluteUri -UseBasicParsing -TimeoutSec 45 -ErrorAction Stop
+        $content = if ($response.Content -is [byte[]]) { [Text.Encoding]::UTF8.GetString($response.Content) } else { [string]$response.Content }
+    } elseif (([Uri]::TryCreate($Uri, [UriKind]::Absolute, [ref]$parsed) -and $parsed.Scheme -eq 'file') -or (Test-Path -LiteralPath $Uri -PathType Leaf)) {
+        $localPath = if ($parsed -and $parsed.Scheme -eq 'file') { $parsed.LocalPath } else { $Uri }
+        $content = [IO.File]::ReadAllText($localPath, [Text.Encoding]::UTF8)
+    } else {
+        throw "SSMS channel URI is neither HTTPS nor an accessible local layout path."
+    }
+    return ($content | ConvertFrom-Json -ErrorAction Stop)
+}
+
+function Get-SsmsChannelTarget {
+    param(
+        [Parameter(Mandatory)][string]$ChannelUri,
+        [Parameter(Mandatory)][string]$ChannelId
+    )
+    $channel = Get-SsmsJsonDocument -Uri $ChannelUri
+    if ([string]$channel.info.manifestName -cne $ChannelId) {
+        throw "SSMS_SCHEMA: channel manifest name does not match the installed channel '$ChannelId'."
+    }
+    $channelBuild = ConvertTo-SsmsVersion ([string]$channel.info.buildVersion)
+    if (-not $channelBuild) { throw 'SSMS_SCHEMA: channel is missing a supported buildVersion.' }
+
+    $items = @($channel.channelItems)
+    $manifestItems = @($items | Where-Object { [string]$_.id -ieq 'Microsoft.VisualStudio.Manifests.SSMS' })
+    $productItems = @($items | Where-Object { [string]$_.id -ieq 'Microsoft.VisualStudio.Product.Ssms' })
+    if ($manifestItems.Count -ne 1 -or $productItems.Count -lt 1) { throw 'SSMS_SCHEMA: channel has an unsupported manifest or product shape.' }
+
+    $productVersions = [Collections.Generic.List[version]]::new()
+    foreach ($product in $productItems) {
+        $versionTexts = [Collections.Generic.List[string]]::new()
+        foreach ($propertyName in @('version', 'buildVersion', 'productVersion')) {
+            $candidate = [string]$product.$propertyName
+            if (-not [string]::IsNullOrWhiteSpace($candidate)) { $versionTexts.Add($candidate) }
+        }
+        $distinctTexts = @($versionTexts | Select-Object -Unique)
+        if ($distinctTexts.Count -ne 1) { throw 'SSMS_SCHEMA: channel product entry has ambiguous version metadata.' }
+        $version = ConvertTo-SsmsVersion $distinctTexts[0]
+        if (-not $version) { throw 'SSMS_SCHEMA: channel product entry has no supported version.' }
+        $productVersions.Add($version)
+    }
+    if (@($productVersions | Select-Object -Unique).Count -ne 1 -or $productVersions[0] -ne $channelBuild) {
+        throw 'SSMS_SCHEMA: channel product entries disagree with the channel build.'
+    }
+
+    $manifestVersion = ConvertTo-SsmsVersion ([string]$manifestItems[0].version)
+    if (-not $manifestVersion -or $manifestVersion -ne $channelBuild) { throw 'SSMS_SCHEMA: manifest entry version does not agree with its channel.' }
+    return [pscustomobject]@{ Version = $channelBuild; ChannelId = $ChannelId; ChannelUri = $ChannelUri }
+}
+
+function Test-SsmsProcessOpen {
+    return $null -ne (Get-Process -Name 'Ssms' -ErrorAction SilentlyContinue | Select-Object -First 1)
+}
+
+function Find-SsmsInstance {
+    param([Parameter(Mandatory)][object[]]$Instances, [Parameter(Mandatory)][object]$Expected)
+    $match = @($Instances | Where-Object {
+        ([string]$_.InstanceId -and [string]$_.InstanceId -ieq [string]$Expected.InstanceId) -or
+        ([string]$_.InstallationPath -and [string]$_.InstallationPath -ieq [string]$Expected.InstallationPath)
+    }) | Select-Object -First 1
+    return $match
+}
+
+function New-SsmsUpdateResult {
+    param([bool]$Success, [int]$Count = 0, [bool]$Triggered = $false, [bool]$TerminalFailure = $false, [string[]]$AttentionDetails = @())
+    foreach ($detail in @($AttentionDetails)) { if ($detail) { Write-SsmsUpdateLog $detail -Level $(if ($Success) { 'Info' } else { 'Warn' }) } }
+    $records = @($AttentionDetails | Where-Object { $_ } | ForEach-Object {
+        [pscustomobject]@{ Name = 'SSMS'; Id = 'Microsoft.VisualStudio.Product.Ssms'; Code = 0; Hex = ''; Command = ''; Detail = [string]$_ }
+    })
+    return @{ Success = $Success; Count = $Count; Triggered = $Triggered; TerminalFailure = $TerminalFailure; AttentionDetails = $records }
+}
+
+function Register-SsmsRebootEvidence {
+    param([Parameter(Mandatory)][string]$Detail)
+    if (-not $script:ExplicitRebootRequests) {
+        $script:ExplicitRebootRequests = [Collections.Generic.List[object]]::new()
+    }
+    $script:ExplicitRebootRequests.Add([pscustomobject]@{ Source = 'SSMS-inventory-reboot-required'; Status = 'Pending'; Detail = $Detail })
+    if ($script:CurrentState -and (Get-Command Set-BootUpdateState -ErrorAction SilentlyContinue)) {
+        $script:CurrentState.ExplicitRebootRequests = @($script:ExplicitRebootRequests)
+        Set-BootUpdateState -State $script:CurrentState
+    }
+}
+
+function Get-SsmsPendingUpdate {
+    param([Parameter(Mandatory)]$Instance)
+    if (-not $script:CurrentState) { return $null }
+    $records = @($script:CurrentState.SsmsPendingUpdates | Where-Object { $_.InstanceId -eq $Instance.InstanceId })
+    if ($records.Count -gt 1) { throw 'SSMS pending accounting contains duplicate instance identities.' }
+    if ($records.Count -eq 0) { return $null }
+    $record = $records[0]
+    if ($record.InstallationPath -ine $Instance.InstallationPath -or
+        $record.ChannelId -ine $Instance.ChannelId -or
+        $record.ChannelUri -cne $Instance.ChannelUri -or
+        -not (ConvertTo-SsmsVersion $record.BeforeVersion)) {
+        throw 'SSMS pending update identity or source changed; verification is withheld.'
+    }
+    return $record
+}
+
+function Save-SsmsPendingUpdate {
+    param([Parameter(Mandatory)]$Instance)
+    if (-not $script:CurrentState) { return }
+    if (-not (Get-SsmsPendingUpdate -Instance $Instance)) {
+        $record = [pscustomobject]@{
+            InstanceId = $Instance.InstanceId; InstallationPath = $Instance.InstallationPath
+            ChannelId = $Instance.ChannelId; ChannelUri = $Instance.ChannelUri
+            BeforeVersion = [string]$Instance.InstallationVersion; Verified = $false
+        }
+        $script:CurrentState.SsmsPendingUpdates = @($script:CurrentState.SsmsPendingUpdates) + $record
+    }
+    # Persist the old build before starting setup, including across a process kill.
+    Set-BootUpdateState -State $script:CurrentState
+}
+
+function Confirm-SsmsPendingUpdate {
+    param([Parameter(Mandatory)]$Instance, [version]$FallbackVersion)
+    $record = Get-SsmsPendingUpdate -Instance $Instance
+    $before = if ($record) { ConvertTo-SsmsVersion $record.BeforeVersion } else { $FallbackVersion }
+    if ($record) { $record.Verified = $true }
+    if ($before -and $Instance.InstallationVersion -gt $before) { return 1 }
+    return 0
+}
+
+function Complete-SsmsUpdateAccounting {
+    param([Parameter(Mandatory)]$State)
+    # Called by the phase dispatcher after adding Count and before its atomic
+    # checkpoint. Until then, retain baselines even when a later instance starts.
+    # A kill therefore leaves either both the count and retirement, or neither.
+    $State.SsmsPendingUpdates = @($State.SsmsPendingUpdates | Where-Object { -not $_.Verified })
+}
+
+function Reset-SsmsPendingVerification {
+    # Verified is an acknowledgment for this invocation only. A prior pass may
+    # have persisted it while checkpointing the next instance, without yet
+    # adding its Count. Early failure in this pass must not retire that baseline.
+    foreach ($pending in @($script:CurrentState.SsmsPendingUpdates | Where-Object { $null -ne $_ })) {
+        $pending.Verified = $false
+    }
+}
+
+function Update-SsmsInstances {
+    param(
+        [string]$VswherePath = (Get-SsmsVswherePath),
+        [string]$InstallerPath = (Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\setup.exe'),
+        [int]$TimeoutMinutes = $(if ($script:PackageTimeoutMinutes) { [int]$script:PackageTimeoutMinutes } else { 60 })
+    )
+    Reset-SsmsPendingVerification
+    $inventory = Get-SsmsInstances -VswherePath $VswherePath
+    if ($inventory.Broken) { return New-SsmsUpdateResult -Success $false -AttentionDetails @($inventory.Detail) }
+    foreach ($pending in @($script:CurrentState.SsmsPendingUpdates | Where-Object { $null -ne $_ })) {
+        if (-not @($inventory.Instances | Where-Object InstanceId -eq $pending.InstanceId).Count) {
+            return New-SsmsUpdateResult -Success $false -AttentionDetails @('A previously attempted SSMS instance is missing from inventory; its update cannot be verified.')
+        }
+    }
+    if ($inventory.Absent) { Write-SsmsUpdateLog 'No SSMS instance found.'; return New-SsmsUpdateResult -Success $true }
+    if (-not (Test-Path -LiteralPath $InstallerPath -PathType Leaf)) {
+        return New-SsmsUpdateResult -Success $false -AttentionDetails @("Visual Studio Installer setup.exe is missing: $InstallerPath")
+    }
+    if (-not (Test-SsmsSafeProviderArgument $InstallerPath)) {
+        return New-SsmsUpdateResult -Success $false -AttentionDetails @('Visual Studio Installer path contains an unsupported apostrophe.')
+    }
+
+    $count = 0; $triggered = $false
+    foreach ($instance in @($inventory.Instances)) {
+        $null = Get-SsmsPendingUpdate -Instance $instance
+        if ($instance.InstallationVersion.Major -ne 22) {
+            Write-SsmsUpdateLog "Leaving unsupported SSMS major version $($instance.InstallationVersion) unchanged." -Level Warn
+            continue
+        }
+        if ($instance.IsRebootRequired) {
+            $detail = "SSMS inventory reports a reboot is required for '$($instance.InstallationPath)' before update assessment."
+            Register-SsmsRebootEvidence -Detail $detail
+            return New-SsmsUpdateResult -Success $false -Count $count -Triggered $triggered -AttentionDetails @($detail)
+        }
+        if (-not $instance.IsComplete -or -not $instance.IsLaunchable) {
+            return New-SsmsUpdateResult -Success $false -Count $count -Triggered $triggered -AttentionDetails @("SSMS instance '$($instance.InstallationPath)' is incomplete or not launchable.")
+        }
+        if (-not (Test-SsmsSafeProviderArgument $instance.InstallationPath)) {
+            return New-SsmsUpdateResult -Success $false -Count $count -Triggered $triggered -AttentionDetails @("SSMS installation path contains an unsupported apostrophe: $($instance.InstallationPath)")
+        }
+        try { $target = Get-SsmsChannelTarget -ChannelUri $instance.ChannelUri -ChannelId $instance.ChannelId }
+        catch {
+            return New-SsmsUpdateResult -Success $false -Count $count -Triggered $triggered -AttentionDetails @("Cannot validate SSMS channel for '$($instance.InstallationPath)': $($_.Exception.Message)")
+        }
+        if ($target.Version.Major -ne $instance.InstallationVersion.Major) {
+            return New-SsmsUpdateResult -Success $false -Count $count -Triggered $triggered -AttentionDetails @("SSMS channel target $($target.Version) changes major version from $($instance.InstallationVersion); native servicing will not cross major versions.")
+        }
+
+        if ($instance.InstallationVersion -ge $target.Version) {
+            $count += Confirm-SsmsPendingUpdate -Instance $instance
+            Write-SsmsUpdateLog "Instance '$($instance.InstallationPath)' is already at $($instance.InstallationVersion)."
+            continue
+        }
+        if (Test-SsmsProcessOpen) {
+            return New-SsmsUpdateResult -Success $false -Count $count -Triggered $triggered -AttentionDetails @('SSMS is open. Close SSMS and the cycle will retry; no application was closed.')
+        }
+        Save-SsmsPendingUpdate -Instance $instance
+        $triggered = $true
+        $run = Invoke-PackageManagerWithTimeout -Name 'SSMS-native-update' -Status 'Visual Studio Installer is updating SSMS' `
+            -ScriptBlock {
+                param($SetupPath, $InstallPath)
+                $arguments = "update --installPath `"$InstallPath`" --quiet --norestart"
+                $process = Start-Process -FilePath $SetupPath -ArgumentList $arguments -WorkingDirectory ([IO.Path]::GetTempPath()) -Wait -PassThru -NoNewWindow
+                $global:LASTEXITCODE = $process.ExitCode
+            } `
+            -ArgumentList @($InstallerPath, $instance.InstallationPath) -IdleTimeoutMinutes 10 -HardTimeoutMinutes $TimeoutMinutes
+        if ($run.RebootRequired) {
+            return New-SsmsUpdateResult -Success $false -Count $count -Triggered $triggered -AttentionDetails @("SSMS update for '$($instance.InstallationPath)' requires reboot before verification.")
+        }
+        if ($run.Failed -or $run.TimedOut) {
+            $busy = ($run.ExitCode -in @(1001,1003,1618,8006)) -or (($run.Output -join "`n") -match '(?i)another installation|installer.*busy|in use|already running')
+            $detail = if ($busy) { 'Visual Studio Installer is busy; the cycle will retry without closing applications.' } else { "SSMS installer failed (exit $($run.ExitCode)); the cycle will retry." }
+            return New-SsmsUpdateResult -Success $false -Count $count -Triggered $triggered -AttentionDetails @($detail)
+        }
+
+        $afterInventory = Get-SsmsInstances -VswherePath $VswherePath
+        if ($afterInventory.Broken) { return New-SsmsUpdateResult -Success $false -Count $count -Triggered $triggered -AttentionDetails @($afterInventory.Detail) }
+        $after = Find-SsmsInstance -Instances @($afterInventory.Instances) -Expected $instance
+        if (-not $after -or $after.InstallationVersion -le $instance.InstallationVersion) {
+            return New-SsmsUpdateResult -Success $false -Count $count -Triggered $triggered -AttentionDetails @("SSMS installer exited successfully but '$($instance.InstallationPath)' did not advance from $($instance.InstallationVersion).")
+        }
+        if ([string]$after.InstanceId -ine [string]$instance.InstanceId -or
+            [string]$after.InstallationPath -ine [string]$instance.InstallationPath -or
+            [string]$after.ChannelId -ine [string]$instance.ChannelId -or
+            [string]$after.ChannelUri -cne [string]$instance.ChannelUri) {
+            return New-SsmsUpdateResult -Success $false -Count $count -Triggered $triggered -AttentionDetails @("SSMS instance identity, path, or channel changed during update for '$($instance.InstallationPath)'.")
+        }
+        if ($after.IsRebootRequired) {
+            $detail = "SSMS inventory reports a reboot is required for '$($instance.InstallationPath)' before verification."
+            Register-SsmsRebootEvidence -Detail $detail
+            return New-SsmsUpdateResult -Success $false -Count $count -Triggered $triggered -AttentionDetails @($detail)
+        }
+        if (-not $after.IsComplete -or -not $after.IsLaunchable) {
+            return New-SsmsUpdateResult -Success $false -Count $count -Triggered $triggered -AttentionDetails @("SSMS post-update inventory for '$($instance.InstallationPath)' is incomplete or not launchable.")
+        }
+        if ($after.InstallationVersion -lt $target.Version) {
+            return New-SsmsUpdateResult -Success $false -Count $count -Triggered $triggered -AttentionDetails @("SSMS advanced to $($after.InstallationVersion) but the validated channel target is $($target.Version).")
+        }
+        $count += Confirm-SsmsPendingUpdate -Instance $after -FallbackVersion $instance.InstallationVersion
+        Write-SsmsUpdateLog "Verified SSMS update: $($instance.InstallationVersion) -> $($after.InstallationVersion)."
+    }
+    if (@($script:CurrentState.SsmsPendingUpdates | Where-Object { $null -ne $_ -and -not $_.Verified }).Count) {
+        return New-SsmsUpdateResult -Success $false -Count $count -Triggered $triggered -AttentionDetails @('An attempted SSMS update still lacks same-instance verification.')
+    }
+    return New-SsmsUpdateResult -Success $true -Count $count -Triggered $triggered
+}
+
 function Install-WindowsUpdates {
     [CmdletBinding(SupportsShouldProcess)]
     param()
@@ -6431,6 +6797,7 @@ function Send-WebhookNotification {
     $perMgr = @(
         @{ n = 'Winget';          k = 'Winget'          }
         @{ n = 'Chocolatey';      k = 'Chocolatey'      }
+        @{ n = 'SSMS';            k = 'Ssms'            }
         @{ n = 'Windows Update';  k = 'WindowsUpdate'   }
         @{ n = 'pip';             k = 'Pip'             }
         @{ n = 'npm';             k = 'Npm'             }
@@ -6547,6 +6914,7 @@ function Send-EmailNotification {
         "Per package manager:"
         "  Winget:          $($Data['Winget'] ?? 0)"
         "  Chocolatey:      $($Data['Chocolatey'] ?? 0)"
+        "  SSMS:            $($Data['Ssms'] ?? 0)"
         "  Windows Update:  $($Data['WindowsUpdate'] ?? 0)"
         "  pip:             $($Data['Pip'] ?? 0)"
         "  npm:             $($Data['Npm'] ?? 0)"
@@ -7716,7 +8084,7 @@ function Invoke-BootUpdateCycle {
     }
 
     <# ---- Phase counter for progress display ---- #>
-    <# Sequential phases: must run one at a time — Winget/Chocolatey/WindowsUpdate/
+    <# Sequential phases: must run one at a time — Winget/Chocolatey/Ssms/WindowsUpdate/
        DriverFirmware/AwsTooling all contend for the msiexec mutex or CBS/TrustedInstaller;
        Wsl/Containers stay sequential out of caution (opt-in, network/VM heavy).
        Parallel cohort (below): everything with no shared installer locks. #>
@@ -7724,6 +8092,7 @@ function Invoke-BootUpdateCycle {
     $allPhases = @(
         @{ Name='Winget';            Flag='WingetDone';            Key='Winget';            Skip=$false; Defer=$false; UserCompletionDeferred=$isSystemCtx;                  Action={ Update-WingetPackages } }
         @{ Name='Chocolatey';        Flag='ChocolateyDone';        Key='Chocolatey';        Skip=$false;                                                                       Action={ Update-ChocolateyPackages } }
+        @{ Name='Ssms';              Flag='SsmsDone';              Key='Ssms';              Skip=$false;                                                                       Action={ Update-SsmsInstances } }
         @{ Name='WindowsUpdate';     Flag='WindowsUpdateDone';     Key='WindowsUpdate';     Skip=$false;                                                                       Action={ Install-WindowsUpdates } }
         @{ Name='DriverFirmware';    Flag='DriverFirmwareDone';    Key='DriverFirmware';    Skip=(-not ($IncludeDriverUpdates -or $IncludeFirmwareUpdates));                    Action={ Install-DriverFirmwareUpdates } }
         @{ Name='AwsTooling';        Flag='AwsToolingDone';        Key=$null;               Skip=[bool]$SkipAwsTooling;                                                        Action={ $r = Repair-AwsTooling; @{ Success = $r; Count = 0 } } }
@@ -7803,6 +8172,7 @@ function Invoke-BootUpdateCycle {
                 $state.($targetPhase.Flag) = $phaseSucceeded
                 $phaseCount = if ($targetPhase.Key -and $r.Count) { $state.Summary.($targetPhase.Key) += $r.Count; $r.Count } else { 0 }
                 if ($r.Triggered) { $state.Summary.ActionsTriggered += [int]$r.Triggered }
+                if ($targetPhase -and $targetPhase.Name -eq 'Ssms') { Complete-SsmsUpdateAccounting -State $state }
                 $elapsed = (Get-Date) - $phaseStart
 
                 Write-PhaseResult -Num $phaseNum -Total $enabledPhases.Count -Name $targetPhase.Name -Success $phaseSucceeded -Deferred:$targetPhase.UserCompletionDeferred -Minutes $elapsed.TotalMinutes -Count $phaseCount
@@ -7830,7 +8200,7 @@ function Invoke-BootUpdateCycle {
     }
 
     if (-not $script:StagedRollout) {
-        <# ── Sequential phases (Winget, Chocolatey, WindowsUpdate, DriverFirmware, AwsTooling, Wsl, Containers) ── #>
+        <# ── Sequential phases (Winget, Chocolatey, Ssms, WindowsUpdate, DriverFirmware, AwsTooling, Wsl, Containers) ── #>
         $rebootBarrierRaised = $false
         foreach ($phase in $allPhases) {
             if ($phase.Skip) {
@@ -7873,6 +8243,7 @@ function Invoke-BootUpdateCycle {
                 $state.($phase.Flag) = $phaseSucceeded
                 $phaseCount = if ($phase.Key -and $r.Count) { $state.Summary.($phase.Key) += $r.Count; $r.Count } else { 0 }
                 if ($r.Triggered) { $state.Summary.ActionsTriggered += [int]$r.Triggered }
+                if ($phase.Name -eq 'Ssms') { Complete-SsmsUpdateAccounting -State $state }
                 $elapsed = (Get-Date) - $phaseStart
 
                 <# Console: styled result #>
@@ -8613,11 +8984,11 @@ function Invoke-BootUpdateCycle {
         if ($WhatIfPreference) { Write-Log '[WHATIF] Pending reboot check skipped — reporting clean (no actual updates ran)' }
         $duration = if ($state.StartTime) { (Get-Date) - [datetime]$state.StartTime } else { [timespan]::Zero }
         $s = $state.Summary
-        $total = $s.Winget + $s.Chocolatey + $s.WindowsUpdate + $s.Pip + $s.Npm + $s.Office365 + $s.PowerShellModules + $s.Scoop + $s.DotnetTools + $s.Vscode
+        $total = $s.Winget + $s.Chocolatey + $s.Ssms + $s.WindowsUpdate + $s.Pip + $s.Npm + $s.Office365 + $s.PowerShellModules + $s.Scoop + $s.DotnetTools + $s.Vscode
         $actionsTriggered = [int]($s.ActionsTriggered ?? 0)
         $reboots = [int]$state.RebootCount
         $durMin = [math]::Round($duration.TotalMinutes, 1)
-        $pkgLine = "Winget=$($s.Winget) Choco=$($s.Chocolatey) WU=$($s.WindowsUpdate) Pip=$($s.Pip) Npm=$($s.Npm) O365=$($s.Office365) PSMod=$($s.PowerShellModules) Scoop=$($s.Scoop) Dotnet=$($s.DotnetTools) VSCode=$($s.Vscode)"
+        $pkgLine = "Winget=$($s.Winget) Choco=$($s.Chocolatey) SSMS=$($s.Ssms) WU=$($s.WindowsUpdate) Pip=$($s.Pip) Npm=$($s.Npm) O365=$($s.Office365) PSMod=$($s.PowerShellModules) Scoop=$($s.Scoop) Dotnet=$($s.DotnetTools) VSCode=$($s.Vscode)"
         $wingetQuarantines = @(Get-WingetQuarantineRecords)
         $hasWingetQuarantine = -not $WhatIfPreference -and (Test-Path -LiteralPath $script:WingetQuarantinePath)
         $cleanupAdvisories = @($script:LastPendingFileRenameOperations | Where-Object { -not $_.IsBlocking })
@@ -8685,6 +9056,7 @@ function Invoke-BootUpdateCycle {
             $summaryData = [pscustomobject]@{
                 Winget           = $s.Winget
                 Chocolatey       = $s.Chocolatey
+                Ssms             = $s.Ssms
                 WindowsUpdate    = $s.WindowsUpdate
                 Pip              = $s.Pip
                 Npm              = $s.Npm
