@@ -5,6 +5,12 @@ serviced by Visual Studio Installer, whose update availability can differ from
 the package managers' published versions. Earlier SSMS generations remain under
 their existing package-manager paths.
 
+Native servicing is enabled by default. `upd --skip-ssms` (alias `--no-ssms`),
+or `-SkipSsms` on the PowerShell entry points, disables this phase for the cycle.
+The setting survives deployment, self-update, and reboot resume, including an
+explicit `-SkipSsms:$false` override. It does not filter SSMS packages from Winget
+or Chocolatey.
+
 The phase discovers installed instances through `vswhere`, including prerelease
 and incomplete instances, and filters for the SSMS product. It never invokes
 `updateall`, installs a new instance, changes a channel, or passes `--force`.

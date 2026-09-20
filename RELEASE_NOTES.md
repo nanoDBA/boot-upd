@@ -1,12 +1,12 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.80
-**Release Date:** 2026-09-12
+**Current Version:** v2.5.82
+**Release Date:** 2026-09-20
 **Status:** STABLE
 
 ---
 
-## Unreleased
+## v2.5.82 (2026-09-20)
 
 ### Fixed
 
