@@ -1,0 +1,46 @@
+{
+  "name": "feedback",
+  "description": "YouTube/community comments, forum posts, GitHub discussions, app reviews. Finds questions worth answering, churn risk, testimonials, and spam.",
+  "questions": {
+    "kind": {
+      "type": "choice",
+      "instructions": "What is this comment or post primarily doing?",
+      "criteria": {
+        "question": "Asking a genuine question that the creator or maintainer could answer",
+        "bug_problem": "Reporting something broken, confusing, or not working",
+        "feature_request": "Asking for a new capability or change",
+        "praise": "Thanks, praise, or a success story",
+        "criticism": "Negative opinion or complaint without a concrete problem",
+        "spam_bot": "Spam, self-promotion, scam links, bot-generated filler",
+        "chatter": "Off-topic, jokes, or conversation between other people"
+      }
+    },
+    "sentiment": {
+      "type": "score",
+      "instructions": "What is the author's sentiment toward the product, creator, or project?",
+      "criteria": ["Hostile", "Negative", "Neutral", "Positive", "Enthusiastic"]
+    },
+    "reply_worthy": {
+      "type": "noul",
+      "instructions": "Would a reply from the creator or maintainer meaningfully help this person or other readers?"
+    },
+    "churn_risk": {
+      "type": "noul",
+      "instructions": "Is the author signaling they may stop using, unsubscribe, cancel, or leave?"
+    },
+    "testimonial": {
+      "type": "noul",
+      "instructions": "Could this be quoted as a credible, specific testimonial describing a concrete result?"
+    }
+  },
+  "route": {
+    "rules": [
+      { "bucket": "drop", "when": { "question": "kind", "choiceIn": ["spam_bot"], "minConfidence": 0.5 } },
+      { "bucket": "retain", "when": { "question": "churn_risk", "noulAtLeast": 0.6 } },
+      { "bucket": "reply", "when": { "question": "reply_worthy", "noulAtLeast": 0.6 } },
+      { "bucket": "testimonial", "when": { "question": "testimonial", "noulAtLeast": 0.7 } },
+      { "bucket": "backlog", "when": { "question": "kind", "choiceIn": ["bug_problem", "feature_request"], "minConfidence": 0.4 } }
+    ],
+    "default": "drop"
+  }
+}

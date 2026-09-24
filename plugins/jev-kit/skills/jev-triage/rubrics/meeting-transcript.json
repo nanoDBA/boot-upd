@@ -1,0 +1,39 @@
+{
+  "name": "meeting-transcript",
+  "description": "Classify meeting transcripts or transcript chunks: type, whether decisions or owned action items exist. Send only 'extract' items to Claude for summarization.",
+  "questions": {
+    "meeting_type": {
+      "type": "choice",
+      "instructions": "What type of meeting is this transcript from?",
+      "criteria": {
+        "status_standup": "Recurring status update, standup, or check-in",
+        "planning_decision": "Planning, prioritization, design review, or a meeting held to make a decision",
+        "incident_review": "Outage response, incident bridge, or postmortem",
+        "customer_external": "Call with a customer, vendor, candidate, or other external party",
+        "one_on_one": "Manager/report or peer one-on-one",
+        "social_other": "Social chat, all-hands broadcast, or content with no working agenda"
+      }
+    },
+    "has_decision": {
+      "type": "noul",
+      "instructions": "Did the participants explicitly agree on a decision (not merely discuss options)?"
+    },
+    "has_owned_action": {
+      "type": "noul",
+      "instructions": "Is there at least one action item assigned to a named person, with that person accepting it?"
+    },
+    "has_risk": {
+      "type": "noul",
+      "instructions": "Did anyone raise a risk, blocker, missed deadline, or escalation that leadership would want to know about?"
+    }
+  },
+  "route": {
+    "rules": [
+      { "bucket": "escalate", "when": { "question": "has_risk", "noulAtLeast": 0.65 } },
+      { "bucket": "extract", "when": { "question": "has_decision", "noulAtLeast": 0.55 } },
+      { "bucket": "extract", "when": { "question": "has_owned_action", "noulAtLeast": 0.55 } },
+      { "bucket": "drop", "when": { "question": "meeting_type", "choiceIn": ["social_other"], "minConfidence": 0.5 } }
+    ],
+    "default": "archive"
+  }
+}

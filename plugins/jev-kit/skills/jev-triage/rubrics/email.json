@@ -1,0 +1,47 @@
+{
+  "name": "email",
+  "description": "Inbox triage: surfaces what needs a reply today, quarantines scams, drops newsletters. State: subject + from + body (JSON record or text).",
+  "questions": {
+    "type": {
+      "type": "choice",
+      "instructions": "What kind of email is this?",
+      "criteria": {
+        "direct_request": "A real person asking the recipient to do, answer, approve, or decide something",
+        "fyi_update": "A real person sharing information with no action requested",
+        "invoice_billing": "An invoice, receipt, payment reminder, renewal, or billing notice",
+        "alert_notification": "An automated system alert, monitoring notification, CI result, or security notice",
+        "sales_outreach": "Unsolicited sales, recruiting, partnership, or sponsorship pitches",
+        "newsletter_marketing": "Newsletters, digests, promotions, product announcements",
+        "scam_phishing": "Phishing, credential harvesting, fake invoices, impersonation, or fraud"
+      }
+    },
+    "urgency": {
+      "type": "score",
+      "instructions": "How time-sensitive is a response or action on this email?",
+      "criteria": [
+        "No deadline; can wait indefinitely",
+        "This week",
+        "Today",
+        "Immediately; something is broken or a deadline is hours away"
+      ]
+    },
+    "needs_reply": {
+      "type": "noul",
+      "instructions": "Does the sender expect a written reply from the recipient?"
+    },
+    "is_scam": {
+      "type": "noul",
+      "instructions": "Is this email likely a scam, phishing attempt, or impersonation (mismatched sender, urgent payment or credential request, suspicious links)?"
+    }
+  },
+  "route": {
+    "rules": [
+      { "bucket": "quarantine", "when": { "question": "is_scam", "noulAtLeast": 0.6 } },
+      { "bucket": "now", "when": { "question": "urgency", "scoreAtLeast": 2.3 } },
+      { "bucket": "reply", "when": [ { "question": "needs_reply", "noulAtLeast": 0.6 }, { "question": "type", "choiceIn": ["direct_request", "invoice_billing"] } ] },
+      { "bucket": "drop", "when": { "question": "type", "choiceIn": ["newsletter_marketing", "sales_outreach"], "minConfidence": 0.5 } }
+    ],
+    "default": "read_later",
+    "reviewWhen": { "question": "type", "confidenceBelow": 0.3 }
+  }
+}

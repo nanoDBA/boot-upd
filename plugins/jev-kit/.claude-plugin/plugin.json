@@ -1,0 +1,9 @@
+{
+  "name": "jev-kit",
+  "version": "1.0.0",
+  "description": "Jev (TypeSafe System One) skills for Claude Code: typed one-shot judgments, bulk log/email/comment triage with deterministic routing, and a Jev-powered skill router.",
+  "author": { "name": "nanoDBA" },
+  "homepage": "https://github.com/nanoDBA/boot-upd/tree/master/plugins/jev-kit",
+  "license": "MIT",
+  "keywords": ["jev", "typesafe", "triage", "classification", "logs", "skills", "powershell"]
+}

@@ -1,0 +1,51 @@
+{
+  "name": "sql-errorlog",
+  "description": "SQL Server ERRORLOG / Agent log / Windows Application event entries. Pages on corruption and data-loss risk, drops login-audit and startup chatter.",
+  "questions": {
+    "category": {
+      "type": "choice",
+      "instructions": "What kind of SQL Server event does this log entry describe?",
+      "criteria": {
+        "corruption": "DBCC CHECKDB errors, checksum or torn-page failures, error 823/824/825, suspect pages, msdb.dbo.suspect_pages entries",
+        "io_latency": "I/O requests taking longer than 15 seconds, stalled I/O, storage path or disk problems",
+        "backup_restore": "Backup or restore failures, missing log backups, VDI/VSS snapshot errors",
+        "availability": "Always On availability group, mirroring, log shipping or cluster role changes, failover, disconnected replicas, redo/send queue problems",
+        "resource_pressure": "Memory grant waits, non-yielding scheduler, low virtual memory, tempdb or log file full (error 9002), autogrowth storms",
+        "deadlock_blocking": "Deadlock graphs, lock timeouts, long blocking chains",
+        "security": "Login failures (error 18456) from unexpected sources, permission denied, certificate or TDE key problems",
+        "agent_job": "SQL Server Agent job or step failures",
+        "startup_config": "Service start/stop, configuration changes, trace flags, recovery progress messages",
+        "informational": "Routine success messages, successful backups, log rotation, login audit success, anything with no operational consequence"
+      }
+    },
+    "severity": {
+      "type": "score",
+      "instructions": "How operationally severe is this entry for a production database server?",
+      "criteria": [
+        "Informational: expected, no action needed",
+        "Low: worth noting, no user impact",
+        "Medium: degraded or at risk, needs attention today",
+        "High: outage, data loss risk, or corruption; needs attention now"
+      ]
+    },
+    "data_loss_risk": {
+      "type": "noul",
+      "instructions": "Does this entry indicate that data could be lost or is already damaged (corruption, failed log backups breaking the chain, a full transaction log, a replica that cannot catch up)?"
+    },
+    "needs_human": {
+      "type": "noul",
+      "instructions": "Would an experienced DBA need to take a manual action because of this entry, as opposed to it resolving on its own?"
+    }
+  },
+  "route": {
+    "rules": [
+      { "bucket": "page", "when": { "question": "category", "choiceIn": ["corruption"], "minConfidence": 0.4 } },
+      { "bucket": "page", "when": { "question": "data_loss_risk", "noulAtLeast": 0.7 } },
+      { "bucket": "page", "when": { "question": "severity", "scoreAtLeast": 2.5 } },
+      { "bucket": "drop", "when": [ { "question": "category", "choiceIn": ["informational", "startup_config"], "minConfidence": 0.6 }, { "question": "severity", "scoreBelow": 0.8 } ] },
+      { "bucket": "act", "when": { "question": "needs_human", "noulAtLeast": 0.5 } }
+    ],
+    "default": "watch",
+    "reviewWhen": { "question": "category", "confidenceBelow": 0.35 }
+  }
+}

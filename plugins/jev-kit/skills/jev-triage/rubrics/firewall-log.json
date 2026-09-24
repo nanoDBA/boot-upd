@@ -1,0 +1,46 @@
+{
+  "name": "firewall-log",
+  "description": "OPNsense/pfSense filterlog, Suricata/Zenarmor alerts, Home Assistant or router syslog lines. Separates real threats from scanner noise.",
+  "questions": {
+    "category": {
+      "type": "choice",
+      "instructions": "What does this network or firewall log entry most likely represent?",
+      "criteria": {
+        "internet_scan_noise": "Inbound blocked connection attempts from the internet to closed or filtered ports; mass scanners, Shodan-style probes, background radiation",
+        "ids_alert": "An IDS/IPS signature match (Suricata, Snort, Zenarmor) describing an exploit, malware, command-and-control, or policy violation",
+        "internal_anomaly": "Traffic from an internal host that is unusual: an IoT device contacting unexpected destinations, lateral movement, a LAN host scanning other hosts, DNS to non-approved resolvers",
+        "config_or_service": "Gateway down/up, DHCP, WAN IP change, certificate expiry, VPN tunnel state, service restarts, rule reloads",
+        "auth_event": "Login success or failure to the firewall, VPN, SSH, or web UI",
+        "benign": "Normal allowed traffic, routine housekeeping, or anything with no security or availability consequence"
+      }
+    },
+    "threat": {
+      "type": "score",
+      "instructions": "How much risk does this entry indicate for a home or small-office network?",
+      "criteria": [
+        "None: routine or noise",
+        "Low: suspicious but blocked or inconsequential",
+        "Medium: plausible compromise attempt or misconfiguration worth checking",
+        "High: likely compromise, successful unauthorized access, or active exfiltration"
+      ]
+    },
+    "outbound_from_lan": {
+      "type": "noul",
+      "instructions": "Did this traffic originate from inside the local network (a private RFC1918 or ULA source address) heading outward?"
+    },
+    "was_allowed": {
+      "type": "noul",
+      "instructions": "Was this traffic allowed or passed rather than blocked or dropped?"
+    }
+  },
+  "route": {
+    "rules": [
+      { "bucket": "page", "when": { "question": "threat", "scoreAtLeast": 2.4 } },
+      { "bucket": "investigate", "when": [ { "question": "category", "choiceIn": ["internal_anomaly", "ids_alert"], "minConfidence": 0.4 }, { "question": "was_allowed", "noulAtLeast": 0.5 } ] },
+      { "bucket": "drop", "when": [ { "question": "category", "choiceIn": ["internet_scan_noise", "benign"], "minConfidence": 0.5 }, { "question": "was_allowed", "noulBelow": 0.5 } ] },
+      { "bucket": "drop", "when": { "question": "threat", "scoreBelow": 0.5 } }
+    ],
+    "default": "watch",
+    "reviewWhen": { "question": "category", "confidenceBelow": 0.35 }
+  }
+}
