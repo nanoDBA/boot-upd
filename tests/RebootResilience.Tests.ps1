@@ -86,6 +86,7 @@ BeforeAll {
           'Get-WingetInventoryPackageIds',
           'Get-WingetOutputSummary',
           'Get-ChocolateyOutputSummary',
+          'Test-BootUpdateDualManagedPackageMatch',
           'Complete-ChocolateyFailureClassification',
           'Test-WingetExitReconciled',
           'Get-WingetRemediationCommand',
@@ -98,6 +99,7 @@ BeforeAll {
           'Set-WingetResolvedAbsentRecords',
           'Resolve-WingetStaleAbsentPresentation',
           'Write-WingetScopeSummary',
+          'Save-BootUpdateWingetSuccessIds',
           'Update-WingetPackages',
           'Test-PipFatalInterpreterEvidence',
           'Get-PipInterpreterAttentionDetail',
@@ -2699,6 +2701,118 @@ Describe 'Chocolatey terminal failure classification' {
         $result.Success | Should -BeTrue
         $script:CurrentState.ChocolateyFailureRepeatCount | Should -Be 0
         [string]$script:CurrentState.ChocolateyFailureSignature | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Dual-managed Winget and Chocolatey package detection' {
+    <# Diagnostics 2026-09-25 (laptop, v2.5.82): Winget's machine phase upgraded
+       Amazon.AWSCLI successfully ("0 attempted, 1 updated, 0 failed"), then Chocolatey's
+       awscli package tried to install 2.37.1 over the same product and its MSI returned
+       1603 on three consecutive passes. One product was registered with two package
+       managers; the operator fix is to let Winget keep servicing it and remove only
+       Chocolatey's package record. #>
+
+    It 'matches normalized package identities across managers' {
+        Test-BootUpdateDualManagedPackageMatch -NameA 'awscli' -NameB 'Amazon.AWSCLI' | Should -BeTrue
+    }
+
+    It 'never matches a token shorter than 5 characters, even as a substring' {
+        Test-BootUpdateDualManagedPackageMatch -NameA 'git' -NameB 'gitextensions' | Should -BeFalse
+    }
+
+    It 'does not match unrelated package names' {
+        Test-BootUpdateDualManagedPackageMatch -NameA 'notepadplusplus' -NameB 'Amazon.AWSCLI' | Should -BeFalse
+    }
+
+    It 'treats an empty or missing name as no match' {
+        Test-BootUpdateDualManagedPackageMatch -NameA '' -NameB 'Amazon.AWSCLI' | Should -BeFalse
+        Test-BootUpdateDualManagedPackageMatch -NameA $null -NameB 'Amazon.AWSCLI' | Should -BeFalse
+    }
+
+    It 'produces the dual-managed repair for a Chocolatey awscli failure Winget already updated' {
+        $state = [pscustomobject]@{ WingetUpdatedIds = @('Amazon.AWSCLI') }
+        $failures = @([pscustomobject]@{ Name = 'awscli'; Code = 1603; ExpectedChecksum = ''; ActualChecksum = '' })
+
+        $null = Complete-ChocolateyFailureClassification -State $state -Failures $failures
+        $second = Complete-ChocolateyFailureClassification -State $state -Failures $failures
+
+        $second.TerminalFailure | Should -BeTrue
+        $detail = @($second.Details)[0]
+        $detail.Command | Should -Be 'choco uninstall awscli -y --skip-autouninstaller'
+        $detail.Note | Should -Match 'both Winget and Chocolatey'
+        $detail.Note | Should -Match 'Amazon\.AWSCLI'
+    }
+
+    It 'leads with upd aws for a non-dual-managed Chocolatey awscli failure' {
+        $state = [pscustomobject]@{ WingetUpdatedIds = @() }
+        $failures = @([pscustomobject]@{ Name = 'awscli'; Code = 1603; ExpectedChecksum = ''; ActualChecksum = '' })
+
+        $null = Complete-ChocolateyFailureClassification -State $state -Failures $failures
+        $result = Complete-ChocolateyFailureClassification -State $state -Failures $failures
+
+        $detail = @($result.Details)[0]
+        $detail.Command | Should -Be 'upd aws'
+        [string]$detail.Note | Should -BeNullOrEmpty
+    }
+
+    It 'leads with upd aws for a non-dual-managed Winget awscli failure' {
+        Get-WingetRemediationCommand -PackageId 'Amazon.AWSCLI' -Code 1603 | Should -Be 'upd aws'
+        Get-WingetRemediationCommand -PackageId 'awscli' -Code 1603 | Should -Be 'upd aws'
+    }
+
+    It 'keeps today''s plan for an unrelated package failure' {
+        $state = [pscustomobject]@{ WingetUpdatedIds = @('Amazon.AWSCLI') }
+        $failures = @([pscustomobject]@{ Name = 'notepadplusplus'; Code = 1603; ExpectedChecksum = ''; ActualChecksum = '' })
+
+        $null = Complete-ChocolateyFailureClassification -State $state -Failures $failures
+        $result = Complete-ChocolateyFailureClassification -State $state -Failures $failures
+
+        $detail = @($result.Details)[0]
+        [string]$detail.Command | Should -BeNullOrEmpty
+        [string]$detail.Note | Should -BeNullOrEmpty
+    }
+
+    It 'writes the dual-managed commands in order, ahead of the trailing upd' {
+        $script:InstallDir = $TestDrive
+        Mock Set-BootUpdateClipboardText { $true }
+        $items = @(
+            [pscustomobject]@{
+                Name = 'awscli'; Id = 'awscli'; Code = 1603; Hex = '0x00000643'
+                Command = 'choco uninstall awscli -y --skip-autouninstaller'
+                Note = 'awscli is registered with both Winget and Chocolatey (Winget id Amazon.AWSCLI already updated it this session).'
+            }
+        )
+
+        $result = Write-BootUpdateRepairPlan -Items $items
+        $lines = Get-Content -LiteralPath $result.Path
+
+        ($lines -join "`n") | Should -Match 'both Winget and Chocolatey'
+        $blockStart = [array]::IndexOf($lines, 'COPY/PASTE BLOCK — ELEVATED COMMAND PROMPT') + 1
+        $block = @($lines | Select-Object -Skip $blockStart | Where-Object { $_ -notmatch '^REM' })
+        $block[0] | Should -Be 'choco uninstall awscli -y --skip-autouninstaller'
+        $block[1] | Should -Be 'upd'
+    }
+
+    It 'saves Winget success ids onto state so a same-boot resume can still see them' {
+        $state = [pscustomobject]@{}
+        Mock Set-BootUpdateState { }
+
+        Save-BootUpdateWingetSuccessIds -State $state -Ids @('Amazon.AWSCLI')
+        Save-BootUpdateWingetSuccessIds -State $state -Ids @('Amazon.AWSCLI', 'Mozilla.Firefox')
+
+        @($state.WingetUpdatedIds) | Should -Be @('Amazon.AWSCLI', 'Mozilla.Firefox')
+    }
+
+    It 'defaults WingetUpdatedIds on a state file written before the field existed' {
+        Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 6 -Scope Script -Force
+        $legacy = New-BootUpdateStateV2
+        $legacy.PSObject.Properties.Remove('WingetUpdatedIds')
+        $legacy.PSObject.Properties.Name | Should -Not -Contain 'WingetUpdatedIds'
+
+        Update-BootUpdateStateSchema -State $legacy
+
+        $legacy.PSObject.Properties.Name | Should -Contain 'WingetUpdatedIds'
+        @($legacy.WingetUpdatedIds).Count | Should -Be 0
     }
 }
 

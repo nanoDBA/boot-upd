@@ -1212,6 +1212,11 @@ function Get-WingetRemediationCommand {
     param([AllowEmptyString()][AllowNull()][string]$PackageId,[long]$Code = 0)
     # Never echo arbitrary provider output into a shell command.
     if ([string]::IsNullOrEmpty($PackageId) -or $PackageId -notmatch '^[A-Za-z0-9][A-Za-z0-9._+-]*$') { return $null }
+    <# A Winget-reported AWS CLI failure is, by definition, not "dual-managed by Winget and
+       Chocolatey" (that classification requires a Winget SUCCESS in this session). The
+       launcher's dedicated AWS CLI repair (tools/Repair-AwsTooling.ps1, invoked as
+       `upd aws`) is the correct first step for either manager's own AWS CLI failure. #>
+    if ($PackageId -in @('awscli', 'Amazon.AWSCLI')) { return 'upd aws' }
     $verb = if ($Code -eq 1612) { 'repair' } else { 'install' }
     return "winget $verb --id $PackageId -e --source winget --force --accept-source-agreements --accept-package-agreements"
 }
@@ -2119,6 +2124,11 @@ function New-BootUpdateStateV2 {
         SsmsPendingUpdates    = @()
         WingetAggressiveRepairSignatures = @()
         WingetQuarantines       = @()
+        <# Package IDs Winget reported "Successfully installed" for this session, across
+           every pass since the checkpoint. Detects a product registered with both Winget
+           and Chocolatey: the Winget success may have happened in an earlier same-boot
+           pass, so this must survive a resume rather than living in a per-run variable. #>
+        WingetUpdatedIds      = @()
         ResumeUser            = $null
         ResumeUserSid         = $null
         Summary               = [pscustomobject]@{
@@ -2193,6 +2203,8 @@ function Update-BootUpdateStateSchema {
     else { $State.SsmsPendingUpdates = @($State.SsmsPendingUpdates | Where-Object { $null -ne $_ }) }
     if ($props -notcontains 'WingetAggressiveRepairSignatures') { $State | Add-Member -NotePropertyName 'WingetAggressiveRepairSignatures' -NotePropertyValue @() -Force }
     if ($props -notcontains 'WingetQuarantines') { $State | Add-Member -NotePropertyName 'WingetQuarantines' -NotePropertyValue @() -Force }
+    if ($props -notcontains 'WingetUpdatedIds') { $State | Add-Member -NotePropertyName 'WingetUpdatedIds' -NotePropertyValue @() -Force }
+    else { $State.WingetUpdatedIds = @($State.WingetUpdatedIds | Where-Object { $null -ne $_ }) }
     if ($props -notcontains 'DeferredInventory') { $State | Add-Member -NotePropertyName 'DeferredInventory' -NotePropertyValue @() -Force }
     else { $State.DeferredInventory = @($State.DeferredInventory | Where-Object { $null -ne $_ }) }
     if ($props -notcontains 'UnobservedStops') { $State | Add-Member -NotePropertyName 'UnobservedStops' -NotePropertyValue @() -Force }
@@ -3134,6 +3146,9 @@ function Stop-BootUpdateForManualAttention {
     $names = @($Phases.Name) -join ', '
     $repairItems = @($Phases | ForEach-Object { @($_.AttentionDetails) })
     $details = @($repairItems | ForEach-Object { "$($_.Name) [$($_.Id)] ($($_.Code), $($_.Hex))" }) -join '; '
+    $dualManagedNote = @($repairItems | Where-Object {
+        $_.PSObject.Properties.Name -contains 'Note' -and -not [string]::IsNullOrWhiteSpace([string]$_.Note)
+    } | ForEach-Object { [string]$_.Note })[0]
     $reason = "Persistent non-transient failure requires manual attention: $names"
     $State.Phase = 'AttentionRequired'
     $State.LimitReachedAt = [datetime]::UtcNow.ToString('o')
@@ -3169,6 +3184,7 @@ function Stop-BootUpdateForManualAttention {
         'Automatic retries stopped because the same non-transient failure repeated.'
         "Incomplete phase(s): $names"
         $(if ($details) { "Failures: $details" } else { 'See the diagnostic log for the exact provider failure.' })
+        $(if ($dualManagedNote) { "[DUAL-MANAGED] $dualManagedNote" })
         $(if ($unobservedStopsSummary) { "[NOTE] A pass stopped without reporting and was resumed by a watchdog probe: $unobservedStopsSummary" })
         $(if ($plan) {
             if ($plan.ClipboardCopied) { "Repair plan (path copied to clipboard): $($plan.Path)" }
@@ -3234,7 +3250,12 @@ function Write-BootUpdateRepairPlan {
     $lines.Add('The same non-transient package failure repeated. Automatic continuation was stopped.')
     $lines.Add('Review the package names below before using the elevated Command Prompt block.')
     $lines.Add('')
-    foreach ($item in $Items) { $lines.Add("- $($item.Name) [$($item.Id)]: $($item.Code) / $($item.Hex)") }
+    foreach ($item in $Items) {
+        $lines.Add("- $($item.Name) [$($item.Id)]: $($item.Code) / $($item.Hex)")
+        if ($item.PSObject.Properties.Name -contains 'Note' -and -not [string]::IsNullOrWhiteSpace([string]$item.Note)) {
+            $lines.Add("  $($item.Note)")
+        }
+    }
     $lines.Add('')
     <# ADR-0003: deferred inventory is outstanding work that qualified this run's claim. It
        is reported here as fact and deliberately carries no commands. Per ADR-0001 the plan
@@ -3650,6 +3671,33 @@ try {
 #endregion
 
 #region Package Manager Updates
+function Save-BootUpdateWingetSuccessIds {
+    <# Records package IDs Winget reported "Successfully installed" for this session,
+       merged onto whatever the state already holds. A same-boot resume runs this pass
+       in a fresh process, so an earlier pass's success is only visible here because it
+       was persisted to $State rather than kept in a per-run variable. Merge, not
+       replace: dropping an earlier pass's evidence would make dual-manager detection
+       depend on which pass happens to observe the Chocolatey failure. #>
+    param(
+        [pscustomobject]$State,
+        [object[]]$Ids = @()
+    )
+    if (-not $State -or -not @($Ids).Count) { return }
+    $existing = if ($State.PSObject.Properties.Name -contains 'WingetUpdatedIds') { @($State.WingetUpdatedIds) } else { @() }
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $merged = [Collections.Generic.List[string]]::new()
+    foreach ($id in (@($existing) + @($Ids))) {
+        $value = [string]$id
+        if ($value -and $seen.Add($value)) { $merged.Add($value) }
+    }
+    if ($State.PSObject.Properties.Name -contains 'WingetUpdatedIds') {
+        $State.WingetUpdatedIds = $merged.ToArray()
+    } else {
+        $State | Add-Member -NotePropertyName 'WingetUpdatedIds' -NotePropertyValue $merged.ToArray() -Force
+    }
+    Set-BootUpdateState -State $State
+}
+
 function Update-WingetPackages {
     [CmdletBinding(SupportsShouldProcess)]
     param()
@@ -3822,6 +3870,7 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
             Write-Log 'Winget: one automatic verification pass remains; manual commands are withheld unless the same failure repeats.' -Level Warn
         }
         $phaseSuccess = if ($quarantine -and $quarantine.AllPinned) { $true } elseif ($script:CurrentWingetFailures.Count) { $false } else { -not $anyTimeout }
+        Save-BootUpdateWingetSuccessIds -State $script:CurrentState -Ids $successfulPackageIds
         return @{ Success = $phaseSuccess; Count = $totalCount; TerminalFailure=$classification.TerminalFailure; AttentionDetails=$classification.Details }
     }
 
@@ -3975,6 +4024,7 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
         Write-Log 'Winget: one automatic verification pass remains; manual commands are withheld unless the same failure repeats.' -Level Warn
     }
     $phaseSuccess = if ($quarantine -and $quarantine.AllPinned) { $true } elseif ($script:CurrentWingetFailures.Count) { $false } else { -not $anyTimeout }
+    Save-BootUpdateWingetSuccessIds -State $script:CurrentState -Ids $successfulPackageIds
     return @{ Success = $phaseSuccess; Count = $totalCount; TerminalFailure=$classification.TerminalFailure; AttentionDetails=$classification.Details }
 }
 
@@ -4020,6 +4070,28 @@ function Get-ChocolateyOutputSummary {
     return [pscustomobject]@{ Failures = $failures.ToArray() }
 }
 
+function Test-BootUpdateDualManagedPackageMatch {
+    <# Diagnostics 2026-09-25: Winget's machine phase upgraded Amazon.AWSCLI successfully,
+       then Chocolatey's awscli package tried to install over the same product and its MSI
+       returned 1603 on every pass. One product was registered with two package managers;
+       comparing package identities across providers by exact string never catches this,
+       because Winget and Chocolatey each name the same product differently.
+
+       Normalizes both names (lower-case, strip everything but letters and digits) and
+       reports whether one contains the other. Requires the SHORTER normalized token to be
+       at least 5 characters so a short, generic name cannot false-positive against an
+       unrelated longer name that happens to contain it (e.g. 'git' inside
+       'gitextensions'). #>
+    param([string]$NameA, [string]$NameB)
+    $tokenA = ([string]$NameA).ToLowerInvariant() -replace '[^a-z0-9]', ''
+    $tokenB = ([string]$NameB).ToLowerInvariant() -replace '[^a-z0-9]', ''
+    if (-not $tokenA -or -not $tokenB) { return $false }
+    if ($tokenA.Length -le $tokenB.Length) { $shorter = $tokenA; $longer = $tokenB }
+    else { $shorter = $tokenB; $longer = $tokenA }
+    if ($shorter.Length -lt 5) { return $false }
+    return $longer.Contains($shorter)
+}
+
 function Complete-ChocolateyFailureClassification {
     <# Recognise the same Chocolatey failure recurring across passes so a cause that cannot
        succeed stops consuming the retry budget. Chocolatey exits -1 for every failing
@@ -4058,6 +4130,7 @@ function Complete-ChocolateyFailureClassification {
         Details=@($Failures | ForEach-Object {
             $expected = [string]$_.ExpectedChecksum
             $actual = [string]$_.ActualChecksum
+            $name = [string]$_.Name
             <# Hex is the free-text detail slot the repair plan prints beside the package.
                For a checksum mismatch it carries both hashes so a human can compare them
                against the vendor's published value. Command is deliberately left empty:
@@ -4069,12 +4142,27 @@ function Complete-ChocolateyFailureClassification {
             } else {
                 Format-NativeExitCode ([long]$_.Code)
             }
+            <# Same product registered with both Winget and Chocolatey: Winget already
+               updated it successfully this session (persisted state, so an earlier
+               same-boot pass still counts), so the state facts and options are "let one
+               manager own it" — never --force or --ignore-checksums. #>
+            $wingetIds = if ($State.PSObject.Properties.Name -contains 'WingetUpdatedIds') { @($State.WingetUpdatedIds) } else { @() }
+            $dualManagedId = @($wingetIds | Where-Object { Test-BootUpdateDualManagedPackageMatch -NameA $name -NameB $_ })[0]
+            $command = ''
+            $note = ''
+            if ($dualManagedId) {
+                $command = "choco uninstall $name -y --skip-autouninstaller"
+                $note = "$name is registered with both Winget and Chocolatey (Winget id $dualManagedId already updated it this session). --skip-autouninstaller removes only Chocolatey's package record; the Winget-installed program stays."
+            } elseif (Test-BootUpdateDualManagedPackageMatch -NameA $name -NameB 'awscli') {
+                $command = 'upd aws'
+            }
             [pscustomobject]@{
-                Name=[string]$_.Name
-                Id=[string]$_.Name
+                Name=$name
+                Id=$name
                 Code=[long]$_.Code
                 Hex=$detail
-                Command=''
+                Command=$command
+                Note=$note
             }
         })
     }

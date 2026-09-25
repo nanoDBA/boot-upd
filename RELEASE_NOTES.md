@@ -6,6 +6,22 @@
 
 ---
 
+## Unreleased
+
+### Fixed
+
+- Laptop diagnostics on 2026-09-25 (v2.5.82) found Winget's machine phase upgrade
+  `Amazon.AWSCLI` successfully, then Chocolatey's `awscli` package fail identically
+  (MSI `1603`) on three consecutive passes because the same product was registered
+  with both managers. The updater now recognizes this pattern — a Chocolatey
+  terminal failure whose package name matches a Winget package this session already
+  updated — and the repair plan explains that the product is dual-managed and leads
+  with `choco uninstall <package> -y --skip-autouninstaller` (which removes only
+  Chocolatey's record, leaving the Winget-installed program in place) followed by
+  `upd`. The manual-attention banner gets a matching `[DUAL-MANAGED]` line. A
+  Chocolatey or Winget AWS CLI failure that is *not* dual-managed now leads instead
+  with `upd aws`, the launcher's dedicated AWS CLI repair, before `upd`.
+
 ## v2.5.82 (2026-09-20)
 
 ### Fixed
