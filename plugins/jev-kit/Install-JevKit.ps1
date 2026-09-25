@@ -2,15 +2,16 @@
 # File:        Install-JevKit.ps1
 # Description: 📦 Installs/updates the jev-kit skills for every project on a box
 # Purpose:     For machines that don't use the Claude Code plugin marketplace:
-#              - Copies jev, jev-triage, jev-skill-router into a user-level
+#              - Copies jev, jev-triage, jev-skill-router, jev-review-loop to a user-level
 #                skills directory (default ~/.claude/skills) - replacing only
-#                those three folders, never touching anything else
+#                those four folders, never touching anything else
 #              - Optionally mirrors them to other agents' skill dirs
 #              - Optionally adds/removes the skill-router UserPromptSubmit hook
-#                in ~/.claude/settings.json, with a timestamped backup first
+#                and the review-loop PreToolUse scope guard in
+#                ~/.claude/settings.json, with a timestamped backup first
 #              Re-run after `git pull` to update.  Idempotent.
 # Created:     2026-09-24
-# Modified:    2026-09-24
+# Modified:    2026-09-25
 # ------------------------------------------------------------------------------
 
 <#
@@ -36,6 +37,11 @@ param(
 
     [switch]$DisableSkillRouterHook,
 
+    # PreToolUse guard for jev-review-loop runs.  Inert unless a run is active.
+    [switch]$EnableReviewScopeGuard,
+
+    [switch]$DisableReviewScopeGuard,
+
     [ValidateRange(5, 60)]
     [int]$HookTimeoutSec = 15
 )
@@ -44,14 +50,14 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 if ($EnableSkillRouterHook -and $DisableSkillRouterHook) { throw 'Pick one of -EnableSkillRouterHook / -DisableSkillRouterHook.' }
+if ($EnableReviewScopeGuard -and $DisableReviewScopeGuard) { throw 'Pick one of -EnableReviewScopeGuard / -DisableReviewScopeGuard.' }
 if ($PSVersionTable.PSVersion.Major -lt 7) { throw 'PowerShell 7+ required (the skills use pwsh-only features).' }
 
 $sourceRoot = Join-Path $PSScriptRoot 'skills'
-$skillNames = 'jev', 'jev-triage', 'jev-skill-router'
+$skillNames = 'jev', 'jev-triage', 'jev-skill-router', 'jev-review-loop'
 foreach ($name in $skillNames) {
     if (-not (Test-Path -LiteralPath (Join-Path $sourceRoot "$name/SKILL.md"))) { throw "Source skill '$name' missing under $sourceRoot." }
 }
-$marker = 'Select-JevSkill.ps1'
 
 $results = [System.Collections.Generic.List[object]]::new()
 
@@ -78,38 +84,49 @@ foreach ($dest in $Destination) {
     }
 }
 
-if ($EnableSkillRouterHook -or $DisableSkillRouterHook) {
-    $scriptPath = Join-Path ([IO.Path]::GetFullPath($Destination[0])) "jev/scripts/$marker"
+$hookChanges = @(
+    if ($EnableSkillRouterHook -or $DisableSkillRouterHook) {
+        [pscustomobject]@{ Event = 'UserPromptSubmit'; Matcher = $null; Marker = 'Select-JevSkill.ps1'; Enable = [bool]$EnableSkillRouterHook
+            Command = "pwsh -NoProfile -File `"$(Join-Path ([IO.Path]::GetFullPath($Destination[0])) 'jev/scripts/Select-JevSkill.ps1')`" -Hook"; Timeout = $HookTimeoutSec }
+    }
+    if ($EnableReviewScopeGuard -or $DisableReviewScopeGuard) {
+        [pscustomobject]@{ Event = 'PreToolUse'; Matcher = 'Bash|Edit|Write|MultiEdit|NotebookEdit'; Marker = 'Test-ReviewScope.ps1'; Enable = [bool]$EnableReviewScopeGuard
+            Command = "pwsh -NoProfile -File `"$(Join-Path ([IO.Path]::GetFullPath($Destination[0])) 'jev-review-loop/scripts/Test-ReviewScope.ps1')`""; Timeout = 10 }
+    }
+)
+
+if ($hookChanges.Count -gt 0) {
     $settings = if (Test-Path -LiteralPath $SettingsPath) {
         $raw = Get-Content -LiteralPath $SettingsPath -Raw
         if ([string]::IsNullOrWhiteSpace($raw)) { [ordered]@{} } else { $raw | ConvertFrom-Json -AsHashtable -Depth 50 }
     } else { [ordered]@{} }
-
     if (-not $settings.Contains('hooks')) { $settings['hooks'] = [ordered]@{} }
     $hooks = $settings['hooks']
-    $groups = [System.Collections.Generic.List[object]]::new()
-    if ($hooks.Contains('UserPromptSubmit')) { foreach ($g in @($hooks['UserPromptSubmit'])) { if ($null -ne $g) { $groups.Add($g) } } }
+    $details = [System.Collections.Generic.List[string]]::new()
 
-    # Drop any existing router entries (enable re-adds a fresh one; disable stops there).
-    $removed = 0
-    foreach ($g in @($groups)) {
-        $kept = @(@($g['hooks']) | Where-Object { $null -ne $_ -and ([string]$_['command']) -notlike "*$marker*" })
-        $removed += @($g['hooks']).Count - $kept.Count
-        if ($kept.Count -eq 0) { [void]$groups.Remove($g) } else { $g['hooks'] = $kept }
+    foreach ($change in $hookChanges) {
+        $groups = [System.Collections.Generic.List[object]]::new()
+        if ($hooks.Contains($change.Event)) { foreach ($g in @($hooks[$change.Event])) { if ($null -ne $g) { $groups.Add($g) } } }
+        # Drop existing entries for this marker (enable re-adds a fresh one; disable stops there).
+        $removed = 0
+        foreach ($g in @($groups)) {
+            $kept = @(@($g['hooks']) | Where-Object { $null -ne $_ -and ([string]$_['command']) -notlike "*$($change.Marker)*" })
+            $removed += @($g['hooks']).Count - $kept.Count
+            if ($kept.Count -eq 0) { [void]$groups.Remove($g) } else { $g['hooks'] = $kept }
+        }
+        $details.Add("$($change.Event): removed $removed $($change.Marker) hook(s)")
+        if ($change.Enable) {
+            $group = [ordered]@{}
+            if ($change.Matcher) { $group['matcher'] = $change.Matcher }
+            $group['hooks'] = @([ordered]@{ type = 'command'; command = $change.Command; timeout = $change.Timeout })
+            $groups.Add($group)
+            $details.Add("$($change.Event): added $($change.Marker)")
+        }
+        if ($groups.Count -gt 0) { $hooks[$change.Event] = $groups.ToArray() } else { [void]$hooks.Remove($change.Event) }
     }
-
-    $detail = "removed $removed existing router hook(s)"
-    if ($EnableSkillRouterHook) {
-        $groups.Add([ordered]@{ hooks = @([ordered]@{
-            type = 'command'
-            command = "pwsh -NoProfile -File `"$scriptPath`" -Hook"
-            timeout = $HookTimeoutSec
-        }) })
-        $detail += '; added router hook'
-    }
-    if ($groups.Count -gt 0) { $hooks['UserPromptSubmit'] = $groups.ToArray() } else { [void]$hooks.Remove('UserPromptSubmit') }
     if ($hooks.Count -eq 0) { [void]$settings.Remove('hooks') }
 
+    $detail = $details -join '; '
     if ($PSCmdlet.ShouldProcess($SettingsPath, $detail)) {
         New-Item -ItemType Directory -Path (Split-Path -Parent $SettingsPath) -Force | Out-Null
         if (Test-Path -LiteralPath $SettingsPath) {
@@ -123,7 +140,7 @@ if ($EnableSkillRouterHook -or $DisableSkillRouterHook) {
     }
     $results.Add([pscustomobject]@{ Action = 'settings'; Target = $SettingsPath; Detail = $detail })
     if ($EnableSkillRouterHook -and -not $env:TYPESAFE_API_KEY) {
-        Write-Warning 'TYPESAFE_API_KEY is not set in this session.  The hook stays silent (fails open) until it is set in the environment Claude Code starts from.'
+        Write-Warning 'TYPESAFE_API_KEY is not set in this session.  The router hook stays silent (fails open) until it is set in the environment Claude Code starts from.'
     }
 }
 

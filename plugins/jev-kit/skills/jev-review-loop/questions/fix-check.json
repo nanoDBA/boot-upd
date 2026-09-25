@@ -1,0 +1,13 @@
+{
+  "_doc": "D6. State: { finding: { summary }, fix: { diff } }. 'true' on scope_creep / weakens_test means escalate.",
+  "addresses": { "type": "noul", "instructions": "Does `fix.diff` directly correct the problem described in `finding.summary`?" },
+  "scope_creep": {
+    "type": "noul",
+    "instructions": "Does `fix.diff` change behavior unrelated to `finding.summary` (other features, refactors, formatting of untouched code, new dependencies)?",
+    "criteria": { "true": "It changes something the finding did not ask for", "false": "Every changed line serves the fix or its test" }
+  },
+  "weakens_test": {
+    "type": "noul",
+    "instructions": "Does `fix.diff` delete, skip, loosen, or rewrite an existing test assertion so that it passes more easily?"
+  }
+}

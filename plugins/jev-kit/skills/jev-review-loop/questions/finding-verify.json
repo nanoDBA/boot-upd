@@ -1,0 +1,16 @@
+{
+  "_doc": "D4. State: { finding: { lens, severity, summary, evidence }, code: { file, excerpt } }. The script adds a 'duplicate_of' choice at runtime (open finding ids + 'new'). The evidence string-match check runs in code first.",
+  "verdict": {
+    "type": "choice",
+    "instructions": "Read `code.excerpt`. Does it support the claim in `finding.summary`?",
+    "criteria": {
+      "supported": "The excerpt shows the problem the claim describes",
+      "unsupported": "The excerpt neither shows nor rules out the problem; more context would be needed",
+      "contradicted": "The excerpt shows the claim is wrong: the problem is handled or cannot occur"
+    }
+  },
+  "style_only": {
+    "type": "noul",
+    "instructions": "Is `finding.summary` only about naming, formatting, wording, or personal style, with no effect on behavior, safety, or maintainability risk?"
+  }
+}

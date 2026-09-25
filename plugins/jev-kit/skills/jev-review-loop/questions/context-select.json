@@ -1,0 +1,8 @@
+{
+  "_doc": "D2. State: { change: { node, diff }, passage: { id, relation, text } }. One call per (node, candidate passage).",
+  "needed": {
+    "type": "noul",
+    "instructions": "Would a reviewer need to read `passage.text` to judge whether the change in `change.diff` is correct (for example because it calls the changed code, is called by it, tests it, or documents its behavior)?",
+    "criteria": { "true": "Reading the passage could change the review verdict", "false": "The passage is unrelated or only incidentally mentions the same names" }
+  }
+}

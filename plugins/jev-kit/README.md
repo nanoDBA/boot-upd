@@ -14,6 +14,7 @@ they're versioned and can be installed on any machine.
 | `jev` | One-shot typed questions about a piece of text or JSON, question design rules, and API errors |
 | `jev-triage` | Bulk triage of logs, mail, comments, tickets, and transcripts into routed buckets. Claude reads only what matters |
 | `jev-skill-router` | Picking at most one installed skill per prompt, with an optional fail-open `UserPromptSubmit` hook |
+| `jev-review-loop` | An unattended review → fix → verify loop. Jev decides which code needs review, through which lenses, and at which model tier. It also settles findings and checks fixes, so opus, sonnet, and haiku are spent only where Jev says they matter. It uses a deterministic impact graph, a persisted ledger and state graph (for `/loop` or scheduled runs), and a fail-closed scope guard. The contract is `skills/jev-review-loop/SPEC.md` |
 
 Built-in triage rubrics: `sql-errorlog`, `firewall-log` (OPNsense, Suricata,
 Zenarmor), `email`, `meeting-transcript`, and `feedback` (YouTube, community,
@@ -54,13 +55,16 @@ pwsh -NoProfile -File ./plugins/jev-kit/Install-JevKit.ps1 -WhatIf
 pwsh -NoProfile -File ./plugins/jev-kit/Install-JevKit.ps1
 ```
 
-- The installer replaces only the `jev`, `jev-triage`, and `jev-skill-router`
+- The installer replaces only the `jev`, `jev-triage`, `jev-skill-router`, and `jev-review-loop`
   folders in `~/.claude/skills`. It doesn't touch anything else.
 - `-Destination` takes several directories if other agents read skills from
   somewhere else.
 - `-EnableSkillRouterHook` and `-DisableSkillRouterHook` add or remove the
   router hook in `~/.claude/settings.json`. The installer writes a timestamped
   backup first and leaves other hooks alone.
+- `-EnableReviewScopeGuard` and `-DisableReviewScopeGuard` do the same for the
+  review loop's `PreToolUse` guard. The guard does nothing unless a run is
+  active (`.review-loop/ACTIVE` exists in the project).
 
 ## Companion: TypeSafe's official skill
 
@@ -82,4 +86,8 @@ Invoke-Pester ./plugins/jev-kit/tests
 
 They cover skill frontmatter, script syntax, the manifest versions matching,
 rubric question limits and routing references, local question validation, and
-the rule that an API key never appears in an error message.
+the rule that an API key never appears in an error message. For the review
+loop, they cover the acceptance criteria in `SPEC.md` §11: legal transitions,
+every stop rule, oscillation escalation, falling back to more LLM review when
+Jev is unreachable, rejecting fabricated evidence, the scope guard (active,
+inactive, and fail-closed), and the impact graph.

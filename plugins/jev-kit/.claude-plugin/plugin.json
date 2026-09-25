@@ -1,9 +1,22 @@
 {
   "name": "jev-kit",
-  "version": "1.0.0",
-  "description": "Jev (TypeSafe System One) skills for Claude Code: typed one-shot judgments, bulk log/email/comment triage with deterministic routing, and a Jev-powered skill router.",
-  "author": { "name": "nanoDBA" },
+  "version": "1.1.0",
+  "description": "Jev (TypeSafe System One) skills for Claude Code: typed one-shot judgments, bulk triage with deterministic routing, a Jev-powered skill router, and a Jev-gated unattended review loop that spends frontier-LLM tokens only where Jev says they matter.",
+  "author": {
+    "name": "nanoDBA"
+  },
   "homepage": "https://github.com/nanoDBA/boot-upd/tree/master/plugins/jev-kit",
   "license": "MIT",
-  "keywords": ["jev", "typesafe", "triage", "classification", "logs", "skills", "powershell"]
+  "keywords": [
+    "autonomous",
+    "classification",
+    "code-review",
+    "cost",
+    "jev",
+    "logs",
+    "powershell",
+    "skills",
+    "triage",
+    "typesafe"
+  ]
 }

@@ -1,0 +1,104 @@
+{
+  "_doc": "boot-upd review-loop profile. Live update cycles, task registration, reboots, releases, and beads writes are never unattended (see CLAUDE.md). Lifecycle, launcher, task, mutex, state, and reboot code is always reviewed at opus.",
+  "scope": {
+    "writeScope": "impacted",
+    "allowPushBranch": "^claude/[A-Za-z0-9._/-]+$",
+    "testPaths": [
+      "tests/*"
+    ],
+    "denyWritePaths": [
+      ".git/*",
+      ".github/*",
+      ".claude/settings*.json",
+      ".claude/review-scope.json",
+      ".claude/hooks/*",
+      ".beads/*",
+      ".gitattributes",
+      "LICENSE",
+      "RELEASE_NOTES.md",
+      "*.pfx",
+      "*.p12",
+      "*.key",
+      ".env",
+      ".env.*"
+    ],
+    "denyCommands": [
+      {
+        "pattern": "(?i)(^|[;&|(]\\s*|&\\s*|\\bpwsh\\b[^;&|]*?-File\\s+)[\"']?[.\\\\/\\w-]*(Invoke-BootUpdateCycle|Deploy-BootUpdateCycle|Register-BootUpdateTask|Unregister-BootUpdateTask|Repair-AwsTooling|Install-PowerShell7|Install-UpdCompat|Invoke-UpdBootstrap|Initialize-BootUpdateWebhook|Initialize-BeadsCredential)\\.ps1",
+        "reason": "live-system effect: CLAUDE.md forbids running the updater, registering tasks, installing, or touching credentials unattended"
+      },
+      {
+        "pattern": "(?i)(^|[;&|(]\\s*|&\\s*|\\bcmd(\\.exe)?\\s+/c\\s+)[\\\"']?(\\.[\\\\/])?upd(\\.cmd)?[\\\"']?(\\s|$)",
+        "reason": "the launcher runs the live update cycle"
+      },
+      {
+        "pattern": "(?i)New-Release\\.ps1|\\bgh\\s+release\\b",
+        "reason": "releases are never unattended"
+      },
+      {
+        "pattern": "(?i)Invoke-Beads\\.ps1\\s+(create|update|close|comment|label|remember|export|sync|github)",
+        "reason": "tracker writes are outward-facing; record escalations in the ledger"
+      },
+      {
+        "pattern": "(?i)\\bgit\\s+(reset\\s+--hard|rebase|filter-branch|filter-repo|commit\\s+--amend|branch\\s+-[dD]\\b|tag\\s+-d|clean\\s+-[a-z]*f|checkout\\s+--\\s+\\.|restore\\s+--source)",
+        "reason": "history rewrite or destructive git operation"
+      },
+      {
+        "pattern": "(?i)--no-verify\\b",
+        "reason": "bypassing hooks is out of scope"
+      },
+      {
+        "pattern": "(?i)\\bgh\\s+(pr\\s+(merge|close|review)|repo\\s+(delete|edit))",
+        "reason": "merging or repo administration is out of scope"
+      },
+      {
+        "pattern": "(?i)\\b(Restart-Computer|Stop-Computer|shutdown(\\.exe)?|reboot)\\b",
+        "reason": "live-system effect"
+      },
+      {
+        "pattern": "(?i)\\b(Register|Unregister|Start)-ScheduledTask\\b|\\bschtasks(\\.exe)?\\s+/(create|delete|change|run)",
+        "reason": "scheduled-task changes are a live-system effect"
+      },
+      {
+        "pattern": "(?i)\\bwinget\\s+(install|upgrade|uninstall)|\\bchoco\\s+(install|upgrade)|\\bInstall-(Module|Package|PSResource)\\b|\\bUpdate-Module\\b",
+        "reason": "package installation is a live-system effect"
+      },
+      {
+        "pattern": "(?i)\\bsudo\\b|\\bSet-ExecutionPolicy\\b",
+        "reason": "privilege changes are out of scope"
+      }
+    ]
+  },
+  "gates": [
+    {
+      "name": "test-gates-fast",
+      "command": "pwsh -NoProfile -File ./tools/Invoke-TestGates.ps1 -SkipOsBoundary -SkipPublishedUpgrade",
+      "required": true,
+      "note": "Windows + PowerShell 7. The OS-boundary and published-upgrade gates are skipped here and must be reported as not run."
+    },
+    {
+      "name": "jev-kit-offline",
+      "command": "pwsh -NoProfile -Command \"Invoke-Pester -Path ./plugins/jev-kit/tests -CI\"",
+      "required": false
+    }
+  ],
+  "tiers": {
+    "default": "sonnet",
+    "max": "opus",
+    "alwaysReview": [
+      "Invoke-BootUpdateCycle.ps1",
+      "upd.cmd",
+      "tools/Invoke-UpdLauncher.ps1",
+      "Register-BootUpdateTask.ps1",
+      "Unregister-BootUpdateTask.ps1",
+      "tools/Invoke-UpdBootstrap.ps1"
+    ],
+    "minTierByPath": {
+      "Invoke-BootUpdateCycle.ps1": "opus",
+      "upd.cmd": "opus",
+      "tools/Invoke-UpdLauncher.ps1": "opus",
+      "Register-BootUpdateTask.ps1": "opus"
+    }
+  },
+  "thresholds": {}
+}

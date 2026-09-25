@@ -1,0 +1,36 @@
+{
+  "_doc": "Default review-loop profile. Copy to <repo>/.claude/review-scope.json and tighten per repository. Patterns under scope.denyCommands are .NET regexes matched against the whole Bash command; path globs use PowerShell -like (where * also matches /).",
+  "scope": {
+    "writeScope": "impacted",
+    "allowPushBranch": "^(claude|review)/[A-Za-z0-9._/-]+$",
+    "testPaths": ["tests/*", "test/*", "*/tests/*", "*.Tests.ps1", "*_test.*", "*.test.*", "*.spec.*"],
+    "denyWritePaths": [
+      ".git/*", ".github/*", ".claude/settings*.json", ".claude/review-scope.json", ".claude/hooks/*",
+      "*.pfx", "*.p12", "*.key", ".env", ".env.*", "*secret*", "LICENSE",
+      "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "*.lock"
+    ],
+    "denyCommands": [
+      { "pattern": "(?i)\\bgit\\s+(reset\\s+--hard|rebase|filter-branch|filter-repo|commit\\s+--amend|branch\\s+-[dD]\\b|tag\\s+-d|clean\\s+-[a-z]*f|checkout\\s+--\\s+\\.|restore\\s+--source)", "reason": "history rewrite or destructive git operation" },
+      { "pattern": "(?i)--no-verify\\b", "reason": "bypassing hooks is out of scope" },
+      { "pattern": "(?i)\\bgh\\s+(pr\\s+(merge|close|review)|release|repo\\s+(delete|edit))", "reason": "merging, releasing, or repo administration is out of scope" },
+      { "pattern": "(?i)\\b(npm|pnpm|yarn|pip|uv|cargo|dotnet|choco|winget|apt(-get)?|brew)\\s+(install|add|update|upgrade|publish|i)\\b", "reason": "dependency or package changes are out of scope" },
+      { "pattern": "(?i)\\bInstall-(Module|Package|PSResource)\\b|\\bUpdate-Module\\b", "reason": "module installation is out of scope" },
+      { "pattern": "(?i)\\b(Restart-Computer|Stop-Computer|shutdown(\\.exe)?|reboot|systemctl\\s+(reboot|poweroff))\\b", "reason": "live-system effect" },
+      { "pattern": "(?i)\\b(Register|Unregister)-ScheduledTask\\b|\\bschtasks(\\.exe)?\\s+/(create|delete|change|run)", "reason": "scheduled-task changes are a live-system effect" },
+      { "pattern": "(?i)\\bsudo\\b|\\bSet-ExecutionPolicy\\b|\\bchmod\\s+-R\\s+777\\b", "reason": "privilege changes are out of scope" },
+      { "pattern": "(?i)\\brm\\s+-[a-z]*r[a-z]*f?\\s+(/|~|\\$HOME|\\.\\.)(\\s|$)|Remove-Item\\s+.*-Recurse.*\\s(/|~|\\$HOME|C:\\\\)(\\s|$)", "reason": "recursive delete outside the working tree" },
+      { "pattern": "(?i)(curl|wget|iwr|Invoke-WebRequest|irm|Invoke-RestMethod)[^|;&]*\\|\\s*(sh|bash|iex|Invoke-Expression|pwsh)", "reason": "piping downloaded code into a shell" },
+      { "pattern": "(?i)\\b(terraform\\s+(apply|destroy)|kubectl\\s+(apply|delete|patch)|docker\\s+push|helm\\s+(install|upgrade|delete))\\b", "reason": "infrastructure change" }
+    ]
+  },
+  "gates": [
+    { "name": "pester-offline", "command": "pwsh -NoProfile -Command \"Invoke-Pester -Path ./tests -CI\"", "required": true }
+  ],
+  "tiers": {
+    "default": "sonnet",
+    "max": "opus",
+    "alwaysReview": [],
+    "minTierByPath": {}
+  },
+  "thresholds": {}
+}

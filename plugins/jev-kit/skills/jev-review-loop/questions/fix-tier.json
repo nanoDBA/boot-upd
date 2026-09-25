@@ -1,0 +1,14 @@
+{
+  "_doc": "D5. State: { finding: { lens, severity, summary }, code: { file, excerpt } }.",
+  "tier": {
+    "type": "choice",
+    "instructions": "Which is the cheapest model that can write a correct, minimal fix for `finding.summary` in `code.excerpt`?",
+    "criteria": {
+      "haiku": "A mechanical, local edit whose correct form is obvious",
+      "sonnet": "A standard fix needing care with surrounding logic",
+      "opus": "A fix touching state, concurrency, security, or several call sites, where a wrong fix is costly"
+    }
+  },
+  "mechanical": { "type": "noul", "instructions": "Can `finding.summary` be fixed by a local edit of a few lines whose correct form is obvious from `code.excerpt` alone?" },
+  "high_stakes": { "type": "noul", "instructions": "Could a wrong fix for `finding.summary` cause data loss, a security exposure, an unrecoverable machine, or damage to production systems?" }
+}

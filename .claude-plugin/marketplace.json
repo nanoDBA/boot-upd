@@ -1,13 +1,17 @@
 {
   "name": "nanodba",
-  "owner": { "name": "nanoDBA" },
-  "metadata": { "description": "Portable Claude Code plugins maintained alongside boot-upd." },
+  "owner": {
+    "name": "nanoDBA"
+  },
+  "metadata": {
+    "description": "Portable Claude Code plugins maintained alongside boot-upd."
+  },
   "plugins": [
     {
       "name": "jev-kit",
       "source": "./plugins/jev-kit",
-      "description": "Jev (TypeSafe) skills: typed judgments, bulk triage, skill routing.",
-      "version": "1.0.0",
+      "description": "Jev (TypeSafe) skills: typed judgments, bulk triage, skill routing, Jev-gated unattended code review.",
+      "version": "1.1.0",
       "category": "productivity"
     }
   ]

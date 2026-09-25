@@ -1,0 +1,50 @@
+{
+  "_doc": "D1 + D3. State: { change: { file, node, kind, diff }, neighbors: { callers: [], callees: [] }, notes }. One call per frontier node; every question answered in parallel. 'true' always means 'spend review effort'.",
+  "lens_correctness": { "type": "noul", "instructions": "Could the change in `change.diff` alter program behavior in a way that produces wrong results, wrong branches, or broken edge cases (null/empty input, off-by-one, wrong comparison, inverted condition)?" },
+  "lens_security": { "type": "noul", "instructions": "Does the change in `change.diff` touch credentials, secrets, authentication, permissions, input that reaches a shell or query, file paths from outside input, network endpoints, or logging that could leak sensitive values?" },
+  "lens_error_handling": { "type": "noul", "instructions": "Does the change in `change.diff` add, remove, or alter error handling, exit codes, retries, timeouts, or what happens when a called command fails?" },
+  "lens_concurrency": { "type": "noul", "instructions": "Does the change in `change.diff` involve state that survives the process (files, registry, scheduled tasks, locks, mutexes, databases), parallel execution, or code that may run twice after a crash or reboot?" },
+  "lens_resources": { "type": "noul", "instructions": "Does the change in `change.diff` create, open, register, or allocate something (files, handles, processes, tasks, temp directories, connections) that must later be cleaned up?" },
+  "lens_contract_drift": { "type": "noul", "instructions": "Does the change in `change.diff` alter a parameter, output shape, file format, command-line syntax, or documented behavior that callers listed in `neighbors.callers` or documentation may depend on?" },
+  "lens_test_gap": { "type": "noul", "instructions": "Does the change in `change.diff` add or alter behavior that a reasonable test suite would need a new or updated test to cover?" },
+  "trivial_change": {
+    "type": "noul",
+    "instructions": "Is the change in `change.diff` limited to comments, whitespace, formatting, spelling in prose, or renaming a local variable, with no possible effect on behavior?",
+    "criteria": { "true": "Only comments, whitespace, formatting, prose spelling, or a purely local rename", "false": "Anything else, including any change to logic, strings used at runtime, parameters, or configuration values" }
+  },
+  "high_stakes": {
+    "type": "noul",
+    "instructions": "Could a defect in this change cause data loss, a security exposure, an unbootable or unrecoverable machine, money loss, or damage to production systems?"
+  },
+  "change_kind": {
+    "type": "choice",
+    "instructions": "What kind of change is `change.diff`?",
+    "criteria": {
+      "cosmetic": "Comments, whitespace, formatting, prose only",
+      "refactor": "Restructures code with intended identical behavior",
+      "logic": "Changes what the code does",
+      "new_code": "Adds a new function, script, or feature",
+      "config": "Changes configuration, manifests, or data files",
+      "tests_docs": "Changes only tests or documentation"
+    }
+  },
+  "risk": {
+    "type": "score",
+    "instructions": "How likely is it that the change in `change.diff` contains a defect a careful reviewer would want fixed?",
+    "criteria": [
+      "Very unlikely: mechanical, cosmetic, or trivially verifiable",
+      "Unlikely: small, local, easy to reason about",
+      "Plausible: non-trivial logic or several interacting parts",
+      "Likely: complex, stateful, security-relevant, or subtle"
+    ]
+  },
+  "tier": {
+    "type": "choice",
+    "instructions": "Which is the cheapest reviewer that will not miss a real defect in `change.diff`?",
+    "criteria": {
+      "haiku": "Small, local, mechanical change a quick reader can fully check",
+      "sonnet": "Ordinary logic change needing careful but standard review",
+      "opus": "Subtle, stateful, concurrent, security-relevant, or cross-cutting change needing deep reasoning"
+    }
+  }
+}

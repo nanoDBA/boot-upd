@@ -15,7 +15,7 @@ BeforeAll {
 }
 
 Describe 'jev-kit skills' {
-    It 'ships valid frontmatter for <_>' -ForEach @('jev', 'jev-triage', 'jev-skill-router') {
+    It 'ships valid frontmatter for <_>' -ForEach @('jev', 'jev-triage', 'jev-skill-router', 'jev-review-loop') {
         $source = Get-Content (Join-Path $skillsRoot "$_/SKILL.md") -Raw
         $source | Should -Match "(?s)\A---\r?\nname: $_\r?\ndescription: .{80,}?\r?\n---\r?\n"
     }
