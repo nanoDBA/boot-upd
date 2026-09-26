@@ -1,8 +1,7 @@
-# Boot Update Cycle - Release Notes
+# Boot Update Cycle — Release Notes
 
-**Latest published version:** v2.5.82
-**Next version:** v2.5.83
-**Status:** CANDIDATE — headless VM acceptance is blocked by lab disk capacity.
+**Latest published version:** v2.5.83
+**Status:** RELEASED — scoped AWS repair; VM validation includes disclosed headless deferrals.
 
 ---
 
@@ -10,34 +9,34 @@
 
 ### Fixed
 
-- Laptop diagnostics recorded Winget success for `Amazon.AWSCLI` and repeated
-  Chocolatey `awscli` failure (MSI `1603`). This is evidence for the known AWS CLI
-  package pair, not proof that the providers caused the installer failure. The repair
-  plan now describes that evidence and, for a non-checksum failure, leads with
-  `choco uninstall awscli -y --skip-autouninstaller --skip-powershell` to remove only
-  Chocolatey's package metadata, followed by `upd`. AWS CLI failures without that
-  Winget success evidence lead with `upd aws`. Package IDs are validated before they
-  can enter a command, and checksum failures continue to offer no command until a
-  person verifies the hashes.
-- Ordinary unnumbered Winget `Found ... [Package.Id]` output now retains its success
+- AWS repair guidance distinguishes a direct AWS CLI failure from the exact
+  cross-manager case where Winget reports `Amazon.AWSCLI` successful but Chocolatey
+  reports `awscli` failed. Only for that pair, the repair plan offers
+  `choco uninstall awscli -y --skip-autouninstaller --skip-powershell` to remove
+  Chocolatey's package record; it asks the operator to confirm the installed product
+  and never runs the command automatically. Checksum failures offer no command pending
+  hash verification. The disposable fixture verified uninstall-script suppression and
+  external-file retention; it does not prove behavior for Chocolatey hooks or AWS
+  publisher rollover. Direct AWS CLI failures without that Winget success evidence point
+  to `upd aws`.
+- Ordinary unnumbered Winget `Found ... [Package.Id]` output now preserves its success
   identity across checkpoint/resume. Related product names, preview editions, and
   launcher packages are not treated as interchangeable package identities.
+- The README puts the quick start before navigation and screenshots, warns about
+  administrator rights and immediate restarts before installation, and explains that
+  the install prompt starts `upd` by default while `plan` previews without changes.
 
 ### Validation
 
-- Publication is on hold. The interactive VM and scoped AWS repair fixture passed,
-  but Hyper-V paused the headless VM after its backing disk ran out of space.
-  Final convergence and cleanup remain unverified; the multi-reboot gate is
-  **PARTIAL**, not PASS. See [candidate validation](docs/validation-aws-repair-2.5.83.md).
-- The GitHub quick start now appears before screenshots and explains the install
-  prompt, immediate reboot behavior, and read-only preview without burying the first run.
-
-- Added a disposable Chocolatey fixture with a normal-uninstall control to verify
-  that record removal suppresses package uninstall scripts and retains the external
-  application fixture. It does not establish AWS publisher-rollover behavior.
-- Progress tests separate deadline behavior from frame cadence and account for the
-  animation palette wrapping during long waits.
-
+- Pre-release GitHub CI for `3f20003` passed **608 tests**: [run 36252566075](https://github.com/nanoDBA/boot-upd/actions/runs/36252566075). CI does not replace VM evidence.
+- Focused regressions: **12 passed**, including a real checkpoint file write/read.
+- Chocolatey package-script suppression and external-file retention fixture: **PASS** within its documented scope; it is not live AWS publisher-rollover evidence.
+- Fresh interactive A: **SCOPED PASS** — 4 passes and 3 claimed/observed reboots; hashes match, state is absent, tasks are 0, CBS is clear, and all five health checks passed. Evidence: `A-release-final-20ce892b295d47fca942660365160534`.
+- Fresh headless SYSTEM B: **COMPLETED WITH DEFERRED INVENTORY (PARTIAL)** — 5 passes and 3 claimed/observed reboots; hashes match, state is absent, tasks are 0, CBS is clear, and all five health checks passed. Evidence: `B-release-final-03fd1bb381b74fab9525e17ee7f4ced1`.
+- B recorded deferred user-scope Winget, Scoop, and VS Code work because no interactive user appeared. Windows Update KB5007651 remained applicable after one successful install and was recorded as deferred inventory. B completed and removed both continuation tasks, but it did not establish full convergence.
+- A's initial deploy task recorded `0xC000013A`, consistent with termination at the first reboot; that cause is inferred because Scheduler events were not exported. Do not blanket-whitelist it. Follow-up: [#81](https://github.com/nanoDBA/boot-upd/issues/81).
+- B's Task Scheduler Operational export scanned a bounded 2,000 events and matched 44; its lookback began before the run. It corroborates final task removal but is not a complete event history.
+- Full evidence and coverage limits: [AWS CLI repair validation](docs/validation-aws-repair-2.5.83.md).
 ## v2.5.82 (2026-09-20)
 
 ### Fixed

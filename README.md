@@ -230,7 +230,7 @@ has exited**. It verifies the installer against the hash embedded below, then th
 verifies and transactionally replaces the complete release bundle before forwarding `aws`:
 
 ```powershell
-$u='https://github.com/nanoDBA/boot-upd/releases/download/v2.5.82/Install-UpdCompat.ps1'; $f=Join-Path $env:TEMP 'Install-UpdCompat-v2.5.82.ps1'; Invoke-WebRequest $u -OutFile $f; if((Get-FileHash $f -Algorithm SHA256).Hash -ne '67662B3B02252FF6DE045FCDF28FB74D8DEB6FDA8080C46B1DAFC7BFBE54ABE3'){throw 'Compatibility installer hash mismatch'}; & $f -CommandArguments aws
+$u='https://github.com/nanoDBA/boot-upd/releases/download/v2.5.83/Install-UpdCompat.ps1'; $f=Join-Path $env:TEMP 'Install-UpdCompat-v2.5.83.ps1'; Invoke-WebRequest $u -OutFile $f; if((Get-FileHash $f -Algorithm SHA256).Hash -ne '67662B3B02252FF6DE045FCDF28FB74D8DEB6FDA8080C46B1DAFC7BFBE54ABE3'){throw 'Compatibility installer hash mismatch'}; & $f -CommandArguments aws
 ```
 
 This is the one-time chicken-and-egg escape hatch. It resolves the first `upd.cmd` on PATH,
@@ -512,14 +512,14 @@ No. AWS tooling is opt-in. `upd aws` explicitly modernizes AWS CLI v2 and modula
 `upd --aws-tooling` includes that phase in the complete update cycle. Use the preservation flags
 only when an older script genuinely depends on legacy modules, not because old versions look lonely.
 
-In the **v2.5.83 candidate** (not yet published), an AWS CLI repair plan points to
-`upd aws`. If Winget reports
-`Amazon.AWSCLI` successful while Chocolatey reports `awscli` failed, the plan offers a
-metadata-only Chocolatey cleanup command and asks you to confirm the installed product first.
-The updater does not remove that package record automatically; follow the exact command and
-note in the repair plan. Checksum mismatches withhold repair commands pending hash
-verification. The latest published release remains v2.5.82; see the
-[release notes](RELEASE_NOTES.md) for candidate status.
+For a direct AWS CLI failure, the repair plan points to `upd aws`. If Winget reports
+`Amazon.AWSCLI` successful while Chocolatey reports `awscli` failed, the plan offers the
+exact command `choco uninstall awscli -y --skip-autouninstaller --skip-powershell` to remove
+only Chocolatey's package record, after asking you to confirm the installed product. The
+updater never runs that command automatically. Checksum mismatches withhold repair commands
+pending hash verification. The disposable fixture verified uninstall-script suppression and
+external-file retention; it does not establish behavior for Chocolatey hooks or AWS publisher
+rollover. See the [release notes](RELEASE_NOTES.md) and [v2.5.83 validation report](docs/validation-aws-repair-2.5.83.md).
 
 ### Can I see everything without the console becoming a novel?
 
@@ -613,7 +613,7 @@ This means Visual Studio can install for 45 minutes (busy CPU = fine), but a hun
 
 ## Testing
 
-Testing is split into explicit confidence gates rather than a single test count. See [Testing Boot Update Cycle](docs/TESTING.md), or run `./tools/Invoke-TestGates.ps1` from an elevated PowerShell 7 console.
+Testing is split into explicit confidence gates rather than a single test count. See [Testing Boot Update Cycle](docs/TESTING.md) and the [v2.5.83 AWS repair validation](docs/validation-aws-repair-2.5.83.md), or run `./tools/Invoke-TestGates.ps1` from an elevated PowerShell 7 console.
 
 ## License
 
