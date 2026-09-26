@@ -20,7 +20,7 @@ Fixes the AWS CLI repair instructions for machines where Winget reports a succes
 
 608 tests passed, along with the User/SYSTEM and launcher checks. The published installer also passed [fresh-install and legacy-repair tests](https://github.com/nanoDBA/boot-upd/actions/runs/36260989149).
 
-Interactive testing passed, with four passes and three reboots. The headless VM completed five passes and three reboots, but deferred user-only updates and a Windows update that remained offered after installation. Both cleaned up their resume tasks and saved state. The overall VM result is **PARTIAL**, not a claim that everything was patched.
+The interactive VM passed its checks after four update passes and three reboots. The headless VM completed five passes and three reboots, but deferred user-only updates and a Windows update that remained offered after installation. Both cleaned up their resume tasks and saved state. The overall VM result is **PARTIAL**, not a claim that everything was patched.
 
 The Chocolatey test checked that uninstall scripts stayed suppressed and an external application file remained. It was not a live AWS publisher-rollover test. Full results, the initial launcher-exit caveat, and remaining coverage gaps are in the [validation report](docs/validation-aws-repair-2.5.83.md).
 

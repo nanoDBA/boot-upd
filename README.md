@@ -95,7 +95,7 @@ Switch with `BOOT_UPDATE_SPLASH_THEME=0|1|2`.
 
 ## Updater in action
 
-The default `Normal` view stays zoomed out while the animated `BOOT//PULSE` row shows the current operation:
+The default `Normal` view shows a summary, with the current operation in the animated `BOOT//PULSE` row:
 
 <img src="docs/img/updater-progress.png" alt="Boot Update Cycle resumed after reboot, reusing a verified Windows Update assessment and refreshing Defender in the compact Normal console view" width="900">
 
@@ -270,8 +270,7 @@ export includes all three log streams and fails closed if its identity, network,
 redaction checks detect material that should not leave the machine. Its single absolute
 ZIP path is displayed and copied to the Windows clipboard for easy attachment.
 
-Because AWS maintenance is opt-in, `upd aws` fully modernizes the requested tooling by
-default: it verifies the current Amazon-signed modular modules, then removes validated
+By default, `upd aws` verifies the current Amazon-signed modular modules, then removes validated
 older modular versions and legacy `AWSPowerShell*` version directories. Use
 `upd aws --keep-aws-legacy --keep-aws-old` only when compatibility requires preserving them.
 
@@ -321,8 +320,8 @@ repair plan without changing the convergence claim.
 
 ### Reliability lineage
 
-The reboot design intentionally borrows proven boundaries instead of treating every registry
-artifact as equally authoritative:
+These projects and Windows APIs informed the reboot handling and the distinction between
+blocking reboot signals and advisory registry entries:
 
 - [Boxstarter](https://github.com/chocolatey-community/boxstarter) checkpoints around package work and recognizes provider-native reboot results rather than restarting an entire provisioning plan from zero.
 - [Microsoft DSC](https://learn.microsoft.com/powershell/dsc/configurations/reboot-a-node) resumes dependency-ordered resources after reboot and makes pending-file-rename checks policy-selectable.
@@ -578,13 +577,13 @@ Package managers get killed if they're truly stuck, but busy installs are left a
 
 - **Idle timeout (5 min)**: If the entire process tree (winget + msiexec + setup.exe + children) has zero CPU activity for 5 minutes, it's stuck — kill it
 - **Hard timeout (configurable)**: Absolute ceiling regardless of activity
-- **Timed-out packages retry next boot** — not lost, just delayed
+- **Timed-out packages retry next boot**
 
 This means Visual Studio can install for 45 minutes (busy CPU = fine), but a hung winget source refresh gets killed in 5 minutes (zero CPU = stuck).
 
 ## Testing
 
-Testing is split into explicit confidence gates rather than a single test count. See [Testing Boot Update Cycle](docs/TESTING.md) and the [v2.5.83 AWS repair validation](docs/validation-aws-repair-2.5.83.md), or run `./tools/Invoke-TestGates.ps1` from an elevated PowerShell 7 console.
+Tests cover unit behavior, User/SYSTEM execution, and published-launcher compatibility separately. See [Testing Boot Update Cycle](docs/TESTING.md) and the [v2.5.83 AWS repair validation](docs/validation-aws-repair-2.5.83.md), or run `./tools/Invoke-TestGates.ps1` from an elevated PowerShell 7 console.
 
 ## License
 
