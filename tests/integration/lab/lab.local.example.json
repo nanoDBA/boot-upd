@@ -1,0 +1,14 @@
+{
+  "CredentialTarget": "boot-upd-lab-guest",
+  "GuestUser": "updtest",
+  "SourceRoot": "C:\\Path\\To\\boot-upd",
+  "EvidenceRoot": "C:\\HyperV\\evidence",
+  "ModuleCachePath": "C:\\HyperV\\module-cache.zip",
+  "ModuleCacheSha256": "",
+  "Guests": [
+    {
+      "Name": "lab-a",
+      "Checkpoint": "fresh"
+    }
+  ]
+}

@@ -54,7 +54,9 @@ if (-not (Test-Path -LiteralPath $xml)) { throw "No autounattend.xml in $SourceD
 . (Join-Path $PSScriptRoot 'LabCredential.ps1')
 $labPassword = Get-BootUpdLabPassword
 if (-not $labPassword) {
-    throw 'No lab guest password available. Store one with: . ./LabCredential.ps1; Set-BootUpdLabPassword -Generate'
+    Initialize-BootUpdLabCredential
+    $labPassword = Get-BootUpdLabPassword
+    if (-not $labPassword) { throw 'Lab credential initialization did not produce a retrievable credential.' }
 }
 $rendered = Join-Path ([IO.Path]::GetTempPath()) ('unattend-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $rendered -Force | Out-Null

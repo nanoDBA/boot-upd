@@ -23,6 +23,9 @@ Use `-SkipOsBoundary` only on a non-elevated development machine and report that
 
 ## Multi-reboot VM matrix
 
+For existing guests, credentials, local configuration, source manifests, and exact
+row commands, start with the [lab handoff runbook](../tests/integration/lab/HANDOFF.md).
+
 Before releasing changes to checkpointing, tasks, reboot detection, mutexes, provider convergence, or final cleanup, exercise at least:
 
 - Windows 10 and Windows 11 where supported;

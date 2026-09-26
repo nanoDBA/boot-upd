@@ -6,11 +6,16 @@ cleanup. These scripts build and drive that lab on Hyper-V.
 
 ## Setup
 
+**Reusing existing VMs? Start with [the handoff runbook](HANDOFF.md)** and the
+ignored `lab.local.json` / `HANDOFF.local.md` beside it. Do not recreate a guest or
+generate a replacement password simply because this is a new agent session.
+The read-only `Test-LabReadiness.ps1` checks this machine's setup without changing it.
+
+For a new lab only, from this directory in elevated PowerShell 7:
+
 ```powershell
-$env:BOOTUPD_LAB_PASSWORD = '<a throwaway password for the guest>'
+. ./LabCredential.ps1; Initialize-BootUpdLabCredential
 ./New-UnattendIso.ps1                       # renders the template, builds unattend.iso
-# One-time: store the disposable guest credential where it survives the session.
-. ./LabCredential.ps1; Set-BootUpdLabPassword -Generate
 
 ./New-LabGuest.ps1 -Name lab-a -Checkpoint fresh
 ./Invoke-LabRow.ps1 -VMName lab-a -Row A -Checkpoint fresh -ArmReboots 3
@@ -20,7 +25,7 @@ $env:BOOTUPD_LAB_PASSWORD = '<a throwaway password for the guest>'
 ./Invoke-LabRow.ps1 -VMName lab-a -Row B -Checkpoint headless -SystemContext -ArmReboots 1
 ```
 
-The guest password is supplied through `BOOTUPD_LAB_PASSWORD` and never committed. The
+The guest password is stored in Windows Credential Manager and never committed. The
 tracked answer file carries `__LAB_PASSWORD__` and the ISO builder substitutes it into a
 temporary copy that is deleted afterwards.
 

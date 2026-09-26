@@ -1,6 +1,8 @@
 # Dev scratch files
 scratch.ps1
 testResults.xml
+tests/integration/lab/lab.local.json
+tests/integration/lab/*.local.md
 
 # Temp cleanup utilities (not part of the tool)
 DEL_ALL*.CMD

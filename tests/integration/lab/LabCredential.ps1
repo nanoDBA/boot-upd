@@ -44,6 +44,27 @@ function ConvertTo-BootUpdLabSecureString {
     ConvertTo-SecureString $Value -AsPlainText -Force
 }
 
+function Get-BootUpdLabStoredCredential {
+    param([Parameter(Mandatory)][string]$Target)
+
+    try {
+        return [CredentialManagement.Store]::Load($Target, [CredentialManagement.CredentialType]::Generic, $false)
+    } catch {
+        # 1168 is ERROR_NOT_FOUND: an absent credential is expected during first-time setup.
+        if ($_.Exception.InnerException.NativeErrorCode -eq 1168) { return $null }
+        throw
+    }
+}
+
+function Set-BootUpdLabStoredCredential {
+    param(
+        [Parameter(Mandatory)][System.Management.Automation.PSCredential]$Credential,
+        [Parameter(Mandatory)][string]$Target
+    )
+
+    BetterCredentials\Set-Credential -Credential $Credential -Target $Target -Type Generic -Persistence LocalComputer | Out-Null
+}
+
 function Get-BootUpdLabPassword {
     <# Returns the plain password, or $null when nothing is stored. Order: the environment
        variable first as a deliberate override, then Credential Manager. #>
@@ -53,20 +74,15 @@ function Get-BootUpdLabPassword {
     if ($env:BOOTUPD_LAB_PASSWORD) { return $env:BOOTUPD_LAB_PASSWORD }
 
     Initialize-BootUpdLabCredentialModule
-    try {
-        $stored = [CredentialManagement.Store]::Load($Target, [CredentialManagement.CredentialType]::Generic, $false)
-    } catch {
-        # 1168 is ERROR_NOT_FOUND: no such credential, which is not an error here.
-        if ($_.Exception.InnerException.NativeErrorCode -eq 1168) { return $null }
-        throw
-    }
+    $stored = Get-BootUpdLabStoredCredential -Target $Target
     if (-not $stored) { return $null }
     return $stored.GetNetworkCredential().Password
 }
 
 function Set-BootUpdLabPassword {
-    <# Stores the guest password for future sessions. With -Generate, invents one and returns
-       it, so a rebuild never needs a human to choose or retype a value.
+    <# Stores the guest password for future sessions. With -Generate, invents one. It does not
+       write the plaintext to the pipeline unless -RevealGeneratedPassword is explicitly used.
+       Existing credentials are preserved unless -Replace is explicitly used.
 
        The generated alphabet excludes characters that would have to be escaped somewhere in
        the chain this password travels: an unattend XML document, a PowerShell string, and a
@@ -77,6 +93,8 @@ function Set-BootUpdLabPassword {
     param(
         [string]$Password,
         [switch]$Generate,
+        [switch]$Replace,
+        [switch]$RevealGeneratedPassword,
         [int]$Length = 28,
         [string]$UserName = 'updtest',
         [string]$Target = $script:BootUpdLabCredentialTarget
@@ -84,16 +102,53 @@ function Set-BootUpdLabPassword {
 
     if ($Generate) {
         if ($Password) { throw 'Pass -Password or -Generate, not both.' }
+        if ($Length -lt 1) { throw '-Length must be greater than zero.' }
         $alphabet = 'abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789-_'
         $bytes = [byte[]]::new($Length)
         [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
         $Password = -join ($bytes | ForEach-Object { $alphabet[$_ % $alphabet.Length] })
     }
     if (-not $Password) { throw 'Nothing to store: pass -Password or -Generate.' }
+    if ($RevealGeneratedPassword -and -not $Generate) {
+        throw '-RevealGeneratedPassword is only valid with -Generate.'
+    }
 
     Initialize-BootUpdLabCredentialModule
+    $existing = Get-BootUpdLabStoredCredential -Target $Target
+    if ($existing -and -not $Replace) {
+        throw "A lab credential already exists for target '$Target'. It was left unchanged; pass -Replace only when intentionally rotating or migrating the guest credential."
+    }
+
     $credential = [System.Management.Automation.PSCredential]::new(
         $UserName, (ConvertTo-BootUpdLabSecureString $Password))
-    BetterCredentials\Set-Credential -Credential $credential -Target $Target -Type Generic -Persistence LocalComputer | Out-Null
-    return $Password
+    Set-BootUpdLabStoredCredential -Credential $credential -Target $Target
+    if ($Generate -and $RevealGeneratedPassword) { return $Password }
+}
+
+function Initialize-BootUpdLabCredential {
+    <# Ensures the default lab guest credential exists for future sessions. Existing stored
+       credentials are reused unchanged. This deliberately reads Credential Manager directly,
+       so BOOTUPD_LAB_PASSWORD is never persisted as a side effect. #>
+    [CmdletBinding()]
+    param(
+        [string]$Target = $script:BootUpdLabCredentialTarget,
+        [string]$UserName = 'updtest',
+        [int]$Length = 28,
+        [switch]$PassThru
+    )
+
+    Initialize-BootUpdLabCredentialModule
+    $existing = Get-BootUpdLabStoredCredential -Target $Target
+    $created = $false
+    if (-not $existing) {
+        Set-BootUpdLabPassword -Generate -Length $Length -UserName $UserName -Target $Target
+        $created = $true
+    }
+
+    if ($PassThru) {
+        return [pscustomobject]@{
+            Created = $created
+            Target  = $Target
+        }
+    }
 }

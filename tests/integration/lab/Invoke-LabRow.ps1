@@ -26,7 +26,7 @@ param(
     [Parameter(Mandatory)][string]$VMName,
     [Parameter(Mandatory)][string]$Row,
     [string]$Checkpoint   = 'staged',
-    [string]$SourceRoot   = 'G:\My Drive\backups\projects\boot-upd',
+    [string]$SourceRoot   = (Resolve-Path (Join-Path $PSScriptRoot '../../..')).Path,
     [string]$EvidenceRoot = 'C:\HyperV\evidence',
     [int]$ArmReboots      = 0,
     [string]$GuestUser    = 'updtest',
@@ -49,7 +49,11 @@ param(
        already has PowerShell 7 wants. 'upd' runs upd.cmd under cmd.exe instead: that is the
        documented fresh-install path, and the only one that works on a guest with Windows
        PowerShell 5.1 only, since pwsh.exe does not exist there for a task to execute. #>
-    [ValidateSet('deploy','upd')][string]$Launcher = 'deploy'
+    [ValidateSet('deploy','upd')][string]$Launcher = 'deploy',
+    [string]$CredentialTarget = 'boot-upd-lab-guest',
+    [string]$ModuleCachePath = '',
+    [string]$ModuleCacheSha256 = '',
+    [string]$ScreenCaptureScript = ''
 )
 
 function Test-LabCompletionEvidence {
@@ -63,14 +67,63 @@ function Test-LabCompletionEvidence {
 }
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'LabCredential.ps1')
-if (-not $GuestPassword) { $GuestPassword = Get-BootUpdLabPassword }
+if (-not $GuestPassword) { $GuestPassword = Get-BootUpdLabPassword -Target $CredentialTarget }
 if (-not $GuestPassword) {
     throw 'No lab guest password available. Store one with: . ./LabCredential.ps1; Set-BootUpdLabPassword -Generate'
 }
 $cred = New-Object System.Management.Automation.PSCredential($GuestUser,
         (ConvertTo-BootUpdLabSecureString $GuestPassword))
-$evidenceDir = Join-Path $EvidenceRoot ("{0}-{1}-{2}" -f $Row, $VMName, (Get-Date -Format 'yyyyMMdd-HHmmss'))
+if ($Row -notmatch '^[A-Za-z0-9][A-Za-z0-9_.-]*$') { throw 'Row must be a simple label, not a path.' }
+$SourceRoot = (Resolve-Path -LiteralPath $SourceRoot).Path.TrimEnd('\','/')
+if ($ModuleCachePath) {
+    if ($ModuleCacheSha256 -notmatch '^[A-Fa-f0-9]{64}$') { throw 'Module cache requires an explicit SHA256.' }
+    if ((Get-FileHash -LiteralPath $ModuleCachePath).Hash -ne $ModuleCacheSha256) { throw 'Host module cache hash mismatch.' }
+}
+elseif ($ModuleCacheSha256) { throw 'ModuleCacheSha256 requires ModuleCachePath.' }
+if ($ScreenCaptureScript -and -not (Test-Path -LiteralPath $ScreenCaptureScript -PathType Leaf)) {
+    throw 'ScreenCaptureScript does not exist.'
+}
+$vm = Get-VM -Name $VMName -ErrorAction Stop
+$lockRoot = Join-Path $env:ProgramData 'BootUpdateCycle-Lab/locks'
+New-Item -ItemType Directory -Path $lockRoot -Force | Out-Null
+$lockPath = Join-Path $lockRoot ($vm.Id.ToString() + '.lock')
+try { $lease = [IO.File]::Open($lockPath, 'OpenOrCreate', 'ReadWrite', 'Read') }
+catch { throw "Cannot acquire exclusive VM lease at $lockPath. Another row may own this guest." }
+$manifest = $null
+try {
+if ((Get-VM -Name $VMName).State -ne 'Off') { throw 'Cold restore requires guest Off. Inspect any existing run before shutting it down.' }
+$snapshots = @(Get-VMSnapshot -VMName $VMName -Name $Checkpoint -ErrorAction Stop)
+if ($snapshots.Count -ne 1 -or $snapshots[0].State -ne 'Off') {
+    throw 'Choose exactly one cold (Off) checkpoint; saved running-state checkpoints are not supported.'
+}
+$sourceNames = @(& git -C $SourceRoot -c core.quotepath=false ls-files --cached --others --exclude-standard)
+if ($LASTEXITCODE -ne 0 -or $sourceNames.Count -eq 0) { throw 'SourceRoot must be a populated Git checkout.' }
+$files = @($sourceNames | Where-Object { $_ -notmatch '^\.beads/|(^|/)lab\.local\.json$|\.local\.md$' -and
+    (Test-Path -LiteralPath (Join-Path $SourceRoot $_) -PathType Leaf) } |
+    ForEach-Object { Get-Item -LiteralPath (Join-Path $SourceRoot $_) -ErrorAction Stop })
+$sourceHashes = @($files | ForEach-Object {
+    [ordered]@{ Path=[IO.Path]::GetRelativePath($SourceRoot,$_.FullName); Sha256=(Get-FileHash -LiteralPath $_.FullName).Hash }
+})
+$runId = [guid]::NewGuid().ToString('N')
+$evidenceDir = Join-Path $EvidenceRoot ("{0}-{1}" -f $Row, $runId)
 New-Item -ItemType Directory -Path $evidenceDir -Force | Out-Null
+$manifestPath = Join-Path $evidenceDir 'run-manifest.json'
+$manifest = [ordered]@{
+    RunId=$runId; StartedAtUtc=[datetime]::UtcNow.ToString('o'); Status='Running'; HostPid=$PID
+    VM=$VMName; Checkpoint=$Checkpoint; SourceRoot=$SourceRoot; EvidenceDir=$evidenceDir
+    SourceCommit=(& git -C $SourceRoot rev-parse HEAD 2>$null | Select-Object -First 1)
+    SourceStatus=@(& git -C $SourceRoot status --porcelain 2>$null)
+    OrchestratorSha256=(Get-FileHash (Join-Path $SourceRoot 'Invoke-BootUpdateCycle.ps1')).Hash
+    HarnessSha256=(Get-FileHash $PSCommandPath).Hash
+    Launcher=$Launcher; DeployArgs=$DeployArgs; ArmReboots=$ArmReboots
+    SystemContext=[bool]$SystemContext; TimeoutMinutes=$TimeoutMinutes; SkipSync=[bool]$SkipSync
+    ModuleCacheSha256=$ModuleCacheSha256; InjectWhen=$InjectWhen; InjectionConfigured=[bool]$InjectAction
+    SourceFiles=$sourceHashes
+    InjectionAction=if ($InjectAction) { $InjectAction.ToString() } else { $null }
+}
+$manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $manifestPath
+$owner = [Text.Encoding]::UTF8.GetBytes(($manifest | ConvertTo-Json -Depth 5))
+$lease.SetLength(0); $lease.Write($owner,0,$owner.Length); $lease.Flush()
 function Say { param($m) Write-Host ("[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $m) -ForegroundColor Cyan }
 
 Say "row $Row on $VMName from checkpoint '$Checkpoint'"
@@ -110,8 +163,7 @@ Say 'guest ready'
 
 if (-not $SkipSync) {
     Say 'syncing working tree'
-    $files = Get-ChildItem -LiteralPath $SourceRoot -Recurse -File |
-             Where-Object { $_.FullName -notmatch '\\\.git\\|\\\.beads\\|\\testResults\.xml' }
+    # The manifest and transfer use the same Git-listed, non-ignored file set.
     <# Two ways in, because one of them does not work on every guest.
 
        PowerShell Direct sessions are the fast path, but a PowerShell 7 host negotiates the
@@ -176,6 +228,15 @@ if (-not $SkipSync) {
             Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
         }
     }
+    Invoke-Command -VMName $VMName -Credential $cred -ArgumentList (, $sourceHashes) -ScriptBlock {
+        param($ExpectedFiles)
+        foreach ($expected in $ExpectedFiles) {
+            $target = Join-Path 'C:\Lab\boot-upd' $expected.Path
+            if ((Get-FileHash -LiteralPath $target -ErrorAction Stop).Hash -ne $expected.Sha256) {
+                throw "Transferred file differs from run manifest: $($expected.Path)"
+            }
+        }
+    } | Out-Null
     $hash = Invoke-Command -VMName $VMName -Credential $cred -ScriptBlock { (Get-FileHash 'C:\Lab\boot-upd\Invoke-BootUpdateCycle.ps1' -Algorithm SHA256).Hash }
     $hostHash = (Get-FileHash (Join-Path $SourceRoot 'Invoke-BootUpdateCycle.ps1') -Algorithm SHA256).Hash
     <# One file, named for what it is: this proves the orchestrator matches, and both copy
@@ -184,6 +245,54 @@ if (-not $SkipSync) {
     Say "synced $($files.Count) files, orchestrator hash verified"
 }
 
+if ($ModuleCachePath) {
+Say 'provisioning verified host module cache before Deploy'
+Enable-VMIntegrationService -VMName $VMName -Name 'Guest Service Interface' -ErrorAction Stop
+for ($copyAttempt=1; $copyAttempt -le 3; $copyAttempt++) {
+    try {
+        Copy-VMFile -Name $VMName -SourcePath $ModuleCachePath -DestinationPath 'C:\Lab\prerequisite-modules.zip' -CreateFullPath -FileSource Host -Force -ErrorAction Stop
+        break
+    } catch {
+        if ($copyAttempt -eq 3) { throw }
+        Say "guest copy service not ready; retry $copyAttempt of 3"
+        Start-Sleep -Seconds 10
+    }
+}
+$moduleProof = Invoke-Command -VMName $VMName -Credential $cred -ErrorAction Stop -ArgumentList $ModuleCacheSha256 -ScriptBlock {
+    param($ExpectedHash)
+    if ((Get-FileHash 'C:\Lab\prerequisite-modules.zip').Hash -ne $ExpectedHash) { throw 'Module cache transfer hash mismatch' }
+    Expand-Archive -LiteralPath 'C:\Lab\prerequisite-modules.zip' -DestinationPath 'C:\Program Files\PowerShell\Modules' -Force
+    $probe = {
+        $proof = foreach ($name in @('PSWindowsUpdate','BurntToast')) {
+            $module = Get-Module -ListAvailable $name | Sort-Object Version -Descending | Select-Object -First 1
+            if (-not $module) { throw "Required module $name unavailable in deployment PowerShell 7" }
+            [pscustomobject]@{Name=$name;Version=[string]$module.Version;Path=$module.ModuleBase;PSVersion=$PSVersionTable.PSVersion.ToString()}
+        }
+        ConvertTo-Json -InputObject @($proof)
+    }
+    & 'C:\Program Files\PowerShell\7\pwsh.exe' -NoProfile -ExecutionPolicy Bypass -Command $probe
+    if ($LASTEXITCODE -ne 0) { throw 'Module prerequisite probe failed under PowerShell 7' }
+}
+$moduleProof | Set-Content (Join-Path $evidenceDir 'module-prerequisites.json')
+Say 'required modules available before deployment'
+}
+Invoke-Command -VMName $VMName -Credential $cred -ErrorAction Stop -ScriptBlock {
+    $before=Get-WinEvent -ListLog 'Microsoft-Windows-TaskScheduler/Operational'
+    & wevtutil.exe sl 'Microsoft-Windows-TaskScheduler/Operational' /e:true
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot enable scheduler evidence' }
+    [pscustomobject]@{TimeUtc=[datetime]::UtcNow.ToString('o');WasEnabled=$before.IsEnabled;NowEnabled=(Get-WinEvent -ListLog 'Microsoft-Windows-TaskScheduler/Operational').IsEnabled}
+} | ConvertTo-Json | Set-Content (Join-Path $evidenceDir 'scheduler-instrument.json')
+Invoke-Command -VMName $VMName -Credential $cred -ErrorAction Stop -ScriptBlock {
+    $root = 'C:\ProgramData\BootUpdateCycle'
+    if (Test-Path -LiteralPath (Join-Path $root 'BootUpdateCycle.state.json')) { throw 'Baseline contains active updater state.' }
+    $archive = Join-Path $root ('pre-lab-run-' + [guid]::NewGuid().ToString('N'))
+    if (Test-Path -LiteralPath $root) {
+        New-Item -ItemType Directory -Path $archive -Force | Out-Null
+        Get-ChildItem -LiteralPath $root -File -Filter '*.log' | ForEach-Object {
+            Move-Item -LiteralPath $_.FullName -Destination $archive -Force
+        }
+    }
+} | Out-Null
 if ($ArmReboots -gt 0) {
     Say "arming $ArmReboots real pending reboot(s)"
     Invoke-Command -VMName $VMName -Credential $cred -ArgumentList $ArmReboots -ScriptBlock {
@@ -380,7 +489,10 @@ if ($evidence.ActiveStateJson) { $evidence.ActiveStateJson | Set-Content (Join-P
 ConvertTo-Json -InputObject @($evidence.UpdaterProcesses) -Depth 3 | Set-Content (Join-Path $evidenceDir 'updater-processes.json')
 $evidence.Log | Set-Content (Join-Path $evidenceDir 'BootUpdateCycle.log')
 if ($evidence.DeployOutput.Count) { $evidence.DeployOutput | Set-Content (Join-Path $evidenceDir 'deploy-output.txt') }
-& 'C:\HyperV\Get-VmScreen.ps1' -VMName $VMName -Path (Join-Path $evidenceDir 'console.png') | Out-Null
+ConvertTo-Json -InputObject @($evidence.OsBootTimes) | Set-Content (Join-Path $evidenceDir 'os-boot-times.json')
+if ($ScreenCaptureScript) {
+    & $ScreenCaptureScript -VMName $VMName -Path (Join-Path $evidenceDir 'console.png') | Out-Null
+}
 
 <# Completed is a fact about the machine, not about whether a poll happened to catch it.
 
@@ -445,3 +557,13 @@ $summary = [pscustomobject]@{
 }
 $summary | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $evidenceDir 'summary.json')
 $summary
+$manifest.Status = 'Collected'
+} finally {
+    try {
+    if ($manifest) {
+        if ($manifest.Status -eq 'Running') { $manifest.Status = 'InterruptedOrFailed' }
+        $manifest['EndedAtUtc'] = [datetime]::UtcNow.ToString('o')
+        $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $manifestPath
+    }
+    } finally { $lease.Dispose() }
+}
