@@ -11,36 +11,24 @@ behind is how software becomes folklore.
 [![PowerShell 7+](https://img.shields.io/badge/PowerShell-7%2B-5391FE?logo=powershell&logoColor=white)](#requirements)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-<img src="docs/img/splash-theme0.png" alt="Boot Update Cycle splash — neon gradient theme" width="684">
-
-<a id="navigate"></a>
-## 🧭 Navigate
-
-- [Quick start](#quick-start)
-- [Which command do I want?](#which-command-do-i-want)
-- [See it in action](#updater-in-action)
-- [What it updates](#what-it-updates)
-- [Commands](#friendly-launcher)
-- [How reboot/resume works](#what-happens)
-- [Status and recovery](#status-and-recovery)
-- [Common questions](#common-questions)
-- [Security model](#security-model)
-- [Configuration](#configuration) · [Testing](#testing)
-
 <a id="quick-start"></a>
 ## 🚀 Quick start
 
-Open **Windows PowerShell as Administrator**, paste this command, and press Enter. Yes,
-PowerShell—not Command Prompt wearing a PowerShell command as a hat:
+**Windows 10/11 · Windows PowerShell · Administrator rights.** Save your work first:
+`upd` can restart Windows immediately when an update requires it. Use `run --delay 120`
+at the installer prompt for a two-minute warning (`shutdown /a` cancels a pending restart).
+
+Paste this in elevated Windows PowerShell to install the verified release and choose the
+first command:
 
 ```powershell
 [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; & ([ScriptBlock]::Create((Invoke-RestMethod -UseBasicParsing -TimeoutSec 30 'https://github.com/nanoDBA/boot-upd/releases/latest/download/Install-UpdCompat.ps1'))) -PromptForArguments
 ```
 
-After the compatibility installer starts, it verifies every runtime asset against the
-release bundle's SHA256 sidecars before installing the runtime bundle. At the
-prompt, press Enter to use the defaults. After installation, everyday use is deliberately
-short:
+The installer verifies the runtime files against the release's SHA256 sidecars, then asks
+what to run. Press Enter (the default) to start `upd` now; type `plan` for a read-only
+preview, or `help` to browse commands. A normal run resumes after any required reboot.
+For later runs, the command is simply:
 
 ```powershell
 upd          # update, reboot when required, and resume automatically
@@ -48,6 +36,31 @@ upd status   # show the current checkpoint and continuation tasks
 upd logs     # create a sanitized support ZIP on the Desktop
 upd help     # commands, short aliases, and every option
 ```
+
+<a id="navigate"></a>
+## 🧭 Navigate
+
+- [Which command do I want?](#which-command-do-i-want)
+- [See it in action](#updater-in-action)
+- [What it updates](#what-it-updates)
+- [Commands](#friendly-launcher)
+- [Install and recovery details](#install-details-and-compatibility)
+- [How reboot/resume works](#what-happens)
+- [Status and recovery](#status-and-recovery)
+- [Common questions](#common-questions)
+- [Security model](#security-model)
+- [Configuration](#configuration) · [Testing](#testing)
+
+<img src="docs/img/splash-theme0.png" alt="Boot Update Cycle splash — neon gradient theme" width="684">
+
+<details>
+<summary>The other two splash themes</summary>
+
+<img src="docs/img/splash-theme1.png" alt="Boot Update Cycle outline dither theme" width="684">
+
+<img src="docs/img/splash-theme2.png" alt="Boot Update Cycle classic 16-color theme" width="684">
+
+</details>
 
 ### Which command do I want?
 
@@ -61,11 +74,6 @@ upd help     # commands, short aliases, and every option
 | Tell me what is happening | `upd status` | Read the checkpoint, continuation tasks, and Winget quarantine records |
 | Package evidence for support | `upd logs` | Create a sanitized ZIP and copy its full path to the clipboard |
 | Just admire the pixels | `upd fun 12` | Splash parade and live animation; absolutely no useful work, proudly |
-
-> [!IMPORTANT]
-> `upd` installs software and can restart Windows immediately by default. Save your work
-> first, or use `upd -r 120` for a two-minute reboot warning. Cancel a pending restart with
-> `shutdown /a`.
 
 Want to look around without changing the machine? These commands are read-only and do not
 request elevation. Suspicion is healthy; production has taught us all things.
@@ -83,16 +91,8 @@ runtime asset. Checksums protect integrity but are not publisher signatures. See
 [Security model](#security-model) and the [version-pinned recovery path](#install-details-and-compatibility)
 before using it in a controlled environment.
 
-The BBS-style splash defaults to the neon gradient theme above; two more ship with it (`upd splash` previews them all; switch with `BOOT_UPDATE_SPLASH_THEME=0|1|2`):
-
-<details>
-<summary>The other two themes</summary>
-
-<img src="docs/img/splash-theme1.png" alt="Boot Update Cycle outline dither theme" width="684">
-
-<img src="docs/img/splash-theme2.png" alt="Boot Update Cycle classic 16-color theme" width="684">
-
-</details>
+The BBS-style splash defaults to the neon gradient theme; `upd splash` previews all three.
+Switch with `BOOT_UPDATE_SPLASH_THEME=0|1|2`.
 
 ## Updater in action
 
@@ -230,7 +230,7 @@ has exited**. It verifies the installer against the hash embedded below, then th
 verifies and transactionally replaces the complete release bundle before forwarding `aws`:
 
 ```powershell
-$u='https://github.com/nanoDBA/boot-upd/releases/download/v2.5.83/Install-UpdCompat.ps1'; $f=Join-Path $env:TEMP 'Install-UpdCompat-v2.5.83.ps1'; Invoke-WebRequest $u -OutFile $f; if((Get-FileHash $f -Algorithm SHA256).Hash -ne '67662B3B02252FF6DE045FCDF28FB74D8DEB6FDA8080C46B1DAFC7BFBE54ABE3'){throw 'Compatibility installer hash mismatch'}; & $f -CommandArguments aws
+$u='https://github.com/nanoDBA/boot-upd/releases/download/v2.5.82/Install-UpdCompat.ps1'; $f=Join-Path $env:TEMP 'Install-UpdCompat-v2.5.82.ps1'; Invoke-WebRequest $u -OutFile $f; if((Get-FileHash $f -Algorithm SHA256).Hash -ne '67662B3B02252FF6DE045FCDF28FB74D8DEB6FDA8080C46B1DAFC7BFBE54ABE3'){throw 'Compatibility installer hash mismatch'}; & $f -CommandArguments aws
 ```
 
 This is the one-time chicken-and-egg escape hatch. It resolves the first `upd.cmd` on PATH,
@@ -511,6 +511,15 @@ and then a reversible blocking pin. Use `upd status` to see it and `upd uq Packa
 No. AWS tooling is opt-in. `upd aws` explicitly modernizes AWS CLI v2 and modular AWS.Tools;
 `upd --aws-tooling` includes that phase in the complete update cycle. Use the preservation flags
 only when an older script genuinely depends on legacy modules, not because old versions look lonely.
+
+In the **v2.5.83 candidate** (not yet published), an AWS CLI repair plan points to
+`upd aws`. If Winget reports
+`Amazon.AWSCLI` successful while Chocolatey reports `awscli` failed, the plan offers a
+metadata-only Chocolatey cleanup command and asks you to confirm the installed product first.
+The updater does not remove that package record automatically; follow the exact command and
+note in the repair plan. Checksum mismatches withhold repair commands pending hash
+verification. The latest published release remains v2.5.82; see the
+[release notes](RELEASE_NOTES.md) for candidate status.
 
 ### Can I see everything without the console becoming a novel?
 

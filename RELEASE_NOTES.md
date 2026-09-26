@@ -1,8 +1,8 @@
 # Boot Update Cycle - Release Notes
 
-**Current Version:** v2.5.83
-**Release Date:** 2026-09-26
-**Status:** STABLE
+**Latest published version:** v2.5.82
+**Next version:** v2.5.83
+**Status:** CANDIDATE — headless VM acceptance is blocked by lab disk capacity.
 
 ---
 
@@ -24,6 +24,13 @@
   launcher packages are not treated as interchangeable package identities.
 
 ### Validation
+
+- Publication is on hold. The interactive VM and scoped AWS repair fixture passed,
+  but Hyper-V paused the headless VM after its backing disk ran out of space.
+  Final convergence and cleanup remain unverified; the multi-reboot gate is
+  **PARTIAL**, not PASS. See [candidate validation](docs/validation-aws-repair-2.5.83.md).
+- The GitHub quick start now appears before screenshots and explains the install
+  prompt, immediate reboot behavior, and read-only preview without burying the first run.
 
 - Added a disposable Chocolatey fixture with a normal-uninstall control to verify
   that record removal suppresses package uninstall scripts and retains the external
