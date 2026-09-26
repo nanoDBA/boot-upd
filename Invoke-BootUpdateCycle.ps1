@@ -394,7 +394,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 6 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.82' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.83' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 Set-Variable -Name 'RebootSignalSettleSeconds' -Value 20 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 $script:ExplicitRebootRequests = [System.Collections.Generic.List[object]]::new()
 $script:LastPendingFileRenameOperations = @()
@@ -1123,14 +1123,15 @@ function Get-WingetOutputSummary {
         # --no-vt. Normalize before matching so failures cannot become false green.
         $line = ([string]$rawLine) -replace "`e\[[0-?]*[ -/]*[@-~]", ''
         $line = $line.Trim()
-        if ($line -match '^\((\d+)/(\d+)\)\s+Found\s+(.+?)\s+\[([^\]]+)\](?:\s+Version\s+(\S+))?') {
-            $attempted = [math]::Max($attempted, [int]$Matches[2])
+        if ($line -match '^(?:\((\d+)/(\d+)\)\s+)?Found\s+(.+?)\s+\[([^\]]+)\](?:\s+Version\s+(\S+))?') {
+            if ($Matches[2]) { $attempted = [math]::Max($attempted, [int]$Matches[2]) }
             $currentName = $Matches[3].Trim()
             $currentId = $Matches[4].Trim()
-            $currentVersion = if ($Matches.Count -gt 5) { $Matches[5].Trim() } else { '' }
+            $currentVersion = if ($Matches[5]) { $Matches[5].Trim() } else { '' }
         } elseif ($line -match '^Successfully installed(?:\.|\s|$)') {
             $updated++
             if ($currentId -and -not $successfulIds.Contains($currentId)) { $successfulIds.Add($currentId) }
+            $currentId = ''
         } elseif ($line -match '^(?:Uninstall|Installer) failed with exit code:\s*(0x[0-9A-Fa-f]+|-?\d+)') {
             $rawCode = $Matches[1]
             $code = if ($rawCode -match '^0x') { [long][Convert]::ToUInt32($rawCode.Substring(2), 16) } else { [long]$rawCode }
@@ -1141,6 +1142,7 @@ function Get-WingetOutputSummary {
             }
             if ($code -eq 1605) { $staleAbsent.Add($record) }
             else { $failures.Add($record) }
+            $currentId = ''
         } elseif ($line -match '^The package installed for user scope cannot be uninstalled when running with administrator privileges') {
             <# Elevated Winget definitionally cannot replace a user-scope (portable)
                package; retrying from the same elevated context can never succeed. #>
@@ -1203,6 +1205,11 @@ function Test-WingetExitReconciled {
         ([int]$Summary.Updated + $accounted) -ge [int]$Summary.Attempted)
 }
 
+function Test-BootUpdateSafePackageId {
+    param([AllowEmptyString()][AllowNull()][string]$PackageId)
+    return (-not [string]::IsNullOrEmpty($PackageId) -and $PackageId -match '^[A-Za-z0-9][A-Za-z0-9._+-]*$')
+}
+
 function Get-WingetRemediationCommand {
     <# PackageId is deliberately not Mandatory: a Mandatory [string] parameter makes
        PowerShell reject an empty string during binding, before this function's own
@@ -1211,12 +1218,12 @@ function Get-WingetRemediationCommand {
        whose output never printed the "(N/M) Found ... [Id]" header). #>
     param([AllowEmptyString()][AllowNull()][string]$PackageId,[long]$Code = 0)
     # Never echo arbitrary provider output into a shell command.
-    if ([string]::IsNullOrEmpty($PackageId) -or $PackageId -notmatch '^[A-Za-z0-9][A-Za-z0-9._+-]*$') { return $null }
+    if (-not (Test-BootUpdateSafePackageId -PackageId $PackageId)) { return $null }
     <# A Winget-reported AWS CLI failure is, by definition, not "dual-managed by Winget and
        Chocolatey" (that classification requires a Winget SUCCESS in this session). The
        launcher's dedicated AWS CLI repair (tools/Repair-AwsTooling.ps1, invoked as
        `upd aws`) is the correct first step for either manager's own AWS CLI failure. #>
-    if ($PackageId -in @('awscli', 'Amazon.AWSCLI')) { return 'upd aws' }
+    if ($PackageId -eq 'Amazon.AWSCLI') { return 'upd aws' }
     $verb = if ($Code -eq 1612) { 'repair' } else { 'install' }
     return "winget $verb --id $PackageId -e --source winget --force --accept-source-agreements --accept-package-agreements"
 }
@@ -2125,9 +2132,9 @@ function New-BootUpdateStateV2 {
         WingetAggressiveRepairSignatures = @()
         WingetQuarantines       = @()
         <# Package IDs Winget reported "Successfully installed" for this session, across
-           every pass since the checkpoint. Detects a product registered with both Winget
-           and Chocolatey: the Winget success may have happened in an earlier same-boot
-           pass, so this must survive a resume rather than living in a per-run variable. #>
+           every pass since the checkpoint. The AWS CLI repair note uses this evidence
+           only for the explicit Amazon.AWSCLI/awscli provider-ID pair, and it must
+           survive a same-boot resume rather than living in a per-run variable. #>
         WingetUpdatedIds      = @()
         ResumeUser            = $null
         ResumeUserSid         = $null
@@ -3675,9 +3682,7 @@ function Save-BootUpdateWingetSuccessIds {
     <# Records package IDs Winget reported "Successfully installed" for this session,
        merged onto whatever the state already holds. A same-boot resume runs this pass
        in a fresh process, so an earlier pass's success is only visible here because it
-       was persisted to $State rather than kept in a per-run variable. Merge, not
-       replace: dropping an earlier pass's evidence would make dual-manager detection
-       depend on which pass happens to observe the Chocolatey failure. #>
+       was persisted to $State rather than kept in a per-run variable. #>
     param(
         [pscustomobject]$State,
         [object[]]$Ids = @()
@@ -4070,26 +4075,12 @@ function Get-ChocolateyOutputSummary {
     return [pscustomobject]@{ Failures = $failures.ToArray() }
 }
 
-function Test-BootUpdateDualManagedPackageMatch {
-    <# Diagnostics 2026-09-25: Winget's machine phase upgraded Amazon.AWSCLI successfully,
-       then Chocolatey's awscli package tried to install over the same product and its MSI
-       returned 1603 on every pass. One product was registered with two package managers;
-       comparing package identities across providers by exact string never catches this,
-       because Winget and Chocolatey each name the same product differently.
-
-       Normalizes both names (lower-case, strip everything but letters and digits) and
-       reports whether one contains the other. Requires the SHORTER normalized token to be
-       at least 5 characters so a short, generic name cannot false-positive against an
-       unrelated longer name that happens to contain it (e.g. 'git' inside
-       'gitextensions'). #>
-    param([string]$NameA, [string]$NameB)
-    $tokenA = ([string]$NameA).ToLowerInvariant() -replace '[^a-z0-9]', ''
-    $tokenB = ([string]$NameB).ToLowerInvariant() -replace '[^a-z0-9]', ''
-    if (-not $tokenA -or -not $tokenB) { return $false }
-    if ($tokenA.Length -le $tokenB.Length) { $shorter = $tokenA; $longer = $tokenB }
-    else { $shorter = $tokenB; $longer = $tokenA }
-    if ($shorter.Length -lt 5) { return $false }
-    return $longer.Contains($shorter)
+function Test-BootUpdateAwsCliPackagePair {
+    <# These are the exact IDs used by the two providers for AWS CLI. Do not infer
+       product identity from display names or substring overlap; package names such as
+       python and Python.Launcher are distinct identities. #>
+    param([AllowNull()][string]$ChocolateyId, [AllowNull()][string]$WingetId)
+    return ($ChocolateyId -eq 'awscli' -and $WingetId -eq 'Amazon.AWSCLI')
 }
 
 function Complete-ChocolateyFailureClassification {
@@ -4142,19 +4133,22 @@ function Complete-ChocolateyFailureClassification {
             } else {
                 Format-NativeExitCode ([long]$_.Code)
             }
-            <# Same product registered with both Winget and Chocolatey: Winget already
-               updated it successfully this session (persisted state, so an earlier
-               same-boot pass still counts), so the state facts and options are "let one
-               manager own it" — never --force or --ignore-checksums. #>
-            $wingetIds = if ($State.PSObject.Properties.Name -contains 'WingetUpdatedIds') { @($State.WingetUpdatedIds) } else { @() }
-            $dualManagedId = @($wingetIds | Where-Object { Test-BootUpdateDualManagedPackageMatch -NameA $name -NameB $_ })[0]
+            <# The explicit AWS CLI pair is a narrow evidence pattern, not proof of why
+               Chocolatey's installer failed. Offer a metadata-only record removal only
+               when Winget success was reported and the package ID is safe to use. #>
             $command = ''
             $note = ''
-            if ($dualManagedId) {
-                $command = "choco uninstall $name -y --skip-autouninstaller"
-                $note = "$name is registered with both Winget and Chocolatey (Winget id $dualManagedId already updated it this session). --skip-autouninstaller removes only Chocolatey's package record; the Winget-installed program stays."
-            } elseif (Test-BootUpdateDualManagedPackageMatch -NameA $name -NameB 'awscli') {
-                $command = 'upd aws'
+            # Checksum failures require human verification before any command is offered,
+            # per ADR-0001, even if another provider reported a successful update.
+            if (-not $expected -and (Test-BootUpdateSafePackageId -PackageId $name)) {
+                $wingetIds = if ($State.PSObject.Properties.Name -contains 'WingetUpdatedIds') { @($State.WingetUpdatedIds) } else { @() }
+                $dualManagedId = @($wingetIds | Where-Object { Test-BootUpdateAwsCliPackagePair -ChocolateyId $name -WingetId ([string]$_) })[0]
+                if ($dualManagedId) {
+                    $command = 'choco uninstall awscli -y --skip-autouninstaller --skip-powershell'
+                    $note = 'Winget reported success for Amazon.AWSCLI and Chocolatey reported failure for awscli. These are the known AWS CLI package IDs; confirm the installed product before removing only Chocolatey metadata.'
+                } elseif ($name -eq 'awscli') {
+                    $command = 'upd aws'
+                }
             }
             [pscustomobject]@{
                 Name=$name

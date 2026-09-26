@@ -77,6 +77,8 @@ BeforeAll {
           'Wait-BootUpdateInstallerMutex',
           'New-BootUpdateStateV2',
           'Update-BootUpdateStateSchema',
+          'Get-BootUpdateState',
+          'Set-BootUpdateState',
           'Update-BootUpdateResumeIdentity',
           'Resolve-BootUpdateResumeAccount',
           'Update-BootUpdateUserIdentityWait',
@@ -86,7 +88,8 @@ BeforeAll {
           'Get-WingetInventoryPackageIds',
           'Get-WingetOutputSummary',
           'Get-ChocolateyOutputSummary',
-          'Test-BootUpdateDualManagedPackageMatch',
+          'Test-BootUpdateAwsCliPackagePair',
+          'Test-BootUpdateSafePackageId',
           'Complete-ChocolateyFailureClassification',
           'Test-WingetExitReconciled',
           'Get-WingetRemediationCommand',
@@ -2704,29 +2707,18 @@ Describe 'Chocolatey terminal failure classification' {
     }
 }
 
-Describe 'Dual-managed Winget and Chocolatey package detection' {
-    <# Diagnostics 2026-09-25 (laptop, v2.5.82): Winget's machine phase upgraded
-       Amazon.AWSCLI successfully ("0 attempted, 1 updated, 0 failed"), then Chocolatey's
-       awscli package tried to install 2.37.1 over the same product and its MSI returned
-       1603 on three consecutive passes. One product was registered with two package
-       managers; the operator fix is to let Winget keep servicing it and remove only
-       Chocolatey's package record. #>
-
-    It 'matches normalized package identities across managers' {
-        Test-BootUpdateDualManagedPackageMatch -NameA 'awscli' -NameB 'Amazon.AWSCLI' | Should -BeTrue
+Describe 'Explicit Winget and Chocolatey package identity handling' {
+    It 'maps only the explicit AWS CLI provider ID pair' {
+        Test-BootUpdateAwsCliPackagePair -ChocolateyId 'awscli' -WingetId 'Amazon.AWSCLI' | Should -BeTrue
+        Test-BootUpdateAwsCliPackagePair -ChocolateyId 'python' -WingetId 'Python.Launcher' | Should -BeFalse
+        Test-BootUpdateAwsCliPackagePair -ChocolateyId 'powershell' -WingetId 'Microsoft.PowerShell.Preview' | Should -BeFalse
+        Test-BootUpdateAwsCliPackagePair -ChocolateyId 'awscli-tools' -WingetId 'Amazon.AWSCLI' | Should -BeFalse
     }
 
-    It 'never matches a token shorter than 5 characters, even as a substring' {
-        Test-BootUpdateDualManagedPackageMatch -NameA 'git' -NameB 'gitextensions' | Should -BeFalse
-    }
-
-    It 'does not match unrelated package names' {
-        Test-BootUpdateDualManagedPackageMatch -NameA 'notepadplusplus' -NameB 'Amazon.AWSCLI' | Should -BeFalse
-    }
-
-    It 'treats an empty or missing name as no match' {
-        Test-BootUpdateDualManagedPackageMatch -NameA '' -NameB 'Amazon.AWSCLI' | Should -BeFalse
-        Test-BootUpdateDualManagedPackageMatch -NameA $null -NameB 'Amazon.AWSCLI' | Should -BeFalse
+    It 'rejects shell metacharacters from provider package IDs' {
+        Test-BootUpdateSafePackageId -PackageId 'awscli' | Should -BeTrue
+        Test-BootUpdateSafePackageId -PackageId 'python&python' | Should -BeFalse
+        Get-WingetRemediationCommand -PackageId 'python&python' -Code 1603 | Should -BeNullOrEmpty
     }
 
     It 'produces the dual-managed repair for a Chocolatey awscli failure Winget already updated' {
@@ -2738,8 +2730,8 @@ Describe 'Dual-managed Winget and Chocolatey package detection' {
 
         $second.TerminalFailure | Should -BeTrue
         $detail = @($second.Details)[0]
-        $detail.Command | Should -Be 'choco uninstall awscli -y --skip-autouninstaller'
-        $detail.Note | Should -Match 'both Winget and Chocolatey'
+        $detail.Command | Should -Be 'choco uninstall awscli -y --skip-autouninstaller --skip-powershell'
+        $detail.Note | Should -Match 'Chocolatey reported failure for awscli'
         $detail.Note | Should -Match 'Amazon\.AWSCLI'
     }
 
@@ -2757,7 +2749,7 @@ Describe 'Dual-managed Winget and Chocolatey package detection' {
 
     It 'leads with upd aws for a non-dual-managed Winget awscli failure' {
         Get-WingetRemediationCommand -PackageId 'Amazon.AWSCLI' -Code 1603 | Should -Be 'upd aws'
-        Get-WingetRemediationCommand -PackageId 'awscli' -Code 1603 | Should -Be 'upd aws'
+        Get-WingetRemediationCommand -PackageId 'awscli' -Code 1603 | Should -Match '^winget install'
     }
 
     It 'keeps today''s plan for an unrelated package failure' {
@@ -2778,29 +2770,71 @@ Describe 'Dual-managed Winget and Chocolatey package detection' {
         $items = @(
             [pscustomobject]@{
                 Name = 'awscli'; Id = 'awscli'; Code = 1603; Hex = '0x00000643'
-                Command = 'choco uninstall awscli -y --skip-autouninstaller'
-                Note = 'awscli is registered with both Winget and Chocolatey (Winget id Amazon.AWSCLI already updated it this session).'
+                Command = 'choco uninstall awscli -y --skip-autouninstaller --skip-powershell'
+                Note = 'Winget reported success for Amazon.AWSCLI and Chocolatey reported failure for awscli.'
             }
         )
 
         $result = Write-BootUpdateRepairPlan -Items $items
         $lines = Get-Content -LiteralPath $result.Path
 
-        ($lines -join "`n") | Should -Match 'both Winget and Chocolatey'
+        ($lines -join "`n") | Should -Match 'Chocolatey reported failure for awscli'
         $blockStart = [array]::IndexOf($lines, 'COPY/PASTE BLOCK — ELEVATED COMMAND PROMPT') + 1
         $block = @($lines | Select-Object -Skip $blockStart | Where-Object { $_ -notmatch '^REM' })
-        $block[0] | Should -Be 'choco uninstall awscli -y --skip-autouninstaller'
+        $block[0] | Should -Be 'choco uninstall awscli -y --skip-autouninstaller --skip-powershell'
         $block[1] | Should -Be 'upd'
     }
 
-    It 'saves Winget success ids onto state so a same-boot resume can still see them' {
-        $state = [pscustomobject]@{}
-        Mock Set-BootUpdateState { }
+    It 'parses ordinary Winget transcript identity without leaking it to the next success' {
+        $summary = Get-WingetOutputSummary -Lines @(
+            'Found AWS Command Line Interface [Amazon.AWSCLI] Version 2.37.1',
+            'Successfully installed',
+            'Successfully installed'
+        )
+        $summary.Updated | Should -Be 2
+        @($summary.SuccessfulIds) | Should -Be @('Amazon.AWSCLI')
+    }
 
-        Save-BootUpdateWingetSuccessIds -State $state -Ids @('Amazon.AWSCLI')
-        Save-BootUpdateWingetSuccessIds -State $state -Ids @('Amazon.AWSCLI', 'Mozilla.Firefox')
+    It 'carries parsed Winget evidence through persisted state into the failure classifier' {
+        $state = New-BootUpdateStateV2
+        $testStatePath = Join-Path $TestDrive 'state.json'
+        $script:StatePath = $testStatePath
+        $writerText = (Get-FunctionText $invokeAst 'Set-BootUpdateState') -replace 'function Set-BootUpdateState', 'function Set-TestBootUpdateState'
+        . ([scriptblock]::Create($writerText))
+        $saverText = (Get-FunctionText $invokeAst 'Save-BootUpdateWingetSuccessIds') -replace 'function Save-BootUpdateWingetSuccessIds', 'function Save-TestBootUpdateWingetSuccessIds'
+        $saverText = $saverText.Replace('Set-BootUpdateState -State $State', 'Set-TestBootUpdateState -State $State')
+        . ([scriptblock]::Create($saverText))
+        $transcript = Get-WingetOutputSummary -Lines @(
+            'Found AWS Command Line Interface [Amazon.AWSCLI] Version 2.37.1',
+            'Successfully installed'
+        )
+        Save-TestBootUpdateWingetSuccessIds -State $state -Ids $transcript.SuccessfulIds
+        Test-Path -LiteralPath $testStatePath | Should -BeTrue
+        $resumedState = Get-BootUpdateState
+        @($resumedState.WingetUpdatedIds) | Should -Be @('Amazon.AWSCLI')
 
-        @($state.WingetUpdatedIds) | Should -Be @('Amazon.AWSCLI', 'Mozilla.Firefox')
+        $failures = (Get-ChocolateyOutputSummary -Lines @(
+            'awscli v2.37.1 [Approved]', 'Failures', '- awscli (exited -1)'
+        )).Failures
+        $null = Complete-ChocolateyFailureClassification -State $resumedState -Failures $failures
+        $classified = Complete-ChocolateyFailureClassification -State $resumedState -Failures $failures
+        $classified.Details[0].Command | Should -Be 'choco uninstall awscli -y --skip-autouninstaller --skip-powershell'
+    }
+
+    It 'does not insert an invalid Chocolatey package name into a command' {
+        $state = [pscustomobject]@{ WingetUpdatedIds = @('Amazon.AWSCLI') }
+        $result = Complete-ChocolateyFailureClassification -State $state -Failures @(
+            [pscustomobject]@{ Name='python&python'; Code=-1; ExpectedChecksum=''; ActualChecksum='' }
+        )
+        $result.Details[0].Command | Should -BeNullOrEmpty
+    }
+
+    It 'preserves the checksum stop even when Winget reported AWS CLI success' {
+        $state = [pscustomobject]@{ WingetUpdatedIds = @('Amazon.AWSCLI') }
+        $result = Complete-ChocolateyFailureClassification -State $state -Failures @(
+            [pscustomobject]@{ Name='awscli'; Code=-1; ExpectedChecksum='AA'; ActualChecksum='BB' }
+        )
+        $result.Details[0].Command | Should -BeNullOrEmpty
     }
 
     It 'defaults WingetUpdatedIds on a state file written before the field existed' {
