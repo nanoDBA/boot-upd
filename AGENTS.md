@@ -8,6 +8,10 @@ On a new Windows checkout, run `./tools/Initialize-BeadsCredential.ps1` once. It
 
 ## Quick Reference
 
+For public documentation, release notes, or requests to remove AI writing patterns,
+use [humanize-docs](.agents/skills/humanize-docs/SKILL.md). Preserve commands and factual
+qualifications while applying the requested voice.
+
 ```bash
 bd ready              # Find available work
 bd show <id>          # View issue details

@@ -24,9 +24,10 @@ continuation. They are shown only in an interactive user session; SYSTEM resume 
 
 Choose the initial view explicitly with `-OutputMode Quiet|Normal|Verbose|Debug`, or set
 `OutputMode` in `Deploy-BootUpdateCycle.ps1`. The interactive `BOOT//PULSE` row uses a
-classic `| / - \` ASCII propeller with a 112-step, seven-stop theme-zero glow. Cyan, blue,
-magenta, acid green, and electric yellow-green flow through near-black violet and cyan valleys,
-making the pulse discernible at a distance without abrupt flashes. Motion and color advance independently.
+classic `| / - \` ASCII propeller with a 112-step, seven-stop theme-zero gradient. It uses
+cyan, blue, magenta, acid green, and electric yellow-green with near-black violet and cyan.
+The gradual color changes keep the pulse visible at a distance without abrupt flashes.
+Motion and color advance independently.
 At narrower widths the row keeps the operation,
 elapsed time, and `v:NORMAL` mode visible, shortens repeated provider prose, and drops decorative meter
 cells first. Normal and Verbose omit `CPU 0s | 0 proc`; nonzero activity remains visible, while Debug

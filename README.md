@@ -167,7 +167,7 @@ Already installed:
 upd
 ```
 
-That's it. Once installed, `upd` runs from an elevated Command Prompt, PowerShell, or the
+Once installed, `upd` runs from an elevated Command Prompt, PowerShell, or the
 Run dialog (Win+R → `upd` → Ctrl+Shift+Enter). The installer is PowerShell; the installed
 launcher works from any of those entry points.
 
@@ -212,7 +212,7 @@ leading dash; ambiguous dashed forms fail before they can reach the update path.
 names remain available for scripts. Run `upd help` for the commands supported by your
 installed version.
 
-A stable raw-argument bootstrap now checks the latest GitHub release before an operational
+A stable raw-argument bootstrap checks the latest GitHub release before an operational
 command reaches the typed parser. Every executable
 asset must have a valid SHA256 sidecar or the refresh is rejected. These checksums detect
 corruption but are not code-signing signatures. PowerShell files are
@@ -223,8 +223,8 @@ the stale in-memory copy. Use `upd u` to request the refresh explicitly or `-nu`
 automatic check for one run. `upd repair` can bootstrap a missing launcher and repair a
 missing or corrupt core bundle.
 
-An already-running historical batch cannot benefit from code it has not downloaded: some
-pre-v2.5.29 launchers parse the first token as a reboot delay before self-update is reachable.
+Some launchers from before v2.5.29 parse the first token as a reboot delay before they
+can reach self-update.
 For those installations, run this version-pinned compatibility bridge **after the old batch
 has exited**. It verifies the installer against the hash embedded below, then the installer
 verifies and transactionally replaces the complete release bundle before forwarding `aws`:
