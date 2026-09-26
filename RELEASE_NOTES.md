@@ -1,42 +1,29 @@
 # Boot Update Cycle — Release Notes
 
 **Latest published version:** v2.5.83
-**Status:** RELEASED — scoped AWS repair; VM validation includes disclosed headless deferrals.
+**Status:** Released
 
 ---
 
 ## v2.5.83 (2026-09-26)
 
-### Fixed
+Fixes the AWS CLI repair instructions for machines where Winget reports a successful update but Chocolatey still fails.
 
-- AWS repair guidance distinguishes a direct AWS CLI failure from the exact
-  cross-manager case where Winget reports `Amazon.AWSCLI` successful but Chocolatey
-  reports `awscli` failed. Only for that pair, the repair plan offers
-  `choco uninstall awscli -y --skip-autouninstaller --skip-powershell` to remove
-  Chocolatey's package record; it asks the operator to confirm the installed product
-  and never runs the command automatically. Checksum failures offer no command pending
-  hash verification. The disposable fixture verified uninstall-script suppression and
-  external-file retention; it does not prove behavior for Chocolatey hooks or AWS
-  publisher rollover. Direct AWS CLI failures without that Winget success evidence point
-  to `upd aws`.
-- Ordinary unnumbered Winget `Found ... [Package.Id]` output now preserves its success
-  identity across checkpoint/resume. Related product names, preview editions, and
-  launcher packages are not treated as interchangeable package identities.
-- The README puts the quick start before navigation and screenshots, warns about
-  administrator rights and immediate restarts before installation, and explains that
-  the install prompt starts `upd` by default while `plan` previews without changes.
+### Changes
 
-### Validation
+- For the specific `Amazon.AWSCLI` / `awscli` case, the repair plan asks you to confirm the installed product, then offers `choco uninstall awscli -y --skip-autouninstaller --skip-powershell` to remove Chocolatey's package record. You decide whether to run it.
+- Other AWS CLI failures point to `upd aws`. Package IDs are checked before they appear in commands, and checksum failures require hash verification before a repair command is offered.
+- The updater now recognizes ordinary Winget success messages and remembers them after a reboot. Similar package names and preview editions are kept separate.
+- The README starts with installation and the commands you'll actually use. Longer explanations are linked from there.
 
-- Pre-release GitHub CI for `3f20003` passed **608 tests**: [run 36252566075](https://github.com/nanoDBA/boot-upd/actions/runs/36252566075). CI does not replace VM evidence.
-- Focused regressions: **12 passed**, including a real checkpoint file write/read.
-- Chocolatey package-script suppression and external-file retention fixture: **PASS** within its documented scope; it is not live AWS publisher-rollover evidence.
-- Fresh interactive A: **SCOPED PASS** — 4 passes and 3 claimed/observed reboots; hashes match, state is absent, tasks are 0, CBS is clear, and all five health checks passed. Evidence: `A-release-final-20ce892b295d47fca942660365160534`.
-- Fresh headless SYSTEM B: **COMPLETED WITH DEFERRED INVENTORY (PARTIAL)** — 5 passes and 3 claimed/observed reboots; hashes match, state is absent, tasks are 0, CBS is clear, and all five health checks passed. Evidence: `B-release-final-03fd1bb381b74fab9525e17ee7f4ced1`.
-- B recorded deferred user-scope Winget, Scoop, and VS Code work because no interactive user appeared. Windows Update KB5007651 remained applicable after one successful install and was recorded as deferred inventory. B completed and removed both continuation tasks, but it did not establish full convergence.
-- A's initial deploy task recorded `0xC000013A`, consistent with termination at the first reboot; that cause is inferred because Scheduler events were not exported. Do not blanket-whitelist it. Follow-up: [#81](https://github.com/nanoDBA/boot-upd/issues/81).
-- B's Task Scheduler Operational export scanned a bounded 2,000 events and matched 44; its lookback began before the run. It corroborates final task removal but is not a complete event history.
-- Full evidence and coverage limits: [AWS CLI repair validation](docs/validation-aws-repair-2.5.83.md).
+### Testing
+
+608 tests passed, along with the User/SYSTEM and launcher checks. The published installer also passed [fresh-install and legacy-repair tests](https://github.com/nanoDBA/boot-upd/actions/runs/36260989149).
+
+Interactive testing passed, with four passes and three reboots. The headless VM completed five passes and three reboots, but deferred user-only updates and a Windows update that remained offered after installation. Both cleaned up their resume tasks and saved state. The overall VM result is **PARTIAL**, not a claim that everything was patched.
+
+The Chocolatey test checked that uninstall scripts stayed suppressed and an external application file remained. It was not a live AWS publisher-rollover test. Full results, the initial launcher-exit caveat, and remaining coverage gaps are in the [validation report](docs/validation-aws-repair-2.5.83.md).
+
 ## v2.5.82 (2026-09-20)
 
 ### Fixed

@@ -1,11 +1,10 @@
 # Boot Update Cycle
 
-**Run `upd` as admin. Walk away. Come back patched—or with a clear, reversible explanation of which installer chose violence.**
+**Run `upd` as admin. Let it handle the updates and reboots.**
 
-A reboot-resilient Windows updater that runs the configured package managers, checkpoints real
-progress, restarts when required, and resumes only the unfinished work until the selected scope
-verifies clean. Then it removes its continuation tasks, because leaving mysterious scheduled tasks
-behind is how software becomes folklore.
+`upd` updates Windows and your apps, saves its progress, and picks up where it left off
+after a reboot. It reports anything it couldn't finish.
+You shouldn't have to sit there clicking Restart all afternoon.
 
 [![Latest release](https://img.shields.io/github/v/release/nanoDBA/boot-upd?display_name=tag&sort=semver)](https://github.com/nanoDBA/boot-upd/releases/latest)
 [![PowerShell 7+](https://img.shields.io/badge/PowerShell-7%2B-5391FE?logo=powershell&logoColor=white)](#requirements)
@@ -67,16 +66,16 @@ upd help     # commands, short aliases, and every option
 | Goal | Run | What you are authorizing |
 |---|---|---|
 | Patch normally | `upd` | Default providers, immediate restart when required |
-| Give me a warning | `upd -r 120` | Same run, with 120 seconds to remember where you left that unsaved document |
+| Give me a warning | `upd -r 120` | Same run, with a two-minute warning before restarting |
 | Show the plan first | `upd plan -drv -r 120` | Resolve options only; no elevation, installs, tasks, or reboots |
-| Be more forceful with Winget | `upd -ar` | One bounded repair attempt, then reversible quarantine instead of an eternal loop |
-| Update AWS tooling | `upd aws` | AWS CLI v2 and modular AWS.Tools; AWS gets its own side quest because of course it does |
+| Be more forceful with Winget | `upd -ar` | Try a repair, then pin a persistent failure so it stops retrying; the pin can be removed |
+| Update AWS tooling | `upd aws` | Update AWS CLI v2 and modular AWS.Tools |
 | Tell me what is happening | `upd status` | Read the checkpoint, continuation tasks, and Winget quarantine records |
-| Package evidence for support | `upd logs` | Create a sanitized ZIP and copy its full path to the clipboard |
-| Just admire the pixels | `upd fun 12` | Splash parade and live animation; absolutely no useful work, proudly |
+| Get logs for support | `upd logs` | Create a sanitized ZIP and copy its full path to the clipboard |
+| Just show me the animation | `upd fun 12` | Preview the splash and animation. No updates; this one is entirely unnecessary. |
 
 Want to look around without changing the machine? These commands are read-only and do not
-request elevation. Suspicion is healthy; production has taught us all things.
+request elevation:
 
 ```powershell
 upd splash
@@ -102,7 +101,8 @@ The default `Normal` view stays zoomed out while the animated `BOOT//PULSE` row 
 
 The splash immediately marks restart status as **checking**. Before updates begin—and again after they finish—the Normal view displays a prominent **RESTART REQUIRED** or **RESTART NOT REQUIRED** result. If a restart is required, the screen also confirms that automatic continuation is armed.
 
-When the configured work, restart checks, service assessment, and terminal cleanup all pass, the final screen leads with a plain-language result: the run finished, whether a restart is needed, whether any packages were skipped, and what (if anything) the user should do next. It still has some earned personality:
+The final screen tells you what finished, whether a restart is needed, what was skipped,
+and whether you need to do anything else:
 
 <img src="docs/img/updater-complete.png" alt="Boot Update Cycle configured patch pass verified completion screen" width="900">
 
@@ -169,7 +169,7 @@ upd
 
 That's it. Once installed, `upd` runs from an elevated Command Prompt, PowerShell, or the
 Run dialog (Win+R → `upd` → Ctrl+Shift+Enter). The installer is PowerShell; the installed
-launcher is the part that works everywhere. Tiny distinction, surprisingly large number of error messages.
+launcher works from any of those entry points.
 
 `upd.cmd` auto-adds itself to your system PATH on first run, so it works from anywhere after that.
 
@@ -209,8 +209,8 @@ upd --exclude Teams,OneDrive --skip-office365
 Short forms keep everyday commands light: `upd d 12`, `upd f`, `upd p -drv -r 120`,
 `upd r -s -o Verbose`, `upd a`, `upd l`, `upd u`, and `upd v`. Short commands do not use a
 leading dash; ambiguous dashed forms fail before they can reach the update path. Long
-names remain available for scripts and discoverability. `upd help` knows all of them, has
-no feelings about your typing speed, and is more current than a copied command from six releases ago.
+names remain available for scripts. Run `upd help` for the commands supported by your
+installed version.
 
 A stable raw-argument bootstrap now checks the latest GitHub release before an operational
 command reaches the typed parser. Every executable
@@ -233,7 +233,7 @@ verifies and transactionally replaces the complete release bundle before forward
 $u='https://github.com/nanoDBA/boot-upd/releases/download/v2.5.83/Install-UpdCompat.ps1'; $f=Join-Path $env:TEMP 'Install-UpdCompat-v2.5.83.ps1'; Invoke-WebRequest $u -OutFile $f; if((Get-FileHash $f -Algorithm SHA256).Hash -ne '67662B3B02252FF6DE045FCDF28FB74D8DEB6FDA8080C46B1DAFC7BFBE54ABE3'){throw 'Compatibility installer hash mismatch'}; & $f -CommandArguments aws
 ```
 
-This is the one-time chicken-and-egg escape hatch. It resolves the first `upd.cmd` on PATH,
+Use this when the old launcher cannot update itself. It resolves the first `upd.cmd` on PATH,
 stages outside cloud storage, preserves a rollback snapshot, detects sync races, and replaces
 only runtime files. It deliberately does not use a mutable gist or `iex`.
 
@@ -284,57 +284,30 @@ Press `v` at any time during an interactive run to cycle through:
 | `Verbose` | Normal plus detailed package-manager output |
 | `Debug` | Verbose plus process IDs and heartbeat diagnostics |
 
-Choose the initial view explicitly with `-OutputMode Quiet|Normal|Verbose|Debug`, or set
-`OutputMode` in `Deploy-BootUpdateCycle.ps1`. The interactive `BOOT//PULSE` row uses a
-classic `| / - \` ASCII propeller with a 112-step, seven-stop theme-zero glow. Cyan, blue,
-magenta, acid green, and electric yellow-green flow through near-black violet and cyan valleys,
-making the pulse discernible at a distance without abrupt flashes. Motion and color advance independently.
-The row adapts instead of blindly chopping off its tail: at narrower widths it keeps the operation,
-elapsed time, and `v:NORMAL` mode visible, shortens repeated provider prose, and drops decorative meter
-cells first. Normal and Verbose omit `CPU 0s | 0 proc`; nonzero activity remains visible, while Debug
-shows the raw heartbeat fields for diagnosis.
-ASCII status text is kept immutable; non-ASCII glyphs are represented safely in the live row while
-remaining untouched in the log. Key polling and animation disable themselves under SYSTEM,
-redirected output, and non-console hosts; file logging is unchanged.
+Set the initial view with `-OutputMode Quiet|Normal|Verbose|Debug`, or change
+`OutputMode` in `Deploy-BootUpdateCycle.ps1`. The display adapts to the console width.
+Headless runs keep logging without trying to show an animation or read keyboard input.
 
-On VT consoles, steady-state frames overwrite the owned row in place to avoid ConsoleHost flicker;
-a full erase is reserved for width changes, ordinary output, mode transitions, and cleanup.
-
-All console rendering is built in; the updater does not install or import a third-party TUI module.
-Phase headers and results use native ANSI/console output, and the themed splash remains unchanged.
-
-To visually smoke-test animation without running any package updates:
-
-```powershell
-.\tools\Show-BootUpdateProgressDemo.ps1
-```
-
-The demo renders the same four-frame `BOOT//PULSE` propeller, adaptive-width row, and interpolated neon
-gradient at the production 100 ms cadence, includes the photographed Windows Update status text, accepts
-live `v` mode cycling, and restores its console row and cursor when complete.
-
-Built-in operations that can block for more than a moment run behind a process-tree-aware,
-progress-pumped adapter, keeping both animation and `v` key handling responsive. Administrator-supplied
-hooks intentionally retain same-scope execution semantics; a long hook must provide its own
-console feedback because isolating it would change how hook variables and side effects work.
+Use `upd demo 12` to preview the display without running updates.
+[Console rendering details](docs/how-it-works.md#console-rendering) are documented separately.
 
 ### What happens
 
-1. Pre-flight checks visibly report their current check and elapsed time while validating disk space, network, battery, and conflicting installers. They observe—but never start—the Windows Update service
-2. First iteration runs in **your** console (user context) — the only chance for user-scoped winget/Scoop/VS Code
-3. Before mutation, two reboot-signal probes span a 20-second servicing-settle window. CBS, Windows Update Agent, real file replacements, protected Windows-file deletes, and provider-native reboot results are hard barriers; delete-only application/cloud/temp housekeeping is reported as an advisory
-4. Native `3010`/`1641`, Chocolatey `350`/`1604`, and `Microsoft.Update.SystemInfo.RebootRequired` results are persisted immediately instead of waiting for registry flags to appear
-5. Verified resume tasks are armed before updates start: user-at-logon plus a delayed SYSTEM fallback, with dated watchdogs for canceled shutdowns and deferred retries
-6. `shutdown /g` restarts Windows; the checkpoint resumes automatically, preserves successful provider phases, preserves user-only work for user context, and retries only incomplete or interrupted work
-7. Windows Update owns its service recovery: start and component-reset attempts are isolated behind a 30-second boundary. A stuck or indefinitely `StartPending` service makes only that phase retryable while safe independent providers continue
-8. A successful online Windows Update assessment is reusable for six hours—even across reboots—only after an offline WUA catalog check confirms zero applicable work and the update source, scope, and recent servicing history fingerprints still match
-9. Completion requires every enabled phase, a zero-applicable Windows Update assessment, and two probes with no blocking reboot evidence (max 5 completed reboot safety valve). Optional third-party cleanup cannot create a reboot loop; routine categories are compact in Verbose, fingerprints are reserved for Debug and the log, and Normal remains focused on actionable state
-10. Hooks run, resume tasks and transient state are removed and verified absent, and only then does the final screen congratulate the user and send a result-specific notification
-11. If explicit aggressive mode quarantined a persistent Winget failure, its durable record survives cleanup and the final screen reports degraded completion with an `upd uq` reversal command
+1. Check disk space, network access, battery state, and other installers.
+2. Run the enabled update providers and save completed work.
+3. If Windows needs a restart, verify the resume tasks and reboot.
+4. Pick up unfinished work after reboot. User-only updates wait for a user session.
+5. Check for remaining updates and pending restarts, then check service health.
+6. Report what finished and what was skipped or still needs attention. Completed
+   cycles remove their continuation tasks and temporary state. Stops that need
+   attention keep the checkpoint for troubleshooting.
 
-Notifications distinguish four outcomes instead of using one generic toast: updates complete with no restart,
-another pass scheduled with no restart, user-context work waiting for sign-in, and restart required with automatic
-continuation. They are shown only in an interactive user session; SYSTEM resume work never attempts a desktop toast.
+There are limits on reboots and retries. If an update keeps failing, the run stops
+and tells you what needs attention. Deferred work stays in the report; it isn't
+counted as a successful update.
+
+See [reboot and resume checks](docs/how-it-works.md#reboot-and-resume-checks) for the
+checkpoint rules, Windows Update verification, and retry limits.
 
 ### Watchdog probe
 
@@ -393,9 +366,8 @@ Package managers are auto-detected. Missing ones are skipped with a warning.
 <a id="status-and-recovery"></a>
 ## 🛟 Status and recovery
 
-Start with the built-in commands; they keep the common support path short and preserve
-useful evidence. Copying a 4,000-line console screenshot into chat is technically evidence,
-in the same sense that a landfill is technically a filing system:
+Start with `upd status`. If you need help, attach the ZIP from `upd logs`.
+Please don't make someone reconstruct a log from screenshots.
 
 ```powershell
 upd status    # checkpoint, resume tasks, and reversible Winget quarantines
@@ -408,12 +380,12 @@ upd update    # refresh the verified source bundle without starting an update cy
 
 | Result | Meaning | What you should do |
 |---|---|---|
-| **Updates complete — no restart required** | Every enabled phase and verification check passed | Enjoy the rare moment when Windows has no further requests |
+| **Updates complete — no restart required** | Every enabled phase and verification check passed | You're done |
 | **Updates complete** with skipped packages | Repeated Winget failures were reversibly pinned to prevent another loop | Nothing now; use the displayed `upd uq` command when you want to retry them |
 | **Recovery pass queued** | One or more phases did not verify; a near-term retry is armed | No action unless it keeps returning or reaches the safety limit |
 | **User update pass pending** | Machine work finished, but user-scoped work needs the saved user to sign in | Sign in as that user; do not "fix" it by deleting the checkpoint |
 | **Restart required** | Blocking evidence was confirmed and continuation was verified | Save work; boot-upd resumes automatically after Windows restarts |
-| **Needs attention** | A bounded safety limit or terminal failure stopped automation | Run `upd status`, then `upd logs`; the tool stopped rather than improvising on your operating system |
+| **Needs attention** | A safety limit or persistent failure stopped the run | Run `upd status`, then `upd logs`; check the reported failure before retrying |
 
 If explicit `-ar` mode quarantines a repeatedly failing Winget package, the final screen says
 the selected update run finished **with skipped packages**—not that the machine is fully patched.
@@ -475,8 +447,8 @@ Get-ScheduledTask -TaskName 'BootUpdateCycle','BootUpdateCycleFallback' -ErrorAc
 & "$env:ProgramData\BootUpdateCycle\Uninstall.ps1" -RemoveFolder
 ```
 
-Canceling `shutdown` does not mean the update checkpoint has forgotten why it wanted a reboot.
-That would be convenient, but it would also be lying.
+`shutdown /a` cancels the pending restart. It doesn't cancel the update cycle or remove
+its resume tasks; use the task-removal command above to stop automatic continuation.
 
 <a id="common-questions"></a>
 ## 🙋 Common questions
@@ -492,13 +464,13 @@ retain sanitized fingerprints. A real source/destination replacement is still bl
 
 Some updates reveal more applicable work only after reboot. boot-upd preserves completed phases,
 increments the reboot count only after observing a new Windows boot session, and resumes the
-unfinished work. It is a checkpointed update cycle, not `while ($true) { reboot }` with branding.
+unfinished work.
 
 ### Why is Windows Update being checked again?
 
 A clean online assessment can be reused for up to six hours across reboots only when the local
 Windows Update catalog, configured scope, update source, and servicing-history fingerprints still
-agree. If one changes, boot-upd asks Windows again. Cached confidence is useful; cached fiction is not.
+agree. If one changes, boot-upd checks Windows Update again.
 
 ### Why did a package get skipped?
 
@@ -510,21 +482,20 @@ and then a reversible blocking pin. Use `upd status` to see it and `upd uq Packa
 
 No. AWS tooling is opt-in. `upd aws` explicitly modernizes AWS CLI v2 and modular AWS.Tools;
 `upd --aws-tooling` includes that phase in the complete update cycle. Use the preservation flags
-only when an older script genuinely depends on legacy modules, not because old versions look lonely.
+only when an older script still needs those module versions.
 
 For a direct AWS CLI failure, the repair plan points to `upd aws`. If Winget reports
 `Amazon.AWSCLI` successful while Chocolatey reports `awscli` failed, the plan offers the
 exact command `choco uninstall awscli -y --skip-autouninstaller --skip-powershell` to remove
 only Chocolatey's package record, after asking you to confirm the installed product. The
 updater never runs that command automatically. Checksum mismatches withhold repair commands
-pending hash verification. The disposable fixture verified uninstall-script suppression and
-external-file retention; it does not establish behavior for Chocolatey hooks or AWS publisher
-rollover. See the [release notes](RELEASE_NOTES.md) and [v2.5.83 validation report](docs/validation-aws-repair-2.5.83.md).
+pending hash verification. See the [release notes](RELEASE_NOTES.md) for the changes and
+the [validation report](docs/validation-aws-repair-2.5.83.md) for what was tested.
 
-### Can I see everything without the console becoming a novel?
+### How do I get more detail?
 
-Press `v` during a run to cycle Quiet → Normal → Verbose → Debug. Normal is designed for humans;
-the rotating logs preserve the exhaustive details for humans who have become debuggers.
+Press `v` during a run to cycle Quiet → Normal → Verbose → Debug. Use Normal for progress
+and warnings, or Verbose for package-manager output. The logs keep the details in either mode.
 
 <a id="security-model"></a>
 ## 🔐 Security model

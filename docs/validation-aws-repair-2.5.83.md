@@ -98,6 +98,11 @@ causes, registry-based automatic uninstall, or AWS publisher rollover.
 
 ## Coverage limits
 
+The published v2.5.83 installer passed both fresh-install and legacy-repair jobs in
+the [live bootstrap workflow](https://github.com/nanoDBA/boot-upd/actions/runs/36260989149).
+The [release-commit quality workflow](https://github.com/nanoDBA/boot-upd/actions/runs/36260966856)
+also passed, including User/SYSTEM exclusion and published-launcher checks.
+
 - Overall A/B matrix result: **PARTIAL** because B completed with deferred user-scope and
   Windows Update inventory. The B row verifies resume and cleanup, not full convergence.
 - Native SSMS servicing remains enabled by default. A verified SSMS was already current;
