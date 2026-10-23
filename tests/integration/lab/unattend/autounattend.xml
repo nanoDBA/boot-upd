@@ -189,6 +189,14 @@
           <Description>Mark the baseline so a reverted checkpoint is identifiable</Description>
           <CommandLine>cmd.exe /c echo baseline &gt; C:\updtest-baseline.txt</CommandLine>
         </SynchronousCommand>
+        <!-- Checkpoints outlive the 42-day default password age. A restored guest syncs its
+             clock to the host, so its password expires and PowerShell Direct reports only
+             "The credential is invalid" (hit 2026-10-23 on 9/9 checkpoints). -->
+        <SynchronousCommand wcm:action="add">
+          <Order>3</Order>
+          <Description>Keep the lab password from expiring under long-lived checkpoints</Description>
+          <CommandLine>powershell.exe -NoProfile -Command "net accounts /maxpwage:unlimited; Set-LocalUser -Name updtest -PasswordNeverExpires $true"</CommandLine>
+        </SynchronousCommand>
       </FirstLogonCommands>
     </component>
   </settings>

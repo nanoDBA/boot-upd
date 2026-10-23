@@ -100,6 +100,15 @@ appears at the moment the row cares about, not one that could also match on an e
   session that thinks it is still capture time and behaves non-deterministically after restore.
 - **The tree-sync path deletes the guest copy before copying**, so a file removed on the host
   cannot survive on the guest while the orchestrator hash still matches.
+- **"The credential is invalid" from PowerShell Direct usually means the guest password expired**,
+  not that the stored credential is wrong. Windows' 42-day default outlives checkpoints, and a
+  restored guest syncs its clock to the host. Look before rotating anything: capture the console
+  with `Get-VmScreen.ps1`. To recover without a human, restore the checkpoint cold, answer the
+  change prompt over `Msvm_Keyboard` with the *same* stored password (`TypeText`; on the
+  autologon checkpoint Shift+Tab to the empty old-password field first), then over PowerShell
+  Direct run `Set-LocalUser updtest -PasswordNeverExpires $true` and `net accounts
+  /maxpwage:unlimited`, shut down from inside the guest, rename the old checkpoint and re-take it
+  under its name. New guests get this from `autounattend.xml`.
 - **`DeployTaskResult` 267014 or 1073807364 on a row that rebooted is benign** — the launcher
   task got killed by the reboot. `0x80070002` means the task's executable is missing.
   `RebootsClaimed: $null` means no completion claim was made, not a disagreement with the OS.

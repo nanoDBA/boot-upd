@@ -8079,6 +8079,20 @@ function Invoke-BootUpdateCycle {
         exit 0
     }
 
+    <# Arm the checkpoint before pre-flight and the first mutating phase, not merely after
+       detecting a reboot. Native exit 1641 means an installer has already initiated
+       restart; pre-registration is what makes that surprise reboot resumable. It precedes
+       pre-flight because a pass can die there too: Windows Update's own Microsoft Update
+       channel has replaced pwsh.exe under a same-boot resume pass mid-pre-flight, and Task
+       Scheduler records a crashed action as completed, so without the repeating watchdog
+       nothing re-fires until the next boot. Pre-flight's abort paths re-register or
+       unregister as before. Completion removes both tasks, and the mutex prevents a
+       scheduled collision. #>
+    if (-not $WhatIfPreference) {
+        $null = Register-BootUpdateTaskForReboot -InFlightWatchdog
+        Write-Log "Resume checkpoint armed before update phases; watchdog probe every $($script:WatchdogIntervalMinutes) minutes." -Visibility Verbose
+    }
+
     <# Pre-flight checks (every iteration — disk/network can change between reboots) #>
     $preflight = Test-PreFlightChecks -Force:$Force -State $state
     if (-not $preflight.CanProceed) {
@@ -8103,15 +8117,6 @@ function Invoke-BootUpdateCycle {
     if (-not $waitingForIdentity) { $state.Iteration++ }
     else { Write-Log 'User identity discovery retry does not consume a mutation iteration.' -Level Warn }
     Set-BootUpdateState -State $state
-
-    <# Arm the checkpoint before the first mutating phase, not merely after detecting
-       a reboot. Native exit 1641 means an installer has already initiated restart;
-       pre-registration is what makes that surprise reboot resumable. Completion
-       removes both tasks, and the mutex prevents a scheduled collision. #>
-    if (-not $WhatIfPreference) {
-        $null = Register-BootUpdateTaskForReboot -InFlightWatchdog
-        Write-Log "Resume checkpoint armed before update phases; watchdog probe every $($script:WatchdogIntervalMinutes) minutes." -Visibility Verbose
-    }
 
     <# A pending reboot is a phase barrier. Do not feed MSI/CBS/package work into a
        machine which already needs to finish servicing from an earlier transaction. #>
