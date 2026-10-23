@@ -1103,15 +1103,20 @@ function Get-WingetInventoryPackageIds {
 }
 
 function Get-WingetOutputSummary {
-    param([object[]]$Lines = @())
+    <# TargetPackageId marks a targeted `winget upgrade --id X` run. Its transcript has
+       no "(N/M)" counter and may report the outcome before (or without) any Found
+       header, so the targeted package is the attempt and owns unattributed records. #>
+    param([object[]]$Lines = @(),[string]$TargetPackageId = '')
     $attempted = 0
+    $foundIds = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $technologyMismatch = 0
     $updated = 0
     $pinned = 0
     $unknown = 0
     $technologyBlocked = 0
     $noApplicable = $false
-    $currentName = 'Unknown package'
-    $currentId = ''
+    $currentName = if ($TargetPackageId) { $TargetPackageId } else { 'Unknown package' }
+    $currentId = $TargetPackageId
     $currentVersion = ''
     $failures = [Collections.Generic.List[object]]::new()
     $staleAbsent = [Collections.Generic.List[object]]::new()
@@ -1128,6 +1133,7 @@ function Get-WingetOutputSummary {
             $currentName = $Matches[3].Trim()
             $currentId = $Matches[4].Trim()
             $currentVersion = if ($Matches[5]) { $Matches[5].Trim() } else { '' }
+            $null = $foundIds.Add($currentId)
         } elseif ($line -match '^Successfully installed(?:\.|\s|$)') {
             $updated++
             if ($currentId -and -not $successfulIds.Contains($currentId)) { $successfulIds.Add($currentId) }
@@ -1162,10 +1168,16 @@ function Get-WingetOutputSummary {
             $unknown = [math]::Max($unknown, [int]$Matches[1])
         } elseif ($line -match '^(\d+) package\(s\) have upgrades blocked because newer versions use a different install technology') {
             $technologyBlocked = [int]$Matches[1]
-        } elseif ($line -match '^No installed package found matching input criteria') {
+        } elseif ($line -match '^A newer version was found, but the install technology is different') {
+            # Per-package wording of the bulk "upgrades blocked ... install technology" line.
+            $technologyMismatch++
+        } elseif ($line -match '^No installed package found matching input criteria' -or
+                  $line -match '^No (?:applicable|available) upgrade found') {
             $noApplicable = $true
         }
     }
+    $attempted = [math]::Max($attempted, $foundIds.Count)
+    $technologyBlocked = [math]::Max($technologyBlocked, $technologyMismatch)
     return [pscustomobject]@{
         Attempted=$attempted; Updated=$updated; Pinned=$pinned; Unknown=$unknown
         TechnologyBlocked=$technologyBlocked; NoApplicable=$noApplicable; Failures=$failures.ToArray()
@@ -1173,6 +1185,7 @@ function Get-WingetOutputSummary {
         ScopeBlocked=$scopeBlocked.ToArray()
         PortableModified=$portableModified.ToArray()
         SuccessfulIds=$successfulIds.ToArray()
+        Targeted=[bool]$TargetPackageId
         Recognized=($attempted -gt 0 -or $updated -gt 0 -or $pinned -gt 0 -or $unknown -gt 0 -or
             $technologyBlocked -gt 0 -or $noApplicable -or $failures.Count -gt 0 -or $staleAbsent.Count -gt 0 -or
             $scopeBlocked.Count -gt 0 -or $portableModified.Count -gt 0)
@@ -1200,9 +1213,18 @@ function Test-WingetExitReconciled {
     $portableModifiedCount = @($Summary.PortableModified).Count
     $deferredCount = [int]$Summary.Pinned + [int]$Summary.Unknown + [int]$Summary.TechnologyBlocked
     $accounted = $staleCount + $scopeBlockedCount + $portableModifiedCount + $deferredCount
+    $attempted = [int]$Summary.Attempted
+    <# A targeted run always attempts exactly its one package, and Winget's own
+       "no applicable upgrade" verdict accounts for it. Bulk runs get neither
+       allowance: there, prose cannot say which packages it covers. #>
+    $targeted = $Summary.PSObject.Properties['Targeted'] -and [bool]$Summary.Targeted
+    if ($targeted) {
+        $attempted = [math]::Max($attempted, 1)
+        if ($Summary.NoApplicable -and [int]$Summary.Updated -eq 0) { $accounted++ }
+    }
     return ($accounted -gt 0 -and @($Summary.Failures).Count -eq 0 -and
-        [int]$Summary.Attempted -gt 0 -and
-        ([int]$Summary.Updated + $accounted) -ge [int]$Summary.Attempted)
+        $attempted -gt 0 -and
+        ([int]$Summary.Updated + $accounted) -ge $attempted)
 }
 
 function Test-BootUpdateSafePackageId {
@@ -1523,15 +1545,32 @@ function Resolve-WingetStaleAbsentPresentation {
     return [pscustomobject]@{ Suppressed=$suppressed; NewlyResolved=$newlyResolved; Unresolved=$unresolved; Invalidated=$invalidated }
 }
 
+function Get-WingetDeferredInventoryRecords {
+    <# Deferred-inventory ledger records for one scope, summed across its summaries: one
+       for a bulk `--all` run, one per package for a targeted run. #>
+    param([object[]]$Summaries = @())
+    $counts = [ordered]@{ Pinned=0; UnknownVersion=0; TechnologyBlocked=0; ScopeBlocked=0; PortableModified=0 }
+    foreach ($summary in @($Summaries | Where-Object { $_ })) {
+        $counts.Pinned += [int]$summary.Pinned
+        $counts.UnknownVersion += [int]$summary.Unknown
+        $counts.TechnologyBlocked += [int]$summary.TechnologyBlocked
+        $counts.ScopeBlocked += @($summary.ScopeBlocked).Count
+        $counts.PortableModified += @($summary.PortableModified).Count
+    }
+    return @($counts.Keys | Where-Object { $counts[$_] -gt 0 } |
+        ForEach-Object { [pscustomobject]@{ Kind = $_; Count = $counts[$_] } })
+}
+
 function Write-WingetScopeSummary {
     param(
         [Parameter(Mandatory)][string]$Scope,
         [object[]]$Lines = @(),
         [AllowNull()][object]$ExitCode,
-        [string]$WingetPath = ''
+        [string]$WingetPath = '',
+        [string]$TargetPackageId = ''
     )
     Write-ProviderTranscript -Provider Winget -Scope $Scope -Lines $Lines
-    $summary = Get-WingetOutputSummary -Lines $Lines
+    $summary = Get-WingetOutputSummary -Lines $Lines -TargetPackageId $TargetPackageId
     $exitReconciled = Test-WingetExitReconciled -Summary $summary -ExitCode $ExitCode
     $summary | Add-Member -NotePropertyName ExitReconciled -NotePropertyValue $exitReconciled -Force
     $collector = Get-Variable -Name CurrentWingetFailures -Scope Script -ErrorAction SilentlyContinue
@@ -1597,14 +1636,8 @@ function Write-WingetScopeSummary {
        full-scope pass instead, which errs toward reporting outstanding work rather than
        silently dropping it. #>
     if ($script:CurrentState -and $Scope -in @('user', 'machine')) {
-        $deferredRecords = @(
-            if ($summary.Pinned)           { [pscustomobject]@{ Kind = 'Pinned'; Count = [int]$summary.Pinned } }
-            if ($summary.Unknown)          { [pscustomobject]@{ Kind = 'UnknownVersion'; Count = [int]$summary.Unknown } }
-            if ($summary.TechnologyBlocked){ [pscustomobject]@{ Kind = 'TechnologyBlocked'; Count = [int]$summary.TechnologyBlocked } }
-            if ($summary.ScopeBlocked.Count) { [pscustomobject]@{ Kind = 'ScopeBlocked'; Count = @($summary.ScopeBlocked).Count } }
-            if ($summary.PortableModified.Count) { [pscustomobject]@{ Kind = 'PortableModified'; Count = @($summary.PortableModified).Count } }
-        )
-        Add-BootUpdateDeferredInventory -State $script:CurrentState -Provider 'Winget' -Scope $Scope -Records $deferredRecords
+        Add-BootUpdateDeferredInventory -State $script:CurrentState -Provider 'Winget' -Scope $Scope `
+            -Records (Get-WingetDeferredInventoryRecords -Summaries $summary)
     }
     if ($summary.Pinned) { Write-Log 'Winget suggested inspection: winget pin list' -Level Warn }
     if ($summary.Unknown -or $summary.TechnologyBlocked) {
@@ -3984,6 +4017,7 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
                 Write-Log "Winget ($scope): $($toUpgrade.Count) package(s) to upgrade after exclusions"
 
                 $count = 0
+                $packageSummaries = [Collections.Generic.List[object]]::new()
                 foreach ($pkgId in $toUpgrade) {
                     Write-Log "Winget ($scope): Upgrading $pkgId"
                     $pkgResult = Invoke-PackageManagerWithTimeout -Name "Winget-$scope-$pkgId" -ScriptBlock {
@@ -3991,10 +4025,18 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
                         & $wp upgrade --id $id --scope $sc -e --accept-source-agreements --accept-package-agreements --disable-interactivity --no-vt 2>&1
                     } -ArgumentList @($wingetPath, $pkgId, $scope) -IdleTimeoutMinutes 5 -HardTimeoutMinutes $TimeoutMinutes `
                         -DeferExitCodeReporting
-                    $packageSummary = Write-WingetScopeSummary -Scope "$scope/$pkgId" -Lines $pkgResult.Output -ExitCode $pkgResult.ExitCode
+                    $packageSummary = Write-WingetScopeSummary -Scope "$scope/$pkgId" -TargetPackageId $pkgId -Lines $pkgResult.Output -ExitCode $pkgResult.ExitCode
                     $count += $packageSummary.Updated
+                    $packageSummaries.Add($packageSummary)
                     foreach ($successfulId in @($packageSummary.SuccessfulIds)) { $null = $successfulPackageIds.Add($successfulId) }
                     if ($pkgResult.TimedOut) { $anyTimeout = $true }
+                }
+                <# Per-package summaries use "<scope>/<id>" labels, which the scope summary
+                   deliberately keeps out of the ledger. Record their deferrals under the
+                   scope itself, or targeted runs would never qualify the completion claim. #>
+                if ($script:CurrentState) {
+                    Add-BootUpdateDeferredInventory -State $script:CurrentState -Provider 'Winget' -Scope $scope `
+                        -Records (Get-WingetDeferredInventoryRecords -Summaries $packageSummaries.ToArray())
                 }
                 $totalCount += $count
             }
