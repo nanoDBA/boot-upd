@@ -1611,6 +1611,19 @@ Describe 'Durable resume chain' {
         $checkpoint | Should -BeLessThan $firstPhase
     }
 
+    It 'arms the in-flight watchdog before pre-flight so a pass that dies there still resumes' {
+        <# Lab row B, 2026-10-23: Windows Update's own Microsoft Update channel replaced
+           pwsh.exe under a same-boot SYSTEM resume pass during pre-flight (0xC00000FD). The
+           previous pass's handoff had left only a one-shot retry, and Task Scheduler records a
+           crashed action as completed, so nothing re-fired until the next boot. #>
+        $text = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
+        $arm = $text.IndexOf('$null = Register-BootUpdateTaskForReboot -InFlightWatchdog')
+        $preflight = $text.IndexOf('Test-PreFlightChecks -Force')
+        $arm | Should -BeGreaterThan 0
+        $preflight | Should -BeGreaterThan 0
+        $arm | Should -BeLessThan $preflight
+    }
+
     It 'arms a dated watchdog before a cancelable delayed restart' {
         $text = Get-FunctionText $invokeAst 'Start-BootUpdateRestart'
         $text | Should -Match 'restartWatchdog'
