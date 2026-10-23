@@ -76,7 +76,7 @@ bd close <id>         # Complete work
 4. **PUSH TO REMOTE** - This is MANDATORY:
    ```bash
    git pull --rebase
-   ./tools/Invoke-Beads.ps1 export -o .beads/issues.jsonl   # Direct-SQL writes are already durable on boot_upd @ 100.88.59.72:3336
+   ./tools/Invoke-Beads.ps1 export -o .beads/issues.jsonl   # Direct-SQL writes are already durable on boot_upd on the central beads server
    git push
    git status  # MUST show "up to date with origin"
    ```

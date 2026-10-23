@@ -101,6 +101,7 @@ BeforeAll {
           'Get-WingetResolvedAbsentRecords',
           'Set-WingetResolvedAbsentRecords',
           'Resolve-WingetStaleAbsentPresentation',
+          'Get-WingetDeferredInventoryRecords',
           'Write-WingetScopeSummary',
           'Save-BootUpdateWingetSuccessIds',
           'Update-WingetPackages',
@@ -286,6 +287,119 @@ Describe 'Concise provider diagnostics' {
             'Uninstall failed with exit code: 1605'
         )
         Test-WingetExitReconciled -Summary $summary -ExitCode -1978335184 | Should -BeTrue
+    }
+
+    Context 'targeted single-package transcripts as Winget actually prints them' {
+        <# `winget upgrade --id X` prints "Found Name [Id] Version V" with no "(N/M)"
+           counter, and reports not-applicable and install-technology outcomes in
+           per-package wording rather than the bulk `--all` summary lines. Fixtures
+           above that carry a "(1/1)" prefix cannot see that difference. #>
+        BeforeEach {
+            $script:CurrentWingetFailures = [Collections.Generic.List[object]]::new()
+            $script:WingetResolvedAbsentPath = Join-Path $TestDrive 'resolved-absent-targeted.json'
+            Mock Write-ProviderTranscript { }
+            Mock Write-Log { }
+        }
+
+        It 'counts an uncounted Found header as the attempt and reconciles MSI 1605 (0x8A150030)' {
+            $summary = Write-WingetScopeSummary -Scope 'machine/Example.Health' -TargetPackageId 'Example.Health' -Lines @(
+                'Found Example Health [Example.Health] Version 4.0',
+                'Starting package uninstall...',
+                'Uninstall failed with exit code: 1605'
+            ) -ExitCode -1978335184
+
+            $summary.Attempted | Should -Be 1
+            $summary.ExitReconciled | Should -BeTrue
+            Should -Invoke Write-Log -Times 0 -ParameterFilter { $Message -match 'partial failure, retry required' }
+        }
+
+        It 'treats "No available upgrade found" (0x8A15002B) as not applicable, not a failure' {
+            $summary = Write-WingetScopeSummary -Scope 'machine/Example.Browser' -TargetPackageId 'Example.Browser' -Lines @(
+                'No available upgrade found.',
+                'No newer package versions are available from the configured sources.'
+            ) -ExitCode -1978335189
+
+            $summary.NoApplicable | Should -BeTrue
+            $summary.ExitReconciled | Should -BeTrue
+            Should -Invoke Write-Log -Times 0 -ParameterFilter { $Message -match 'partial failure, retry required|without recognizable' }
+            Should -Invoke Write-Log -Times 1 -Exactly -ParameterFilter { $Message -match 'no applicable upgrades' }
+        }
+
+        It 'treats "No applicable upgrade found" (0x8A15002B) as not applicable' {
+            $summary = Get-WingetOutputSummary -TargetPackageId 'Example.Audio' -Lines @(
+                'No applicable upgrade found.',
+                'A newer package version is available in a configured source, but it does not apply to your system or requirements.'
+            )
+            Test-WingetExitReconciled -Summary $summary -ExitCode -1978335189 | Should -BeTrue
+        }
+
+        It 'defers a per-package install-technology mismatch (0x8A15008E) as inventory' {
+            $summary = Write-WingetScopeSummary -Scope 'machine/Example.Chat' -TargetPackageId 'Example.Chat' -Lines @(
+                'A newer version was found, but the install technology is different from the current version installed. Please uninstall the package and install the newer version.'
+            ) -ExitCode -1978335090
+
+            $summary.TechnologyBlocked | Should -Be 1
+            $summary.Failures | Should -BeNullOrEmpty
+            $summary.ExitReconciled | Should -BeTrue
+            Should -Invoke Write-Log -Times 0 -ParameterFilter { $Message -match 'partial failure, retry required|without recognizable' }
+        }
+
+        It 'does not double-count technology blocks when the bulk summary line is also present' {
+            $summary = Get-WingetOutputSummary -Lines @(
+                'A newer version was found, but the install technology is different from the current version installed. Please uninstall the package and install the newer version.',
+                '1 package(s) have upgrades blocked because newer versions use a different install technology than the current installation.'
+            )
+            $summary.TechnologyBlocked | Should -Be 1
+        }
+
+        It 'attributes a failure printed before any Found header to the targeted package' {
+            $summary = Write-WingetScopeSummary -Scope 'machine/Example.Browser' -TargetPackageId 'Example.Browser' -Lines @(
+                'Installer failed with exit code: 1618'
+            ) -ExitCode -1978335226
+
+            $summary.Failures.Count | Should -Be 1
+            $summary.Failures[0].Id | Should -Be 'Example.Browser'
+            $summary.Failures[0].Name | Should -Be 'Example.Browser'
+            $summary.ExitReconciled | Should -BeFalse
+            Should -Invoke Write-Log -Times 1 -Exactly -ParameterFilter { $Message -match 'partial failure, retry required' }
+        }
+
+        It 'keeps a genuine targeted installer failure as failure evidence (0x8A150006)' {
+            $summary = Get-WingetOutputSummary -TargetPackageId 'Example.Peripheral' -Lines @(
+                'Found Example Peripheral [Example.Peripheral] Version 5.0',
+                'Installer failed with exit code: 3221226525'
+            )
+            $summary.Attempted | Should -Be 1
+            $summary.Failures[0].Id | Should -Be 'Example.Peripheral'
+            Test-WingetExitReconciled -Summary $summary -ExitCode -1978335226 | Should -BeFalse
+        }
+
+        It 'sums per-package deferrals into scope ledger records' {
+            $chat = Get-WingetOutputSummary -TargetPackageId 'Example.Chat' -Lines @(
+                'A newer version was found, but the install technology is different from the current version installed. Please uninstall the package and install the newer version.')
+            $other = Get-WingetOutputSummary -TargetPackageId 'Example.Other' -Lines @(
+                'A newer version was found, but the install technology is different from the current version installed. Please uninstall the package and install the newer version.')
+            $clean = Get-WingetOutputSummary -TargetPackageId 'Example.App' -Lines @(
+                'Found Example App [Example.App] Version 2.0', 'Successfully installed')
+
+            $records = @(Get-WingetDeferredInventoryRecords -Summaries @($chat, $other, $clean))
+            $records.Count | Should -Be 1
+            $records[0].Kind | Should -Be 'TechnologyBlocked'
+            $records[0].Count | Should -Be 2
+            @(Get-WingetDeferredInventoryRecords -Summaries @($clean)).Count | Should -Be 0
+        }
+
+        It 'records targeted-run deferrals under the scope, not the per-package label' {
+            $winget = Get-FunctionText $invokeAst 'Update-WingetPackages'
+            $winget | Should -Match '-TargetPackageId \$pkgId'
+            $winget | Should -Match 'Add-BootUpdateDeferredInventory -State \$script:CurrentState -Provider ''Winget'' -Scope \$scope '
+            $winget | Should -Match 'Get-WingetDeferredInventoryRecords -Summaries \$packageSummaries'
+        }
+
+        It 'does not treat bulk "no applicable" prose as accounting for a non-targeted failure exit' {
+            $summary = Get-WingetOutputSummary -Lines @('No available upgrade found.')
+            Test-WingetExitReconciled -Summary $summary -ExitCode -1978335188 | Should -BeFalse
+        }
     }
 
     It 'never reconciles the known Winget success/reboot-pending exit codes' {
