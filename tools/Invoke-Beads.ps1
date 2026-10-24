@@ -8,6 +8,11 @@
     beads.credentialTarget Git setting, makes its username and password available
     only for the lifetime of the bd invocation, and clears both in a finally block.
 
+    Requires repository-local beads.clientPath to name the approved bd 1.1.0
+    Windows executable. The executable checksum is checked before credentials
+    are loaded. The project metadata host overrides inherited host settings
+    for this invocation only; the original host environment is restored.
+
     The password is never printed, passed on the command line, or persisted as
     a User/Machine environment variable.
 
@@ -174,6 +179,23 @@ function Get-BeadsExportOutputPath {
     return $null
 }
 
+# Resolve and verify the compatible client before retrieving any credentials.
+$beadsClient = & git -C $repoRoot config --local --get beads.clientPath
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($beadsClient)) {
+    throw 'Set repository-local beads.clientPath to the approved bd 1.1.0 Windows executable. PATH clients are not used.'
+}
+if (-not [IO.Path]::IsPathRooted($beadsClient) -or -not (Test-Path -LiteralPath $beadsClient -PathType Leaf)) {
+    throw 'beads.clientPath must name an existing absolute executable path.'
+}
+$approvedHash = 'CA997B648C1902B8082991A4D2DBEFA9C7CC2864AF404547A3AE654EA72DF3D1'
+if ((Get-FileHash -LiteralPath $beadsClient -Algorithm SHA256).Hash -ne $approvedHash) {
+    throw 'Unapproved Beads client. This shared database requires the pinned bd 1.1.0 Windows build; refusing to connect.'
+}
+$metadata = Get-Content -LiteralPath (Join-Path $repoRoot '.beads/metadata.json') -Raw | ConvertFrom-Json
+if ($metadata.dolt_mode -ne 'server' -or [string]::IsNullOrWhiteSpace($metadata.dolt_server_host)) {
+    throw 'Beads metadata must configure a central server host.'
+}
+
 $credentialTarget = & git -C $repoRoot config --local --get beads.credentialTarget
 if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($credentialTarget)) {
     throw 'Missing repository-local beads.credentialTarget setting. Run: ./tools/Initialize-BeadsCredential.ps1'
@@ -204,6 +226,7 @@ if (-not $credential) {
 }
 
 $exitCode = 1
+$previousHost = $env:BEADS_DOLT_SERVER_HOST
 try {
     $doltUsername = $credential.UserName
     if ([string]::IsNullOrWhiteSpace($doltUsername)) {
@@ -212,7 +235,8 @@ try {
 
     $env:BEADS_DOLT_SERVER_USER = $doltUsername
     $env:BEADS_DOLT_PASSWORD = $credential.GetNetworkCredential().Password
-    & bd -C $repoRoot @args
+    $env:BEADS_DOLT_SERVER_HOST = $metadata.dolt_server_host
+    & $beadsClient -C $repoRoot @args
     $exitCode = $LASTEXITCODE
 
     if ($exitCode -eq 0 -and $args.Count -gt 0 -and $args[0] -eq 'export') {
@@ -227,6 +251,7 @@ try {
     }
 }
 finally {
+    $env:BEADS_DOLT_SERVER_HOST = $previousHost
     Remove-Item Env:BEADS_DOLT_SERVER_USER -ErrorAction SilentlyContinue
     Remove-Item Env:BEADS_DOLT_PASSWORD -ErrorAction SilentlyContinue
     $credential = $null
