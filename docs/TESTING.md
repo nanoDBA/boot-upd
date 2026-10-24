@@ -86,3 +86,6 @@ Release assets:              PASS
 ```
 
 Do not collapse `NOT RUN`, `NOT APPLICABLE`, and `PASS`. Release assets must be downloaded again, matched to SHA256 sidecars, checked for expected line endings, and matched to the tag and embedded version.
+
+The [saved-user continuation validation](validation-user-continuation.md) records
+the October 24 candidate's results, earlier failures, and coverage limits.

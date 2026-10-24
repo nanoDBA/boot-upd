@@ -2,9 +2,9 @@
 # ------------------------------------------------------------------------------
 # File:        Deploy-BootUpdateCycle.ps1
 # Description: Single-file paste-to-deploy boot update cycle installer
-# Purpose:     Deploys Invoke-BootUpdateCycle.ps1 to ProgramData, runs the first
-#              iteration directly in the launching account's context,
-#              and registers a scheduled task only if reboots are needed.
+# Purpose:     Deploys Invoke-BootUpdateCycle.ps1 to ProgramData and starts it
+#              directly or through a scheduled task, according to configuration.
+#              The updater arms reboot and saved-user continuations as needed.
 # Created:     2025-01-10
 # Modified:    2026-04-25
 # ------------------------------------------------------------------------------
@@ -48,11 +48,12 @@ param(
 
 .DESCRIPTION
     Copies Invoke-BootUpdateCycle.ps1 from the source directory to
-    $env:ProgramData\BootUpdateCycle, installs required modules, and starts
-    the first iteration directly in the launching account's context.
+    $env:ProgramData\BootUpdateCycle and installs required modules. By default,
+    it starts directly in the launching account's context. DirectFirstRun=false
+    selects a scheduled task; RunAsUser chooses the launching user instead of SYSTEM.
 
     WINGET SCOPE STRATEGY:
-    - First run (user context): Updates BOTH user-scope AND machine-scope packages
+    - User-context passes: Update BOTH user-scope AND machine-scope packages
     - SYSTEM passes: Machine-scope only
     - User-scope work left by SYSTEM resumes through the saved account's logon task
 
@@ -499,7 +500,9 @@ if (Test-Path $statePath) {
 }
 
 Write-Host "Deployed scripts to: $installDir" -ForegroundColor Green
-Write-Host "  First run: Direct in the launching account's context"
+$scheduledContext = if ($Config.RunAsUser) { 'current user' } else { 'SYSTEM' }
+$firstRunMode = if ($Config.DirectFirstRun) { "Direct in the launching account's context" } else { "Scheduled task as $scheduledContext" }
+Write-Host "  First run: $firstRunMode"
 Write-Host "  Continuation: Saved-user logon task plus a delayed SYSTEM fallback"
 
 <# Common arg splatting for all execution modes #>
@@ -563,7 +566,8 @@ function Show-DeploymentModal {
         [string]$InstallDir,
         [string]$UninstallPath,
         [string]$TaskName,
-        [bool]$DirectFirstRun = $true
+        [bool]$DirectFirstRun = $true,
+        [string]$ScheduledContext = 'SYSTEM'
     )
 
     $e = [char]27
@@ -597,10 +601,10 @@ function Show-DeploymentModal {
         Write-Host "$red   Do NOT log off until complete or reboot begins.$reset"
         Write-Host "$dim   Lock screen (Win+L) is safe.$reset"
     } else {
-        Write-Host "$yellow   EXECUTION MODE: SCHEDULED TASK (SYSTEM context)$reset"
+        Write-Host "$yellow   EXECUTION MODE: SCHEDULED TASK ($ScheduledContext context)$reset"
         Write-Host ""
-        Write-Host "$yellow   This pass runs as SYSTEM and updates machine-scope packages.$reset"
-        Write-Host "$dim   User-only work waits for the saved user's session.$reset"
+        Write-Host "$yellow   This pass uses the configured task principal.$reset"
+        Write-Host "$dim   User-only work requires the saved user's interactive session.$reset"
         Write-Host ""
         Write-Host "$dim   Use DirectFirstRun = `$true to start in your current session.$reset"
     }
@@ -794,7 +798,7 @@ if ($Config.NonInteractive) {
             Write-Host "Log: $installDir\BootUpdateCycle.log"
             Invoke-DeployedCycle
         } else {
-            Write-Host "The first pass runs as SYSTEM; user-only work waits for the saved user's session." -ForegroundColor Yellow
+            Write-Host "The scheduled pass runs as $scheduledContext; user-only work requires an interactive user session." -ForegroundColor Yellow
             Register-ScheduledTaskNow
             Start-ScheduledTask -TaskName $taskName
             Write-Host "Task started. Log: $installDir\BootUpdateCycle.log" -ForegroundColor Green
@@ -805,7 +809,7 @@ if ($Config.NonInteractive) {
     }
 } else {
     <# Interactive mode: show deployment info with execution context warning #>
-    Show-DeploymentModal -InstallDir $installDir -UninstallPath $uninstallPath -TaskName $taskName -DirectFirstRun $Config.DirectFirstRun
+    Show-DeploymentModal -InstallDir $installDir -UninstallPath $uninstallPath -TaskName $taskName -DirectFirstRun $Config.DirectFirstRun -ScheduledContext $scheduledContext
 
     if ($Config.StartNow) {
         <# Flush keyboard buffer - paste+Enter leaves keys in buffer that would skip the prompt #>
@@ -824,8 +828,8 @@ if ($Config.NonInteractive) {
             Write-Host ""
             Invoke-DeployedCycle
         } else {
-            Write-Host "Starting via scheduled task (SYSTEM context)..." -ForegroundColor Yellow
-            Write-Host "User-only work stays queued for the saved user's session." -ForegroundColor Yellow
+            Write-Host "Starting via scheduled task ($scheduledContext context)..." -ForegroundColor Yellow
+            Write-Host "User-only work requires the saved user's interactive session." -ForegroundColor Yellow
             Write-Host ""
             Register-ScheduledTaskNow
             Start-ScheduledTask -TaskName $taskName
