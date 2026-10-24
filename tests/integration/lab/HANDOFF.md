@@ -90,6 +90,9 @@ $parameters = @{
 $harness = (Resolve-Path ./tests/integration/lab/Invoke-LabRow.ps1).Path
 $job = Start-Job -ArgumentList $harness,$parameters -ScriptBlock {
     param($script,$arguments)
+    if ($arguments.InjectAction -is [string]) {
+        $arguments.InjectAction = [scriptblock]::Create($arguments.InjectAction)
+    }
     & $script @arguments
 }
 ```
@@ -102,10 +105,50 @@ result; use `host-timeline.txt` for progress without repeatedly dumping raw logs
 A lost host process releases its lease but does not stop guest tasks. Inspect and
 collect evidence before shutting down or restoring that guest.
 
+For an injection row, `Start-Job` serializes the `InjectAction` scriptblock as
+text. The worker above reconstructs it before calling the harness. Use only the
+injection code you supplied for the row; never reconstruct code from guest logs.
+
 The harness does not automatically shut down guests at completion, so failed
 state remains inspectable. When finished collecting evidence, use a guest-side
 normal shutdown (`shutdown.exe /s /t 0` through PowerShell Direct), wait for Off,
 then run the next row. Never use `Restart-VM` as a substitute for a guest reboot.
+
+### Verify the saved user's next sign-in
+
+Add `StopAtSavedUserWait=$true` to the headless row's parameters. The row stops
+collecting once the checkpoint is `UserContextPending` and the saved user's
+logon task is the only continuation left. That result is PARTIAL: the user work
+hasn't run yet. `continuation-tasks.json` contains the actual task definitions.
+
+After the row job finishes, leave that guest running and run this as another
+background job, using the same configuration and source tree:
+
+```powershell
+$resume = Join-Path $config.SourceRoot 'tests/integration/lab/Resume-LabSavedUser.ps1'
+$arguments = @{
+    VMName = $guest.Name
+    GuestUser = $config.GuestUser
+    CredentialTarget = $config.CredentialTarget
+    EvidenceRoot = $config.EvidenceRoot
+    ExpectedSourceSha256 = (Get-FileHash (Join-Path $config.SourceRoot 'Invoke-BootUpdateCycle.ps1')).Hash
+    TimeoutMinutes = 20
+}
+$job = Start-Job -ArgumentList $resume,$arguments -ScriptBlock {
+    param($script,$parameters)
+    & $script @parameters
+}
+```
+
+This helper checks the saved account and installed source, configures one
+temporary guest autologon, and restarts the guest normally. It never starts the
+updater task itself: Windows must launch the existing logon continuation.
+`UserContinuationVerified` requires a new user-context pass, the scheduler's
+task-start event, health verification, and task/state cleanup. The cycle result
+is still PARTIAL if other provider inventory remains outstanding. Read
+`summary.json` and `cleanup.json`; the latter must confirm the temporary guest
+autologon settings were removed. A cleanup failure fails the gate and names the
+guest that needs scrubbing. This helper operates on the disposable guest only.
 
 ## Dependencies and source identity
 
@@ -149,6 +192,11 @@ banner with deferred inventory is PARTIAL. Missing files or a failed collector
 are not success. `os-boot-times.json` retains raw boot timestamps for independent
 recounting. An optional `-ScreenCaptureScript` enables a local screenshot helper;
 there is no implicit dependency on one.
+
+`task-events.json` retains the updater's scheduler events. The collector parses
+XML fields rather than matching quote characters: Windows may return attributes
+with single quotes. If an export is empty, check `SchedulerTotalEvents` and query
+the channel for a known task before treating that as evidence that nothing ran.
 
 Raw evidence stays outside Git and can contain guest identities and private paths.
 Publish only sanitized summaries. Preserve earlier failed attempts and name tests

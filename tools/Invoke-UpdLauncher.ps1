@@ -220,8 +220,9 @@ function Start-UpdLegacyBatchAdoption {
         '-File', ('"{0}"' -f $PSCommandPath),
         'adopt-staged-batch', '-LegacyAdoptionWorker'
     )
-    $null = Start-Process -FilePath (Get-Command pwsh).Source -WindowStyle Hidden -ArgumentList $arguments
+    # Publish queued before spawning: the worker may finish before Start-Process returns.
     Set-Content -LiteralPath $workerLog -Value "$(Get-Date -Format o) Legacy launcher adoption queued." -Encoding utf8
+    $null = Start-Process -FilePath (Get-Command pwsh).Source -WindowStyle Hidden -ArgumentList $arguments
 }
 
 function Get-UpdDeployParameters {

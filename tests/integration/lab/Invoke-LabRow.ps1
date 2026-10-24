@@ -53,7 +53,10 @@ param(
     [string]$CredentialTarget = 'boot-upd-lab-guest',
     [string]$ModuleCachePath = '',
     [string]$ModuleCacheSha256 = '',
-    [string]$ScreenCaptureScript = ''
+    [string]$ScreenCaptureScript = '',
+    <# Collect a deliberate saved-user wait as PARTIAL instead of idling until timeout.
+       Resume-LabSavedUser.ps1 can then test the real sign-in continuation. #>
+    [switch]$StopAtSavedUserWait
 )
 
 function Test-LabCompletionEvidence {
@@ -65,8 +68,22 @@ function Test-LabCompletionEvidence {
     )
     return ($Passes -ge 1 -and $CompletionRecords -ge 1 -and $TasksRemaining -eq 0 -and -not $StateFileExists)
 }
+
+function Test-LabSavedUserWaitEvidence {
+    param(
+        [string]$Phase,
+        [string]$ResumeUser,
+        [string[]]$TaskNames,
+        [string[]]$PrimaryTriggerTypes,
+        [bool]$LogonOnlyVerified
+    )
+    return ($Phase -eq 'UserContextPending' -and -not [string]::IsNullOrWhiteSpace($ResumeUser) -and
+        $LogonOnlyVerified -and @($TaskNames).Count -eq 1 -and $TaskNames[0] -eq 'BootUpdateCycle' -and
+        @($PrimaryTriggerTypes).Count -eq 1 -and $PrimaryTriggerTypes[0] -eq 'MSFT_TaskLogonTrigger')
+}
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'LabCredential.ps1')
+. (Join-Path $PSScriptRoot 'LabEvidence.ps1')
 if (-not $GuestPassword) { $GuestPassword = Get-BootUpdLabPassword -Target $CredentialTarget }
 if (-not $GuestPassword) {
     throw 'No lab guest password available. Store one with: . ./LabCredential.ps1; Set-BootUpdLabPassword -Generate'
@@ -117,6 +134,7 @@ $manifest = [ordered]@{
     HarnessSha256=(Get-FileHash $PSCommandPath).Hash
     Launcher=$Launcher; DeployArgs=$DeployArgs; ArmReboots=$ArmReboots
     SystemContext=[bool]$SystemContext; TimeoutMinutes=$TimeoutMinutes; SkipSync=[bool]$SkipSync
+    StopAtSavedUserWait=[bool]$StopAtSavedUserWait
     ModuleCacheSha256=$ModuleCacheSha256; InjectWhen=$InjectWhen; InjectionConfigured=[bool]$InjectAction
     SourceFiles=$sourceHashes
     InjectionAction=if ($InjectAction) { $InjectAction.ToString() } else { $null }
@@ -402,6 +420,8 @@ while ((Get-Date) -lt $deadline) {
                ended 80 seconds in, "complete after 1 pass", against a log holding one
                self-update line. #>
             $lines = @(if (Test-Path $log) { Get-Content $log -ErrorAction SilentlyContinue })
+            $tasks = @(Get-ScheduledTask -TaskName 'BootUpdateCycle*' -ErrorAction SilentlyContinue)
+            $state = try { Get-Content 'C:\ProgramData\BootUpdateCycle\BootUpdateCycle.state.json' -Raw -ErrorAction Stop | ConvertFrom-Json } catch { $null }
             <# Where-Object rather than -match for the same reason: it returns a collection
                whatever it is given, so no count here can be a boolean in disguise. #>
             [pscustomobject]@{
@@ -414,6 +434,11 @@ while ((Get-Date) -lt $deadline) {
                    after the updater had finished saying everything it had to say. #>
                 Terminal = @($lines | Where-Object { $_ -match '(recovery limit|Reboot limit) .*reached' }).Count
                 Tasks    = @(Get-ScheduledTask -TaskName 'BootUpdateCycle*' -ErrorAction SilentlyContinue).Count
+                TaskNames = @($tasks.TaskName)
+                PrimaryTriggerTypes = @($tasks | Where-Object TaskName -eq 'BootUpdateCycle' | ForEach-Object { $_.Triggers } | ForEach-Object { $_.CimClass.CimClassName })
+                Phase = [string]$state.Phase
+                ResumeUser = [string]$state.ResumeUser
+                LogonOnlyVerified = @($lines | Where-Object { $_ -match 'Resume chain verified: BootUpdateCycle \(saved-user logon only\)' }).Count -gt 0
                 StateFileExists = Test-Path 'C:\ProgramData\BootUpdateCycle\BootUpdateCycle.state.json'
                 <# consent.exe is the UAC consent dialog itself, so counting it counts real prompts rather than inferring them from a log. #>
                 Consent  = @(Get-Process consent -ErrorAction SilentlyContinue).Count
@@ -448,6 +473,10 @@ while ((Get-Date) -lt $deadline) {
            bug above: a cycle cannot complete before it has started, so a claim of completion
            with zero observed passes is a harness fault, not a result. #>
         if (Test-LabCompletionEvidence -Passes $r.Passes -CompletionRecords $r.Complete -TasksRemaining $r.Tasks -StateFileExists $r.StateFileExists) { $complete = $true; Say "cycle complete after $($r.Passes) pass(es)"; break }
+        if ($StopAtSavedUserWait -and (Test-LabSavedUserWaitEvidence -Phase $r.Phase -ResumeUser $r.ResumeUser -TaskNames $r.TaskNames -PrimaryTriggerTypes $r.PrimaryTriggerTypes -LogonOnlyVerified $r.LogonOnlyVerified)) {
+            Say 'machine servicing finished; collecting saved-user wait as PARTIAL'
+            break
+        }
         if ($r.Terminal -ge 1 -and $r.Tasks -eq 0) { Say "cycle stopped itself at a limit after $($r.Passes) pass(es)"; break }
     } catch { Add-Timeline (("{0} unreachable (rebooting)" -f (Get-Date -Format 'HH:mm:ss'))) }
     <# Poll fast while waiting to inject: a restart countdown is measured in seconds, so a
@@ -465,6 +494,12 @@ $evidence = Invoke-Command -VMName $VMName -Credential $cred -ScriptBlock {
     $boots = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 6005 } -MaxEvents 40 -ErrorAction SilentlyContinue |
                Select-Object -ExpandProperty TimeCreated)
     $activeStateJson = try { [IO.File]::ReadAllText('C:\ProgramData\BootUpdateCycle\BootUpdateCycle.state.json') } catch [IO.FileNotFoundException] { $null } catch [IO.DirectoryNotFoundException] { $null }
+    $firstPass = $lines | Where-Object { $_ -match 'BOOT UPDATE CYCLE (STARTED|RESUMED)' } | Select-Object -First 1
+    $taskEvents = @()
+    if ($firstPass -match '\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]') {
+        $taskEvents = @(Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-TaskScheduler/Operational';StartTime=[datetime]$Matches[1]} -ErrorAction SilentlyContinue |
+            ForEach-Object { $_.ToXml() })
+    }
     [pscustomobject]@{
         Log             = $lines
         CollectedAtUtc  = [datetime]::UtcNow.ToString('o')
@@ -472,9 +507,13 @@ $evidence = Invoke-Command -VMName $VMName -Credential $cred -ScriptBlock {
         CandidateSourceHash = (Get-FileHash 'C:\Lab\boot-upd\Invoke-BootUpdateCycle.ps1' -Algorithm SHA256).Hash
         InstalledOrchestratorHash = if (Test-Path 'C:\ProgramData\BootUpdateCycle\Invoke-BootUpdateCycle.ps1') { (Get-FileHash 'C:\ProgramData\BootUpdateCycle\Invoke-BootUpdateCycle.ps1' -Algorithm SHA256).Hash } else { $null }
         ActiveStateJson = $activeStateJson
+        SchedulerEvents = $taskEvents
         UpdaterProcesses = @(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'Invoke-BootUpdateCycle|Deploy-BootUpdateCycle|Invoke-UpdLauncher' } | Select-Object ProcessId,ParentProcessId,Name)
         StateFileExists = Test-Path 'C:\ProgramData\BootUpdateCycle\BootUpdateCycle.state.json'
         TasksRemaining  = @(Get-ScheduledTask -TaskName 'BootUpdateCycle*' -ErrorAction SilentlyContinue).Count
+        ContinuationTasks = @(Get-ScheduledTask -TaskName 'BootUpdateCycle*' -ErrorAction SilentlyContinue | ForEach-Object {
+            [pscustomobject]@{ Name=$_.TaskName; TriggerTypes=@($_.Triggers | ForEach-Object { $_.CimClass.CimClassName }); Xml=(Export-ScheduledTask -TaskName $_.TaskName) }
+        })
         CbsPending      = Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
         <# For a no-user row, proof that no interactive session ever appeared is part of the
            result: a SYSTEM-fallback claim means nothing if somebody was quietly logged in. #>
@@ -487,6 +526,9 @@ $evidence = Invoke-Command -VMName $VMName -Credential $cred -ScriptBlock {
 
 if ($evidence.ActiveStateJson) { $evidence.ActiveStateJson | Set-Content (Join-Path $evidenceDir 'active-state.json') }
 ConvertTo-Json -InputObject @($evidence.UpdaterProcesses) -Depth 3 | Set-Content (Join-Path $evidenceDir 'updater-processes.json')
+ConvertTo-Json -InputObject @($evidence.ContinuationTasks) -Depth 5 | Set-Content (Join-Path $evidenceDir 'continuation-tasks.json')
+$schedulerEvents = @($evidence.SchedulerEvents | ConvertFrom-BootUpdLabTaskEvent | Where-Object { $_.TaskName -in @('\BootUpdateCycle','\BootUpdateCycleFallback') })
+ConvertTo-Json -InputObject @($schedulerEvents.Xml) | Set-Content (Join-Path $evidenceDir 'task-events.json')
 $evidence.Log | Set-Content (Join-Path $evidenceDir 'BootUpdateCycle.log')
 if ($evidence.DeployOutput.Count) { $evidence.DeployOutput | Set-Content (Join-Path $evidenceDir 'deploy-output.txt') }
 ConvertTo-Json -InputObject @($evidence.OsBootTimes) | Set-Content (Join-Path $evidenceDir 'os-boot-times.json')
@@ -527,6 +569,14 @@ $claimed = $null
 $claimLine = $completionLine
 if ($claimLine -match '(\d+) reboot\(s\)') { $claimed = [int]$Matches[1] }
 
+$collectedState = if ($evidence.ActiveStateJson) { $evidence.ActiveStateJson | ConvertFrom-Json } else { $null }
+$waitEvidence = @{
+    Phase = [string]$collectedState.Phase
+    ResumeUser = [string]$collectedState.ResumeUser
+    TaskNames = @($evidence.ContinuationTasks.Name)
+    PrimaryTriggerTypes = @($evidence.ContinuationTasks | Where-Object Name -eq 'BootUpdateCycle' | ForEach-Object { $_.TriggerTypes })
+    LogonOnlyVerified = @($evidence.Log | Where-Object { $_ -match 'Resume chain verified: BootUpdateCycle \(saved-user logon only\)' }).Count -gt 0
+}
 $summary = [pscustomobject]@{
     Row              = $Row
     VM               = $VMName
@@ -541,6 +591,9 @@ $summary = [pscustomobject]@{
     InstalledOrchestratorHash = $evidence.InstalledOrchestratorHash
     StateFileRemains = $evidence.StateFileExists
     TasksRemaining   = $evidence.TasksRemaining
+    WaitingForSavedUser = Test-LabSavedUserWaitEvidence @waitEvidence
+    SchedulerEventsCollected = $schedulerEvents.Count
+    SchedulerTotalEvents = @($evidence.SchedulerEvents).Count
     CbsPending       = $evidence.CbsPending
     Injected         = $injected
     InjectionAttempted = $injectAttempted

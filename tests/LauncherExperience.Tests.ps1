@@ -54,6 +54,20 @@ BeforeAll {
     }
 }
 
+Describe 'Legacy adoption terminal record ordering' {
+    It 'never overwrites a worker that finishes before Start-Process returns' {
+        $script:RaceAdoptionLog=Join-Path $TestDrive 'upd.cmd.adoption.log'
+        Mock Start-Process { Set-Content -LiteralPath $script:RaceAdoptionLog -Value 'Legacy launcher adoption completed.' }
+        $functionText=Get-FunctionText -Ast $launcherAst -Name 'Start-UpdLegacyBatchAdoption'
+        & {
+            param($repoRoot,$definition)
+            . ([scriptblock]::Create($definition))
+            Start-UpdLegacyBatchAdoption
+        } $TestDrive $functionText
+        Get-Content -LiteralPath $script:RaceAdoptionLog -Raw | Should -Match 'completed'
+    }
+}
+
 Describe 'Batch launcher file format' {
     It 'stores only CRLF line endings because cmd.exe misparses LF-only files' {
         $bytes = [IO.File]::ReadAllBytes($cmdPath)
