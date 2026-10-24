@@ -1,9 +1,28 @@
 # Boot Update Cycle — Release Notes
 
-**Latest published version:** v2.5.83
+**Latest published version:** v2.5.84
 **Status:** Released
 
 ---
+
+## v2.5.84 (2026-10-24)
+
+Fixes two ways a run could stall or misreport: single-package Winget upgrades, and a pass that dies before it starts updating.
+
+### Changes
+
+- **Targeted Winget upgrades are read correctly.** When the updater upgrades one package at a time (`winget upgrade --id ...`), Winget prints a different transcript than a bulk upgrade: no `(1/3)` counter, and its own wording for "no applicable upgrade" and "installed with a different technology". Those runs are now counted as attempted, and their exit codes reconcile with what Winget actually did. Packages Winget can't upgrade in place (pinned, unknown version, different installer technology) are now recorded in the deferred inventory for targeted runs too, as they already were for bulk runs.
+- **A pass that crashes during pre-flight now resumes.** The repeating watchdog task used to be armed only after the pre-flight checks. If PowerShell died in between, for example because Windows Update replaced `pwsh.exe` underneath it, nothing restarted the run until the next reboot. Task Scheduler records a crashed action as "completed", so the gap stayed invisible. The watchdog is now armed before pre-flight.
+
+### Testing
+
+619 tests passed, along with the User/SYSTEM and launcher checks.
+
+The interactive VM passed after four update passes and three reboots. The headless VM completed five passes and two reboots, but deferred user-only updates (no one was signed in), a Windows update that stayed offered after installing, and some delete-only file cleanup. Both cleaned up their resume tasks and saved state. The overall VM result is **PARTIAL**, not a claim that everything was patched.
+
+A separate VM row killed a resumed pass during pre-flight on purpose; the watchdog restarted it about 18 minutes later and the run finished.
+
+Full results are in the [validation report](docs/validation-2.5.84.md).
 
 ## v2.5.83 (2026-09-26)
 
