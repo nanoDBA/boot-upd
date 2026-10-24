@@ -90,6 +90,9 @@ $parameters = @{
 $harness = (Resolve-Path ./tests/integration/lab/Invoke-LabRow.ps1).Path
 $job = Start-Job -ArgumentList $harness,$parameters -ScriptBlock {
     param($script,$arguments)
+    if ($arguments.InjectAction -is [string]) {
+        $arguments.InjectAction = [scriptblock]::Create($arguments.InjectAction)
+    }
     & $script @arguments
 }
 ```
@@ -101,6 +104,10 @@ Keep the PowerShell job's owning process alive. `Receive-Job -Wait` waits for th
 result; use `host-timeline.txt` for progress without repeatedly dumping raw logs.
 A lost host process releases its lease but does not stop guest tasks. Inspect and
 collect evidence before shutting down or restoring that guest.
+
+For an injection row, `Start-Job` serializes the `InjectAction` scriptblock as
+text. The worker above reconstructs it before calling the harness. Use only the
+injection code you supplied for the row; never reconstruct code from guest logs.
 
 The harness does not automatically shut down guests at completion, so failed
 state remains inspectable. When finished collecting evidence, use a guest-side

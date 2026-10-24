@@ -35,6 +35,7 @@ BeforeAll {
         'Get-BootUpdateBootReading',
         'Update-BootUpdateStateForBootSession',
         'Get-BootUpdateLaunchContract',
+        'Wait-BootUpdateDelayedServiceStart',
         'Test-PostUpdateHealth',
         'Get-BootUpdateBootSessionId',
         'Set-BootUpdateRebootCheckpoint',
@@ -951,6 +952,54 @@ Describe 'Concise provider diagnostics' {
 }
 
 Describe 'Do-no-harm service health assessment' {
+    It 'observes delayed automatic time service startup without repairing it' {
+        $script:healthReads=0
+        $result=Test-PostUpdateHealth -CriticalServices W32Time `
+            -ServiceProvider { param($name) $script:healthReads++; [pscustomobject]@{Status=if($script:healthReads -gt 1){'Running'}else{'Stopped'}} } `
+            -ConfigurationProvider { param($name) [pscustomobject]@{StartMode='Auto';DelayedAutoStart=$true} } `
+            -UptimeProvider {82} -SleepProvider {param($seconds)}
+        $result.AllHealthy | Should -BeTrue
+        $result.MutationsAttempted | Should -Be 0
+        $script:healthReads | Should -BeGreaterThan 1
+    }
+
+    It 'still fails when delayed startup never reaches Running' {
+        $script:healthSleeps=0
+        $result=Test-PostUpdateHealth -CriticalServices W32Time `
+            -ServiceProvider { param($name) [pscustomobject]@{Status='Stopped'} } `
+            -ConfigurationProvider { param($name) [pscustomobject]@{StartMode='Auto';DelayedAutoStart=$true} } `
+            -UptimeProvider {298} -SleepProvider {param($seconds) $script:healthSleeps += $seconds}
+        $result.AllHealthy | Should -BeFalse
+        $script:healthSleeps | Should -Be 2
+        $result.MutationsAttempted | Should -Be 0
+    }
+
+    It 'also observes a delayed automatic service that is already starting' {
+        $script:healthReads=0
+        $result=Test-PostUpdateHealth -CriticalServices W32Time `
+            -ServiceProvider { param($name) $script:healthReads++; [pscustomobject]@{Status=if($script:healthReads -gt 1){'Running'}else{'StartPending'}} } `
+            -ConfigurationProvider { param($name) [pscustomobject]@{StartMode='Auto';DelayedAutoStart=$true} } `
+            -UptimeProvider {82} -SleepProvider {param($seconds)}
+        $result.AllHealthy | Should -BeTrue
+        $result.MutationsAttempted | Should -Be 0
+    }
+
+    It 'does not wait for stopped automatic services without delayed startup' {
+        $result=Test-PostUpdateHealth -CriticalServices W32Time `
+            -ServiceProvider { param($name) [pscustomobject]@{Status='Stopped'} } `
+            -ConfigurationProvider { param($name) [pscustomobject]@{StartMode='Auto';DelayedAutoStart=$false} } `
+            -UptimeProvider {82} -SleepProvider {throw 'Must not sleep'}
+        $result.AllHealthy | Should -BeFalse
+    }
+
+    It 'does not extend the grace for a service stopped after the boot window' {
+        $result=Test-PostUpdateHealth -CriticalServices W32Time `
+            -ServiceProvider { param($name) [pscustomobject]@{Status='Stopped'} } `
+            -ConfigurationProvider { param($name) [pscustomobject]@{StartMode='Auto';DelayedAutoStart=$true} } `
+            -UptimeProvider {301} -SleepProvider {throw 'Must not sleep'}
+        $result.AllHealthy | Should -BeFalse
+    }
+
     It 'does not mutate services and accepts expected or policy-managed stopped states' {
         $services = @{ W32Time='Stopped'; WinDefend='Stopped'; Spooler='Stopped'; Dnscache='Running'; EventLog='Running' }
         $startModes = @{ W32Time='Manual'; WinDefend='Manual'; Spooler='Disabled'; Dnscache='Auto'; EventLog='Auto' }

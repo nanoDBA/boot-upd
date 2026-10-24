@@ -6219,6 +6219,28 @@ function Repair-AwsTooling {
 #endregion
 
 #region Health Check
+function Wait-BootUpdateDelayedServiceStart {
+    <# Observe startup only. Five minutes from boot bounds delayed-start settling;
+       it is not permission to accept a service that never becomes Running. #>
+    param(
+        [string]$Name,
+        [double]$UptimeSeconds,
+        [scriptblock]$ServiceProvider,
+        [scriptblock]$SleepProvider = { param($Seconds) Start-Sleep -Seconds $Seconds }
+    )
+    if ($UptimeSeconds -lt 0 -or $UptimeSeconds -ge 300) { return $false }
+    $remaining = [math]::Ceiling(300 - $UptimeSeconds)
+    Write-Log "  Health check: observing delayed startup for $Name (up to $remaining seconds; no service changes)."
+    while ($remaining -gt 0) {
+        $seconds = [math]::Min(5, $remaining)
+        & $SleepProvider $seconds
+        $remaining -= $seconds
+        $observed = & $ServiceProvider $Name
+        if ($observed -and [string]$observed.Status -eq 'Running') { return $true }
+    }
+    return $false
+}
+
 function Test-PostUpdateHealth {
     <# Read-only by design. Service repair is a separate mutation that requires
        explicit user scope; a health check never implies that authorization. #>
@@ -6228,11 +6250,19 @@ function Test-PostUpdateHealth {
             param($Name) Get-Service -Name $Name -ErrorAction SilentlyContinue
         },
         [Parameter(DontShow)][scriptblock]$ConfigurationProvider = {
-            param($Name) Get-CimInstance Win32_Service -Filter "Name='$Name'" -ErrorAction SilentlyContinue
+            param($Name)
+            $configuration = Get-CimInstance Win32_Service -Filter "Name='$Name'" -ErrorAction SilentlyContinue
+            if ($configuration) {
+                $delayed = Get-ItemProperty -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\$Name" -Name DelayedAutoStart -ErrorAction SilentlyContinue
+                $configuration | Add-Member -NotePropertyName DelayedAutoStart -NotePropertyValue ($delayed.DelayedAutoStart -eq 1) -Force
+                $configuration
+            }
         },
         [Parameter(DontShow)][scriptblock]$DefenderStatusProvider = {
             Get-MpComputerStatus -ErrorAction SilentlyContinue
-        }
+        },
+        [Parameter(DontShow)][scriptblock]$UptimeProvider = { Get-BootUpdateUptimeSeconds },
+        [Parameter(DontShow)][scriptblock]$SleepProvider = { param($Seconds) Start-Sleep -Seconds $Seconds }
     )
 
     Write-Log '--- Post-Update Health Check (read-only) ---'
@@ -6252,6 +6282,11 @@ function Test-PostUpdateHealth {
             $status = [string]$serviceObj.Status
             $config = & $ConfigurationProvider $svc
             $startMode = if ($config -and $config.StartMode) { [string]$config.StartMode } else { 'Unknown' }
+            if ($svc -eq 'W32Time' -and $status -in @('Stopped','StartPending') -and $startMode -eq 'Auto' -and $config.DelayedAutoStart -eq $true) {
+                if (Wait-BootUpdateDelayedServiceStart -Name $svc -UptimeSeconds (& $UptimeProvider) -ServiceProvider $ServiceProvider -SleepProvider $SleepProvider) {
+                    $status = 'Running'
+                }
+            }
             if ($status -eq 'Running') {
                 Write-Log "  Health check: $svc is Running (start mode: $startMode)"
                 continue
