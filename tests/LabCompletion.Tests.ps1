@@ -8,6 +8,37 @@ BeforeAll {
         $node.Name -eq 'Test-LabCompletionEvidence'
     }, $true)
     . ([scriptblock]::Create($fn.Extent.Text))
+    $waitFn = $ast.Find({ param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Test-LabSavedUserWaitEvidence'
+    }, $true)
+    . ([scriptblock]::Create($waitFn.Extent.Text))
+}
+
+Describe 'A parked saved-user cycle needs checkpoint and scheduler evidence' {
+    BeforeEach {
+        $waitEvidence=@{Phase='UserContextPending';ResumeUser='LAB\test';TaskNames=@('BootUpdateCycle');PrimaryTriggerTypes=@('MSFT_TaskLogonTrigger');LogonOnlyVerified=$true}
+    }
+    It 'recognizes a saved-user wait without declaring completion' {
+        Test-LabSavedUserWaitEvidence @waitEvidence | Should -BeTrue
+        Test-LabCompletionEvidence -Passes 3 -CompletionRecords 0 -TasksRemaining 1 -StateFileExists $true | Should -BeFalse
+    }
+    It 'rejects a stale log record when the SYSTEM fallback still exists' {
+        $waitEvidence.TaskNames=@('BootUpdateCycle','BootUpdateCycleFallback')
+        Test-LabSavedUserWaitEvidence @waitEvidence | Should -BeFalse
+    }
+    It 'rejects a dated retry or watchdog still attached to the task' {
+        $waitEvidence.PrimaryTriggerTypes+= 'MSFT_TaskTimeTrigger'
+        Test-LabSavedUserWaitEvidence @waitEvidence | Should -BeFalse
+    }
+    It 'rejects missing checkpoint ownership' {
+        $waitEvidence.ResumeUser=''
+        Test-LabSavedUserWaitEvidence @waitEvidence | Should -BeFalse
+    }
+    It 'rejects a pending checkpoint before successful task verification' {
+        $waitEvidence.LogonOnlyVerified=$false
+        Test-LabSavedUserWaitEvidence @waitEvidence | Should -BeFalse
+    }
 }
 
 Describe 'Lab completion requires observed cleanup' {

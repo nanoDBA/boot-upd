@@ -3,7 +3,7 @@
 # File:        Deploy-BootUpdateCycle.ps1
 # Description: Single-file paste-to-deploy boot update cycle installer
 # Purpose:     Deploys Invoke-BootUpdateCycle.ps1 to ProgramData, runs the first
-#              iteration directly in user context (critical for user-scope winget),
+#              iteration directly in the launching account's context,
 #              and registers a scheduled task only if reboots are needed.
 # Created:     2025-01-10
 # Modified:    2026-04-25
@@ -54,7 +54,7 @@ param(
     WINGET SCOPE STRATEGY:
     - First run (user context): Updates BOTH user-scope AND machine-scope packages
     - Subsequent runs (SYSTEM): Machine-scope only
-    - First run MUST be direct — it's the only chance for user-scope!
+    - User-scope work left by SYSTEM resumes through the saved account's logon task
 
     The update cycle:
     - Winget, Chocolatey, native SSMS, Windows Update, pip, npm, Office 365,
@@ -96,7 +96,7 @@ $Config = @{
     DisableSelfUpdate     = $false  # Suppress GitHub release self-update
     MaxIterations         = 5       # Safety valve for reboot loops
     MaxRetryPasses        = 5       # Consecutive same-boot recovery failures
-    MaxUserIdentityWaits  = 10      # Rediscovery attempts before concluding no user will sign in
+    MaxUserIdentityWaits  = 10      # Timed session checks before parking known-user work for sign-in
     WatchdogIntervalMinutes = 15    # Minutes between watchdog probes while a cycle is in flight (floor 2, no off switch)
     PackageTimeoutMin     = 30      # Minutes before killing a hung package manager (hard timeout)
                                     # Smart idle detection kills stuck processes after 5 min of no CPU
@@ -107,8 +107,9 @@ $Config = @{
     <# EXECUTION CONTEXT - READ THIS #>
     DirectFirstRun        = $true   # *** RECOMMENDED: First run in YOUR console (user context)
                                     #     - Updates BOTH user-scope AND machine-scope winget packages
-                                    #     - If reboot: task registered, subsequent runs as SYSTEM
-                                    # Set $false for headless: all runs as SYSTEM (no user-scope)
+                                    #     - If reboot: user-at-logon task plus delayed SYSTEM fallback
+                                    # Set $false for headless: machine work starts as SYSTEM;
+                                    # user work waits for the saved account to sign in
 
     RunAsUser             = $false  # Only matters if DirectFirstRun = $false
     NonInteractive        = $false  # Set $true for fire-and-forget: no prompts, no TUI

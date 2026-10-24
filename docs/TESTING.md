@@ -21,6 +21,18 @@ Run the locally available gates from an elevated PowerShell 7 console:
 
 Use `-SkipOsBoundary` only on a non-elevated development machine and report that category as **not run**, never as passed. `-SkipPublishedUpgrade` is for offline development only.
 
+For changes to saved-user session detection, also run this from an elevated
+PowerShell 7 console with a user already signed in:
+
+```powershell
+./tests/integration/Invoke-SavedUserSessionGate.ps1 | ConvertTo-Json -Depth 4
+```
+
+It runs the production session check as SYSTEM and requires three outcomes: the
+saved console user is present, a different local account is absent, and an
+unresolvable account is absent. It reads the updater functions without running
+updates. Its temporary SYSTEM task is removed afterwards; it never reboots the host.
+
 ## Multi-reboot VM matrix
 
 For existing guests, credentials, local configuration, source manifests, and exact
@@ -35,6 +47,12 @@ Before releasing changes to checkpointing, tasks, reboot detection, mutexes, pro
 - local profiles plus OneDrive-redirected module paths;
 - killed-process recovery during checkpoint creation and immediately after state promotion;
 - a cycle killed mid-pass on a machine that neither reboots nor logs on again is resumed by the watchdog probe within the configured interval, and a healthy long-running pass is not double-run by probes (run with a short interval).
+
+For a headless SYSTEM row with a saved user account, machine-scope work should finish
+without waiting on that account. User-scope work stays in the checkpoint, and only the
+saved user's logon continuation remains armed; their next sign-in resumes the cycle
+without a manual rerun. If no account can be resolved, report user-scope work as deferred
+inventory instead. A headless row with queued user work is **PARTIAL**, not PASS.
 
 Capture the updater log, every checkpoint revision, task definitions and results, boot identifiers, effective identities, provider exit/reboot evidence, and the final cleanup inventory. A scenario passes only when every enabled phase converges, no reboot evidence remains after settling, health checks pass, and both tasks and active state are absent.
 

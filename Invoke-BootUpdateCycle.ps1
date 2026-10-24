@@ -50,10 +50,9 @@
 param(
     [ValidateRange(1,50)][int]$MaxIterations = 5,
     [ValidateRange(1,50)][int]$MaxRetryPasses = 5,
-    <# How many times the cycle will re-look for an interactive user before concluding that
-       none is coming. Only consumed when NO user is known at all: when a user has been seen,
-       the continuation waits on a logon trigger instead and costs nothing. At the two-minute
-       rediscovery interval the default is roughly twenty minutes. #>
+    <# How many two-minute rediscovery attempts to make when no interactive session is
+       present. If a saved account is known when this bound is reached, the updater keeps
+       its user work queued for that account's next sign-in instead of retrying forever. #>
     [ValidateRange(1,500)][int]$MaxUserIdentityWaits = 10,
     <# While a cycle is in flight, Task Scheduler starts a watchdog probe on both
        continuation tasks every N minutes (repeating -Once trigger, added only to the
@@ -6519,7 +6518,7 @@ function Resolve-BootUpdateResumeAccount {
 }
 
 function Test-BootUpdateInteractiveUserPresent {
-    <# Is there an interactive user signed in right now, who could run user-scope work?
+    <# Is the account needed for user-scope work signed in right now?
 
        This is not the same question as "do we know who the user is", and conflating the two
        stranded a headless guest. Once the resume-SID discovery started working, ResumeUser
@@ -6528,29 +6527,37 @@ function Test-BootUpdateInteractiveUserPresent {
        will never fire, and never took another pass. Lab row B sat at
        UserContextPending with both tasks armed and nothing to fire them.
 
-       The distinction that matters is whether a user-context pass can still happen. A laptop
-       whose owner is signed in, or will sign in, has one: the logon trigger costs nothing and
-       must keep waiting. A machine with no interactive session does not, and Microsoft
-       documents that machine as the *unblocked* servicing path - so its wait is bounded, and
-       on exhaustion the user-scope work becomes deferred inventory.
+       The distinction that matters is whether a user-context pass can run now. A machine
+       with no interactive session uses the *unblocked* machine-servicing path, so timed
+       rediscovery is bounded. If the previous account is resolvable, its user work stays
+       queued on a logon trigger after the bound; only work with no usable account becomes
+       deferred inventory.
 
        Scope, stated because this repo does not let a comment overstate a probe: the lookup
        is Win32_ComputerSystem.UserName, which is the CONSOLE session. An RDP-only server
-       with a signed-in administrator reports nothing here and is therefore bounded. That is
-       the safe direction - it completes with a qualified claim naming the deferred work,
-       rather than waiting forever - but it is not the same question as "is anyone logged
-       on", and a second signal would be needed to make it so.
+       with a signed-in administrator reports nothing here and is therefore bounded. Dated
+       retries still give a saved user's task a chance to run in that session; after the
+       bound, the logon trigger remains available for the next sign-in.
 
        The console lookup is a parameter so a test can drive both machines. #>
     param(
         [scriptblock]$ConsoleUserProvider = {
             try { (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).UserName } catch { $null }
-        }
+        },
+        [AllowNull()][string]$ResumeUser,
+        [AllowNull()][string]$ResumeUserSid,
+        [string]$CurrentIdentitySid = ([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value)
     )
     <# A cycle running as the user IS the interactive session. Only a SYSTEM-context pass has
        to go and look. #>
-    if ([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value -ne 'S-1-5-18') { return $true }
-    return -not [string]::IsNullOrWhiteSpace([string](& $ConsoleUserProvider))
+    if ($CurrentIdentitySid -ne 'S-1-5-18') { return $true }
+    $consoleUser = [string](& $ConsoleUserProvider)
+    if ([string]::IsNullOrWhiteSpace($consoleUser)) { return $false }
+    if (-not $ResumeUser -and -not $ResumeUserSid) { return $true }
+    # Another signed-in account cannot run this saved user's interactive task.
+    $expectedSid = Resolve-BootUpdateResumeAccount -Account $ResumeUser -PreferredSid $ResumeUserSid
+    $consoleSid = Resolve-BootUpdateResumeAccount -Account $consoleUser
+    return (-not [string]::IsNullOrWhiteSpace($expectedSid) -and $consoleSid -eq $expectedSid)
 }
 function Update-BootUpdateUserIdentityWait {
     <# Decides whether to keep waiting for an interactive user, and returns $true when the
@@ -6563,17 +6570,17 @@ function Update-BootUpdateUserIdentityWait {
        *unblocked* servicing path, so a cycle that can never finish there is wrong about the
        platform, not merely slow.
 
-       Only the unknown-user case is bounded. When a user has been seen, the continuation
-       waits on a logon trigger, costs nothing, and must keep waiting: a laptop whose owner
-       returns tomorrow has not stopped having a user. That case resets the counter, so an
-       intermittent identity lookup cannot accumulate its way to a false exhaustion. #>
+       The absent-session case is bounded even when a saved account is known. An active
+       session resets the counter, so an intermittent session lookup cannot accumulate its
+       way to a false exhaustion. Once the bound is reached, a resolvable account is kept
+       queued on its logon trigger instead of being discarded. #>
     param(
         [Parameter(Mandatory)][pscustomobject]$State,
-        [Parameter(Mandatory)][bool]$UserUnknown,
+        [Parameter(Mandatory)][bool]$NoInteractiveUser,
         [int]$MaxWaits = 10
     )
 
-    if (-not $UserUnknown) {
+    if (-not $NoInteractiveUser) {
         if ($State.PSObject.Properties.Name -contains 'UserIdentityWaitCount') { $State.UserIdentityWaitCount = 0 }
         return $false
     }
@@ -6621,7 +6628,10 @@ function Register-BootUpdateTaskForReboot {
            repeating -Once trigger to each registered task so an in-flight cycle that dies
            without ever reporting still gets probed periodically; see Enter-BootUpdateMutex
            for why a probe that finds the mutex held is a normal, silent no-op. #>
-        [switch]$InFlightWatchdog
+        [switch]$InFlightWatchdog,
+        <# Once machine servicing is done but a known user's phases remain, leave only
+           that user's logon trigger armed. No SYSTEM retry or watchdog is useful here. #>
+        [switch]$LogonOnly
     )
     $taskName = 'BootUpdateCycle'
     $pwshPath = (Get-Command pwsh -EA SilentlyContinue).Source
@@ -6685,7 +6695,9 @@ function Register-BootUpdateTaskForReboot {
     $registeredTaskNames = [System.Collections.Generic.List[string]]::new()
     $expectedPrincipal = @{}
     $expectedTriggerTypes = @{}
-    $retryTime = Get-BootUpdateRetryTriggerTime -RetryAt $RetryAt -RetrySoon ([bool]$RetrySoon)
+    $retryTime = if ($LogonOnly) { $null } else {
+        Get-BootUpdateRetryTriggerTime -RetryAt $RetryAt -RetrySoon ([bool]$RetrySoon)
+    }
     $retryTrigger = if ($retryTime) { New-ScheduledTaskTrigger -Once -At $retryTime } else { $null }
     <# Do not launch the user and SYSTEM retry tasks at the same instant. The fallback
        remains available when the interactive principal cannot run, but waits long
@@ -6698,12 +6710,12 @@ function Register-BootUpdateTaskForReboot {
        ISO-8601 duration ("P3650D") that Task Scheduler is documented to accept, where
        MaxValue serializes to a degenerate near-max value; ten years outlives any real
        gap between updater runs. #>
-    $watchdogTrigger = if ($InFlightWatchdog) {
+    $watchdogTrigger = if ($InFlightWatchdog -and -not $LogonOnly) {
         New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes($script:WatchdogIntervalMinutes) `
             -RepetitionInterval (New-TimeSpan -Minutes $script:WatchdogIntervalMinutes) `
             -RepetitionDuration (New-TimeSpan -Days 3650)
     } else { $null }
-    $fallbackWatchdogTrigger = if ($InFlightWatchdog) {
+    $fallbackWatchdogTrigger = if ($InFlightWatchdog -and -not $LogonOnly) {
         New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes($script:WatchdogIntervalMinutes + 3) `
             -RepetitionInterval (New-TimeSpan -Minutes $script:WatchdogIntervalMinutes) `
             -RepetitionDuration (New-TimeSpan -Days 3650)
@@ -6716,39 +6728,49 @@ function Register-BootUpdateTaskForReboot {
        A SYSTEM fallback task with a 3-minute startup delay covers the case where
        ARSO does not sign the user in; the named mutex arbitrates if both fire
        (second instance exits immediately) and phase Done-flags prevent double work.
-       If no interactive identity is discoverable, a SYSTEM task is retained; callers
-       must add a dated retry when user-scoped completion is still pending. #>
+       After machine servicing finishes, a known user can wait on a logon-only task without
+       keeping a SYSTEM startup retry alive. #>
     $currentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
     $resumeUserRaw = if ($script:ResumeUser) { $script:ResumeUser } elseif ($currentIdentity.User.Value -ne 'S-1-5-18') { $currentIdentity.Name } else { $null }
     <# Never hand a raw discovered name to Task Scheduler. An unresolvable one throws a
        terminating error that kills the cycle before any continuation exists; resolving to
        $null here degrades to the SYSTEM-only branch below instead. #>
     $resumeUser = Resolve-BootUpdateResumeAccount -Account $resumeUserRaw -PreferredSid ([string]$script:ResumeUserSid)
+    if ($LogonOnly -and -not $resumeUser) {
+        throw 'A logon-only continuation requires a resolvable saved user account.'
+    }
     if ($resumeUser) {
         $currentUser = $resumeUser
         $userTrigger   = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
         $userPrincipal = New-ScheduledTaskPrincipal -UserId $currentUser -LogonType Interactive -RunLevel Highest
         $userTriggers = if ($retryTrigger) { @($userTrigger, $retryTrigger) } else { @($userTrigger) }
         if ($watchdogTrigger) { $userTriggers = @($userTriggers) + $watchdogTrigger }
+        $userTaskDescription = if ($LogonOnly) {
+            'Boot update cycle: resume queued user-scope updates when this account signs in.'
+        } else {
+            'Boot update loop: patches everything, reboots until clean. (user context via ARSO)'
+        }
         Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $userTriggers -Principal $userPrincipal -Settings $settings `
-            -Description 'Boot update loop: patches everything, reboots until clean. (user context via ARSO)' -Force -ErrorAction Stop | Out-Null
+            -Description $userTaskDescription -Force -ErrorAction Stop | Out-Null
         $registeredTaskNames.Add($taskName)
         $expectedPrincipal[$taskName] = $currentUser
         $expectedTriggerTypes[$taskName] = @('MSFT_TaskLogonTrigger') + $(if ($retryTrigger -or $watchdogTrigger) { 'MSFT_TaskTimeTrigger' } else { @() })
-        $arsoText = if (Test-ArsoAvailable) { 'ARSO or interactive logon' } else { 'next interactive logon' }
+        $arsoText = if ($LogonOnly) { 'next interactive logon' } elseif (Test-ArsoAvailable) { 'ARSO or interactive logon' } else { 'next interactive logon' }
         Write-Log "Scheduled task registered: $taskName ($currentUser at logon — $arsoText)"
 
-        $fbTrigger = New-ScheduledTaskTrigger -AtStartup
-        $fbTrigger.Delay = 'PT3M'
-        $fallbackTriggers = if ($fallbackRetryTrigger) { @($fbTrigger, $fallbackRetryTrigger) } else { @($fbTrigger) }
-        if ($fallbackWatchdogTrigger) { $fallbackTriggers = @($fallbackTriggers) + $fallbackWatchdogTrigger }
-        $fbPrincipal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-        Register-ScheduledTask -TaskName 'BootUpdateCycleFallback' -Action $action -Trigger $fallbackTriggers -Principal $fbPrincipal -Settings $settings `
-            -Description 'Boot update loop fallback: runs as SYSTEM if ARSO sign-on does not occur.' -Force -ErrorAction Stop | Out-Null
-        $registeredTaskNames.Add('BootUpdateCycleFallback')
-        $expectedPrincipal['BootUpdateCycleFallback'] = 'SYSTEM'
-        $expectedTriggerTypes['BootUpdateCycleFallback'] = @('MSFT_TaskBootTrigger') + $(if ($retryTrigger -or $watchdogTrigger) { 'MSFT_TaskTimeTrigger' } else { @() })
-        Write-Log 'Scheduled task registered: BootUpdateCycleFallback (SYSTEM at startup +3min, mutex-arbitrated)'
+        if (-not $LogonOnly) {
+            $fbTrigger = New-ScheduledTaskTrigger -AtStartup
+            $fbTrigger.Delay = 'PT3M'
+            $fallbackTriggers = if ($fallbackRetryTrigger) { @($fbTrigger, $fallbackRetryTrigger) } else { @($fbTrigger) }
+            if ($fallbackWatchdogTrigger) { $fallbackTriggers = @($fallbackTriggers) + $fallbackWatchdogTrigger }
+            $fbPrincipal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+            Register-ScheduledTask -TaskName 'BootUpdateCycleFallback' -Action $action -Trigger $fallbackTriggers -Principal $fbPrincipal -Settings $settings `
+                -Description 'Boot update loop fallback: runs as SYSTEM if ARSO sign-on does not occur.' -Force -ErrorAction Stop | Out-Null
+            $registeredTaskNames.Add('BootUpdateCycleFallback')
+            $expectedPrincipal['BootUpdateCycleFallback'] = 'SYSTEM'
+            $expectedTriggerTypes['BootUpdateCycleFallback'] = @('MSFT_TaskBootTrigger') + $(if ($retryTrigger -or $watchdogTrigger) { 'MSFT_TaskTimeTrigger' } else { @() })
+            Write-Log 'Scheduled task registered: BootUpdateCycleFallback (SYSTEM at startup +3min, mutex-arbitrated)'
+        }
     } else {
         $trigger  = New-ScheduledTaskTrigger -AtStartup
         $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
@@ -6792,6 +6814,9 @@ function Register-BootUpdateTaskForReboot {
         })
         if ($matchingAction.Count -eq 0) { throw "Resume task '$registeredName' does not contain the exact expected orchestrator action and arguments." }
         $actualTriggerTypes = @($task.Triggers | ForEach-Object { $_.CimClass.CimClassName })
+        if ($LogonOnly -and ($actualTriggerTypes.Count -ne 1 -or $actualTriggerTypes[0] -ne 'MSFT_TaskLogonTrigger')) {
+            throw "Resume task '$registeredName' must have only the saved user's logon trigger."
+        }
         foreach ($triggerType in $expectedTriggerTypes[$registeredName]) {
             if ($actualTriggerTypes -notcontains $triggerType) { throw "Resume task '$registeredName' is missing trigger type '$triggerType'." }
         }
@@ -6803,7 +6828,7 @@ function Register-BootUpdateTaskForReboot {
            stops repeating is as dangerous as a deliberate stop that starts repeating. #>
         $actualRepetitionIntervals = @($task.Triggers | Where-Object { $_.Repetition -and -not [string]::IsNullOrEmpty($_.Repetition.Interval) } |
             ForEach-Object { [System.Xml.XmlConvert]::ToTimeSpan($_.Repetition.Interval) })
-        if ($InFlightWatchdog) {
+        if ($InFlightWatchdog -and -not $LogonOnly) {
             $expectedRepetitionInterval = New-TimeSpan -Minutes $script:WatchdogIntervalMinutes
             if ($actualRepetitionIntervals -notcontains $expectedRepetitionInterval) {
                 throw "Resume task '$registeredName' is missing the in-flight watchdog repetition trigger (expected every $($script:WatchdogIntervalMinutes) minute(s))."
@@ -6812,8 +6837,19 @@ function Register-BootUpdateTaskForReboot {
             throw "Resume task '$registeredName' unexpectedly carries a repeating trigger; deliberate stops must never repeat."
         }
     }
-    $watchdogNote = if ($InFlightWatchdog) { "; watchdog probe every $($script:WatchdogIntervalMinutes) minute(s)" } else { '' }
-    Write-Log "Resume chain verified: $($registeredTaskNames -join ', ') (3 retries, 2-minute interval)$watchdogNote."
+    if ($LogonOnly) {
+        $fallback = Get-ScheduledTask -TaskName 'BootUpdateCycleFallback' -ErrorAction SilentlyContinue
+        if ($fallback) {
+            Unregister-ScheduledTask -TaskName 'BootUpdateCycleFallback' -Confirm:$false -ErrorAction Stop
+            Write-Log 'Scheduled task removed: BootUpdateCycleFallback (machine servicing is finished)'
+        }
+        if (Get-ScheduledTask -TaskName 'BootUpdateCycleFallback' -ErrorAction SilentlyContinue) {
+            throw "Could not remove the SYSTEM fallback while waiting for the saved user's next sign-in."
+        }
+    }
+    $watchdogNote = if ($InFlightWatchdog -and -not $LogonOnly) { "; watchdog probe every $($script:WatchdogIntervalMinutes) minute(s)" } else { '' }
+    $retryNote = if ($LogonOnly) { 'saved-user logon only' } else { '3 retries, 2-minute interval' }
+    Write-Log "Resume chain verified: $($registeredTaskNames -join ', ') ($retryNote)$watchdogNote."
     return $registeredTaskNames.ToArray()
 }
 
@@ -8113,7 +8149,7 @@ function Invoke-BootUpdateCycle {
        through the reboot-loop safety valve. #>
     $waitingForIdentity = $state.Phase -eq 'UserContextPending' -and
         $currentIdentity.User.Value -eq 'S-1-5-18' -and
-        [string]::IsNullOrWhiteSpace([string]$state.ResumeUser)
+        -not (Test-BootUpdateInteractiveUserPresent -ResumeUser $state.ResumeUser -ResumeUserSid $state.ResumeUserSid)
     if (-not $waitingForIdentity) { $state.Iteration++ }
     else { Write-Log 'User identity discovery retry does not consume a mutation iteration.' -Level Warn }
     Set-BootUpdateState -State $state
@@ -9070,7 +9106,7 @@ function Invoke-BootUpdateCycle {
                record of a past session made every headless machine look like one with a user
                coming back, and the wait became unbounded again - the exact condition
                MaxUserIdentityWaits exists to prevent. #>
-            $retryForUnknownUser = -not (Test-BootUpdateInteractiveUserPresent)
+            $noInteractiveUser = -not (Test-BootUpdateInteractiveUserPresent -ResumeUser $state.ResumeUser -ResumeUserSid $state.ResumeUserSid)
 
             <# Scope deferral is a handoff to a later user-context pass. On a machine nobody
                ever signs into there is no later pass, and without a bound this waited
@@ -9079,19 +9115,38 @@ function Invoke-BootUpdateCycle {
                that a device with no signed-in user is the *unblocked* servicing path, so an
                updater that can never finish there is wrong about the platform.
 
-               Bound only the unknown-user case. When a user HAS been seen the continuation
-               waits on a logon trigger, costs nothing, and must keep waiting - a laptop
-               whose owner returns tomorrow has not stopped having a user.
+               Bound the absent-session case, whether or not the previous user's account is
+               known. Dated retries stop after the bound; a resolvable user remains queued
+               for their next sign-in.
 
-               On exhaustion the work stops being a scope deferral and becomes deferred
-               inventory: not attemptable from here, never counted as a verified update,
-               and qualifying the completion claim. The cycle then completes normally and
-               reports qualified convergence, which is the truthful reading of a machine
-               that is as converged as it can be made without a user. #>
+               Only an unresolvable account becomes deferred inventory on exhaustion.
+               Those items are never counted as verified updates, and the completion
+               claim reports the outstanding work. A known account keeps its checkpoint. #>
             $identityExhausted = Update-BootUpdateUserIdentityWait -State $state `
-                -UserUnknown $retryForUnknownUser -MaxWaits $script:MaxUserIdentityWaits
+                -NoInteractiveUser $noInteractiveUser -MaxWaits $script:MaxUserIdentityWaits
 
-            if ($identityExhausted) {
+            $knownResumeUserSid = if ($identityExhausted -and -not [string]::IsNullOrWhiteSpace([string]$state.ResumeUser)) {
+                Resolve-BootUpdateResumeAccount -Account ([string]$state.ResumeUser) -PreferredSid ([string]$state.ResumeUserSid)
+            } else { $null }
+            $userContextRetryScheduled = $false
+            if ($identityExhausted -and $knownResumeUserSid) {
+                <# The bounded SYSTEM retries did their job: machine servicing is no longer
+                   blocked on an absent console session. Keep the real user work pending and
+                   let that user's next sign-in resume it; do not turn it into a dead-end
+                   inventory record or leave a SYSTEM task firing on every startup. #>
+                Write-Log ("The saved user did not sign in after {0} rediscovery attempts; machine servicing is finished. Keeping user-scope work queued for {1}'s next sign-in: {2}" -f $script:MaxUserIdentityWaits, $state.ResumeUser, $deferredNames) -Level Warn
+                $state.Phase = 'UserContextPending'
+                Set-BootUpdateState -State $state
+                $null = Register-BootUpdateTaskForReboot -LogonOnly
+                <# Close the check/register race: if the user signed in while the task was
+                   being armed, its logon event may already have passed. A single dated
+                   retry lets the saved user's interactive task pick up the checkpoint. #>
+                if (Test-BootUpdateInteractiveUserPresent -ResumeUser $state.ResumeUser -ResumeUserSid $state.ResumeUserSid) {
+                    Write-Log "The saved user signed in while arming the logon continuation; scheduling one user-context retry for $($state.ResumeUser)." -Level Warn
+                    $null = Register-BootUpdateTaskForReboot -RetrySoon
+                    $userContextRetryScheduled = $true
+                }
+            } elseif ($identityExhausted) {
                 Write-Log ("No interactive user appeared after {0} rediscovery attempts; recording user-scope work as deferred inventory rather than waiting indefinitely: {1}" -f $script:MaxUserIdentityWaits, $deferredNames) -Level Warn
                 foreach ($deferredPhase in @($disposition.Phases)) {
                     Add-BootUpdateDeferredInventory -State $state -Provider $deferredPhase.Name -Scope 'user' -Records @(
@@ -9104,13 +9159,20 @@ function Invoke-BootUpdateCycle {
             } else {
                 $state.Phase = 'UserContextPending'
                 Set-BootUpdateState -State $state
-                $null = Register-BootUpdateTaskForReboot -RetrySoon:$retryForUnknownUser
+                <# A dated user-principal retry also covers an already-active session whose
+                   logon event fired before task registration. With no session it cannot run,
+                   and the logon trigger remains armed. #>
+                $null = Register-BootUpdateTaskForReboot -RetrySoon
+                $userContextRetryScheduled = $true
             }
         }
 
         if (-not $WhatIfPreference -and $disposition.Kind -eq 'UserContext' -and $state.Phase -eq 'UserContextPending') {
-            $userToastMessage = if ($retryForUnknownUser) {
-                "Waiting for an interactive user so these phases can run: $deferredNames. A retry is scheduled; no restart is required."
+            $interactiveUserPresent = Test-BootUpdateInteractiveUserPresent -ResumeUser $state.ResumeUser -ResumeUserSid $state.ResumeUserSid
+            $userToastMessage = if ($userContextRetryScheduled -and $interactiveUserPresent) {
+                "The saved user is signed in; retrying the user-only phases shortly: $deferredNames. No restart is required."
+            } elseif ($userContextRetryScheduled) {
+                "Waiting for the account that owns these user-only updates: $deferredNames. Another check is scheduled; no restart is required."
             } else {
                 "Waiting for the saved user to sign in so these phases can run: $deferredNames. No restart is required."
             }
@@ -9119,8 +9181,8 @@ function Invoke-BootUpdateCycle {
             Write-BootUpdateProgress -Completed
             Show-CycleBanner -Title 'U S E R   P A S S   P E N D I N G' -AnsiColor "$([char]27)[36m" -Info @(
                 'Machine-level work is safe; full verification is intentionally withheld.'
-                $(if ($retryForUnknownUser) { "No interactive user is signed in; rediscovery retries in about 2 minutes: $deferredNames" } else { "Waiting for $($state.ResumeUser) to sign in: $deferredNames" })
-                $(if ($retryForUnknownUser) { 'The SYSTEM watchdog is armed; completion remains blocked on user context.' } else { 'The user-at-logon continuation remains armed.' })
+                $(if ($userContextRetryScheduled -and $interactiveUserPresent) { "The saved user is signed in; a user-context retry is scheduled shortly: $deferredNames" } elseif ($userContextRetryScheduled) { "Waiting for the saved user; checking again in about 2 minutes: $deferredNames" } else { "Waiting for $($state.ResumeUser) to sign in: $deferredNames" })
+                $(if ($userContextRetryScheduled) { 'The saved-user retry and logon continuation are armed.' } else { 'The user-at-logon continuation remains armed.' })
             )
             return
         }
