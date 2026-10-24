@@ -339,7 +339,7 @@ upd 120    # 2-minute countdown — users can cancel with: shutdown /a
 
 ## Requirements
 
-- **Windows 10/11**
+- **Windows 10/11 and Windows Server 2016** (on Server 2016, `upd.cmd` installs PowerShell 7 through the signed MSI when Winget is unavailable)
 - **PowerShell 7+ runtime** (`upd.cmd` can install it side-by-side from Windows PowerShell 5.1)
 - **Administrator privileges**
 
@@ -479,7 +479,7 @@ and then a reversible blocking pin. Use `upd status` to see it and `upd uq Packa
 
 ### Does `upd aws` run during a normal `upd`?
 
-No. AWS tooling is opt-in. `upd aws` explicitly modernizes AWS CLI v2 and modular AWS.Tools;
+No. AWS tooling is opt-in. `upd aws` updates AWS CLI v2 and modular AWS.Tools;
 `upd --aws-tooling` includes that phase in the complete update cycle. Use the preservation flags
 only when an older script still needs those module versions.
 
