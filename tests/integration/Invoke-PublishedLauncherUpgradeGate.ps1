@@ -7,6 +7,7 @@ $repoRoot = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $root = Join-Path $env:TEMP ('boot-upd-published-upgrade-' + [guid]::NewGuid().ToString('N'))
 $tools = Join-Path $root 'tools'
 $null = New-Item -ItemType Directory -Path $tools
+$succeeded = $false
 
 try {
     $oldUrl = "https://github.com/nanoDBA/boot-upd/releases/download/$FromTag/upd.cmd"
@@ -24,6 +25,7 @@ try {
     $output = & cmd.exe /d /c "`"$target`" help" 2>&1
     $exitCode = $LASTEXITCODE
     $text = $output -join "`n"
+    $text | Set-Content -LiteralPath (Join-Path $root 'launcher-output.txt')
     if ($exitCode -ne 0) { throw "$FromTag launcher exited $exitCode.`n$text" }
     if ($text -match 'Terminate batch job|The system cannot find the path specified') {
         throw "Published launcher upgrade emitted a cmd.exe handoff failure.`n$text"
@@ -54,8 +56,10 @@ try {
     }
     [pscustomobject]@{ Gate='published-launcher-upgrade'; From=$FromTag; Result='passed'; CandidateHash=$expected } |
         ConvertTo-Json
+    $succeeded = $true
 } finally {
-    if (Test-Path -LiteralPath $root) {
+    if (-not $succeeded) { Write-Warning "Published launcher failure evidence retained at $root" }
+    if ($succeeded -and (Test-Path -LiteralPath $root)) {
         $cleanupDeadline = [datetime]::UtcNow.AddSeconds(10)
         do {
             try { Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction Stop; break }
