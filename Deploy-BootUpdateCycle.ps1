@@ -49,11 +49,11 @@ param(
 .DESCRIPTION
     Copies Invoke-BootUpdateCycle.ps1 from the source directory to
     $env:ProgramData\BootUpdateCycle, installs required modules, and starts
-    the first iteration directly in user context.
+    the first iteration directly in the launching account's context.
 
     WINGET SCOPE STRATEGY:
     - First run (user context): Updates BOTH user-scope AND machine-scope packages
-    - Subsequent runs (SYSTEM): Machine-scope only
+    - SYSTEM passes: Machine-scope only
     - User-scope work left by SYSTEM resumes through the saved account's logon task
 
     The update cycle:
@@ -471,9 +471,9 @@ Write-Host "Deployed: $uninstallPath"
 <#
     DIRECT-FIRST-RUN ARCHITECTURE:
 
-    First run executes directly in user's console (user context) — ONLY chance for user-scope winget.
-    If reboot needed: Invoke script registers a scheduled task (SYSTEM) before shutdown.
-    If no reboot: done immediately, no task ever created.
+    First run executes directly in the launching account's context.
+    The updater arms a saved-user logon task and a delayed SYSTEM fallback.
+    User-only work left by SYSTEM resumes in the saved user's context.
 #>
 $taskName = 'BootUpdateCycle'
 
@@ -499,8 +499,8 @@ if (Test-Path $statePath) {
 }
 
 Write-Host "Deployed scripts to: $installDir" -ForegroundColor Green
-Write-Host "  First run: Direct (user context - updates user+machine winget scopes)"
-Write-Host "  If reboot: Task registered for SYSTEM at startup (machine scope only)"
+Write-Host "  First run: Direct in the launching account's context"
+Write-Host "  Continuation: Saved-user logon task plus a delayed SYSTEM fallback"
 
 <# Common arg splatting for all execution modes #>
 $invokeArgs = @{
@@ -584,14 +584,14 @@ function Show-DeploymentModal {
     Write-Host ""
 
     if ($DirectFirstRun) {
-        Write-Host "$yellow   EXECUTION MODE: DIRECT (user context)$reset"
+        Write-Host "$yellow   EXECUTION MODE: DIRECT (current account)$reset"
         Write-Host ""
         Write-Host "$white   First run executes directly in THIS console as $($env:USERNAME)$reset"
-        Write-Host "$green   + Winget: Updates BOTH user-scope AND machine-scope packages$reset"
-        Write-Host "$dim     (This is the ONLY opportunity for user-scoped packages!)$reset"
+        Write-Host "$green   + User-only packages run when the saved user's session is available.$reset"
+        Write-Host "$dim     Work left by SYSTEM resumes at that user's next sign-in.$reset"
         Write-Host ""
-        Write-Host "$dim   If reboot needed: Scheduled task created, subsequent runs as SYSTEM$reset"
-        Write-Host "$dim   If no reboot:     Done immediately, no task ever created$reset"
+        Write-Host "$dim   If reboot needed: Saved-user logon task plus delayed SYSTEM fallback$reset"
+        Write-Host "$dim   On completion:    Continuation tasks and active state are removed$reset"
         Write-Host ""
         Write-Host "$red   WARNING: Script runs in THIS console.$reset"
         Write-Host "$red   Do NOT log off until complete or reboot begins.$reset"
@@ -599,10 +599,10 @@ function Show-DeploymentModal {
     } else {
         Write-Host "$yellow   EXECUTION MODE: SCHEDULED TASK (SYSTEM context)$reset"
         Write-Host ""
-        Write-Host "$red   WARNING: Running as SYSTEM - user-scope winget packages will NOT be updated!$reset"
-        Write-Host "$dim   Only machine-scope packages will be touched.$reset"
+        Write-Host "$yellow   This pass runs as SYSTEM and updates machine-scope packages.$reset"
+        Write-Host "$dim   User-only work waits for the saved user's session.$reset"
         Write-Host ""
-        Write-Host "$dim   To update user-scope packages, set DirectFirstRun = `$true in Config$reset"
+        Write-Host "$dim   Use DirectFirstRun = `$true to start in your current session.$reset"
     }
     Write-Host ""
     Write-Host "$cyan$sep$reset"
@@ -790,11 +790,11 @@ if ($Config.NonInteractive) {
 
     if ($Config.StartNow) {
         if ($Config.DirectFirstRun) {
-            Write-Host "Starting update cycle directly (user context)..." -ForegroundColor Green
+            Write-Host "Starting update cycle directly in this session..." -ForegroundColor Green
             Write-Host "Log: $installDir\BootUpdateCycle.log"
             Invoke-DeployedCycle
         } else {
-            Write-Host "WARNING: DirectFirstRun=false - user-scope winget packages will NOT be updated" -ForegroundColor Yellow
+            Write-Host "The first pass runs as SYSTEM; user-only work waits for the saved user's session." -ForegroundColor Yellow
             Register-ScheduledTaskNow
             Start-ScheduledTask -TaskName $taskName
             Write-Host "Task started. Log: $installDir\BootUpdateCycle.log" -ForegroundColor Green
@@ -817,15 +817,15 @@ if ($Config.NonInteractive) {
         Write-Host ""
 
         if ($Config.DirectFirstRun) {
-            Write-Host "Starting update cycle directly (user context)..." -ForegroundColor Green
-            Write-Host "User-scoped winget packages will be updated NOW (only chance)." -ForegroundColor Yellow
+            Write-Host "Starting update cycle directly in this session..." -ForegroundColor Green
+            Write-Host "User-only work runs in user context and can resume after a later sign-in." -ForegroundColor Yellow
             Write-Host ""
             Write-Host "Log: $installDir\BootUpdateCycle.log" -ForegroundColor Cyan
             Write-Host ""
             Invoke-DeployedCycle
         } else {
             Write-Host "Starting via scheduled task (SYSTEM context)..." -ForegroundColor Yellow
-            Write-Host "WARNING: User-scope winget packages will NOT be updated!" -ForegroundColor Red
+            Write-Host "User-only work stays queued for the saved user's session." -ForegroundColor Yellow
             Write-Host ""
             Register-ScheduledTaskNow
             Start-ScheduledTask -TaskName $taskName
