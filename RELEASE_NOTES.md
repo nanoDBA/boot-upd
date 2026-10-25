@@ -17,7 +17,7 @@ A run could stop after five total reboots even while Windows Update or another p
 
 ### Testing
 
-649 Pester tests passed. The User/SYSTEM exclusion gate, published launcher upgrade gate, and quality gate passed.
+649 Pester tests passed. The User/SYSTEM exclusion gate, published launcher upgrade gate, and quality gate passed. The README bootstrap also passed fresh-install and legacy-repair tests on clean Windows PowerShell 5.1 VMs ([workflow run](https://github.com/nanoDBA/boot-upd/actions/runs/40231896651)).
 
 The headless VM row made five updater passes and recorded three Windows boot events, then parked at the saved user's sign-in task. After one test sign-in, that task resumed in the saved user's context, passed health checks, and removed its tasks and checkpoint. The cycle still reported deferred inventory: Windows Update offered KB5007651 again after two successful installs. The test VM also had no Winget installation, so this run did not test upgrades of user-installed apps. The overall VM result is **PARTIAL**. The second VM row is **NOT RUN** because its checkpoint did not reach a desktop.
 

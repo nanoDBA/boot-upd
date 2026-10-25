@@ -8,7 +8,7 @@
 | User/SYSTEM security boundary | PASS | GitHub `User/SYSTEM exclusion gate`. |
 | Published launcher upgrade | PASS | GitHub `Published launcher upgrade gate`, from v2.5.43. |
 | Quality | PASS | GitHub `quality` check. |
-| Live README bootstrap | Runs on release publication | GitHub workflow `Live bootstrap VM`; check its run for fresh-install and legacy-repair results. |
+| Live README bootstrap | PASS | Windows PowerShell 5.1 fresh-install and legacy-repair scenarios passed in [workflow run 40231896651](https://github.com/nanoDBA/boot-upd/actions/runs/40231896651). |
 | Multi-reboot convergence, VM B | PARTIAL | Details below. |
 | Multi-reboot convergence, VM A | NOT RUN | The configured checkpoint did not reach a desktop within the harness wait, so the updater did not start. |
 
