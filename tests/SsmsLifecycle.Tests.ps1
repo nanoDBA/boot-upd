@@ -5,6 +5,7 @@ BeforeAll {
     $errors | Should -BeNullOrEmpty
     foreach ($name in @('New-BootUpdateStateV2','Update-BootUpdateStateSchema',
         'ConvertTo-BootUpdateTimestampString','Test-CrashRecovery','Set-BootUpdateRebootCheckpoint',
+        'Get-BootUpdateProgressFingerprint',
         'ConvertTo-SsmsVersion','Get-SsmsPendingUpdate','Save-SsmsPendingUpdate',
         'Confirm-SsmsPendingUpdate','Complete-SsmsUpdateAccounting','Reset-SsmsPendingVerification',
         'Apply-RemoteConfig')) {
@@ -16,7 +17,7 @@ BeforeAll {
     function Write-Log { param($Message, $Level, $Visibility) }
     function Set-BootUpdateState { param($State) }
     function Update-SsmsInstances { $script:SsmsActionCalls++; return @{Success=$true;Count=1} }
-    $script:BootUpdateStateSchemaVersion = 6
+    $script:BootUpdateStateSchemaVersion = 7
     $script:MaxRetryPasses = 5
 }
 

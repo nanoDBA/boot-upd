@@ -54,6 +54,11 @@ saved user's logon continuation remains armed; their next sign-in resumes the cy
 without a manual rerun. If no account can be resolved, report user-scope work as deferred
 inventory instead. A headless row with queued user work is **PARTIAL**, not PASS.
 
+The reboot guard is a no-progress limit, not a lifetime reboot cap. A cycle with verified
+provider progress across reboot barriers must continue even after total reboots exceed
+`MaxIterations`. Repeated pending evidence with no verified change must stop at that
+threshold, preserve the evidence, disarm continuation tasks, and make no completion claim.
+
 Capture the updater log, every checkpoint revision, task definitions and results, boot identifiers, effective identities, provider exit/reboot evidence, and the final cleanup inventory. A scenario passes only when every enabled phase converges, no reboot evidence remains after settling, health checks pass, and both tasks and active state are absent.
 
 ## How to report a gate

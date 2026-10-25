@@ -24,7 +24,8 @@
     Smart timeouts: kills idle processes but lets busy installs finish.
 
 .PARAMETER MaxIterations
-    Maximum reboot cycles before giving up.  Default 5.
+    Maximum consecutive reboot cycles without verified update progress before
+    stopping for attention. Total reboots are tracked separately. Default 5.
 
 .PARAMETER MaxRetryPasses
     Maximum consecutive same-boot recovery passes for incomplete phases. Default 5.
@@ -392,7 +393,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
     }
 }
 
-Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 6 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 7 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.85' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 Set-Variable -Name 'RebootSignalSettleSeconds' -Value 20 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 $script:ExplicitRebootRequests = [System.Collections.Generic.List[object]]::new()
@@ -1957,9 +1958,84 @@ function Set-BootUpdateRebootCheckpoint {
     $State.Phase = 'Rebooting'
     $State.LastPreflightNetworkAt = $null
     $State.LastPreflightNetworkOk = $null
+    foreach ($field in @('LastRebootProgressFingerprint','LastProgressEvaluationRebootCount','NoProgressRebootCount')) {
+        if ($State.PSObject.Properties.Name -notcontains $field) {
+            $initialValue = switch ($field) {
+                'LastRebootProgressFingerprint' { $null }
+                'LastProgressEvaluationRebootCount' { [int]$State.RebootCount }
+                'NoProgressRebootCount' { 0 }
+            }
+            $State | Add-Member -NotePropertyName $field -NotePropertyValue $initialValue
+        }
+    }
+    $State.LastRebootProgressFingerprint = Get-BootUpdateProgressFingerprint -State $State
+    $State.LastProgressEvaluationRebootCount = [int]$State.RebootCount
     Set-BootUpdateState -State $State
     Write-Log "Reboot checkpoint: preserving $($completedFlags.Count) completed phase(s); only incomplete work will resume after boot." -Level Info
     return $completedFlags
+}
+
+function Get-BootUpdateProgressFingerprint {
+    <# Fingerprint durable work only. Pass numbers, reboot signals, timestamps,
+       triggered actions, and deferred inventory cannot keep a broken loop alive. #>
+    param([Parameter(Mandatory)][pscustomobject]$State)
+
+    $phaseFlags = @(
+        'WingetDone','ChocolateyDone','SsmsDone','WindowsUpdateDone','AwsToolingDone','PipDone','NpmDone',
+        'Office365Done','PowerShellModulesDone','ScoopDone','DotnetToolsDone','VscodeDone',
+        'DefenderDone','DriverFirmwareDone','WslDone','ContainersDone'
+    )
+    $completed = @($phaseFlags | Where-Object { [bool]$State.$_ } | Sort-Object)
+    $summaryNames = @(
+        'Winget','Chocolatey','Ssms','WindowsUpdate','Pip','Npm','Office365',
+        'PowerShellModules','Scoop','DotnetTools','Vscode','Defender','DriverFirmware','Wsl','Containers'
+    )
+    $verifiedCounts = [ordered]@{}
+    foreach ($name in $summaryNames) {
+        $value = 0
+        if ($State.Summary -and $State.Summary.PSObject.Properties.Name -contains $name) {
+            $value = [int]$State.Summary.$name
+        }
+        $verifiedCounts[$name] = $value
+    }
+    $updatedIds = @($State.WingetUpdatedIds | Where-Object { $_ } | ForEach-Object { [string]$_ } | Sort-Object -Unique)
+    $payload = [ordered]@{ CompletedPhases=$completed; VerifiedCounts=$verifiedCounts; WingetUpdatedIds=$updatedIds }
+    $bytes = [Text.Encoding]::UTF8.GetBytes(($payload | ConvertTo-Json -Depth 5 -Compress))
+    $sha = [Security.Cryptography.SHA256]::HashData($bytes)
+    return [Convert]::ToHexString($sha)
+}
+
+function Update-BootUpdateNoProgressRebootCount {
+    <# A same-boot retry cannot spend reboot budget. Progress discovered during
+       this boot resets the stall count even when another restart is still needed. #>
+    param([Parameter(Mandatory)][pscustomobject]$State)
+
+    $fingerprint = Get-BootUpdateProgressFingerprint -State $State
+    $previous = [string]$State.LastRebootProgressFingerprint
+    $rebootCount = [int]$State.RebootCount
+    $lastEvaluatedRebootCount = [int]$State.LastProgressEvaluationRebootCount
+
+    if ([string]::IsNullOrWhiteSpace($previous)) {
+        $State.NoProgressRebootCount = 0
+        $reason = 'baseline recorded; prior progress history was unavailable'
+    } elseif ($rebootCount -gt $lastEvaluatedRebootCount) {
+        if ($fingerprint -eq $previous) {
+            $State.NoProgressRebootCount = [int]$State.NoProgressRebootCount + 1
+            $reason = 'no verified progress since the previous reboot barrier'
+        } else {
+            $State.NoProgressRebootCount = 0
+            $reason = 'verified progress since the previous reboot barrier'
+        }
+    } elseif ($fingerprint -ne $previous) {
+        $State.NoProgressRebootCount = 0
+        $reason = 'verified progress during the current boot'
+    } else {
+        $reason = 'same boot and unchanged progress'
+    }
+
+    $State.LastRebootProgressFingerprint = $fingerprint
+    $State.LastProgressEvaluationRebootCount = $rebootCount
+    return [pscustomobject]@{ Count=[int]$State.NoProgressRebootCount; Reason=$reason }
 }
 
 function Get-BootUpdateDeferredInventory {
@@ -2147,6 +2223,9 @@ function New-BootUpdateStateV2 {
         LastPreflightNetworkOk = $null
         LastPreflightNetworkAt = $null
         LastRebootSignals     = $null
+        LastRebootProgressFingerprint = $null
+        LastProgressEvaluationRebootCount = 0
+        NoProgressRebootCount = 0
         LimitReachedAt        = $null
         LimitReason           = $null
         LimitRebootSignals    = @()
@@ -2236,6 +2315,9 @@ function Update-BootUpdateStateSchema {
     }
     if ($props -notcontains 'LimitRebootSignals') { $State | Add-Member -NotePropertyName 'LimitRebootSignals' -NotePropertyValue @() -Force }
     if ($props -notcontains 'RebootCount') { $State | Add-Member -NotePropertyName 'RebootCount' -NotePropertyValue ([math]::Max(0, [int]$State.Iteration - 1)) -Force }
+    if ($props -notcontains 'LastRebootProgressFingerprint') { $State | Add-Member -NotePropertyName 'LastRebootProgressFingerprint' -NotePropertyValue $null -Force }
+    if ($props -notcontains 'LastProgressEvaluationRebootCount') { $State | Add-Member -NotePropertyName 'LastProgressEvaluationRebootCount' -NotePropertyValue ([int]$State.RebootCount) -Force }
+    if ($props -notcontains 'NoProgressRebootCount') { $State | Add-Member -NotePropertyName 'NoProgressRebootCount' -NotePropertyValue 0 -Force }
     if ($props -notcontains 'ConsecutiveRetryCount') { $State | Add-Member -NotePropertyName 'ConsecutiveRetryCount' -NotePropertyValue 0 -Force }
     if ($props -notcontains 'ExplicitRebootRequests') { $State | Add-Member -NotePropertyName 'ExplicitRebootRequests' -NotePropertyValue @() -Force }
     if ($props -notcontains 'SsmsPendingUpdates') { $State | Add-Member -NotePropertyName 'SsmsPendingUpdates' -NotePropertyValue @() -Force }
@@ -3096,22 +3178,25 @@ function Get-ConfirmedPendingReboot {
 }
 
 function Stop-BootUpdateAtRebootLimit {
-    <# MaxIterations is a reboot budget, not a mutation-pass budget. This guard is
-       called only after the settle-and-recheck probe has returned concrete pending
-       evidence, so the final allowed reboot always gets a chance to converge. #>
+    <# MaxIterations bounds consecutive reboot barriers without durable progress,
+       not total machine reboots. This guard runs only after confirmed pending evidence. #>
     param(
         [Parameter(Mandatory)][pscustomobject]$State,
         [Parameter(Mandatory)][object[]]$PendingSignals,
         [Parameter(Mandatory)][string]$Context
     )
-    if ([int]$State.RebootCount -lt $script:MaxIterations) { return $false }
+    $progress = Update-BootUpdateNoProgressRebootCount -State $State
+    if ([int]$progress.Count -lt $script:MaxIterations) {
+        Write-Log "Reboot progress: $($State.RebootCount) total reboot(s); $($progress.Count)/$script:MaxIterations consecutive reboot(s) without verified progress ($($progress.Reason))." -Level Info
+        return $false
+    }
 
     $evidence = @($PendingSignals | ForEach-Object {
         [pscustomobject]@{ Source=[string]$_.Source; Detail=[string]$_.Detail }
     })
     $sources = (($evidence.Source | Sort-Object -Unique) -join ',')
     $details = (($evidence | ForEach-Object { "$($_.Source): $($_.Detail)" }) -join '; ')
-    $reason = "Reboot limit $($script:MaxIterations) reached; confirmed pending evidence remains ${Context}: $details"
+    $reason = "No-progress reboot limit $($script:MaxIterations) reached after $($State.RebootCount) total reboot(s); confirmed pending evidence remains ${Context}: $details"
 
     $State.Phase = 'LimitReached'
     $State.LastRebootSignals = $sources
@@ -3133,10 +3218,10 @@ function Stop-BootUpdateAtRebootLimit {
         }
     }
     $disposition = if ($disarmed) { 'Continuation tasks were removed and verified absent.' } else { 'WARNING: a continuation task may still be armed; remove BootUpdateCycle and BootUpdateCycleFallback manually.' }
-    Write-EventLogEntry -EventId 1003 -EntryType Error -Message "Cycle stopped at reboot safety limit.`nSession: $($State.StartTime)`nCompleted reboots: $($State.RebootCount)`nPending evidence: $details`n$disposition"
-    Send-CompletionNotification -Kind Error -Title 'Boot Update Cycle NEEDS ATTENTION' -Message "Reboot safety limit reached after $($State.RebootCount) completed reboot(s). Confirmed pending signals: $details. $disposition Diagnostic state remains at $($script:StatePath)."
-    Show-CycleBanner -Title 'R E B O O T   L I M I T   R E A C H E D' -AnsiColor "$([char]27)[31m" -Info @(
-        "Reboot safety limit reached after $($State.RebootCount) completed reboot(s)."
+    Write-EventLogEntry -EventId 1003 -EntryType Error -Message "Cycle stopped at no-progress reboot safety limit.`nSession: $($State.StartTime)`nCompleted reboots: $($State.RebootCount)`nConsecutive reboots without verified progress: $($progress.Count)`nPending evidence: $details`n$disposition"
+    Send-CompletionNotification -Kind Error -Title 'Boot Update Cycle NEEDS ATTENTION' -Message "$reason. $disposition Diagnostic state remains at $($script:StatePath)."
+    Show-CycleBanner -Title 'R E B O O T   P R O G R E S S   S T A L L E D' -AnsiColor "$([char]27)[31m" -Info @(
+        "No verified progress across $($progress.Count) consecutive reboot(s); $($State.RebootCount) total reboot(s)."
         'Windows still reports concrete reboot evidence; no success was claimed.'
         $disposition
         "Signals: $details"
@@ -7423,14 +7508,14 @@ function Show-BootUpdateRestartStatus {
 }
 
 function Show-CycleStartStatus {
-    param([string]$Verb, [string]$SessionId, [int]$Iteration, [int]$RebootCount, [int]$MaxIterations, [string]$Context, [string]$Window = '')
+    param([string]$Verb, [string]$SessionId, [int]$Iteration, [int]$RebootCount, [int]$NoProgressRebootCount, [int]$MaxIterations, [string]$Context, [string]$Window = '')
     if (-not (Test-BootUpdateOutputAtLeast -Minimum Normal)) { return }
     Write-Host '  [' -NoNewline -ForegroundColor DarkGray
     Write-Host $Verb -NoNewline -ForegroundColor Green
     Write-Host '] ' -NoNewline -ForegroundColor DarkGray
     Write-Host "Session: $SessionId " -NoNewline -ForegroundColor White
     Write-Host '| ' -NoNewline -ForegroundColor DarkGray
-    Write-Host "Pass: $Iteration | Reboots: $RebootCount/$MaxIterations " -NoNewline -ForegroundColor White
+    Write-Host "Pass: $Iteration | Reboots: $RebootCount | Stalled: $NoProgressRebootCount/$MaxIterations " -NoNewline -ForegroundColor White
     Write-Host '| ' -NoNewline -ForegroundColor DarkGray
     Write-Host "Context: $Context" -ForegroundColor White
     if (-not [string]::IsNullOrWhiteSpace($Window)) {
@@ -8087,8 +8172,10 @@ function Invoke-BootUpdateCycle {
     <# A terminal checkpoint is idempotent: do not re-arm tasks or repeat alerts on
        every manual/scheduled launch. Raising the relevant budget is the explicit
        operator action that permits another attempt. #>
-    $rebootLimitActive = $state.Phase -in @('LimitReached','LimitDisarmFailed') -and
-        $state.LimitReason -like 'Reboot limit *' -and [int]$state.RebootCount -ge $MaxIterations
+    $rebootLimitActive = $state.Phase -in @('LimitReached','LimitDisarmFailed') -and (
+        ($state.LimitReason -like 'No-progress reboot limit *' -and [int]$state.NoProgressRebootCount -ge $MaxIterations) -or
+        ($state.LimitReason -like 'Reboot limit *' -and [int]$state.RebootCount -ge $MaxIterations)
+    )
     $retryLimitActive = $state.Phase -in @('RetryLimitReached','LimitDisarmFailed') -and
         $state.LimitReason -like 'Same-boot recovery limit *' -and [int]$state.ConsecutiveRetryCount -ge $MaxRetryPasses
     if ($rebootLimitActive -or $retryLimitActive) {
@@ -8098,7 +8185,7 @@ function Invoke-BootUpdateCycle {
         Show-CycleBanner -Title 'A T T E N T I O N   S T I L L   R E Q U I R E D' -AnsiColor "$([char]27)[31m" -Info @(
             $state.LimitReason
             $(if ($tasksDisarmed) { 'Continuation tasks are verified absent.' } else { 'A continuation task may still be armed; manual removal is required.' })
-            'Raise the applicable reboot/retry limit only after reviewing the preserved evidence.'
+            'Review the preserved evidence before raising the stalled-reboot or retry limit.'
         )
         exit 2
     } elseif ($state.Phase -in @('LimitReached','RetryLimitReached','LimitDisarmFailed')) {
@@ -8128,19 +8215,19 @@ function Invoke-BootUpdateCycle {
     if ($script:MaintenanceWindowStart -ge 0) {
         $windowText = "$($script:MaintenanceWindowStart):00 - $($script:MaintenanceWindowEnd):00"
     }
-    Show-CycleStartStatus -Verb $statusVerb -SessionId $sessionId -Iteration $pendingIteration -RebootCount $state.RebootCount -MaxIterations $MaxIterations -Context $context -Window $windowText
+    Show-CycleStartStatus -Verb $statusVerb -SessionId $sessionId -Iteration $pendingIteration -RebootCount $state.RebootCount -NoProgressRebootCount $state.NoProgressRebootCount -MaxIterations $MaxIterations -Context $context -Window $windowText
     if ($script:TuiInteractive -and (Test-BootUpdateOutputAtLeast -Minimum Normal)) {
         Write-Host "  [view] $($script:OutputMode) | press v to cycle Quiet > Normal > Verbose > Debug" -ForegroundColor DarkCyan
     }
     <# Log file: clean greppable entry #>
     $whatIfTag = if ($WhatIfPreference) { ' [WHATIF]' } else { '' }
-    Write-Log "BOOT UPDATE CYCLE$whatIfTag $cycleVerb | Session: $sessionId | Pass: $pendingIteration | Reboots: $($state.RebootCount)/$MaxIterations | Context: $context"
+    Write-Log "BOOT UPDATE CYCLE$whatIfTag $cycleVerb | Session: $sessionId | Pass: $pendingIteration | Reboots: $($state.RebootCount) | Consecutive stalled reboots: $($state.NoProgressRebootCount)/$MaxIterations | Context: $context"
     $isSystemContext = $currentIdentity.User.Value -eq 'S-1-5-18'
     Write-Log (Get-BootUpdateLaunchContract -IsFirstIteration $isFirstIteration -IsSystem $isSystemContext)
     if ($script:MaintenanceWindowStart -ge 0) { Write-Log "Maintenance window: $($script:MaintenanceWindowStart):00 - $($script:MaintenanceWindowEnd):00" -Level Info }
 
     <# Event Log: cycle started #>
-    Write-EventLogEntry -EventId 1002 -Message "Boot Update Cycle $cycleVerb`nSession: $sessionId`nPass: $pendingIteration`nCompleted reboots: $($state.RebootCount) of $MaxIterations allowed"
+    Write-EventLogEntry -EventId 1002 -Message "Boot Update Cycle $cycleVerb`nSession: $sessionId`nPass: $pendingIteration`nCompleted reboots: $($state.RebootCount)`nConsecutive reboots without verified progress: $($state.NoProgressRebootCount) of $MaxIterations allowed"
 
     <# Maintenance window gate — exit clean (task survives) if outside configured window #>
     if (-not (Test-MaintenanceWindow)) {

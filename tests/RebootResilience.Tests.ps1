@@ -25,6 +25,7 @@ BeforeAll {
     $invokeAst = Get-ScriptAst $invokePath
     $deployAst = Get-ScriptAst $deployPath
     $invokeSource = Get-Content $invokePath -Raw
+    $script:BootUpdateStateSchemaVersion = 7
 
     foreach ($functionName in @(
         'ConvertTo-BootUpdateTimestampString',
@@ -39,6 +40,8 @@ BeforeAll {
         'Test-PostUpdateHealth',
         'Get-BootUpdateBootSessionId',
         'Set-BootUpdateRebootCheckpoint',
+        'Get-BootUpdateProgressFingerprint',
+        'Update-BootUpdateNoProgressRebootCount',
         'ConvertFrom-PendingFileRenamePath',
         'Get-PendingFileRenameOperations',
         'Get-ActionablePendingFileRenameOperations',
@@ -1496,31 +1499,91 @@ Describe 'Bounded Windows Update service readiness' {
 }
 
 Describe 'Truthful reboot safety limit' {
+    It 'migrates older checkpoints without inventing stalled reboot history' {
+        $script:BootUpdateStateSchemaVersion = 7
+        $state = New-BootUpdateStateV2
+        $state.StateVersion = 6
+        $state.RebootCount = 9
+        foreach ($field in @('LastRebootProgressFingerprint','LastProgressEvaluationRebootCount','NoProgressRebootCount')) {
+            $state.PSObject.Properties.Remove($field)
+        }
+
+        Update-BootUpdateStateSchema -State $state | Out-Null
+
+        $state.StateVersion | Should -Be 7
+        $state.LastRebootProgressFingerprint | Should -BeNullOrEmpty
+        $state.LastProgressEvaluationRebootCount | Should -Be 9
+        $state.NoProgressRebootCount | Should -Be 0
+    }
+
     It 'checks the reboot budget only after confirmed pending evidence exists' {
         $cycle = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
         $guard = Get-FunctionText $invokeAst 'Stop-BootUpdateAtRebootLimit'
         $cycle | Should -Not -Match '\$state\.Iteration -gt \$MaxIterations'
+        $cycle | Should -Match 'LimitReason -like .Reboot limit \*.'
+        $cycle | Should -Match '\[int\]\$state\.RebootCount -ge \$MaxIterations'
         ([regex]::Matches($cycle, 'Stop-BootUpdateAtRebootLimit')).Count | Should -Be 2
-        $guard | Should -Match '\$State\.RebootCount -lt \$script:MaxIterations'
+        $guard | Should -Match 'Update-BootUpdateNoProgressRebootCount -State \$State'
+        $guard | Should -Match '\$progress\.Count -lt \$script:MaxIterations'
         $guard | Should -Match "Phase = 'LimitReached'"
         $guard | Should -Match 'LimitRebootSignals = \$evidence'
         $guard | Should -Not -Match 'Clear-BootUpdateState|Invoke-Hook'
     }
 
-    It 'allows the final reboot to converge and preserves exact evidence only when still pending' {
+    It 'allows indefinitely many advancing reboots and records their total separately' {
+        $script:MaxIterations = 1
+        $state = [pscustomobject]@{
+            RebootCount=12; LastProgressEvaluationRebootCount=11; LastRebootProgressFingerprint=$null
+            NoProgressRebootCount=4; WingetDone=$false; Summary=[pscustomobject]@{ Winget=0 }
+            WingetUpdatedIds=@(); Phase='Rebooting'; StartTime='2026-07-20T09:00:00Z'
+            LastRebootSignals=$null; LimitReachedAt=$null; LimitReason=$null; LimitRebootSignals=@()
+        }
+        $state.LastRebootProgressFingerprint = Get-BootUpdateProgressFingerprint -State $state
+        $state.WingetDone = $true
+        $state.Summary.Winget = 1
+        $state.WingetUpdatedIds = @('example.app')
+
+        (Stop-BootUpdateAtRebootLimit -State $state -PendingSignals @([pscustomobject]@{ Source='CBS'; Detail='pending' }) -Context 'after update phases') |
+            Should -BeFalse
+        $state.RebootCount | Should -Be 12
+        $state.NoProgressRebootCount | Should -Be 0
+    }
+
+    It 'counts only reboot-to-reboot stalls and resets when verified work advances' {
+        $state = [pscustomobject]@{
+            RebootCount=0; LastProgressEvaluationRebootCount=0; LastRebootProgressFingerprint=$null
+            NoProgressRebootCount=0; WingetDone=$false; WingetUpdatedIds=@()
+            Summary=[pscustomobject]@{ Winget=0; ActionsTriggered=0 }; LastRebootSignals=$null
+        }
+        $state.LastRebootProgressFingerprint = Get-BootUpdateProgressFingerprint -State $state
+
+        $state.RebootCount = 1
+        (Update-BootUpdateNoProgressRebootCount -State $state).Count | Should -Be 1
+        (Update-BootUpdateNoProgressRebootCount -State $state).Count | Should -Be 1 -Because 'a second check in the same boot is not another reboot'
+
+        $state.Summary.ActionsTriggered = 99
+        (Update-BootUpdateNoProgressRebootCount -State $state).Count | Should -Be 1 -Because 'triggered work alone is not verified update progress'
+        $state.WingetDone = $true
+        $state.Summary.Winget = 2
+        (Update-BootUpdateNoProgressRebootCount -State $state).Count | Should -Be 0
+        $state.RebootCount = 2
+        (Update-BootUpdateNoProgressRebootCount -State $state).Count | Should -Be 1 -Because 'the next reboot without further progress starts a new stall streak'
+    }
+
+    It 'preserves exact pending evidence when the consecutive no-progress limit is reached' {
         $script:MaxIterations = 5
         $script:StatePath = 'C:\ProgramData\BootUpdateCycle\BootUpdateCycle.state.json'
         $script:UnregisterCalls = 0
         $script:FailUnregister = $false
         $signal = [pscustomobject]@{ Source='CBS'; Detail='RebootPending key present' }
         $state = [pscustomobject]@{
-            RebootCount=4; Phase='Rebooting'; StartTime='2026-07-20T09:00:00Z'
-            LastRebootSignals=$null; LimitReachedAt=$null; LimitReason=$null; LimitRebootSignals=@()
+            RebootCount=5; LastProgressEvaluationRebootCount=4; LastRebootProgressFingerprint='unchanged'
+            NoProgressRebootCount=4; WingetDone=$false; WingetUpdatedIds=@(); Summary=[pscustomobject]@{ Winget=0 }
+            Phase='Rebooting'; StartTime='2026-07-20T09:00:00Z'; LastRebootSignals=$null
+            LimitReachedAt=$null; LimitReason=$null; LimitRebootSignals=@()
         }
+        $state.LastRebootProgressFingerprint = Get-BootUpdateProgressFingerprint -State $state
 
-        (Stop-BootUpdateAtRebootLimit -State $state -PendingSignals @($signal) -Context 'before update phases') |
-            Should -BeFalse
-        $state.RebootCount = 5
         (Stop-BootUpdateAtRebootLimit -State $state -PendingSignals @($signal) -Context 'before update phases') |
             Should -BeTrue
         $state.Phase | Should -Be 'LimitReached'
@@ -1605,9 +1668,12 @@ Describe 'Truthful reboot safety limit' {
         $script:MaxIterations = 1
         $script:FailUnregister = $true
         $state = [pscustomobject]@{
-            RebootCount=1; Phase='Rebooting'; StartTime='2026-07-20T09:00:00Z'
-            LastRebootSignals=$null; LimitReachedAt=$null; LimitReason=$null; LimitRebootSignals=@()
+            RebootCount=1; LastProgressEvaluationRebootCount=0; LastRebootProgressFingerprint='unchanged'
+            NoProgressRebootCount=0; WingetDone=$false; WingetUpdatedIds=@(); Summary=[pscustomobject]@{ Winget=0 }
+            Phase='Rebooting'; StartTime='2026-07-20T09:00:00Z'; LastRebootSignals=$null
+            LimitReachedAt=$null; LimitReason=$null; LimitRebootSignals=@()
         }
+        $state.LastRebootProgressFingerprint = Get-BootUpdateProgressFingerprint -State $state
         $signal = [pscustomobject]@{ Source='WU'; Detail='RebootRequired key present' }
         (Stop-BootUpdateAtRebootLimit -State $state -PendingSignals @($signal) -Context 'after update phases') |
             Should -BeTrue
@@ -3041,6 +3107,7 @@ Describe 'Explicit Winget and Chocolatey package identity handling' {
 
         $legacy.PSObject.Properties.Name | Should -Contain 'WingetUpdatedIds'
         @($legacy.WingetUpdatedIds).Count | Should -Be 0
+        $script:BootUpdateStateSchemaVersion = 7
     }
 }
 
@@ -3848,7 +3915,7 @@ Describe 'Resume identity discovery through the state object' {
        that is the chain these walk. #>
 
     BeforeAll {
-        Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 6 -Scope Script -Force
+        $script:BootUpdateStateSchemaVersion = 7
     }
 
     It 'declares ResumeUserSid on a freshly constructed state' {
