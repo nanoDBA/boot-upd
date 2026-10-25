@@ -35,6 +35,7 @@ BeforeAll {
         'Get-BootUpdateBootReading',
         'Update-BootUpdateStateForBootSession',
         'Get-BootUpdateLaunchContract',
+        'Wait-BootUpdateDelayedServiceStart',
         'Test-PostUpdateHealth',
         'Get-BootUpdateBootSessionId',
         'Set-BootUpdateRebootCheckpoint',
@@ -951,6 +952,54 @@ Describe 'Concise provider diagnostics' {
 }
 
 Describe 'Do-no-harm service health assessment' {
+    It 'observes delayed automatic time service startup without repairing it' {
+        $script:healthReads=0
+        $result=Test-PostUpdateHealth -CriticalServices W32Time `
+            -ServiceProvider { param($name) $script:healthReads++; [pscustomobject]@{Status=if($script:healthReads -gt 1){'Running'}else{'Stopped'}} } `
+            -ConfigurationProvider { param($name) [pscustomobject]@{StartMode='Auto';DelayedAutoStart=$true} } `
+            -UptimeProvider {82} -SleepProvider {param($seconds)}
+        $result.AllHealthy | Should -BeTrue
+        $result.MutationsAttempted | Should -Be 0
+        $script:healthReads | Should -BeGreaterThan 1
+    }
+
+    It 'still fails when delayed startup never reaches Running' {
+        $script:healthSleeps=0
+        $result=Test-PostUpdateHealth -CriticalServices W32Time `
+            -ServiceProvider { param($name) [pscustomobject]@{Status='Stopped'} } `
+            -ConfigurationProvider { param($name) [pscustomobject]@{StartMode='Auto';DelayedAutoStart=$true} } `
+            -UptimeProvider {298} -SleepProvider {param($seconds) $script:healthSleeps += $seconds}
+        $result.AllHealthy | Should -BeFalse
+        $script:healthSleeps | Should -Be 2
+        $result.MutationsAttempted | Should -Be 0
+    }
+
+    It 'also observes a delayed automatic service that is already starting' {
+        $script:healthReads=0
+        $result=Test-PostUpdateHealth -CriticalServices W32Time `
+            -ServiceProvider { param($name) $script:healthReads++; [pscustomobject]@{Status=if($script:healthReads -gt 1){'Running'}else{'StartPending'}} } `
+            -ConfigurationProvider { param($name) [pscustomobject]@{StartMode='Auto';DelayedAutoStart=$true} } `
+            -UptimeProvider {82} -SleepProvider {param($seconds)}
+        $result.AllHealthy | Should -BeTrue
+        $result.MutationsAttempted | Should -Be 0
+    }
+
+    It 'does not wait for stopped automatic services without delayed startup' {
+        $result=Test-PostUpdateHealth -CriticalServices W32Time `
+            -ServiceProvider { param($name) [pscustomobject]@{Status='Stopped'} } `
+            -ConfigurationProvider { param($name) [pscustomobject]@{StartMode='Auto';DelayedAutoStart=$false} } `
+            -UptimeProvider {82} -SleepProvider {throw 'Must not sleep'}
+        $result.AllHealthy | Should -BeFalse
+    }
+
+    It 'does not extend the grace for a service stopped after the boot window' {
+        $result=Test-PostUpdateHealth -CriticalServices W32Time `
+            -ServiceProvider { param($name) [pscustomobject]@{Status='Stopped'} } `
+            -ConfigurationProvider { param($name) [pscustomobject]@{StartMode='Auto';DelayedAutoStart=$true} } `
+            -UptimeProvider {301} -SleepProvider {throw 'Must not sleep'}
+        $result.AllHealthy | Should -BeFalse
+    }
+
     It 'does not mutate services and accepts expected or policy-managed stopped states' {
         $services = @{ W32Time='Stopped'; WinDefend='Stopped'; Spooler='Stopped'; Dnscache='Running'; EventLog='Running' }
         $startModes = @{ W32Time='Manual'; WinDefend='Manual'; Spooler='Disabled'; Dnscache='Auto'; EventLog='Auto' }
@@ -1690,6 +1739,7 @@ Describe 'In-flight watchdog scheduling' {
         }
         Mock Get-ScheduledTask {
             $captured = $script:CapturedTasks[$TaskName]
+            if (-not $captured) { return $null }
             [pscustomobject]@{
                 TaskName  = $TaskName
                 State     = 'Ready'
@@ -1698,6 +1748,9 @@ Describe 'In-flight watchdog scheduling' {
                 Actions   = @([pscustomobject]@{ Execute = $captured.Action.Execute; Arguments = $captured.Action.Arguments; WorkingDirectory = $captured.Action.WorkingDirectory })
                 Triggers  = @($captured.Trigger)
             }
+        }
+        Mock Unregister-ScheduledTask {
+            $script:CapturedTasks.Remove('BootUpdateCycleFallback') | Out-Null
         }
 
         foreach ($name in @('SkipPip','SkipNpm','SkipOffice365','SkipSsms','SkipAwsTooling','SkipPowerShellModules','SkipScoop','SkipDotnetTools','SkipVscode','SkipDefender','IncludeDriverUpdates','IncludeFirmwareUpdates','UpdateWsl','UpdateContainers','SkipRestorePoint','SkipHealthCheck','SkipBitLocker','AllowMetered','DisableSelfUpdate','StagedRollout','AggressiveRepair')) {
@@ -1760,6 +1813,20 @@ Describe 'In-flight watchdog scheduling' {
         Register-BootUpdateTaskForReboot
         $script:CapturedTasks['BootUpdateCycle'].Action.Arguments | Should -Match '(?<!\w)-SkipSsms\b'
         $script:CapturedTasks['BootUpdateCycleFallback'].Action.Arguments | Should -Match '(?<!\w)-SkipSsms\b'
+    }
+
+    It 'keeps only the saved user logon trigger after machine servicing finishes' {
+        Register-BootUpdateTaskForReboot
+        $script:CapturedTasks['BootUpdateCycleFallback'] | Should -Not -BeNullOrEmpty
+
+        Register-BootUpdateTaskForReboot -LogonOnly
+
+        $primary = $script:CapturedTasks['BootUpdateCycle']
+        @($primary.Trigger).Count | Should -Be 1
+        $primary.Trigger[0].CimClass.CimClassName | Should -Be 'MSFT_TaskLogonTrigger'
+        @($primary.Trigger | Where-Object { $_.Repetition -and $_.Repetition.Interval }).Count | Should -Be 0
+        $script:CapturedTasks['BootUpdateCycleFallback'] | Should -BeNullOrEmpty
+        Should -Invoke Unregister-ScheduledTask -Times 1 -ParameterFilter { $TaskName -eq 'BootUpdateCycleFallback' }
     }
 
     It 'retains an explicit native-SSMS false override across resume and self-update' {
@@ -3577,38 +3644,36 @@ Describe 'Bounded wait for an interactive user' {
 
     It 'keeps waiting while the wait budget remains' {
         $state = [pscustomobject]@{ UserIdentityWaitCount = 0 }
-        $exhausted = Update-BootUpdateUserIdentityWait -State $state -UserUnknown $true -MaxWaits 3
+        $exhausted = Update-BootUpdateUserIdentityWait -State $state -NoInteractiveUser $true -MaxWaits 3
         $exhausted | Should -BeFalse
         $state.UserIdentityWaitCount | Should -Be 1
     }
 
     It 'reports exhaustion once the budget is spent' {
         $state = [pscustomobject]@{ UserIdentityWaitCount = 3 }
-        Update-BootUpdateUserIdentityWait -State $state -UserUnknown $true -MaxWaits 3 |
+        Update-BootUpdateUserIdentityWait -State $state -NoInteractiveUser $true -MaxWaits 3 |
             Should -BeTrue -Because 'the fourth attempt exceeds a budget of three'
     }
 
-    It 'never bounds the wait when a user is known' {
-        <# The laptop case. A logon-triggered continuation costs nothing and must keep
-           waiting: an owner who returns tomorrow has not stopped having a user. #>
+    It 'does not exhaust the absent-session budget while a user is signed in' {
         $state = [pscustomobject]@{ UserIdentityWaitCount = 99 }
-        Update-BootUpdateUserIdentityWait -State $state -UserUnknown $false -MaxWaits 3 |
+        Update-BootUpdateUserIdentityWait -State $state -NoInteractiveUser $false -MaxWaits 3 |
             Should -BeFalse
     }
 
-    It 'resets the counter when a user becomes known again' {
+    It 'resets the counter when an interactive session appears again' {
         <# Prevents an intermittent identity lookup accumulating its way to a false
            exhaustion on a machine that does have a user. #>
         $state = [pscustomobject]@{ UserIdentityWaitCount = 2 }
-        $null = Update-BootUpdateUserIdentityWait -State $state -UserUnknown $false -MaxWaits 3
+        $null = Update-BootUpdateUserIdentityWait -State $state -NoInteractiveUser $false -MaxWaits 3
         $state.UserIdentityWaitCount | Should -Be 0
     }
 
     It 'starts counting on a state that has never carried the property' {
         $state = [pscustomobject]@{ Phase = 'Running' }
-        Update-BootUpdateUserIdentityWait -State $state -UserUnknown $true -MaxWaits 1 | Should -BeFalse
+        Update-BootUpdateUserIdentityWait -State $state -NoInteractiveUser $true -MaxWaits 1 | Should -BeFalse
         $state.UserIdentityWaitCount | Should -Be 1
-        Update-BootUpdateUserIdentityWait -State $state -UserUnknown $true -MaxWaits 1 | Should -BeTrue
+        Update-BootUpdateUserIdentityWait -State $state -NoInteractiveUser $true -MaxWaits 1 | Should -BeTrue
     }
 
     It 'survives a state-file round trip, so the budget cannot silently reset each pass' {
@@ -3616,11 +3681,11 @@ Describe 'Bounded wait for an interactive user' {
            fresh process reading state back from JSON. #>
         $state = [pscustomobject]@{ UserIdentityWaitCount = 0 }
         1..2 | ForEach-Object {
-            $null = Update-BootUpdateUserIdentityWait -State $state -UserUnknown $true -MaxWaits 5
+            $null = Update-BootUpdateUserIdentityWait -State $state -NoInteractiveUser $true -MaxWaits 5
             $state = $state | ConvertTo-Json -Depth 5 | ConvertFrom-Json
         }
         $state.UserIdentityWaitCount | Should -Be 2
-        Update-BootUpdateUserIdentityWait -State $state -UserUnknown $true -MaxWaits 5 | Should -BeFalse
+        Update-BootUpdateUserIdentityWait -State $state -NoInteractiveUser $true -MaxWaits 5 | Should -BeFalse
     }
 }
 
@@ -3860,16 +3925,16 @@ Describe 'Resume identity discovery through the state object' {
     }
 }
 
-Describe 'No interactive user exhausts the bounded wait and completes with deferred inventory' {
+Describe 'No interactive session exhausts retries without losing known-user work' {
     <# -35qb.4. Only the counter (Update-BootUpdateUserIdentityWait) had cover; the branch
        the counter unlocks had none, and that branch is what the release notes describe as
        producing a qualified claim. grep NoInteractiveUser tests/ returned nothing.
 
-       The three assertions the ticket asks for are split by what can carry them. The
-       inventory record and the claim are composed by real functions, so those are driven
-       behaviourally. The fall-through - Phase set to Running, no further continuation task
-       registered - lives inline in Invoke-BootUpdateCycle, so it is pinned the way this
-       file already pins orchestrator-inline invariants, against the function's own text. #>
+       An account recovered from a past logon is enough to resume at the next sign-in, even
+       if no one is signed in now. Only an unresolvable account becomes deferred inventory.
+       The task's exact trigger shape is tested in 'In-flight watchdog scheduling'; the
+       orchestration decision is pinned against the function text, as with other inline
+       invariants in this file. #>
 
     BeforeAll {
         $script:MaxUserIdentityWaits = 2
@@ -3879,14 +3944,14 @@ Describe 'No interactive user exhausts the bounded wait and completes with defer
         $state = New-BootUpdateStateV2
         $state.ResumeUser = $null
 
-        <# The production call passes -UserUnknown from an empty ResumeUser, so drive it the
-           same way rather than hard-coding $true. #>
+        <# The production call counts a missing interactive session, independently of the
+           saved account name. #>
         $unknown = [string]::IsNullOrWhiteSpace([string]$state.ResumeUser)
         $unknown | Should -BeTrue
 
-        Update-BootUpdateUserIdentityWait -State $state -UserUnknown $unknown -MaxWaits $script:MaxUserIdentityWaits | Should -BeFalse
-        Update-BootUpdateUserIdentityWait -State $state -UserUnknown $unknown -MaxWaits $script:MaxUserIdentityWaits | Should -BeFalse
-        Update-BootUpdateUserIdentityWait -State $state -UserUnknown $unknown -MaxWaits $script:MaxUserIdentityWaits |
+        Update-BootUpdateUserIdentityWait -State $state -NoInteractiveUser $unknown -MaxWaits $script:MaxUserIdentityWaits | Should -BeFalse
+        Update-BootUpdateUserIdentityWait -State $state -NoInteractiveUser $unknown -MaxWaits $script:MaxUserIdentityWaits | Should -BeFalse
+        Update-BootUpdateUserIdentityWait -State $state -NoInteractiveUser $unknown -MaxWaits $script:MaxUserIdentityWaits |
             Should -BeTrue -Because 'the bound is a bound: the wait ends, it does not repeat forever'
     }
 
@@ -3897,7 +3962,7 @@ Describe 'No interactive user exhausts the bounded wait and completes with defer
 
         $exhausted = $false
         while (-not $exhausted) {
-            $exhausted = Update-BootUpdateUserIdentityWait -State $state -UserUnknown $true -MaxWaits $script:MaxUserIdentityWaits
+            $exhausted = Update-BootUpdateUserIdentityWait -State $state -NoInteractiveUser $true -MaxWaits $script:MaxUserIdentityWaits
         }
         foreach ($phase in $phases) {
             Add-BootUpdateDeferredInventory -State $state -Provider $phase.Name -Scope 'user' -Records @(
@@ -3940,21 +4005,24 @@ Describe 'No interactive user exhausts the bounded wait and completes with defer
         $toast.Message | Should -Not -Match 'you are all set'
     }
 
-    It 'falls through to the ordinary completion path instead of arming another retry' {
-        <# This is assertion (c): the exhausted branch must NOT register a further
-           continuation, and must hand the run to the same completion path whose cleanup and
-           verification ordering is pinned in 'Evidence-backed completion'. #>
+    It 'keeps a resolvable saved user pending for the next sign-in' {
         $text = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
         $start = $text.IndexOf('$identityExhausted = Update-BootUpdateUserIdentityWait')
         $start | Should -BeGreaterThan 0
         $branch = $text.Substring($start, $text.IndexOf('$disposition.Kind -eq ''UserContext'' -and $state.Phase -eq ''UserContextPending''', $start) - $start)
 
-        $exhausted = $branch.Substring($branch.IndexOf('if ($identityExhausted)'), $branch.IndexOf('} else {') - $branch.IndexOf('if ($identityExhausted)'))
-        $exhausted | Should -Match "Kind = 'NoInteractiveUser'"
-        $exhausted | Should -Match "-Scope 'user'"
-        $exhausted | Should -Match "\`$state\.Phase = 'Running'"
-        $exhausted | Should -Not -Match 'Register-BootUpdateTaskForReboot' -Because 'an exhausted wait completes; it does not schedule another rediscovery'
-        $exhausted | Should -Match 'No interactive user appeared after' -Because 'the lab row reads this line as its evidence that the bound fired'
+        $knownUser = $branch.Substring($branch.IndexOf('if ($identityExhausted -and $knownResumeUserSid)'), $branch.IndexOf('} elseif ($identityExhausted)') - $branch.IndexOf('if ($identityExhausted -and $knownResumeUserSid)'))
+        $knownUser | Should -Match "\`$state\.Phase = 'UserContextPending'"
+        $knownUser | Should -Match 'Register-BootUpdateTaskForReboot -LogonOnly'
+        $knownUser | Should -Match 'Test-BootUpdateInteractiveUserPresent'
+        $knownUser | Should -Match 'Register-BootUpdateTaskForReboot -RetrySoon' -Because 'a sign-in during task registration must not be missed'
+        $knownUser | Should -Not -Match 'Add-BootUpdateDeferredInventory'
+
+        $unknownUser = $branch.Substring($branch.IndexOf('} elseif ($identityExhausted)') + 2)
+        $unknownUser | Should -Match "Kind = 'NoInteractiveUser'"
+        $unknownUser | Should -Match "-Scope 'user'"
+        $unknownUser | Should -Match "\`$state\.Phase = 'Running'"
+        $unknownUser | Should -Match 'No interactive user appeared after'
     }
 }
 
@@ -4867,6 +4935,29 @@ Describe 'The bounded wait is about an absent session, not an unknown name' {
             Should -BeTrue -Because 'this cycle IS the interactive session'
     }
 
+    It 'does not reset the saved account wait when a different console user signs in' {
+        Mock Resolve-BootUpdateResumeAccount {
+            if ($Account -eq 'LAB\saved') { return 'S-1-5-21-1-2-3-1001' }
+            if ($Account -eq 'LAB\other') { return 'S-1-5-21-1-2-3-1002' }
+        }
+        Test-BootUpdateInteractiveUserPresent -CurrentIdentitySid 'S-1-5-18' `
+            -ResumeUser 'LAB\saved' -ResumeUserSid 'S-1-5-21-1-2-3-1001' `
+            -ConsoleUserProvider { 'LAB\other' } | Should -BeFalse
+    }
+
+    It 'recognizes the saved console account by SID even when its name spelling differs' {
+        Mock Resolve-BootUpdateResumeAccount { return 'S-1-5-21-1-2-3-1001' }
+        Test-BootUpdateInteractiveUserPresent -CurrentIdentitySid 'S-1-5-18' `
+            -ResumeUser '.\saved' -ResumeUserSid 'S-1-5-21-1-2-3-1001' `
+            -ConsoleUserProvider { 'LAB\saved' } | Should -BeTrue
+    }
+
+    It 'keeps checking when the saved console account cannot be resolved' {
+        Mock Resolve-BootUpdateResumeAccount { return $null }
+        Test-BootUpdateInteractiveUserPresent -CurrentIdentitySid 'S-1-5-18' `
+            -ResumeUser 'LAB\missing' -ConsoleUserProvider { 'LAB\other' } | Should -BeFalse
+    }
+
     It 'reports no interactive user when SYSTEM finds no console session' {
         <# Only meaningful when the test itself is not SYSTEM, which it is not. #>
         $isSystem = ([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value -eq 'S-1-5-18')
@@ -4881,26 +4972,33 @@ Describe 'The bounded wait is about an absent session, not an unknown name' {
         $headless.ResumeUser = 'LABHOST\updtest'   # known, from a past session - and irrelevant
         $exhausted = $false
         for ($i = 0; $i -lt 5 -and -not $exhausted; $i++) {
-            $exhausted = Update-BootUpdateUserIdentityWait -State $headless -UserUnknown $true -MaxWaits 2
+            $exhausted = Update-BootUpdateUserIdentityWait -State $headless -NoInteractiveUser $true -MaxWaits 2
         }
         $exhausted | Should -BeTrue -Because 'a machine nobody signs into must be able to finish'
 
         $attended = New-BootUpdateStateV2
         $attended.ResumeUser = 'LABHOST\alice'
         for ($i = 0; $i -lt 20; $i++) {
-            Update-BootUpdateUserIdentityWait -State $attended -UserUnknown $false -MaxWaits 2 |
+            Update-BootUpdateUserIdentityWait -State $attended -NoInteractiveUser $false -MaxWaits 2 |
                 Should -BeFalse -Because 'a laptop whose owner is signed in has a pass coming, and waiting costs nothing'
         }
     }
 
     It 'drives the bound from the session test rather than from ResumeUser' {
         $text = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
-        $text | Should -Match '\$retryForUnknownUser = -not \(Test-BootUpdateInteractiveUserPresent\)'
-        $text | Should -Not -Match '\$retryForUnknownUser = \[string\]::IsNullOrWhiteSpace\(\[string\]\$state\.ResumeUser\)'
-        <# The same flag still decides whether a dated retry is armed. Without it no further
-           pass runs, the counter never advances, and the bound can never be reached - which
-           is precisely how the headless guest came to sit there. #>
-        $text | Should -Match 'Register-BootUpdateTaskForReboot -RetrySoon:\$retryForUnknownUser'
+        $text | Should -Match '\$noInteractiveUser = -not \(Test-BootUpdateInteractiveUserPresent -ResumeUser \$state.ResumeUser -ResumeUserSid \$state.ResumeUserSid\)'
+        $text | Should -Not -Match '\$noInteractiveUser = \[string\]::IsNullOrWhiteSpace\(\[string\]\$state\.ResumeUser\)'
+        <# The session result bounds rediscovery; every pending user pass also gets one
+           dated user-principal retry so an already-active user's earlier logon is not lost. #>
+        $text | Should -Match 'Register-BootUpdateTaskForReboot -RetrySoon'
+    }
+
+    It 'does not spend a reboot iteration while waiting for any missing interactive session' {
+        $text = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
+        $waiting = $text.Substring($text.IndexOf('$waitingForIdentity ='), $text.IndexOf('if (-not $waitingForIdentity)', $text.IndexOf('$waitingForIdentity =')) - $text.IndexOf('$waitingForIdentity ='))
+        $waiting | Should -Match '\$state\.Phase -eq ''UserContextPending'''
+        $waiting | Should -Match 'Test-BootUpdateInteractiveUserPresent'
+        $waiting | Should -Not -Match 'IsNullOrWhiteSpace\(\[string\]\$state\.ResumeUser\)'
     }
 }
 
