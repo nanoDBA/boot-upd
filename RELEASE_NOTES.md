@@ -1,10 +1,37 @@
 # Boot Update Cycle — Release Notes
 
-**Latest published version:** v2.5.84
+**Latest published version:** v2.5.86
 **Status:** Released
 
 ---
 
+## v2.5.86 (2026-10-25)
+
+A run could stop after five total reboots even while Windows Update or another provider was making verified progress. The reboot limit now counts consecutive reboot barriers without verified progress. Completed phases and verified update counts reset that counter; repeated no-progress states still stop for attention.
+
+### Changes
+
+- Update cycles can continue through more than five total reboots when providers keep making verified progress.
+- State schema v7 records the progress fingerprint and no-progress reboot streak, while preserving older checkpoints.
+- Status and logs show total reboots separately from the stalled-reboot count.
+
+### Testing
+
+649 Pester tests passed. The User/SYSTEM exclusion gate, published launcher upgrade gate, and quality gate passed.
+
+The headless VM row made five updater passes and recorded three Windows boot events, then parked at the saved user's sign-in task. After one test sign-in, that task resumed in the saved user's context, passed health checks, and removed its tasks and checkpoint. The cycle still reported deferred inventory: Windows Update offered KB5007651 again after two successful installs. The test VM also had no Winget installation, so this run did not test upgrades of user-installed apps. The overall VM result is **PARTIAL**. The second VM row is **NOT RUN** because its checkpoint did not reach a desktop.
+
+See the [v2.5.86 validation report](docs/validation-2.5.86.md) and [issue #96](https://github.com/nanoDBA/boot-upd/issues/96) for the Windows Update re-offer.
+
+## v2.5.85 (2026-10-25)
+
+User-only updates now stay queued after headless servicing finishes. Signing in as the saved user resumes the cycle automatically; there is no manual rerun. The release also fixes a launcher race, gives delayed-start Windows Time a bounded health-check wait, and corrects deployment messages about which account runs updates.
+
+### Testing
+
+645 tests and the User/SYSTEM and published-launcher gates passed. Windows 11 VM rows A, G, and N passed. VM B remained **PARTIAL** because Windows Update offered KB5007651 again after successful installation. The matrix did not cover Windows 10, RDP, simultaneous interactive sessions, or real upgrades of user-installed apps. See the [v2.5.85 validation report](docs/validation-user-continuation.md) and [issue #96](https://github.com/nanoDBA/boot-upd/issues/96).
+
+---
 ## v2.5.84 (2026-10-24)
 
 Fixes two ways a run could stall or misreport: single-package Winget upgrades, and a pass that dies before it starts updating.
