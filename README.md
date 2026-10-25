@@ -525,7 +525,7 @@ Edit the `$Config` block in `Deploy-BootUpdateCycle.ps1`:
 
 ```powershell
 $Config = @{
-    MaxIterations         = 5       # Maximum completed reboot cycles
+    MaxIterations         = 5       # Consecutive reboot barriers without verified progress
     MaxRetryPasses        = 5       # Consecutive failed recovery passes per boot
     WatchdogIntervalMinutes = 15    # Minutes between in-flight watchdog probes (floor 2, no off switch)
     PackageTimeoutMin     = 30      # Hard timeout per package manager

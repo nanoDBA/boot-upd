@@ -432,7 +432,7 @@ while ((Get-Date) -lt $deadline) {
                    converges, and waiting out the timeout after it has already disarmed and
                    reported adds nothing but wall-clock. Row B v5 sat here for eight minutes
                    after the updater had finished saying everything it had to say. #>
-                Terminal = @($lines | Where-Object { $_ -match '(recovery limit|Reboot limit) .*reached' }).Count
+                Terminal = @($lines | Where-Object { $_ -match '(recovery limit|Reboot limit|No-progress reboot limit) .*reached' }).Count
                 Tasks    = @(Get-ScheduledTask -TaskName 'BootUpdateCycle*' -ErrorAction SilentlyContinue).Count
                 TaskNames = @($tasks.TaskName)
                 PrimaryTriggerTypes = @($tasks | Where-Object TaskName -eq 'BootUpdateCycle' | ForEach-Object { $_.Triggers } | ForEach-Object { $_.CimClass.CimClassName })

@@ -42,6 +42,11 @@ Describe 'A parked saved-user cycle needs checkpoint and scheduler evidence' {
 }
 
 Describe 'Lab completion requires observed cleanup' {
+    It 'recognizes the progress-aware reboot stop as a terminal outcome' {
+        $source = Get-Content (Join-Path $PSScriptRoot 'integration/lab/Invoke-LabRow.ps1') -Raw
+        $source | Should -Match 'recovery limit\|Reboot limit\|No-progress reboot limit'
+    }
+
     It 'keeps watching when task removal precedes state removal' {
         Test-LabCompletionEvidence -Passes 5 -CompletionRecords 1 -TasksRemaining 0 -StateFileExists $true |
             Should -BeFalse
