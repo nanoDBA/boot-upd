@@ -1681,6 +1681,19 @@ function Get-BootUpdateUptimeSeconds {
     return [math]::Round([System.Environment]::TickCount64 / 1000.0, 0)
 }
 
+function Get-BootUpdateBootCount {
+    <# Windows' prefetcher maintains a DWORD boot counter. Unlike a boot timestamp
+       reconstructed from wall time, it is unaffected by time corrections. Older or
+       specially configured Windows images may not expose it; callers then retain the
+       timestamp-based compatibility path. #>
+    try {
+        $value = (Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters' -Name BootId -ErrorAction Stop).BootId
+        return [uint32]$value
+    } catch {
+        return $null
+    }
+}
+
 function Get-BootUpdateMonotonicBootId {
     <# A boot identity that does not jitter, used to catch reboots the tolerance window hides.
 
@@ -1800,6 +1813,7 @@ function Get-BootUpdateBootReading {
         SessionId       = Get-BootUpdateBootSessionId
         UptimeSeconds   = Get-BootUpdateUptimeSeconds
         MonotonicBootId = Get-BootUpdateMonotonicBootId
+        BootCount       = Get-BootUpdateBootCount
     }
 }
 
@@ -1832,6 +1846,7 @@ function Update-BootUpdateBootSession {
     $currentSessionId    = [string]$Reading.SessionId
     $currentUptime       = $Reading.UptimeSeconds
     $currentMonotonicId  = $Reading.MonotonicBootId
+    $currentBootCount    = $Reading.BootCount
 
     $priorBootSessionId = ConvertTo-BootUpdateTimestampString -Value $State.LastBootSessionId
     $identityMoved = -not (Test-BootUpdateSameBootSession -Left $priorBootSessionId -Right $currentSessionId)
@@ -1871,10 +1886,14 @@ function Update-BootUpdateBootSession {
         else { $State | Add-Member -NotePropertyName 'LastIdentityJitterSeconds' -NotePropertyValue $identityDeltaSeconds -Force }
     }
 
-    $sameSession = (-not $identityMoved -and -not $monotonicMoved) -or $identityIsJitter
+    $priorBootCount = if ($State.PSObject.Properties.Name -contains 'LastBootCount') { $State.LastBootCount } else { $null }
+    $hasBootCount = $null -ne $priorBootCount -and $null -ne $currentBootCount
+    $bootCountMoved = $hasBootCount -and ([uint32]$priorBootCount -ne [uint32]$currentBootCount)
+
+    $sameSession = if ($hasBootCount) { -not $bootCountMoved } else { (-not $identityMoved -and -not $monotonicMoved) -or $identityIsJitter }
     <# A first-ever pass has nothing to have moved away from, so it is not a new boot. #>
     $newBoot = [bool]$State.LastBootSessionId -and -not $sameSession
-    $reason = if (-not $newBoot) { $null } elseif ($identityMoved -and -not $identityIsJitter) { 'identity' } else { 'monotonic' }
+    $reason = if (-not $newBoot) { $null } elseif ($hasBootCount) { 'boot-count' } elseif ($identityMoved -and -not $identityIsJitter) { 'identity' } else { 'monotonic' }
 
     $rebootCounted = $false
     if ($newBoot) {
@@ -1906,6 +1925,10 @@ function Update-BootUpdateBootSession {
     if ($currentMonotonicId) {
         if ($State.PSObject.Properties.Name -contains 'LastMonotonicBootId') { $State.LastMonotonicBootId = $currentMonotonicId }
         else { $State | Add-Member -NotePropertyName 'LastMonotonicBootId' -NotePropertyValue $currentMonotonicId -Force }
+    }
+    if ($null -ne $currentBootCount) {
+        if ($State.PSObject.Properties.Name -contains 'LastBootCount') { $State.LastBootCount = $currentBootCount }
+        else { $State | Add-Member -NotePropertyName 'LastBootCount' -NotePropertyValue $currentBootCount -Force }
     }
     return [pscustomobject]@{
         NewBoot               = $newBoot
@@ -2243,6 +2266,7 @@ function New-BootUpdateStateV2 {
         RebootCount           = 0
         ConsecutiveRetryCount = 0
         LastBootSessionId     = $null
+        LastBootCount         = $null
         WindowsUpdateZeroEvidence = $null
         <# Task C: each unobserved stop (a crash-shaped resume charged against the retry
            budget — see Test-CrashRecovery) as { Phase, Iteration, ObservedAt }. Surfaced in
@@ -2321,7 +2345,7 @@ function Update-BootUpdateStateSchema {
 
     $props = $State.PSObject.Properties.Name
     <# Add-if-missing: crash recovery, new phase flags, network-check cache #>
-    foreach ($f in @('LastPhaseStarted','LastPhaseTimestamp','StagedNextPhase','LastPreflightNetworkOk','LastPreflightNetworkAt','LastRebootSignals','LastBootSessionId','ResumeUser','ResumeUserSid','LimitReachedAt','LimitReason')) {
+    foreach ($f in @('LastPhaseStarted','LastPhaseTimestamp','StagedNextPhase','LastPreflightNetworkOk','LastPreflightNetworkAt','LastRebootSignals','LastBootSessionId','LastBootCount','ResumeUser','ResumeUserSid','LimitReachedAt','LimitReason')) {
         if ($props -notcontains $f) { $State | Add-Member -NotePropertyName $f -NotePropertyValue $null -Force }
     }
     if ($props -notcontains 'LimitRebootSignals') { $State | Add-Member -NotePropertyName 'LimitRebootSignals' -NotePropertyValue @() -Force }

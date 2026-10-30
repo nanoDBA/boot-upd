@@ -39,6 +39,7 @@ BeforeAll {
         'Wait-BootUpdateDelayedServiceStart',
         'Test-PostUpdateHealth',
         'Get-BootUpdateBootSessionId',
+        'Get-BootUpdateBootCount',
         'Set-BootUpdateRebootCheckpoint',
         'Get-BootUpdateProgressFingerprint',
         'Update-BootUpdateNoProgressRebootCount',
@@ -5244,9 +5245,46 @@ Describe 'One call decides whether this pass followed a reboot' {
 
     BeforeAll {
         function New-Reading {
-            param([string]$SessionId, $Uptime = 600, $Monotonic = $null)
-            [pscustomobject]@{ SessionId = $SessionId; UptimeSeconds = $Uptime; MonotonicBootId = $Monotonic }
+            param([string]$SessionId, $Uptime = 600, $Monotonic = $null, $BootCount = $null)
+            [pscustomobject]@{ SessionId = $SessionId; UptimeSeconds = $Uptime; MonotonicBootId = $Monotonic; BootCount = $BootCount }
         }
+    }
+
+    It 'uses the Windows boot counter to ignore a wall-clock step inside one boot' {
+        Mock Write-Log { }
+        $bootAt = [datetime]::UtcNow
+        $state = (Update-BootUpdateBootSession -State (New-BootUpdateStateV2) `
+            -Reading (New-Reading -SessionId $bootAt.ToString('o') -Uptime 120 -Monotonic $bootAt.ToString('o') -BootCount 41)).State
+        $state.Phase = 'Rebooting'
+        $state.ConsecutiveRetryCount = 2
+        $state.WindowsUpdateZeroEvidence = 'seen'
+
+        # Wall clock steps seven minutes while uptime and the boot counter say same boot.
+        $steppedClock = $bootAt.AddMinutes(7)
+        $observation = Update-BootUpdateBootSession -State $state `
+            -Reading (New-Reading -SessionId $steppedClock.ToString('o') -Uptime 180 -Monotonic $steppedClock.ToString('o') -BootCount 41)
+
+        $observation.NewBoot | Should -BeFalse
+        $observation.State.RebootCount | Should -Be 0
+        $observation.State.ConsecutiveRetryCount | Should -Be 2
+        $observation.State.WindowsUpdateZeroEvidence | Should -Be 'seen'
+    }
+
+    It 'counts a boot-counter change even when the derived boot timestamp barely moves' {
+        $bootAt = [datetime]::UtcNow
+        $state = (Update-BootUpdateBootSession -State (New-BootUpdateStateV2) `
+            -Reading (New-Reading -SessionId $bootAt.ToString('o') -Uptime 120 -Monotonic $bootAt.ToString('o') -BootCount 41)).State
+        $state.Phase = 'Rebooting'
+
+        # A fast reboot can leave both wall-clock-derived timestamps inside their tolerances.
+        $afterBoot = $bootAt.AddSeconds(7)
+        $observation = Update-BootUpdateBootSession -State $state `
+            -Reading (New-Reading -SessionId $afterBoot.ToString('o') -Uptime 180 -Monotonic $bootAt.ToString('o') -BootCount 42)
+
+        $observation.NewBoot | Should -BeTrue
+        $observation.Reason | Should -Be 'boot-count'
+        $observation.RebootCounted | Should -BeTrue
+        $observation.State.RebootCount | Should -Be 1
     }
 
     It 'reports no new boot on the first pass a machine ever takes' {
@@ -5329,7 +5367,7 @@ Describe 'One call decides whether this pass followed a reboot' {
 
     It 'takes the reading itself when the caller does not supply one' {
         $reading = Get-BootUpdateBootReading
-        foreach ($field in 'SessionId','UptimeSeconds','MonotonicBootId') {
+        foreach ($field in 'SessionId','UptimeSeconds','MonotonicBootId','BootCount') {
             $reading.PSObject.Properties.Name | Should -Contain $field
         }
         $reading.SessionId | Should -Not -BeNullOrEmpty
