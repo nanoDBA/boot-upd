@@ -39,6 +39,7 @@ BeforeAll {
         'Wait-BootUpdateDelayedServiceStart',
         'Test-PostUpdateHealth',
         'Get-BootUpdateBootSessionId',
+        'Get-BootUpdateBootCount',
         'Set-BootUpdateRebootCheckpoint',
         'Get-BootUpdateProgressFingerprint',
         'Update-BootUpdateNoProgressRebootCount',
@@ -48,6 +49,7 @@ BeforeAll {
         'Get-PendingFileCleanupDisplaySummary',
         'Write-PendingFileRenameAdvisory',
         'Resolve-BootUpdateCompletionDisposition',
+          'Test-BootUpdateTerminalLimit',
         'Stop-BootUpdateAtRebootLimit',
         'Stop-BootUpdateAtRetryLimit',
         'Update-BootUpdateStagedRetryCount',
@@ -66,7 +68,9 @@ BeforeAll {
         'Test-WindowsUpdateServiceReady',
         'Test-WindowsUpdateConvergence',
         'Get-WindowsUpdateReofferedAfterSuccess',
+        'Get-BootUpdateSuccessfulKbArticleIds',
         'Get-WindowsUpdateInstallHistory',
+        'Get-VscodeExtensionUpdateSummary',
           'Format-NativeExitCode',
           'Get-InstallerExitSummary',
           'Get-ProcessTreeActivity',
@@ -82,6 +86,7 @@ BeforeAll {
           'New-BootUpdateStateV2',
           'Update-BootUpdateStateSchema',
           'Get-BootUpdateState',
+          'Clear-BootUpdateState',
           'Set-BootUpdateState',
           'Update-BootUpdateResumeIdentity',
           'Resolve-BootUpdateResumeAccount',
@@ -97,6 +102,8 @@ BeforeAll {
           'Complete-ChocolateyFailureClassification',
           'Test-WingetExitReconciled',
           'Get-WingetRemediationCommand',
+          'Get-BootUpdateFailureClass',
+          'Get-BootUpdatePreflightDeferredResult',
           'Complete-WingetFailureClassification',
           'Register-WingetAggressiveRepairAttempt',
           'Invoke-WingetFailureQuarantine',
@@ -1516,18 +1523,117 @@ Describe 'Truthful reboot safety limit' {
         $state.NoProgressRebootCount | Should -Be 0
     }
 
+    It 'clamps a restored progress evaluation count to the checkpoint reboot count' {
+        $script:BootUpdateStateSchemaVersion = 7
+        $state = New-BootUpdateStateV2
+        $state.RebootCount = 2
+        $state.LastProgressEvaluationRebootCount = 9
+
+        Update-BootUpdateStateSchema -State $state | Out-Null
+
+        $state.LastProgressEvaluationRebootCount | Should -Be 2
+    }
+
+    It 'loads a v6 JSON checkpoint and fingerprints the migrated state' {
+        $script:BootUpdateStateSchemaVersion = 7
+        $script:StatePath = Join-Path $TestDrive 'v6-state.json'
+        $state = New-BootUpdateStateV2
+        $state.StateVersion = 6
+        $state.RebootCount = 3
+        foreach ($field in @('LastRebootProgressFingerprint','LastProgressEvaluationRebootCount','NoProgressRebootCount')) {
+            $state.PSObject.Properties.Remove($field)
+        }
+        $raw = $state | ConvertTo-Json -Depth 12
+        [IO.File]::WriteAllText($script:StatePath, $raw, [Text.UTF8Encoding]::new($false))
+
+        $restored = Get-BootUpdateState
+        $fingerprint = Get-BootUpdateProgressFingerprint -State $restored
+
+        $restored.StateVersion | Should -Be 7
+        $restored.RebootCount | Should -Be 3
+        $restored.LastProgressEvaluationRebootCount | Should -Be 3
+        $restored.NoProgressRebootCount | Should -Be 0
+        $fingerprint | Should -Match '^[A-F0-9]{64}$'
+    }
+
+    It 'leaves a future-schema checkpoint untouched and fails closed' {
+        $script:BootUpdateStateSchemaVersion = 7
+        $script:StatePath = Join-Path $TestDrive 'future-state.json'
+        $state = New-BootUpdateStateV2
+        $state.StateVersion = 8
+        $state.RebootCount = 12
+        $raw = $state | ConvertTo-Json -Depth 12
+        [IO.File]::WriteAllText($script:StatePath, $raw, [Text.UTF8Encoding]::new($false))
+        $script:UnregisterCalls = 0
+        $script:FailUnregister = $false
+
+        { Get-BootUpdateState } | Should -Throw '*newer than the supported*'
+
+        [IO.File]::ReadAllText($script:StatePath) | Should -BeExactly $raw
+        @(Get-ChildItem -LiteralPath $TestDrive -Filter 'future-state.corrupt-*').Count | Should -Be 0
+        $script:UnregisterCalls | Should -Be 1
+    }
+
+    It 'removes both checkpoint generations after terminal completion' {
+        $clearText = Get-FunctionText $invokeAst 'Clear-BootUpdateState'
+        $backupIndex = $clearText.IndexOf('"$($script:StatePath).bak"', [StringComparison]::Ordinal)
+        $primaryIndex = $clearText.IndexOf('$script:StatePath))', [StringComparison]::Ordinal)
+        $backupIndex | Should -BeGreaterThan -1
+        $primaryIndex | Should -BeGreaterThan -1
+        $backupIndex | Should -BeLessThan $primaryIndex
+        $script:StatePath = Join-Path $TestDrive 'completed-state.json'
+        $WhatIfPreference = $false
+        $oldState = New-BootUpdateStateV2
+        $oldState.RebootCount = 9
+        $currentState = New-BootUpdateStateV2
+        $currentState.RebootCount = 10
+        [IO.File]::WriteAllText($script:StatePath, ($currentState | ConvertTo-Json -Depth 12), [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText("$($script:StatePath).bak", ($oldState | ConvertTo-Json -Depth 12), [Text.UTF8Encoding]::new($false))
+
+        Clear-BootUpdateState
+        $restored = Get-BootUpdateState
+
+        (Test-Path -LiteralPath $script:StatePath) | Should -BeFalse
+        (Test-Path -LiteralPath "$($script:StatePath).bak") | Should -BeFalse
+        $restored.RebootCount | Should -Be 0
+        $restored.Phase | Should -Be 'Init'
+    }
+
     It 'checks the reboot budget only after confirmed pending evidence exists' {
         $cycle = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
         $guard = Get-FunctionText $invokeAst 'Stop-BootUpdateAtRebootLimit'
+        $terminalLimit = Get-FunctionText $invokeAst 'Test-BootUpdateTerminalLimit'
         $cycle | Should -Not -Match '\$state\.Iteration -gt \$MaxIterations'
-        $cycle | Should -Match 'LimitReason -like .Reboot limit \*.'
-        $cycle | Should -Match '\[int\]\$state\.RebootCount -ge \$MaxIterations'
+        $cycle | Should -Match 'Test-BootUpdateTerminalLimit -State \$state'
+        $cycle | Should -Match 'rerun with -MaxIterations greater than'
+        $terminalLimit | Should -Match "LimitReason -like 'Reboot limit \*'"
+        $terminalLimit | Should -Match '\[int\]\$State\.RebootCount -ge \$MaxIterations'
         ([regex]::Matches($cycle, 'Stop-BootUpdateAtRebootLimit')).Count | Should -Be 2
         $guard | Should -Match 'Update-BootUpdateNoProgressRebootCount -State \$State'
         $guard | Should -Match '\$progress\.Count -lt \$script:MaxIterations'
         $guard | Should -Match "Phase = 'LimitReached'"
         $guard | Should -Match 'LimitRebootSignals = \$evidence'
         $guard | Should -Not -Match 'Clear-BootUpdateState|Invoke-Hook'
+    }
+
+    It 'keeps a legacy v6 total-reboot stop parked until its operator raises the limit' {
+        $state = New-BootUpdateStateV2
+        $state.StateVersion = 6
+        $state.Phase = 'LimitReached'
+        $state.LimitReason = 'Reboot limit 5 reached with pending evidence.'
+        $state.RebootCount = 5
+        foreach ($field in @('LastRebootProgressFingerprint','LastProgressEvaluationRebootCount','NoProgressRebootCount')) {
+            $state.PSObject.Properties.Remove($field)
+        }
+        $legacyJson = $state | ConvertTo-Json -Depth 8
+        $restored = $legacyJson | ConvertFrom-Json
+        Update-BootUpdateStateSchema -State $restored | Out-Null
+
+        $stopped = Test-BootUpdateTerminalLimit -State $restored -MaxIterations 5 -MaxRetryPasses 5
+        $stopped.Active | Should -BeTrue
+        $stopped.LegacyTotalReboot | Should -BeTrue
+        (Test-BootUpdateTerminalLimit -State $restored -MaxIterations 6 -MaxRetryPasses 5).Active | Should -BeFalse
+        $restored.RebootCount | Should -Be 5
     }
 
     It 'allows indefinitely many advancing reboots and records their total separately' {
@@ -2042,6 +2148,67 @@ Describe 'A watchdog probe backs off silently when it finds the mutex held' {
     }
 }
 
+Describe 'VS Code extension update results' {
+    It 'counts only confirmed successes and reports per-extension failures' {
+        $lines = @(
+            'Updating extensions: a, b, c',
+            "Error while updating extension 'a': getaddrinfo ENOTFOUND marketplace.visualstudio.com",
+            "Extension 'b' v1.2.3 was successfully updated."
+        )
+
+        $summary = Get-VscodeExtensionUpdateSummary -Lines $lines
+
+        $summary.Updated | Should -Be 1
+        $summary.Failed | Should -Be 1
+        $summary.Success | Should -BeFalse
+    }
+
+    It 'does not count an updating header as a successful update' {
+        $summary = Get-VscodeExtensionUpdateSummary -Lines @('Updating extensions: a, b, c')
+        $summary.Updated | Should -Be 0
+        $summary.Success | Should -BeTrue
+    }
+}
+
+Describe 'Progress fingerprints are stable across machine cultures and PowerShell 7.0' {
+    It 'uses the same fingerprint under English, Czech and Turkish cultures' {
+        $state = [pscustomobject]@{
+            ChocolateyDone=$true; DefenderDone=$true; Office365Done=$true
+            Summary=[pscustomobject]@{}; WingetUpdatedIds=@('Vendor.ch', 'Vendor.H', 'Vendor.I', 'Vendor.i')
+        }
+        $originalCulture = [cultureinfo]::CurrentCulture
+        try {
+            $fingerprints = foreach ($cultureName in @('en-US', 'cs-CZ', 'tr-TR')) {
+                [cultureinfo]::CurrentCulture = [cultureinfo]::GetCultureInfo($cultureName)
+                Get-BootUpdateProgressFingerprint -State $state
+            }
+            @($fingerprints | Select-Object -Unique).Count | Should -Be 1
+        } finally {
+            [cultureinfo]::CurrentCulture = $originalCulture
+        }
+    }
+
+    It 'does not treat repeated Winget counts as progress when the completed package set is unchanged' {
+        $state = [pscustomobject]@{
+            Summary=[pscustomobject]@{ Winget=1 }
+            WingetUpdatedIds=@('Vendor.Package')
+        }
+        $first = Get-BootUpdateProgressFingerprint -State $state
+        $state.Summary.Winget = 4
+        $samePackageAgain = Get-BootUpdateProgressFingerprint -State $state
+        $state.WingetUpdatedIds = @('Vendor.Package', 'Vendor.Other')
+        $newPackage = Get-BootUpdateProgressFingerprint -State $state
+
+        $samePackageAgain | Should -Be $first
+        $newPackage | Should -Not -Be $first
+    }
+
+    It 'uses hashing APIs available on the declared PowerShell 7.0 minimum' {
+        $text = Get-FunctionText $invokeAst 'Get-BootUpdateProgressFingerprint'
+        $text | Should -Not -Match '::HashData\(|::ToHexString\('
+    }
+}
+
 Describe 'Behavioral reboot state transitions' {
     It 'does not consume or clear reboot evidence in the same boot' {
         $state = [pscustomobject]@{ LastBootSessionId='boot-a'; Phase='Rebooting'; RebootCount=2; ExplicitRebootRequests=@('3010') }
@@ -2075,6 +2242,18 @@ Describe 'Behavioral reboot state transitions' {
         $actual = Update-BootUpdateStateForBootSession -State $state -CurrentBootSessionId 'boot-b'
         $actual.RebootCount | Should -Be 3
         $actual.ExplicitRebootRequests | Should -BeNullOrEmpty
+    }
+
+    It 'preserves the retry budget when a provider-phase reboot was not requested' {
+        $state = [pscustomobject]@{
+            LastBootSessionId='boot-a'; Phase='DriverFirmware'; RebootCount=2
+            ExplicitRebootRequests=@(); ConsecutiveRetryCount=2
+        }
+
+        $actual = Update-BootUpdateStateForBootSession -State $state -CurrentBootSessionId 'boot-b'
+
+        $actual.RebootCount | Should -Be 2
+        $actual.ConsecutiveRetryCount | Should -Be 2
     }
 }
 
@@ -2719,6 +2898,19 @@ Describe 'Evidence-backed completion' {
         $text | Should -Match 'Success = \$false'
     }
 
+    It 'does not report a signature command as a verified package update' {
+        $text = Get-FunctionText $invokeAst 'Update-DefenderSignatures'
+        $text | Should -Match 'Success = \$true; Count = 0; Triggered = 1'
+        $text | Should -Match 'Defender signature update command completed'
+        $text | Should -Not -Match 'Defender signatures updated|Count = 1'
+
+        $cohort = $invokeSource.Substring($invokeSource.IndexOf('$defenderSb = {'))
+        $cohort = $cohort.Substring(0, $cohort.IndexOf('$office365Sb = {'))
+        $cohort | Should -Match 'Success=\$true; Count=0; Triggered=1'
+        $cohort | Should -Match 'Defender signature update command completed'
+        $cohort | Should -Not -Match 'Defender signatures updated|Count=1'
+    }
+
     It 'congratulates only the verified green path and reports its evidence' {
         $text = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
         $text | Should -Match 'NICE WORK.*selected updates finished and verification passed'
@@ -2964,6 +3156,121 @@ Describe 'Chocolatey terminal failure classification' {
         $result.Success | Should -BeTrue
         $script:CurrentState.ChocolateyFailureRepeatCount | Should -Be 0
         [string]$script:CurrentState.ChocolateyFailureSignature | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Transient Winget and Chocolatey failures' {
+    BeforeEach {
+        $script:StatePath = Join-Path $TestDrive 'state.json'
+        $script:InstallDir = $TestDrive
+    }
+
+    It 'keeps repeated Chocolatey DNS failures out of the persistent package signature' {
+        $state = [pscustomobject]@{ RebootCount=0; ChocolateyFailureSignature=''; ChocolateyFailureRepeatCount=0 }
+        $summary = Get-ChocolateyOutputSummary -Lines @(
+            'Failures',
+            '- chocolatey (exited -1) - The remote name could not be resolved for the Chocolatey community feed.'
+        )
+
+        foreach ($attempt in 1..3) {
+            $result = Complete-ChocolateyFailureClassification -State $state -Failures $summary.Failures
+            $result.TerminalFailure | Should -BeFalse
+        }
+        $state.ChocolateyFailureRepeatCount | Should -Be 0
+        $summary.Failures[0].Text | Should -Match 'remote name could not be resolved'
+    }
+
+    It 'does not make a Chocolatey file-in-use failure terminal until a reboot separates repeats' {
+        $state = [pscustomobject]@{ RebootCount=0; ChocolateyFailureSignature=''; ChocolateyFailureRepeatCount=0 }
+        $summary = Get-ChocolateyOutputSummary -Lines @(
+            'Failures',
+            '- OBSStudio (exited 6) - Files modified by the installer are currently in use by a different application.'
+        )
+
+        (Complete-ChocolateyFailureClassification -State $state -Failures $summary.Failures).TerminalFailure | Should -BeFalse
+        (Complete-ChocolateyFailureClassification -State $state -Failures $summary.Failures).TerminalFailure | Should -BeFalse
+        $state.RebootCount = 1
+        (Complete-ChocolateyFailureClassification -State $state -Failures $summary.Failures).TerminalFailure | Should -BeTrue
+    }
+
+    It 'keeps same-boot Winget file-in-use repeats retryable and stops after a reboot repeat' {
+        $state = [pscustomobject]@{ RebootCount=0; WingetFailureSignature=''; WingetFailureRepeatCount=0 }
+        $failure = [pscustomobject]@{
+            Name='OBS Studio'; Id='OBSProject.OBSStudio'; Code=6; Hex='0x00000006'
+            Text='Files modified by the installer are currently in use by a different application.'
+        }
+
+        (Complete-WingetFailureClassification -State $state -Failures @($failure)).TerminalFailure | Should -BeFalse
+        (Complete-WingetFailureClassification -State $state -Failures @($failure)).TerminalFailure | Should -BeFalse
+        $state.RebootCount = 1
+        (Complete-WingetFailureClassification -State $state -Failures @($failure)).TerminalFailure | Should -BeTrue
+    }
+
+    It 'does not advance the persistent Winget counter for repeated network failures' {
+        $state = [pscustomobject]@{ RebootCount=0; WingetFailureSignature=''; WingetFailureRepeatCount=0 }
+        $failure = [pscustomobject]@{
+            Name='Git'; Id='Git.Git'; Code=1; Hex='0x00000001'
+            Text='getaddrinfo ENOTFOUND github.com'
+        }
+
+        foreach ($attempt in 1..3) {
+            (Complete-WingetFailureClassification -State $state -Failures @($failure)).TerminalFailure | Should -BeFalse
+        }
+        $state.WingetFailureRepeatCount | Should -Be 0
+    }
+
+    It 'keeps a preflight-deferred Chocolatey phase incomplete and retryable' {
+        $phaseResult = Get-BootUpdatePreflightDeferredResult -Provider 'Chocolatey' -UnavailableProviders @('Chocolatey')
+        $phaseResult.Success | Should -BeFalse
+        $phaseResult.TerminalFailure | Should -BeFalse
+        $enabledPhase = @{ Name='Chocolatey'; Flag='ChocolateyDone'; Skip=$false }
+        $state = [pscustomobject]@{ ChocolateyDone=[bool]$phaseResult.Success }
+        $incomplete = @($enabledPhase | Where-Object { -not $state.($_.Flag) })
+        (Resolve-BootUpdateCompletionDisposition -IncompletePhases $incomplete).Kind | Should -Be 'Retry'
+
+        $preflight = Get-FunctionText $invokeAst 'Test-PreFlightChecks'
+        $orchestrator = $invokeSource
+        $preflight | Should -Match 'UnavailableProviders'
+        $orchestrator | Should -Match 'Name=''Chocolatey''.*Skip=\$false'
+        $orchestrator | Should -Match 'Get-Command choco -ErrorAction SilentlyContinue'
+        $orchestrator | Should -Match 'Get-BootUpdatePreflightDeferredResult -Provider ''Chocolatey'''
+    }
+
+    It 'does not hold an optional absent Chocolatey provider open during a network outage' {
+        $phaseResult = Get-BootUpdatePreflightDeferredResult -Provider 'Chocolatey' -UnavailableProviders @('Chocolatey') -ProviderAvailable $false
+
+        $phaseResult | Should -BeNullOrEmpty
+        $existingAbsentProviderPath = Get-FunctionText $invokeAst 'Update-ChocolateyPackages'
+        $existingAbsentProviderPath | Should -Match 'Get-Command choco'
+    }
+
+    It 'classifies structured Winget MSI 1618 output as in-use contention' {
+        $summary = Get-WingetOutputSummary -TargetPackageId 'Example.Setup' -Lines @(
+            'Installer failed with exit code: 1618'
+        )
+
+        @($summary.Failures).Count | Should -Be 1
+        $summary.Failures[0].Code | Should -Be 1618
+        Get-BootUpdateFailureClass -Failure $summary.Failures[0] | Should -Be 'InUse'
+    }
+
+    It 'keeps Chocolatey transient output attached only to its own package' {
+        $summary = Get-ChocolateyOutputSummary -Lines @(
+            'PackageOne v1.0.0 [Approved]',
+            'The remote name could not be resolved for the community feed.',
+            'The upgrade of PackageOne was NOT successful.',
+            'PackageTwo v2.0.0 [Approved]',
+            "ERROR: Checksum for 'C:\\Temp\\chocolatey\\PackageTwo\\2.0.0\\setup.msi' did not meet 'EEEE2222' for checksum type 'sha256'.",
+            'The upgrade of PackageTwo was NOT successful.',
+            'Failures',
+            '- PackageOne (exited -1) - The remote name could not be resolved.',
+            '- PackageTwo (exited -1) - Checksum verification failed.'
+        )
+
+        $one = @($summary.Failures | Where-Object Name -eq 'PackageOne')[0]
+        $two = @($summary.Failures | Where-Object Name -eq 'PackageTwo')[0]
+        Get-BootUpdateFailureClass -Failure $one | Should -Be 'Network'
+        Get-BootUpdateFailureClass -Failure $two | Should -Be ''
     }
 }
 
@@ -4892,6 +5199,23 @@ Describe 'An update the machine says it installed and offers again is inventory,
             -SinceUtc $script:Boot).Count | Should -Be 0
     }
 
+    It 'returns only KBs that succeeded during this run for later install exclusions' {
+        $history = @(
+            (New-HistoryEntry -Title $script:Kb5007651 -ResultCode 2 -At $script:Boot.AddMinutes(6)),
+            (New-HistoryEntry -Title 'Security Update (KB5126052)' -ResultCode 3 -At $script:Boot.AddMinutes(7)),
+            (New-HistoryEntry -Title 'Older Update (KB5000001)' -ResultCode 2 -At $script:Boot.AddMinutes(-1))
+        )
+
+        @(Get-BootUpdateSuccessfulKbArticleIds -History $history -SinceUtc $script:Boot) |
+            Should -Be @('KB5007651')
+    }
+
+    It 'passes the run-scoped successful KB set to the WU install command' {
+        $text = Get-FunctionText $invokeAst 'Install-WindowsUpdates'
+        $text | Should -Match 'Get-BootUpdateSuccessfulKbArticleIds'
+        $text | Should -Match '\$params\.NotKBArticleID\s*=\s*\$successfulKbIds'
+    }
+
     It 'still accepts a genuinely Local-kind moment by converting it' {
         $localNow = [datetime]::SpecifyKind($script:Boot.AddMinutes(30).ToLocalTime(), [System.DateTimeKind]::Local)
         @(Get-WindowsUpdateReofferedAfterSuccess -Applicable @($script:Kb5007651) `
@@ -5152,9 +5476,48 @@ Describe 'One call decides whether this pass followed a reboot' {
 
     BeforeAll {
         function New-Reading {
-            param([string]$SessionId, $Uptime = 600, $Monotonic = $null)
-            [pscustomobject]@{ SessionId = $SessionId; UptimeSeconds = $Uptime; MonotonicBootId = $Monotonic }
+            param([string]$SessionId, $Uptime = 600, $Monotonic = $null, $BootCount = $null)
+            [pscustomobject]@{ SessionId = $SessionId; UptimeSeconds = $Uptime; MonotonicBootId = $Monotonic; BootCount = $BootCount }
         }
+    }
+
+    It 'uses the Windows boot counter to ignore a wall-clock step inside one boot' {
+        Mock Write-Log { }
+        $bootAt = [datetime]::UtcNow
+        $state = (Update-BootUpdateBootSession -State (New-BootUpdateStateV2) `
+            -Reading (New-Reading -SessionId $bootAt.ToString('o') -Uptime 120 -Monotonic $bootAt.ToString('o') -BootCount 41)).State
+        $state.Phase = 'Rebooting'
+        $state.ConsecutiveRetryCount = 2
+        $state.WindowsUpdateZeroEvidence = 'seen'
+        $state = Update-BootUpdateStateSchema -State ($state | ConvertTo-Json -Depth 8 | ConvertFrom-Json)
+        $state.LastBootCount | Should -Be 41 -Because 'the boot counter must survive a real checkpoint round-trip'
+
+        # Wall clock steps seven minutes while uptime and the boot counter say same boot.
+        $steppedClock = $bootAt.AddMinutes(7)
+        $observation = Update-BootUpdateBootSession -State $state `
+            -Reading (New-Reading -SessionId $steppedClock.ToString('o') -Uptime 180 -Monotonic $steppedClock.ToString('o') -BootCount 41)
+
+        $observation.NewBoot | Should -BeFalse
+        $observation.State.RebootCount | Should -Be 0
+        $observation.State.ConsecutiveRetryCount | Should -Be 2
+        $observation.State.WindowsUpdateZeroEvidence | Should -Be 'seen'
+    }
+
+    It 'counts a boot-counter change even when the derived boot timestamp barely moves' {
+        $bootAt = [datetime]::UtcNow
+        $state = (Update-BootUpdateBootSession -State (New-BootUpdateStateV2) `
+            -Reading (New-Reading -SessionId $bootAt.ToString('o') -Uptime 120 -Monotonic $bootAt.ToString('o') -BootCount 41)).State
+        $state.Phase = 'Rebooting'
+
+        # A fast reboot can leave both wall-clock-derived timestamps inside their tolerances.
+        $afterBoot = $bootAt.AddSeconds(7)
+        $observation = Update-BootUpdateBootSession -State $state `
+            -Reading (New-Reading -SessionId $afterBoot.ToString('o') -Uptime 180 -Monotonic $bootAt.ToString('o') -BootCount 42)
+
+        $observation.NewBoot | Should -BeTrue
+        $observation.Reason | Should -Be 'boot-count'
+        $observation.RebootCounted | Should -BeTrue
+        $observation.State.RebootCount | Should -Be 1
     }
 
     It 'reports no new boot on the first pass a machine ever takes' {
@@ -5237,7 +5600,7 @@ Describe 'One call decides whether this pass followed a reboot' {
 
     It 'takes the reading itself when the caller does not supply one' {
         $reading = Get-BootUpdateBootReading
-        foreach ($field in 'SessionId','UptimeSeconds','MonotonicBootId') {
+        foreach ($field in 'SessionId','UptimeSeconds','MonotonicBootId','BootCount') {
             $reading.PSObject.Properties.Name | Should -Contain $field
         }
         $reading.SessionId | Should -Not -BeNullOrEmpty
@@ -5369,7 +5732,7 @@ Describe 'Identity alone does not outrank an agreeing monotonic reading' {
 
         $observation.NewBoot | Should -BeTrue -Because 'legacy behaviour: no prior monotonic reading means identity alone still decides'
         $observation.Reason | Should -Be 'identity'
-        $observation.State.ConsecutiveRetryCount | Should -Be 0
+        $observation.State.ConsecutiveRetryCount | Should -Be 3 -Because 'an identity-only boot does not clear retry history unless the reboot was requested and counted'
         Should -Invoke Write-Log -Times 0 -ParameterFilter { $Message -match 'treating as clock jitter' }
     }
 
@@ -5512,5 +5875,61 @@ Describe 'The re-offer message says the window it actually used' {
         $block | Should -Match 'Windows Update re-offer after success: \{0\} installed successfully \{1\} time\(s\) during this run'
         $block | Should -Not -Match 'in this boot session'
         $block | Should -Not -Match 'since this boot'
+    }
+}
+
+Describe 'Durable state checkpoint recovery' {
+    It 'loads both reboot budgets from the last good backup when the primary is zero-filled' {
+        $oldStatePath = $script:StatePath
+        $testRoot = Join-Path ([System.IO.Path]::GetTempPath()) "BootUpdateState-$([guid]::NewGuid().ToString('N'))"
+        [System.IO.Directory]::CreateDirectory($testRoot) | Out-Null
+        try {
+            $script:StatePath = Join-Path $testRoot 'state.json'
+            $script:BootUpdateStateSchemaVersion = 7
+            $writerText = (Get-FunctionText $invokeAst 'Set-BootUpdateState') -replace 'function Set-BootUpdateState', 'function Set-TestBootUpdateState'
+            . ([scriptblock]::Create($writerText))
+            $state = New-BootUpdateStateV2
+            $state.RebootCount = 4
+            $state.NoProgressRebootCount = 4
+            Set-TestBootUpdateState -State $state
+            Set-TestBootUpdateState -State $state
+
+            (Test-Path -LiteralPath "$($script:StatePath).bak") | Should -BeTrue
+            [System.IO.File]::WriteAllBytes($script:StatePath, [byte[]]::new(4096))
+
+            $recovered = Get-BootUpdateState
+
+            $recovered.RebootCount | Should -Be 4
+            $recovered.NoProgressRebootCount | Should -Be 4
+
+            Remove-Item -LiteralPath $script:StatePath -Force
+            $recoveredFromMissingPrimary = Get-BootUpdateState
+            $recoveredFromMissingPrimary.RebootCount | Should -Be 4
+            $recoveredFromMissingPrimary.NoProgressRebootCount | Should -Be 4
+        } finally {
+            $script:StatePath = $oldStatePath
+            Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'disarms continuation tasks and refuses to start fresh when neither copy parses' {
+        $oldStatePath = $script:StatePath
+        $oldUnregisterCalls = $script:UnregisterCalls
+        $testRoot = Join-Path ([System.IO.Path]::GetTempPath()) "BootUpdateState-$([guid]::NewGuid().ToString('N'))"
+        [System.IO.Directory]::CreateDirectory($testRoot) | Out-Null
+        try {
+            $script:StatePath = Join-Path $testRoot 'state.json'
+            $script:UnregisterCalls = 0
+            [System.IO.File]::WriteAllText($script:StatePath, '{ broken json')
+
+            { Get-BootUpdateState } | Should -Throw '*Neither the primary state nor its backup is usable*'
+            $script:UnregisterCalls | Should -Be 1
+            (Test-Path -LiteralPath $script:StatePath) | Should -BeFalse
+            @(Get-ChildItem -LiteralPath $testRoot -Filter '*.corrupt-*.json').Count | Should -Be 1
+        } finally {
+            $script:StatePath = $oldStatePath
+            $script:UnregisterCalls = $oldUnregisterCalls
+            Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 }

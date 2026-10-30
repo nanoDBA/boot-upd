@@ -21,12 +21,26 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Cache pinned PowerShell quality modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~\Documents\PowerShell\Modules\Pester\5.7.1
+            ~\Documents\PowerShell\Modules\PSScriptAnalyzer\1.25.0
+          key: ${{ runner.os }}-pwsh7-pester-5.7.1-pssa-1.25.0
+
       - name: Install pinned quality tools
         shell: pwsh
         run: |
           Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
-          Install-Module Pester -RequiredVersion 5.7.1 -Scope CurrentUser -Force -SkipPublisherCheck
-          Install-Module PSScriptAnalyzer -RequiredVersion 1.25.0 -Scope CurrentUser -Force
+          if (-not (Get-Module Pester -ListAvailable | Where-Object Version -eq ([version]'5.7.1'))) {
+              Install-Module Pester -RequiredVersion 5.7.1 -Scope CurrentUser -Force -SkipPublisherCheck
+          }
+          if (-not (Get-Module PSScriptAnalyzer -ListAvailable | Where-Object Version -eq ([version]'1.25.0'))) {
+              Install-Module PSScriptAnalyzer -RequiredVersion 1.25.0 -Scope CurrentUser -Force
+          }
+          Import-Module Pester -RequiredVersion 5.7.1 -ErrorAction Stop
+          Import-Module PSScriptAnalyzer -RequiredVersion 1.25.0 -ErrorAction Stop
 
       - name: Parse tracked PowerShell scripts
         shell: pwsh
@@ -54,16 +68,9 @@ jobs:
       - name: Run Pester 5 tests
         shell: pwsh
         run: |
-          Import-Module Pester -RequiredVersion 5.7.1
-          $configuration = New-PesterConfiguration
-          $configuration.Run.Path = 'tests'
-          $configuration.Run.PassThru = $true
-          $configuration.Output.Verbosity = 'Detailed'
-          $result = Invoke-Pester -Configuration $configuration
-          if ($result.TotalCount -eq 0) { throw 'Pester discovered zero tests.' }
-          if ($result.FailedCount -gt 0) {
-              throw "$($result.FailedCount) Pester test(s) failed."
-          }
+          ./tools/Invoke-ParallelPester.ps1 -ResultPath "$env:RUNNER_TEMP\boot-upd-pester-results.json"
+          $result = Get-Content -LiteralPath "$env:RUNNER_TEMP\boot-upd-pester-results.json" -Raw | ConvertFrom-Json
+          "### Pester gate`n``````json`n$(Get-Content -LiteralPath "$env:RUNNER_TEMP\boot-upd-pester-results.json" -Raw)`n``````" >> $env:GITHUB_STEP_SUMMARY
 
       - name: Run PSScriptAnalyzer error rules
         shell: pwsh

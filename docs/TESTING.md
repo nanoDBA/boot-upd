@@ -21,6 +21,8 @@ Run the locally available gates from an elevated PowerShell 7 console:
 
 Use `-SkipOsBoundary` only on a non-elevated development machine and report that category as **not run**, never as passed. `-SkipPublishedUpgrade` is for offline development only.
 
+The unit/process gate runs its Pester files in three isolated PowerShell processes. It reports the test count and elapsed time for each group. The User/SYSTEM and published-launcher gates still run separately, since they exercise real identities and a clean launcher process. On this machine, 676 tests took 110.47 seconds across the three workers; the earlier 662-test sequential run took 138.99 seconds. That is about 20% less time with 14 more tests. Timings will move around with the machine and whatever else it is doing.
+
 For changes to saved-user session detection, also run this from an elevated
 PowerShell 7 console with a user already signed in:
 

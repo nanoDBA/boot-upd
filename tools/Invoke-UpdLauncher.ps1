@@ -114,7 +114,7 @@ function Show-UpdHelp {
   RUN OPTIONS
     -r, --delay <seconds>      Reboot countdown; default 0
     -o, --output-mode <mode>   Quiet | Normal | Verbose | Debug
-    -n, --max-iterations <n>   Reboot-loop safety limit; default 5
+    -n, --max-iterations <n>   Consecutive reboots without verified progress; default 5
     -t, --timeout <minutes>    Per-provider hard timeout; default 30
     -s, --staged               Run one provider per checkpoint
     -ar, --aggressive-repair   Attempt repair/force reinstall for failed Winget packages
@@ -474,7 +474,7 @@ function Show-UpdStatus {
     }
     if (Test-Path -LiteralPath $statePath) {
         $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
-        Write-Host "  state $($state.Phase)  iteration $($state.Iteration)/$($state.MaxIterations ?? '?')"
+        Write-Host "  state $($state.Phase)  reboots $([int]$state.RebootCount)  stalled $([int]$state.NoProgressRebootCount)"
     } else { Write-Host '  state no active checkpoint' }
     if (Test-Path -LiteralPath $quarantinePath) {
         try {
