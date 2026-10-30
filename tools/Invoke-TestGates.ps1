@@ -26,24 +26,7 @@ Push-Location $root
 try {
     & ./tools/Repair-LineEndings.ps1
     Invoke-Gate 'unit-and-process-behavior' {
-        Import-Module Pester -RequiredVersion 5.7.1
-        $configuration = New-PesterConfiguration
-        $configuration.Run.Path = 'tests'
-        $configuration.Run.ExcludePath = 'tests/integration'
-        $configuration.Run.PassThru = $true
-        $configuration.Output.Verbosity = 'Normal'
-        $pester = Invoke-Pester -Configuration $configuration
-        if ($pester.TotalCount -eq 0 -or $pester.FailedCount) {
-            <# Name them. A gate that reports only a count cannot be diagnosed after the fact:
-               this gate failed once at 1 of 477 during the v2.5.79 release, the suite passed
-               on every rerun, and which test it was is now unknowable. An intermittent test
-               in a release gate is a finding, and a finding needs a name. #>
-            $failed = @($pester.Failed | ForEach-Object {
-                "  - $($_.ExpandedPath): $((($_.ErrorRecord.Exception.Message -split "`n") | Select-Object -First 1).Trim())"
-            })
-            $detail = if ($failed.Count) { "`n" + ($failed -join "`n") } else { '' }
-            throw "Pester gate failed: $($pester.FailedCount) of $($pester.TotalCount) tests failed.$detail"
-        }
+        & ./tools/Invoke-ParallelPester.ps1
     }
     if (-not $SkipOsBoundary) {
         Invoke-Gate 'user-system-security-boundary' { & ./tests/integration/Invoke-CrossContextMutexGate.ps1 | Write-Host }

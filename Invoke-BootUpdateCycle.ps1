@@ -394,7 +394,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 7 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.86' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.87' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 Set-Variable -Name 'RebootSignalSettleSeconds' -Value 20 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 $script:ExplicitRebootRequests = [System.Collections.Generic.List[object]]::new()
 $script:LastPendingFileRenameOperations = @()
@@ -1123,12 +1123,17 @@ function Get-WingetOutputSummary {
     $scopeBlocked = [Collections.Generic.List[object]]::new()
     $portableModified = [Collections.Generic.List[object]]::new()
     $successfulIds = [Collections.Generic.List[string]]::new()
+    $failureContext = [Collections.Generic.List[string]]::new()
     foreach ($rawLine in $Lines) {
         # Winget may indent records or leave ANSI/VT control sequences even with
         # --no-vt. Normalize before matching so failures cannot become false green.
         $line = ([string]$rawLine) -replace "`e\[[0-?]*[ -/]*[@-~]", ''
         $line = $line.Trim()
+        if ($line -match '(?i)(getaddrinfo\s+ENOTFOUND|remote name could not be resolved|server name.*could not be resolved|0x80072EE7|0x80072EFD|0x80072EE2|unable to connect to the remote server|files modified by the installer are currently in use|currently in use by a different application|another installation is already in progress|MSI.*1618)') {
+            $failureContext.Add($line)
+        }
         if ($line -match '^(?:\((\d+)/(\d+)\)\s+)?Found\s+(.+?)\s+\[([^\]]+)\](?:\s+Version\s+(\S+))?') {
+            $failureContext.Clear()
             if ($Matches[2]) { $attempted = [math]::Max($attempted, [int]$Matches[2]) }
             $currentName = $Matches[3].Trim()
             $currentId = $Matches[4].Trim()
@@ -1138,6 +1143,7 @@ function Get-WingetOutputSummary {
             $updated++
             if ($currentId -and -not $successfulIds.Contains($currentId)) { $successfulIds.Add($currentId) }
             $currentId = ''
+            $failureContext.Clear()
         } elseif ($line -match '^(?:Uninstall|Installer) failed with exit code:\s*(0x[0-9A-Fa-f]+|-?\d+)') {
             $rawCode = $Matches[1]
             $code = if ($rawCode -match '^0x') { [long][Convert]::ToUInt32($rawCode.Substring(2), 16) } else { [long]$rawCode }
@@ -1145,10 +1151,12 @@ function Get-WingetOutputSummary {
                 Name=$currentName; Id=$currentId; Code=$code
                 ObservedVersion=$currentVersion; Hex=(Format-NativeExitCode $code)
                 Summary=(Get-InstallerExitSummary $code)
+                Text=($failureContext -join '; ')
             }
             if ($code -eq 1605) { $staleAbsent.Add($record) }
             else { $failures.Add($record) }
             $currentId = ''
+            $failureContext.Clear()
         } elseif ($line -match '^The package installed for user scope cannot be uninstalled when running with administrator privileges') {
             <# Elevated Winget definitionally cannot replace a user-scope (portable)
                package; retrying from the same elevated context can never succeed. #>
@@ -1250,14 +1258,47 @@ function Get-WingetRemediationCommand {
     return "winget $verb --id $PackageId -e --source winget --force --accept-source-agreements --accept-package-agreements"
 }
 
+function Get-BootUpdateFailureClass {
+    param([Parameter(Mandatory)][psobject]$Failure)
+    $text = @(
+        $Failure.Text
+        $Failure.ErrorText
+        $Failure.Message
+    ) -join ' '
+    $code = 0L
+    try { $code = [long]$Failure.Code } catch { }
+    if ($text -match '(?i)(getaddrinfo\s+ENOTFOUND|remote name could not be resolved|server name.*could not be resolved|0x80072EE7|0x80072EFD|0x80072EE2|unable to connect to the remote server)' -or
+        $code -in @(2147954407L, 2147954429L, 2147954402L, -2147012889L, -2147012867L, -2147012894L)) {
+        return 'Network'
+    }
+    if ($text -match '(?i)(files modified by the installer are currently in use|currently in use by a different application|another installation is already in progress|MSI.*1618)' -or $code -in @(1618L, 0x652L)) {
+        return 'InUse'
+    }
+    return ''
+}
+
+function Get-BootUpdatePreflightDeferredResult {
+    param(
+        [Parameter(Mandatory)][string]$Provider,
+        [string[]]$UnavailableProviders = @(),
+        [bool]$ProviderAvailable = $true
+    )
+    if (-not $ProviderAvailable -or $Provider -notin $UnavailableProviders) { return $null }
+    return @{ Success=$false; Count=0; TerminalFailure=$false; AttentionDetails=@() }
+}
+
 function Complete-WingetFailureClassification {
     param(
         [Parameter(Mandatory)][pscustomobject]$State,
         [object[]]$Failures = @(),
         [string[]]$ExecutionFailures = @()
     )
+    $persistentFailures = @($Failures | Where-Object { (Get-BootUpdateFailureClass -Failure $_) -ne 'Network' })
+    if (@($Failures).Count -gt 0 -and $persistentFailures.Count -eq 0) {
+        Write-Log "Winget network failure will use the bounded same-boot retry limit ($script:MaxRetryPasses); it will not create a package repair plan." -Level Warn
+    }
     $signatureParts = @(
-        @($Failures | ForEach-Object { "$($_.Id):$($_.Code)" })
+        @($persistentFailures | ForEach-Object { "$($_.Id):$($_.Code)" })
         @($ExecutionFailures | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { "execution:$_" })
     ) | Sort-Object -Unique
     $signature = ($signatureParts -join '|')
@@ -1269,17 +1310,28 @@ function Complete-WingetFailureClassification {
         Remove-Item -LiteralPath $repairPlan -Force -ErrorAction SilentlyContinue
         return [pscustomobject]@{ Signature=''; TerminalFailure=$false; Details=@() }
     }
+    if (-not $signature) {
+        $State | Add-Member WingetFailureSignature '' -Force
+        $State | Add-Member WingetFailureRepeatCount 0 -Force
+        Set-BootUpdateState -State $State
+        return [pscustomobject]@{ Signature=''; TerminalFailure=$false; Details=@() }
+    }
     $prior = if ($State.PSObject.Properties.Name -contains 'WingetFailureSignature') { [string]$State.WingetFailureSignature } else { '' }
     $priorCount = if ($State.PSObject.Properties.Name -contains 'WingetFailureRepeatCount') { [int]$State.WingetFailureRepeatCount } else { 0 }
     $repeat = if ($prior -eq $signature) { $priorCount + 1 } else { 1 }
+    $firstReboot = if ($prior -eq $signature -and $State.PSObject.Properties.Name -contains 'WingetFailureFirstRebootCount') {
+        [int]$State.WingetFailureFirstRebootCount
+    } else { [int]$State.RebootCount }
     $State | Add-Member WingetFailureSignature $signature -Force
     $State | Add-Member WingetFailureRepeatCount $repeat -Force
+    $State | Add-Member WingetFailureFirstRebootCount $firstReboot -Force
     Set-BootUpdateState -State $State
-    $persistent = $repeat -ge 2
+    $hasInUse = @($persistentFailures | Where-Object { (Get-BootUpdateFailureClass -Failure $_) -eq 'InUse' }).Count -gt 0
+    $persistent = ($repeat -ge 2) -and (-not $hasInUse -or [int]$State.RebootCount -gt $firstReboot)
     return [pscustomobject]@{
         Signature=$signature
         TerminalFailure=$persistent
-        Details=@($Failures | ForEach-Object {
+        Details=@($persistentFailures | ForEach-Object {
             [pscustomobject]@{
                 Name=$_.Name; Id=$_.Id; Code=$_.Code; Hex=$_.Hex
                 Command=(Get-WingetRemediationCommand -PackageId $_.Id -Code $_.Code)
@@ -2228,6 +2280,27 @@ function Resolve-BootUpdateCompletionDisposition {
     return [pscustomobject]@{ Kind='Complete'; Phases=@() }
 }
 
+function Test-BootUpdateTerminalLimit {
+    param(
+        [Parameter(Mandatory)][pscustomobject]$State,
+        [Parameter(Mandatory)][int]$MaxIterations,
+        [Parameter(Mandatory)][int]$MaxRetryPasses
+    )
+    $phaseIsTerminal = $State.Phase -in @('LimitReached','LimitDisarmFailed')
+    $legacyTotalRebootLimit = $phaseIsTerminal -and
+        $State.LimitReason -like 'Reboot limit *' -and [int]$State.RebootCount -ge $MaxIterations
+    $noProgressRebootLimit = $phaseIsTerminal -and
+        $State.LimitReason -like 'No-progress reboot limit *' -and [int]$State.NoProgressRebootCount -ge $MaxIterations
+    $retryLimit = $State.Phase -in @('RetryLimitReached','LimitDisarmFailed') -and
+        $State.LimitReason -like 'Same-boot recovery limit *' -and [int]$State.ConsecutiveRetryCount -ge $MaxRetryPasses
+    return [pscustomobject]@{
+        Active=($legacyTotalRebootLimit -or $noProgressRebootLimit -or $retryLimit)
+        LegacyTotalReboot=$legacyTotalRebootLimit
+        NoProgressReboot=$noProgressRebootLimit
+        SameBootRetry=$retryLimit
+    }
+}
+
 function New-BootUpdateStateV2 {
     return [pscustomobject]@{
         StateVersion          = $script:BootUpdateStateSchemaVersion
@@ -2298,11 +2371,12 @@ function Update-BootUpdateStateSchema {
     $props = $State.PSObject.Properties.Name
     $ver = if ($props -contains 'StateVersion') { [int]$State.StateVersion } else { 1 }
 
-    <# Forward-compat guard: state written by a newer script version — back it up and warn #>
+    <# Never downgrade a checkpoint written by a newer script. Continuing would rewrite
+       fields this version does not understand and could destroy resumable work. #>
     if ($ver -gt $script:BootUpdateStateSchemaVersion) {
-        $bakPath = $script:StatePath -replace '\.json$', ".future-v$ver.bak"
-        Write-Log "WARNING: State file has schema version $ver but this script only knows v$($script:BootUpdateStateSchemaVersion). Saving backup to $bakPath before proceeding." -Level Warn
-        try { Copy-Item -Path $script:StatePath -Destination $bakPath -Force -EA SilentlyContinue } catch { }
+        $exception = [System.NotSupportedException]::new("State schema v$ver is newer than the supported v$($script:BootUpdateStateSchemaVersion); refusing to modify this checkpoint.")
+        $exception.Data['BootUpdateFutureSchema'] = $true
+        throw $exception
     }
 
     <# v1 -> v2: rename inconsistent phase flags #>
@@ -2352,6 +2426,7 @@ function Update-BootUpdateStateSchema {
     if ($props -notcontains 'RebootCount') { $State | Add-Member -NotePropertyName 'RebootCount' -NotePropertyValue ([math]::Max(0, [int]$State.Iteration - 1)) -Force }
     if ($props -notcontains 'LastRebootProgressFingerprint') { $State | Add-Member -NotePropertyName 'LastRebootProgressFingerprint' -NotePropertyValue $null -Force }
     if ($props -notcontains 'LastProgressEvaluationRebootCount') { $State | Add-Member -NotePropertyName 'LastProgressEvaluationRebootCount' -NotePropertyValue ([int]$State.RebootCount) -Force }
+    $State.LastProgressEvaluationRebootCount = [math]::Min([int]$State.LastProgressEvaluationRebootCount, [int]$State.RebootCount)
     if ($props -notcontains 'NoProgressRebootCount') { $State | Add-Member -NotePropertyName 'NoProgressRebootCount' -NotePropertyValue 0 -Force }
     if ($props -notcontains 'ConsecutiveRetryCount') { $State | Add-Member -NotePropertyName 'ConsecutiveRetryCount' -NotePropertyValue 0 -Force }
     if ($props -notcontains 'ExplicitRebootRequests') { $State | Add-Member -NotePropertyName 'ExplicitRebootRequests' -NotePropertyValue @() -Force }
@@ -2437,6 +2512,11 @@ function Get-BootUpdateState {
             }
             return (Update-BootUpdateStateSchema -State $state)
         } catch {
+            if ($_.Exception.Data['BootUpdateFutureSchema']) {
+                try { Unregister-BootUpdateTask }
+                catch { Write-Log "Could not disarm continuation tasks for a future-schema checkpoint: $_" -Level Error }
+                throw
+            }
             Write-Log "State checkpoint unusable at '$candidatePath': $_" -Level Warn
         }
     }
@@ -2508,8 +2588,11 @@ function Clear-BootUpdateState {
     <# Skip disk writes in WhatIf mode #>
     if ($WhatIfPreference) { return }
     $tmpPath = $script:StatePath + '.tmp'
-    if (Test-Path $tmpPath) { Remove-Item $tmpPath -Force -EA SilentlyContinue }
-    if (Test-Path $script:StatePath) { Remove-Item $script:StatePath -Force }
+    <# Remove the backup first. Removing the primary last is the cleanup commit point:
+       if the process stops earlier, the loader still has the primary, never a stale backup. #>
+    foreach ($path in @($tmpPath, "$($script:StatePath).bak", $script:StatePath)) {
+        if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
+    }
 }
 
 function Test-CrashRecovery {
@@ -2651,6 +2734,7 @@ function Test-PreFlightChecks {
 
     $warnings = [System.Collections.Generic.List[string]]::new()
     $errors   = [System.Collections.Generic.List[string]]::new()
+    $unavailableProviders = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     function Add-Warning { param([string]$Msg) $warnings.Add($Msg); Write-Log $Msg -Level Warn }
     function Add-Error   { param([string]$Msg) $errors.Add($Msg);   Write-Log $Msg -Level Error }
     $preflightClock = [Diagnostics.Stopwatch]::StartNew()
@@ -2714,6 +2798,11 @@ function Test-PreFlightChecks {
             $State.LastPreflightNetworkAt = (Get-Date).ToString('o')
             Set-BootUpdateState -State $State
         }
+    }
+
+    if (@($warnings | Where-Object { $_ -match '(?i)Network: DNS failed|Network: chocolatey\.org (?:unreachable|error)' }).Count -gt 0) {
+        $null = $unavailableProviders.Add('Chocolatey')
+        Write-Log 'Network: Chocolatey endpoint is unavailable; its provider phase will be deferred for this pass.' -Level Warn
     }
 
     <# Metered connection detection — abort by default; $AllowMetered overrides.
@@ -2812,7 +2901,12 @@ function Test-PreFlightChecks {
                else { 'ALL CHECKS PASSED' }
     Write-Log "Pre-flight: $summary"
     Write-BootUpdateProgress -Completed
-    return [PSCustomObject]@{ CanProceed = $canProceed; Warnings = $warnings.ToArray(); Errors = $errors.ToArray() }
+    return [PSCustomObject]@{
+        CanProceed = $canProceed
+        Warnings = $warnings.ToArray()
+        Errors = $errors.ToArray()
+        UnavailableProviders = [string[]]@($unavailableProviders)
+    }
 }
 #endregion
 
@@ -4244,12 +4338,26 @@ function Get-ChocolateyOutputSummary {
     param([object[]]$Lines = @())
     $failures = [Collections.Generic.List[object]]::new()
     $checksums = @{}
+    $failureContextByPackage = @{}
+    $failureContext = [Collections.Generic.List[string]]::new()
     $currentName = ''
     $lastActual = ''
     $inFailures = $false
     foreach ($rawLine in $Lines) {
         $line = ([string]$rawLine).Trim()
-        if ($line -match '^(\S+)\s+v\S+\s+\[Approved\]') { $currentName = $Matches[1]; $lastActual = ''; continue }
+        if ($line -match '^(\S+)\s+v\S+\s+\[Approved\]') {
+            $currentName = $Matches[1]
+            $lastActual = ''
+            $failureContext = [Collections.Generic.List[string]]::new()
+            $failureContextByPackage[$currentName] = $failureContext
+            continue
+        }
+        if (-not $inFailures -and $line -match '(?i)(getaddrinfo\s+ENOTFOUND|remote name could not be resolved|server name.*could not be resolved|0x80072EE7|0x80072EFD|0x80072EE2|unable to connect to the remote server|files modified by the installer are currently in use|currently in use by a different application|another installation is already in progress|MSI.*1618)' -and $currentName) {
+            if (-not $failureContextByPackage.ContainsKey($currentName)) {
+                $failureContextByPackage[$currentName] = [Collections.Generic.List[string]]::new()
+            }
+            $failureContextByPackage[$currentName].Add($line)
+        }
         if ($line -match "^Error - hashes do not match\. Actual value was '([0-9A-Fa-f]+)'\.") { $lastActual = $Matches[1]; continue }
         if ($line -match "^ERROR: Checksum for '(.+?)' did not meet '([0-9A-Fa-f]+)' for checksum type") {
             $checksumPath = $Matches[1]
@@ -4265,14 +4373,17 @@ function Get-ChocolateyOutputSummary {
         }
         if ($line -eq 'Failures') { $inFailures = $true; continue }
         if (-not $inFailures) { continue }
-        if ($line -match '^-\s+(\S+)\s+\(exited\s+(-?\d+)\)') {
+        if ($line -match '^-\s+(\S+)\s+\(exited\s+(-?\d+)\)(?:\s*-\s*(.*))?') {
             $name = $Matches[1]
+            $failureLineText = [string]$Matches[3]
             $checksum = $checksums[$name]
+            $packageContext = if ($failureContextByPackage.ContainsKey($name)) { @($failureContextByPackage[$name]) } else { @() }
             $failures.Add([pscustomobject]@{
                 Name = $name
                 Code = [int]$Matches[2]
                 ExpectedChecksum = $(if ($checksum) { $checksum.Expected } else { '' })
                 ActualChecksum = $(if ($checksum) { $checksum.Actual } else { '' })
+                Text = (@($packageContext) + @($failureLineText) | Where-Object { $_ }) -join '; '
             })
         }
     }
@@ -4298,7 +4409,11 @@ function Complete-ChocolateyFailureClassification {
         [Parameter(Mandatory)][pscustomobject]$State,
         [object[]]$Failures = @()
     )
-    $signatureParts = @($Failures | ForEach-Object {
+    $persistentFailures = @($Failures | Where-Object { (Get-BootUpdateFailureClass -Failure $_) -ne 'Network' })
+    if (@($Failures).Count -gt 0 -and $persistentFailures.Count -eq 0) {
+        Write-Log "Chocolatey network failure will use the bounded same-boot retry limit ($script:MaxRetryPasses); it will not create a package repair plan." -Level Warn
+    }
+    $signatureParts = @($persistentFailures | ForEach-Object {
         $expected = [string]$_.ExpectedChecksum
         if ($expected) { "$($_.Name):$($_.Code):$expected" } else { "$($_.Name):$($_.Code)" }
     }) | Sort-Object -Unique
@@ -4316,13 +4431,19 @@ function Complete-ChocolateyFailureClassification {
     $prior = if ($State.PSObject.Properties.Name -contains 'ChocolateyFailureSignature') { [string]$State.ChocolateyFailureSignature } else { '' }
     $priorCount = if ($State.PSObject.Properties.Name -contains 'ChocolateyFailureRepeatCount') { [int]$State.ChocolateyFailureRepeatCount } else { 0 }
     $repeat = if ($prior -eq $signature) { $priorCount + 1 } else { 1 }
+    $firstReboot = if ($prior -eq $signature -and $State.PSObject.Properties.Name -contains 'ChocolateyFailureFirstRebootCount') {
+        [int]$State.ChocolateyFailureFirstRebootCount
+    } else { [int]$State.RebootCount }
     $State | Add-Member ChocolateyFailureSignature $signature -Force
     $State | Add-Member ChocolateyFailureRepeatCount $repeat -Force
+    $State | Add-Member ChocolateyFailureFirstRebootCount $firstReboot -Force
     Set-BootUpdateState -State $State
+    $hasInUse = @($persistentFailures | Where-Object { (Get-BootUpdateFailureClass -Failure $_) -eq 'InUse' }).Count -gt 0
+    $terminal = ($repeat -ge 2) -and (-not $hasInUse -or [int]$State.RebootCount -gt $firstReboot)
     return [pscustomobject]@{
         Signature=$signature
-        TerminalFailure=($repeat -ge 2)
-        Details=@($Failures | ForEach-Object {
+        TerminalFailure=$terminal
+        Details=@($persistentFailures | ForEach-Object {
             $expected = [string]$_.ExpectedChecksum
             $actual = [string]$_.ActualChecksum
             $name = [string]$_.Name
@@ -5657,8 +5778,8 @@ function Update-DefenderSignatures {
                 }
                 throw "Defender signature process failed, timed out, or exited with code $exitCode."
             }
-            Write-Log 'Defender signatures updated.'
-            return @{ Success = $true; Count = 1 }
+            Write-Log 'Defender signature update command completed.'
+            return @{ Success = $true; Count = 0; Triggered = 1 }
         } catch {
             Write-Log "Defender signature update failed: $_" -Level Error
             return @{ Success = $false; Count = 0 }
@@ -8290,20 +8411,20 @@ function Invoke-BootUpdateCycle {
     <# A terminal checkpoint is idempotent: do not re-arm tasks or repeat alerts on
        every manual/scheduled launch. Raising the relevant budget is the explicit
        operator action that permits another attempt. #>
-    $rebootLimitActive = $state.Phase -in @('LimitReached','LimitDisarmFailed') -and (
-        ($state.LimitReason -like 'No-progress reboot limit *' -and [int]$state.NoProgressRebootCount -ge $MaxIterations) -or
-        ($state.LimitReason -like 'Reboot limit *' -and [int]$state.RebootCount -ge $MaxIterations)
-    )
-    $retryLimitActive = $state.Phase -in @('RetryLimitReached','LimitDisarmFailed') -and
-        $state.LimitReason -like 'Same-boot recovery limit *' -and [int]$state.ConsecutiveRetryCount -ge $MaxRetryPasses
-    if ($rebootLimitActive -or $retryLimitActive) {
+    $terminalLimit = Test-BootUpdateTerminalLimit -State $state -MaxIterations $MaxIterations -MaxRetryPasses $MaxRetryPasses
+    if ($terminalLimit.Active) {
         $tasksDisarmed = $true
         try { if (-not $WhatIfPreference) { Unregister-BootUpdateTask } }
         catch { $tasksDisarmed = $false; Write-Log "Terminal checkpoint task cleanup still needs attention: $_" -Level Error }
-        Show-CycleBanner -Title 'A T T E N T I O N   S T I L L   R E Q U I R E D' -AnsiColor "$([char]27)[31m" -Info @(
-            $state.LimitReason
-            $(if ($tasksDisarmed) { 'Continuation tasks are verified absent.' } else { 'A continuation task may still be armed; manual removal is required.' })
+        $limitGuidance = if ($terminalLimit.LegacyTotalReboot) {
+            "This checkpoint was stopped by the pre-v2.5.86 total reboot limit and stays stopped. Review its log, then rerun with -MaxIterations greater than $($state.RebootCount) to resume under the no-progress limit."
+        } else {
             'Review the preserved evidence before raising the stalled-reboot or retry limit.'
+        }
+        Show-CycleBanner -Title 'A T T E N T I O N   S T I L L   R E Q U I R E D' -AnsiColor "$([char]27)[31m" -Info @(
+            $(if ($terminalLimit.LegacyTotalReboot) { $limitGuidance } else { $state.LimitReason })
+            $(if ($tasksDisarmed) { 'Continuation tasks are verified absent.' } else { 'A continuation task may still be armed; manual removal is required.' })
+            $(if ($terminalLimit.LegacyTotalReboot) { 'No automatic resume was attempted because the older checkpoint has no saved no-progress history.' } else { $limitGuidance })
         )
         exit 2
     } elseif ($state.Phase -in @('LimitReached','RetryLimitReached','LimitDisarmFailed')) {
@@ -8502,7 +8623,14 @@ function Invoke-BootUpdateCycle {
     $isSystemCtx = ([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value -eq 'S-1-5-18')
     $allPhases = @(
         @{ Name='Winget';            Flag='WingetDone';            Key='Winget';            Skip=$false; Defer=$false; UserCompletionDeferred=$isSystemCtx;                  Action={ Update-WingetPackages } }
-        @{ Name='Chocolatey';        Flag='ChocolateyDone';        Key='Chocolatey';        Skip=$false;                                                                       Action={ Update-ChocolateyPackages } }
+        @{ Name='Chocolatey';        Flag='ChocolateyDone';        Key='Chocolatey';        Skip=$false;                                                                      Action={
+            $chocoCommand = Get-Command choco -ErrorAction SilentlyContinue
+            $deferred = Get-BootUpdatePreflightDeferredResult -Provider 'Chocolatey' -UnavailableProviders $preflight.UnavailableProviders -ProviderAvailable ([bool]$chocoCommand)
+            if ($deferred) {
+                Write-Log 'Chocolatey phase deferred because pre-flight could not reach its package endpoint; it remains incomplete for the next retry.' -Level Warn
+                $deferred
+            } else { Update-ChocolateyPackages }
+        } }
         @{ Name='Ssms';              Flag='SsmsDone';              Key='Ssms';              Skip=[bool]$SkipSsms;                                                             Action={ Update-SsmsInstances } }
         @{ Name='WindowsUpdate';     Flag='WindowsUpdateDone';     Key='WindowsUpdate';     Skip=$false;                                                                       Action={ Install-WindowsUpdates } }
         @{ Name='DriverFirmware';    Flag='DriverFirmwareDone';    Key='DriverFirmware';    Skip=(-not ($IncludeDriverUpdates -or $IncludeFirmwareUpdates));                    Action={ Install-DriverFirmwareUpdates } }
@@ -8901,8 +9029,8 @@ function Invoke-BootUpdateCycle {
                 try {
                     & $mpCmdRun -SignatureUpdate -MMPC 2>&1 | ForEach-Object { $output.Add($_.ToString()); $log.Add($_.ToString()) }
                     if ($LASTEXITCODE -eq 0) {
-                        $log.Add('Defender signatures updated.')
-                        return @{ Phase='Defender'; Success=$true; Count=1; LogLines=$log.ToArray() }
+                        $log.Add('Defender signature update command completed.')
+                        return @{ Phase='Defender'; Success=$true; Count=0; Triggered=1; LogLines=$log.ToArray() }
                     }
                     $log.Add("[Error] Defender signature update exit code $LASTEXITCODE")
                 } catch { $log.Add("[Error] Defender signature update failed: $_") }
@@ -9523,7 +9651,7 @@ function Invoke-BootUpdateCycle {
             Unregister-BootUpdateTask
             Clear-BootUpdateState
             $leftoverTasks = @('BootUpdateCycle','BootUpdateCycleFallback') | Where-Object { Get-ScheduledTask -TaskName $_ -ErrorAction SilentlyContinue }
-            if ($leftoverTasks -or (Test-Path -LiteralPath $script:StatePath)) {
+            if ($leftoverTasks -or (Test-Path -LiteralPath $script:StatePath) -or (Test-Path -LiteralPath "$($script:StatePath).bak")) {
                 throw "Terminal cleanup verification failed; refusing the verified completion banner. Tasks: $($leftoverTasks -join ', ')"
             }
             $completionToast = Get-BootUpdateCompletionNotification -TotalVerified $total -DurationMinutes $durMin `

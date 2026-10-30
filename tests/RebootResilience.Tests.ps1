@@ -49,6 +49,7 @@ BeforeAll {
         'Get-PendingFileCleanupDisplaySummary',
         'Write-PendingFileRenameAdvisory',
         'Resolve-BootUpdateCompletionDisposition',
+          'Test-BootUpdateTerminalLimit',
         'Stop-BootUpdateAtRebootLimit',
         'Stop-BootUpdateAtRetryLimit',
         'Update-BootUpdateStagedRetryCount',
@@ -85,6 +86,7 @@ BeforeAll {
           'New-BootUpdateStateV2',
           'Update-BootUpdateStateSchema',
           'Get-BootUpdateState',
+          'Clear-BootUpdateState',
           'Set-BootUpdateState',
           'Update-BootUpdateResumeIdentity',
           'Resolve-BootUpdateResumeAccount',
@@ -100,6 +102,8 @@ BeforeAll {
           'Complete-ChocolateyFailureClassification',
           'Test-WingetExitReconciled',
           'Get-WingetRemediationCommand',
+          'Get-BootUpdateFailureClass',
+          'Get-BootUpdatePreflightDeferredResult',
           'Complete-WingetFailureClassification',
           'Register-WingetAggressiveRepairAttempt',
           'Invoke-WingetFailureQuarantine',
@@ -1519,18 +1523,117 @@ Describe 'Truthful reboot safety limit' {
         $state.NoProgressRebootCount | Should -Be 0
     }
 
+    It 'clamps a restored progress evaluation count to the checkpoint reboot count' {
+        $script:BootUpdateStateSchemaVersion = 7
+        $state = New-BootUpdateStateV2
+        $state.RebootCount = 2
+        $state.LastProgressEvaluationRebootCount = 9
+
+        Update-BootUpdateStateSchema -State $state | Out-Null
+
+        $state.LastProgressEvaluationRebootCount | Should -Be 2
+    }
+
+    It 'loads a v6 JSON checkpoint and fingerprints the migrated state' {
+        $script:BootUpdateStateSchemaVersion = 7
+        $script:StatePath = Join-Path $TestDrive 'v6-state.json'
+        $state = New-BootUpdateStateV2
+        $state.StateVersion = 6
+        $state.RebootCount = 3
+        foreach ($field in @('LastRebootProgressFingerprint','LastProgressEvaluationRebootCount','NoProgressRebootCount')) {
+            $state.PSObject.Properties.Remove($field)
+        }
+        $raw = $state | ConvertTo-Json -Depth 12
+        [IO.File]::WriteAllText($script:StatePath, $raw, [Text.UTF8Encoding]::new($false))
+
+        $restored = Get-BootUpdateState
+        $fingerprint = Get-BootUpdateProgressFingerprint -State $restored
+
+        $restored.StateVersion | Should -Be 7
+        $restored.RebootCount | Should -Be 3
+        $restored.LastProgressEvaluationRebootCount | Should -Be 3
+        $restored.NoProgressRebootCount | Should -Be 0
+        $fingerprint | Should -Match '^[A-F0-9]{64}$'
+    }
+
+    It 'leaves a future-schema checkpoint untouched and fails closed' {
+        $script:BootUpdateStateSchemaVersion = 7
+        $script:StatePath = Join-Path $TestDrive 'future-state.json'
+        $state = New-BootUpdateStateV2
+        $state.StateVersion = 8
+        $state.RebootCount = 12
+        $raw = $state | ConvertTo-Json -Depth 12
+        [IO.File]::WriteAllText($script:StatePath, $raw, [Text.UTF8Encoding]::new($false))
+        $script:UnregisterCalls = 0
+        $script:FailUnregister = $false
+
+        { Get-BootUpdateState } | Should -Throw '*newer than the supported*'
+
+        [IO.File]::ReadAllText($script:StatePath) | Should -BeExactly $raw
+        @(Get-ChildItem -LiteralPath $TestDrive -Filter 'future-state.corrupt-*').Count | Should -Be 0
+        $script:UnregisterCalls | Should -Be 1
+    }
+
+    It 'removes both checkpoint generations after terminal completion' {
+        $clearText = Get-FunctionText $invokeAst 'Clear-BootUpdateState'
+        $backupIndex = $clearText.IndexOf('"$($script:StatePath).bak"', [StringComparison]::Ordinal)
+        $primaryIndex = $clearText.IndexOf('$script:StatePath))', [StringComparison]::Ordinal)
+        $backupIndex | Should -BeGreaterThan -1
+        $primaryIndex | Should -BeGreaterThan -1
+        $backupIndex | Should -BeLessThan $primaryIndex
+        $script:StatePath = Join-Path $TestDrive 'completed-state.json'
+        $WhatIfPreference = $false
+        $oldState = New-BootUpdateStateV2
+        $oldState.RebootCount = 9
+        $currentState = New-BootUpdateStateV2
+        $currentState.RebootCount = 10
+        [IO.File]::WriteAllText($script:StatePath, ($currentState | ConvertTo-Json -Depth 12), [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText("$($script:StatePath).bak", ($oldState | ConvertTo-Json -Depth 12), [Text.UTF8Encoding]::new($false))
+
+        Clear-BootUpdateState
+        $restored = Get-BootUpdateState
+
+        (Test-Path -LiteralPath $script:StatePath) | Should -BeFalse
+        (Test-Path -LiteralPath "$($script:StatePath).bak") | Should -BeFalse
+        $restored.RebootCount | Should -Be 0
+        $restored.Phase | Should -Be 'Init'
+    }
+
     It 'checks the reboot budget only after confirmed pending evidence exists' {
         $cycle = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
         $guard = Get-FunctionText $invokeAst 'Stop-BootUpdateAtRebootLimit'
+        $terminalLimit = Get-FunctionText $invokeAst 'Test-BootUpdateTerminalLimit'
         $cycle | Should -Not -Match '\$state\.Iteration -gt \$MaxIterations'
-        $cycle | Should -Match 'LimitReason -like .Reboot limit \*.'
-        $cycle | Should -Match '\[int\]\$state\.RebootCount -ge \$MaxIterations'
+        $cycle | Should -Match 'Test-BootUpdateTerminalLimit -State \$state'
+        $cycle | Should -Match 'rerun with -MaxIterations greater than'
+        $terminalLimit | Should -Match "LimitReason -like 'Reboot limit \*'"
+        $terminalLimit | Should -Match '\[int\]\$State\.RebootCount -ge \$MaxIterations'
         ([regex]::Matches($cycle, 'Stop-BootUpdateAtRebootLimit')).Count | Should -Be 2
         $guard | Should -Match 'Update-BootUpdateNoProgressRebootCount -State \$State'
         $guard | Should -Match '\$progress\.Count -lt \$script:MaxIterations'
         $guard | Should -Match "Phase = 'LimitReached'"
         $guard | Should -Match 'LimitRebootSignals = \$evidence'
         $guard | Should -Not -Match 'Clear-BootUpdateState|Invoke-Hook'
+    }
+
+    It 'keeps a legacy v6 total-reboot stop parked until its operator raises the limit' {
+        $state = New-BootUpdateStateV2
+        $state.StateVersion = 6
+        $state.Phase = 'LimitReached'
+        $state.LimitReason = 'Reboot limit 5 reached with pending evidence.'
+        $state.RebootCount = 5
+        foreach ($field in @('LastRebootProgressFingerprint','LastProgressEvaluationRebootCount','NoProgressRebootCount')) {
+            $state.PSObject.Properties.Remove($field)
+        }
+        $legacyJson = $state | ConvertTo-Json -Depth 8
+        $restored = $legacyJson | ConvertFrom-Json
+        Update-BootUpdateStateSchema -State $restored | Out-Null
+
+        $stopped = Test-BootUpdateTerminalLimit -State $restored -MaxIterations 5 -MaxRetryPasses 5
+        $stopped.Active | Should -BeTrue
+        $stopped.LegacyTotalReboot | Should -BeTrue
+        (Test-BootUpdateTerminalLimit -State $restored -MaxIterations 6 -MaxRetryPasses 5).Active | Should -BeFalse
+        $restored.RebootCount | Should -Be 5
     }
 
     It 'allows indefinitely many advancing reboots and records their total separately' {
@@ -2795,6 +2898,19 @@ Describe 'Evidence-backed completion' {
         $text | Should -Match 'Success = \$false'
     }
 
+    It 'does not report a signature command as a verified package update' {
+        $text = Get-FunctionText $invokeAst 'Update-DefenderSignatures'
+        $text | Should -Match 'Success = \$true; Count = 0; Triggered = 1'
+        $text | Should -Match 'Defender signature update command completed'
+        $text | Should -Not -Match 'Defender signatures updated|Count = 1'
+
+        $cohort = $invokeSource.Substring($invokeSource.IndexOf('$defenderSb = {'))
+        $cohort = $cohort.Substring(0, $cohort.IndexOf('$office365Sb = {'))
+        $cohort | Should -Match 'Success=\$true; Count=0; Triggered=1'
+        $cohort | Should -Match 'Defender signature update command completed'
+        $cohort | Should -Not -Match 'Defender signatures updated|Count=1'
+    }
+
     It 'congratulates only the verified green path and reports its evidence' {
         $text = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
         $text | Should -Match 'NICE WORK.*selected updates finished and verification passed'
@@ -3040,6 +3156,121 @@ Describe 'Chocolatey terminal failure classification' {
         $result.Success | Should -BeTrue
         $script:CurrentState.ChocolateyFailureRepeatCount | Should -Be 0
         [string]$script:CurrentState.ChocolateyFailureSignature | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Transient Winget and Chocolatey failures' {
+    BeforeEach {
+        $script:StatePath = Join-Path $TestDrive 'state.json'
+        $script:InstallDir = $TestDrive
+    }
+
+    It 'keeps repeated Chocolatey DNS failures out of the persistent package signature' {
+        $state = [pscustomobject]@{ RebootCount=0; ChocolateyFailureSignature=''; ChocolateyFailureRepeatCount=0 }
+        $summary = Get-ChocolateyOutputSummary -Lines @(
+            'Failures',
+            '- chocolatey (exited -1) - The remote name could not be resolved for the Chocolatey community feed.'
+        )
+
+        foreach ($attempt in 1..3) {
+            $result = Complete-ChocolateyFailureClassification -State $state -Failures $summary.Failures
+            $result.TerminalFailure | Should -BeFalse
+        }
+        $state.ChocolateyFailureRepeatCount | Should -Be 0
+        $summary.Failures[0].Text | Should -Match 'remote name could not be resolved'
+    }
+
+    It 'does not make a Chocolatey file-in-use failure terminal until a reboot separates repeats' {
+        $state = [pscustomobject]@{ RebootCount=0; ChocolateyFailureSignature=''; ChocolateyFailureRepeatCount=0 }
+        $summary = Get-ChocolateyOutputSummary -Lines @(
+            'Failures',
+            '- OBSStudio (exited 6) - Files modified by the installer are currently in use by a different application.'
+        )
+
+        (Complete-ChocolateyFailureClassification -State $state -Failures $summary.Failures).TerminalFailure | Should -BeFalse
+        (Complete-ChocolateyFailureClassification -State $state -Failures $summary.Failures).TerminalFailure | Should -BeFalse
+        $state.RebootCount = 1
+        (Complete-ChocolateyFailureClassification -State $state -Failures $summary.Failures).TerminalFailure | Should -BeTrue
+    }
+
+    It 'keeps same-boot Winget file-in-use repeats retryable and stops after a reboot repeat' {
+        $state = [pscustomobject]@{ RebootCount=0; WingetFailureSignature=''; WingetFailureRepeatCount=0 }
+        $failure = [pscustomobject]@{
+            Name='OBS Studio'; Id='OBSProject.OBSStudio'; Code=6; Hex='0x00000006'
+            Text='Files modified by the installer are currently in use by a different application.'
+        }
+
+        (Complete-WingetFailureClassification -State $state -Failures @($failure)).TerminalFailure | Should -BeFalse
+        (Complete-WingetFailureClassification -State $state -Failures @($failure)).TerminalFailure | Should -BeFalse
+        $state.RebootCount = 1
+        (Complete-WingetFailureClassification -State $state -Failures @($failure)).TerminalFailure | Should -BeTrue
+    }
+
+    It 'does not advance the persistent Winget counter for repeated network failures' {
+        $state = [pscustomobject]@{ RebootCount=0; WingetFailureSignature=''; WingetFailureRepeatCount=0 }
+        $failure = [pscustomobject]@{
+            Name='Git'; Id='Git.Git'; Code=1; Hex='0x00000001'
+            Text='getaddrinfo ENOTFOUND github.com'
+        }
+
+        foreach ($attempt in 1..3) {
+            (Complete-WingetFailureClassification -State $state -Failures @($failure)).TerminalFailure | Should -BeFalse
+        }
+        $state.WingetFailureRepeatCount | Should -Be 0
+    }
+
+    It 'keeps a preflight-deferred Chocolatey phase incomplete and retryable' {
+        $phaseResult = Get-BootUpdatePreflightDeferredResult -Provider 'Chocolatey' -UnavailableProviders @('Chocolatey')
+        $phaseResult.Success | Should -BeFalse
+        $phaseResult.TerminalFailure | Should -BeFalse
+        $enabledPhase = @{ Name='Chocolatey'; Flag='ChocolateyDone'; Skip=$false }
+        $state = [pscustomobject]@{ ChocolateyDone=[bool]$phaseResult.Success }
+        $incomplete = @($enabledPhase | Where-Object { -not $state.($_.Flag) })
+        (Resolve-BootUpdateCompletionDisposition -IncompletePhases $incomplete).Kind | Should -Be 'Retry'
+
+        $preflight = Get-FunctionText $invokeAst 'Test-PreFlightChecks'
+        $orchestrator = $invokeSource
+        $preflight | Should -Match 'UnavailableProviders'
+        $orchestrator | Should -Match 'Name=''Chocolatey''.*Skip=\$false'
+        $orchestrator | Should -Match 'Get-Command choco -ErrorAction SilentlyContinue'
+        $orchestrator | Should -Match 'Get-BootUpdatePreflightDeferredResult -Provider ''Chocolatey'''
+    }
+
+    It 'does not hold an optional absent Chocolatey provider open during a network outage' {
+        $phaseResult = Get-BootUpdatePreflightDeferredResult -Provider 'Chocolatey' -UnavailableProviders @('Chocolatey') -ProviderAvailable $false
+
+        $phaseResult | Should -BeNullOrEmpty
+        $existingAbsentProviderPath = Get-FunctionText $invokeAst 'Update-ChocolateyPackages'
+        $existingAbsentProviderPath | Should -Match 'Get-Command choco'
+    }
+
+    It 'classifies structured Winget MSI 1618 output as in-use contention' {
+        $summary = Get-WingetOutputSummary -TargetPackageId 'Example.Setup' -Lines @(
+            'Installer failed with exit code: 1618'
+        )
+
+        @($summary.Failures).Count | Should -Be 1
+        $summary.Failures[0].Code | Should -Be 1618
+        Get-BootUpdateFailureClass -Failure $summary.Failures[0] | Should -Be 'InUse'
+    }
+
+    It 'keeps Chocolatey transient output attached only to its own package' {
+        $summary = Get-ChocolateyOutputSummary -Lines @(
+            'PackageOne v1.0.0 [Approved]',
+            'The remote name could not be resolved for the community feed.',
+            'The upgrade of PackageOne was NOT successful.',
+            'PackageTwo v2.0.0 [Approved]',
+            "ERROR: Checksum for 'C:\\Temp\\chocolatey\\PackageTwo\\2.0.0\\setup.msi' did not meet 'EEEE2222' for checksum type 'sha256'.",
+            'The upgrade of PackageTwo was NOT successful.',
+            'Failures',
+            '- PackageOne (exited -1) - The remote name could not be resolved.',
+            '- PackageTwo (exited -1) - Checksum verification failed.'
+        )
+
+        $one = @($summary.Failures | Where-Object Name -eq 'PackageOne')[0]
+        $two = @($summary.Failures | Where-Object Name -eq 'PackageTwo')[0]
+        Get-BootUpdateFailureClass -Failure $one | Should -Be 'Network'
+        Get-BootUpdateFailureClass -Failure $two | Should -Be ''
     }
 }
 

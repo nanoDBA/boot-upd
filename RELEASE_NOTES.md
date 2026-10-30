@@ -5,6 +5,20 @@
 
 ---
 
+## v2.5.87 (unreleased)
+
+Chocolatey no longer gets sent into a DNS outage, and an app that has a file open gets another chance after a reboot. Two failures in a row used to be enough to call both cases permanent and stop the run; that was a bit eager.
+
+An old checkpoint parked by v2.5.85 will stay parked after the upgrade. The banner and README tell you how to resume it with `-MaxIterations` set above its recorded reboot count.
+
+The test gate now spreads Pester files across three PowerShell processes. It ran 676 tests in 110.47 seconds, down from 138.99 seconds for the earlier sequential run of 662 tests—about 20% less time with 14 more tests. CI also caches the pinned test modules; we have not measured the hosted time saved yet.
+
+### Testing
+
+Validation is in progress.
+
+---
+
 ## v2.5.86 (2026-10-25)
 
 A run could stop after five total reboots even while Windows Update or another provider was making verified progress. The reboot limit now counts consecutive reboot barriers without verified progress. Completed phases and verified update counts reset that counter; repeated no-progress states still stop for attention.
