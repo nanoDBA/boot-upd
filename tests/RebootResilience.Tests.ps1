@@ -5258,6 +5258,8 @@ Describe 'One call decides whether this pass followed a reboot' {
         $state.Phase = 'Rebooting'
         $state.ConsecutiveRetryCount = 2
         $state.WindowsUpdateZeroEvidence = 'seen'
+        $state = Update-BootUpdateStateSchema -State ($state | ConvertTo-Json -Depth 8 | ConvertFrom-Json)
+        $state.LastBootCount | Should -Be 41 -Because 'the boot counter must survive a real checkpoint round-trip'
 
         # Wall clock steps seven minutes while uptime and the boot counter say same boot.
         $steppedClock = $bootAt.AddMinutes(7)
