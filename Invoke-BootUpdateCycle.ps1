@@ -2421,18 +2421,35 @@ function Update-BootUpdateStateSchema {
 }
 
 function Get-BootUpdateState {
-    if (-not (Test-Path $script:StatePath)) { return New-BootUpdateStateV2 }
-    try {
-        $raw = Get-Content -Path $script:StatePath -Raw -Encoding UTF8 -ErrorAction Stop
-        if ([string]::IsNullOrWhiteSpace($raw)) { Write-Log 'State file empty, starting fresh.' -Level Warn; return New-BootUpdateStateV2 }
-        $state = $raw | ConvertFrom-Json -ErrorAction Stop
-        return (Update-BootUpdateStateSchema -State $state)
-    } catch {
-        Write-Log "State file corrupted: $_  Starting fresh." -Level Warn
-        $corruptPath = $script:StatePath -replace '\.json$', ".corrupt-$(Get-Date -Format 'yyyyMMdd-HHmmss').json"
-        try { Move-Item -Path $script:StatePath -Destination $corruptPath -Force -EA SilentlyContinue } catch { }
+    $backupPath = "$($script:StatePath).bak"
+    if (-not (Test-Path -LiteralPath $script:StatePath) -and -not (Test-Path -LiteralPath $backupPath)) {
         return New-BootUpdateStateV2
     }
+    foreach ($candidatePath in @($script:StatePath, $backupPath)) {
+        if (-not (Test-Path -LiteralPath $candidatePath)) { continue }
+        try {
+            $raw = Get-Content -LiteralPath $candidatePath -Raw -Encoding UTF8 -ErrorAction Stop
+            if ([string]::IsNullOrWhiteSpace($raw)) { throw 'State document is empty.' }
+            $state = $raw | ConvertFrom-Json -ErrorAction Stop
+            if ($null -eq $state) { throw 'State document contains JSON null.' }
+            if ($candidatePath -ne $script:StatePath) {
+                Write-Log 'Primary state file is unusable; recovered the last good checkpoint from its backup.' -Level Warn
+            }
+            return (Update-BootUpdateStateSchema -State $state)
+        } catch {
+            Write-Log "State checkpoint unusable at '$candidatePath': $_" -Level Warn
+        }
+    }
+
+    $corruptPath = $script:StatePath -replace '\.json$', ".corrupt-$(Get-Date -Format 'yyyyMMdd-HHmmss').json"
+    try { Move-Item -LiteralPath $script:StatePath -Destination $corruptPath -Force -ErrorAction Stop }
+    catch { Write-Log "Could not preserve the corrupt checkpoint: $_" -Level Error }
+    try { Unregister-BootUpdateTask }
+    catch {
+        Write-Log "State recovery failed and continuation-task removal also failed: $_" -Level Error
+        throw "Neither the primary state nor its backup is usable, and continuation tasks could not be removed. Inspect both state files and remove BootUpdateCycle tasks manually. $($_.Exception.Message)"
+    }
+    throw 'Neither the primary state nor its backup is usable. Continuation tasks were removed; inspect the preserved state file and log before restarting.'
 }
 
 function Set-BootUpdateState {
@@ -2446,11 +2463,37 @@ function Set-BootUpdateState {
     $tmpPath = '{0}.{1}.{2}.tmp' -f $script:StatePath, $PID, [guid]::NewGuid().ToString('N')
     try {
         $json = $State | ConvertTo-Json -Depth 10
-        [System.IO.File]::WriteAllText($tmpPath, $json, [System.Text.Encoding]::UTF8)
+        $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($json)
+        $stream = [System.IO.FileStream]::new(
+            $tmpPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::None, 4096, [System.IO.FileOptions]::WriteThrough
+        )
         try {
-            [System.IO.File]::Move($tmpPath, $script:StatePath, $true)
+            $stream.Write($bytes, 0, $bytes.Length)
+            $stream.Flush($true)
+        } finally { $stream.Dispose() }
+
+        try {
+            if (Test-Path -LiteralPath $script:StatePath) {
+                $primaryIsValid = $false
+                try {
+                    $existing = Get-Content -LiteralPath $script:StatePath -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+                    $primaryIsValid = $null -ne $existing
+                } catch { }
+
+                if ($primaryIsValid) {
+                    $backupPath = "$($script:StatePath).bak"
+                    if (Test-Path -LiteralPath $backupPath) { Remove-Item -LiteralPath $backupPath -Force -ErrorAction Stop }
+                    [System.IO.File]::Replace($tmpPath, $script:StatePath, $backupPath)
+                } else {
+                    <# Keep a recovered .bak intact until a valid primary exists again. #>
+                    [System.IO.File]::Move($tmpPath, $script:StatePath, $true)
+                }
+            } else {
+                [System.IO.File]::Move($tmpPath, $script:StatePath)
+            }
         } catch {
-            Write-Log "Failed to promote state file (Move-Item): $_" -Level Error
+            Write-Log "Failed to promote state file: $_" -Level Error
             if (Test-Path $tmpPath) { Remove-Item $tmpPath -Force -EA SilentlyContinue }
             throw
         }

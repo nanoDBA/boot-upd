@@ -5646,3 +5646,59 @@ Describe 'The re-offer message says the window it actually used' {
         $block | Should -Not -Match 'since this boot'
     }
 }
+
+Describe 'Durable state checkpoint recovery' {
+    It 'loads both reboot budgets from the last good backup when the primary is zero-filled' {
+        $oldStatePath = $script:StatePath
+        $testRoot = Join-Path ([System.IO.Path]::GetTempPath()) "BootUpdateState-$([guid]::NewGuid().ToString('N'))"
+        [System.IO.Directory]::CreateDirectory($testRoot) | Out-Null
+        try {
+            $script:StatePath = Join-Path $testRoot 'state.json'
+            $script:BootUpdateStateSchemaVersion = 7
+            $writerText = (Get-FunctionText $invokeAst 'Set-BootUpdateState') -replace 'function Set-BootUpdateState', 'function Set-TestBootUpdateState'
+            . ([scriptblock]::Create($writerText))
+            $state = New-BootUpdateStateV2
+            $state.RebootCount = 4
+            $state.NoProgressRebootCount = 4
+            Set-TestBootUpdateState -State $state
+            Set-TestBootUpdateState -State $state
+
+            (Test-Path -LiteralPath "$($script:StatePath).bak") | Should -BeTrue
+            [System.IO.File]::WriteAllBytes($script:StatePath, [byte[]]::new(4096))
+
+            $recovered = Get-BootUpdateState
+
+            $recovered.RebootCount | Should -Be 4
+            $recovered.NoProgressRebootCount | Should -Be 4
+
+            Remove-Item -LiteralPath $script:StatePath -Force
+            $recoveredFromMissingPrimary = Get-BootUpdateState
+            $recoveredFromMissingPrimary.RebootCount | Should -Be 4
+            $recoveredFromMissingPrimary.NoProgressRebootCount | Should -Be 4
+        } finally {
+            $script:StatePath = $oldStatePath
+            Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'disarms continuation tasks and refuses to start fresh when neither copy parses' {
+        $oldStatePath = $script:StatePath
+        $oldUnregisterCalls = $script:UnregisterCalls
+        $testRoot = Join-Path ([System.IO.Path]::GetTempPath()) "BootUpdateState-$([guid]::NewGuid().ToString('N'))"
+        [System.IO.Directory]::CreateDirectory($testRoot) | Out-Null
+        try {
+            $script:StatePath = Join-Path $testRoot 'state.json'
+            $script:UnregisterCalls = 0
+            [System.IO.File]::WriteAllText($script:StatePath, '{ broken json')
+
+            { Get-BootUpdateState } | Should -Throw '*Neither the primary state nor its backup is usable*'
+            $script:UnregisterCalls | Should -Be 1
+            (Test-Path -LiteralPath $script:StatePath) | Should -BeFalse
+            @(Get-ChildItem -LiteralPath $testRoot -Filter '*.corrupt-*.json').Count | Should -Be 1
+        } finally {
+            $script:StatePath = $oldStatePath
+            $script:UnregisterCalls = $oldUnregisterCalls
+            Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
