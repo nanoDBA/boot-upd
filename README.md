@@ -591,7 +591,7 @@ This means Visual Studio can install for 45 minutes (busy CPU = fine), but a hun
 
 ## Testing
 
-Tests cover unit behavior, User/SYSTEM execution, and published-launcher compatibility separately. See [Testing Boot Update Cycle](docs/TESTING.md), the [v2.5.83 AWS repair validation](docs/validation-aws-repair-2.5.83.md), and the [v2.5.86 validation report](docs/validation-2.5.86.md), or run `./tools/Invoke-TestGates.ps1` from an elevated PowerShell 7 console.
+Tests cover unit behavior, User/SYSTEM execution, and published-launcher compatibility separately. See [Testing Boot Update Cycle](docs/TESTING.md), the [v2.5.83 AWS repair validation](docs/validation-aws-repair-2.5.83.md), the [v2.5.86 validation report](docs/validation-2.5.86.md), and the [v2.5.87 validation report](docs/validation-2.5.87.md), or run `./tools/Invoke-TestGates.ps1` from an elevated PowerShell 7 console.
 
 ## License
 
