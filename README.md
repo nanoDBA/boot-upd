@@ -301,9 +301,12 @@ Use `upd demo 12` to preview the display without running updates.
    cycles remove their continuation tasks and temporary state. Stops that need
    attention keep the checkpoint for troubleshooting.
 
-There are limits on reboots and retries. If an update keeps failing, the run stops
-and tells you what needs attention. Deferred work stays in the report; it isn't
-counted as a successful update.
+By default, boot-upd stops after 5 consecutive reboots without verified progress
+(`MaxIterations`) or 5 failed recovery passes in one boot (`MaxRetryPasses`). A
+reboot that completes a phase or verifies an update resets the stalled-reboot
+count, so a long patch run can reboot more than five times. If an update keeps
+failing, the run stops and tells you what needs attention. Deferred work stays in
+the report; it isn't counted as a successful update.
 
 See [reboot and resume checks](docs/how-it-works.md#reboot-and-resume-checks) for the
 checkpoint rules, Windows Update verification, and retry limits.
@@ -461,9 +464,10 @@ retain sanitized fingerprints. A real source/destination replacement is still bl
 
 ### Why did it restart more than once?
 
-Some updates reveal more applicable work only after reboot. boot-upd preserves completed phases,
-increments the reboot count only after observing a new Windows boot session, and resumes the
-unfinished work.
+Some updates reveal more applicable work only after reboot. Total reboots aren't capped. Only
+reboots with no newly completed phase or verified update count toward the stalled-reboot limit;
+any progress resets that count to zero. boot-upd preserves completed phases and resumes unfinished
+work after a new Windows boot session.
 
 ### Why is Windows Update being checked again?
 
@@ -529,7 +533,7 @@ $Config = @{
     MaxRetryPasses        = 5       # Consecutive failed recovery passes per boot
     WatchdogIntervalMinutes = 15    # Minutes between in-flight watchdog probes (floor 2, no off switch)
     PackageTimeoutMin     = 30      # Hard timeout per package manager
-    RebootDelaySec        = 120     # Countdown before reboot (0 = immediate)
+    RebootDelaySec        = 0       # Seconds before a forced reboot (0 = immediate; apps are force-closed)
     SkipPip               = $false
     SkipNpm               = $false
     SkipOffice365         = $false
@@ -583,7 +587,7 @@ This means Visual Studio can install for 45 minutes (busy CPU = fine), but a hun
 
 ## Testing
 
-Tests cover unit behavior, User/SYSTEM execution, and published-launcher compatibility separately. See [Testing Boot Update Cycle](docs/TESTING.md) and the [v2.5.83 AWS repair validation](docs/validation-aws-repair-2.5.83.md), or run `./tools/Invoke-TestGates.ps1` from an elevated PowerShell 7 console.
+Tests cover unit behavior, User/SYSTEM execution, and published-launcher compatibility separately. See [Testing Boot Update Cycle](docs/TESTING.md), the [v2.5.83 AWS repair validation](docs/validation-aws-repair-2.5.83.md), and the [v2.5.86 validation report](docs/validation-2.5.86.md), or run `./tools/Invoke-TestGates.ps1` from an elevated PowerShell 7 console.
 
 ## License
 

@@ -1884,8 +1884,10 @@ function Update-BootUpdateBootSession {
             $State.RebootCount = [int]$State.RebootCount + 1
             $rebootCounted = $true
         }
-        if ($State.PSObject.Properties.Name -contains 'ConsecutiveRetryCount') { $State.ConsecutiveRetryCount = 0 }
-        else { $State | Add-Member -NotePropertyName 'ConsecutiveRetryCount' -NotePropertyValue 0 -Force }
+        if ($rebootCounted) {
+            if ($State.PSObject.Properties.Name -contains 'ConsecutiveRetryCount') { $State.ConsecutiveRetryCount = 0 }
+            else { $State | Add-Member -NotePropertyName 'ConsecutiveRetryCount' -NotePropertyValue 0 -Force }
+        }
         $State.ExplicitRebootRequests = @()
         if ($State.PSObject.Properties.Name -contains 'WindowsUpdateZeroEvidence') { $State.WindowsUpdateZeroEvidence = $null }
     }
@@ -1985,9 +1987,12 @@ function Get-BootUpdateProgressFingerprint {
         'Office365Done','PowerShellModulesDone','ScoopDone','DotnetToolsDone','VscodeDone',
         'DefenderDone','DriverFirmwareDone','WslDone','ContainersDone'
     )
-    $completed = @($phaseFlags | Where-Object { [bool]$State.$_ } | Sort-Object)
+    [string[]]$completed = @($phaseFlags | Where-Object { [bool]$State.$_ })
+    [Array]::Sort($completed, [StringComparer]::Ordinal)
+    <# Winget counts are cumulative attempts and a re-offered package can be counted
+       again. Its stable completed-ID set below is the progress signal. #>
     $summaryNames = @(
-        'Winget','Chocolatey','Ssms','WindowsUpdate','Pip','Npm','Office365',
+        'Chocolatey','Ssms','WindowsUpdate','Pip','Npm','Office365',
         'PowerShellModules','Scoop','DotnetTools','Vscode','Defender','DriverFirmware','Wsl','Containers'
     )
     $verifiedCounts = [ordered]@{}
@@ -1998,11 +2003,17 @@ function Get-BootUpdateProgressFingerprint {
         }
         $verifiedCounts[$name] = $value
     }
-    $updatedIds = @($State.WingetUpdatedIds | Where-Object { $_ } | ForEach-Object { [string]$_ } | Sort-Object -Unique)
+    $updatedIdSet = [Collections.Generic.SortedSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($id in @($State.WingetUpdatedIds)) {
+        if ($id) { $null = $updatedIdSet.Add(([string]$id).ToLowerInvariant()) }
+    }
+    $updatedIds = @($updatedIdSet)
     $payload = [ordered]@{ CompletedPhases=$completed; VerifiedCounts=$verifiedCounts; WingetUpdatedIds=$updatedIds }
     $bytes = [Text.Encoding]::UTF8.GetBytes(($payload | ConvertTo-Json -Depth 5 -Compress))
-    $sha = [Security.Cryptography.SHA256]::HashData($bytes)
-    return [Convert]::ToHexString($sha)
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try { $sha = $algorithm.ComputeHash($bytes) }
+    finally { $algorithm.Dispose() }
+    return [BitConverter]::ToString($sha).Replace('-', '')
 }
 
 function Update-BootUpdateNoProgressRebootCount {
@@ -5137,6 +5148,21 @@ function Install-WindowsUpdates {
         }
         Remove-WindowsUpdateAssessmentCache
         try {
+            $sessionStart = $null
+            if ($script:CurrentState -and $script:CurrentState.StartTime) {
+                $normalised = ConvertTo-BootUpdateTimestampString -Value $script:CurrentState.StartTime
+                try { $sessionStart = ([datetime]::Parse($normalised, $null, [System.Globalization.DateTimeStyles]::RoundtripKind)).ToUniversalTime() } catch { $sessionStart = $null }
+            }
+            if (-not $sessionStart) {
+                $sessionStart = try { (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime.ToUniversalTime() }
+                                catch { [datetime]::UtcNow }
+            }
+            $successfulKbIds = @(Get-BootUpdateSuccessfulKbArticleIds `
+                -History (Get-WindowsUpdateInstallHistory) -SinceUtc $sessionStart)
+            if ($successfulKbIds.Count -gt 0) {
+                $params.NotKBArticleID = $successfulKbIds
+                Write-Log "Windows Update: skipping KBs already installed successfully during this run: $($successfulKbIds -join ', ')."
+            }
             $result = Invoke-BootUpdateBackgroundOperation -Name 'Installing Windows Updates' `
                 -Status 'Windows Update scan and installation are running' `
                 -TimeoutMinutes $script:PackageTimeoutMinutes -ScriptBlock {
@@ -5314,6 +5340,18 @@ function Get-WindowsUpdateReofferedAfterSuccess {
         }
     }
     return @($records)
+}
+function Get-BootUpdateSuccessfulKbArticleIds {
+    <# A WU update that succeeded earlier in this run must not be installed again
+       just because a later scan still offers it. Keep this set scoped to the run. #>
+    param(
+        [object[]]$History = @(),
+        [datetime]$SinceUtc = [datetime]::MinValue
+    )
+    $titles = @($History | Where-Object { $_ -and [int]$_.ResultCode -eq 2 -and $_.Title } |
+        ForEach-Object { [string]$_.Title } | Select-Object -Unique)
+    return @((Get-WindowsUpdateReofferedAfterSuccess -Applicable $titles -History $History -SinceUtc $SinceUtc) |
+        Where-Object { $_.KB } | ForEach-Object { [string]$_.KB } | Select-Object -Unique)
 }
 function Test-WindowsUpdateConvergence {
     <# A successful install call is not convergence: dependency updates can become
@@ -6231,6 +6269,14 @@ function Update-DotnetTools {
     } catch { Write-Log "dotnet tools error: $_" -Level Error; return @{ Success = $false; Count = 0 } }
 }
 
+function Get-VscodeExtensionUpdateSummary {
+    param([object[]]$Lines = @())
+    $text = @($Lines | ForEach-Object { $_.ToString() })
+    $updated = @($text | Where-Object { $_ -match "(?i)^Extension '.+' v\S+ was successfully (updated|installed)\.$" }).Count
+    $failed = @($text | Where-Object { $_ -match "(?i)^Error while updating extension\b" }).Count
+    return [pscustomobject]@{ Updated=$updated; Failed=$failed; Success=($failed -eq 0) }
+}
+
 function Update-VscodeExtensions {
     [CmdletBinding(SupportsShouldProcess)]
     param()
@@ -6256,7 +6302,12 @@ function Update-VscodeExtensions {
                 Write-Log 'VS Code extension update failed or timed out.' -Level Error
                 return @{ Success = $false; Count = 0 }
             }
-            $count = @($output | Where-Object { $_ -match '(?i)updating extension|updated to version' }).Count
+            $summary = Get-VscodeExtensionUpdateSummary -Lines $output
+            $count = $summary.Updated
+            if (-not $summary.Success) {
+                Write-Log "VS Code extension update reported $($summary.Failed) failure(s)." -Level Error
+                return @{ Success = $false; Count = $count; Triggered = 1 }
+            }
             if ($count -eq 0) {
                 $upToDate = $output | Where-Object { $_ -match '(?i)already installed|up.to.date' }
                 if ($upToDate) { Write-Log 'VS Code extensions: all up to date.'; $count = 0 }
@@ -8727,8 +8778,9 @@ function Invoke-BootUpdateCycle {
                 return @{ Phase='DotnetTools'; Success=$success; Count=$count; LogLines=$log.ToArray() }
             }
 
+            $vscodeParserDefinition = (Get-Command Get-VscodeExtensionUpdateSummary).Definition
             $vscodeSb = {
-                param($IsWhatIf)
+                param($IsWhatIf, $VscodeParserDefinition)
                 $log = [System.Collections.Generic.List[string]]::new()
                 $count = 0; $success = $true
                 $isSystem = ([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value -eq 'S-1-5-18')
@@ -8745,7 +8797,10 @@ function Invoke-BootUpdateCycle {
                     $output = & $codeCmd.Name --update-extensions 2>&1
                     $output | ForEach-Object { $log.Add($_.ToString()) }
                     if ($LASTEXITCODE -ne 0) { $success = $false; $log.Add("[Error] VS Code extension update exited with code $LASTEXITCODE") }
-                    $count = @($output | Where-Object { $_ -match '(?i)updating extension|updated to version' }).Count
+                    . ([scriptblock]::Create("function Get-VscodeExtensionUpdateSummary {`n$VscodeParserDefinition`n}"))
+                    $summary = Get-VscodeExtensionUpdateSummary -Lines $output
+                    $count = $summary.Updated
+                    if (-not $summary.Success) { $success = $false; $log.Add("[Error] VS Code reported $($summary.Failed) extension update failure(s).") }
                     if ($count -eq 0) {
                         $upToDate = $output | Where-Object { $_ -match '(?i)already installed|up.to.date' }
                         if ($upToDate) { $log.Add('VS Code extensions: all up to date.'); $count = 0 }
@@ -8928,7 +8983,7 @@ function Invoke-BootUpdateCycle {
                     'Npm'               { Start-ThreadJob -ScriptBlock $npmSb       -ArgumentList $cohortWhatIf }
                     'Scoop'             { Start-ThreadJob -ScriptBlock $scoopSb     -ArgumentList $cohortWhatIf }
                     'DotnetTools'       { Start-ThreadJob -ScriptBlock $dotnetSb    -ArgumentList $cohortWhatIf }
-                    'Vscode'            { Start-ThreadJob -ScriptBlock $vscodeSb    -ArgumentList $cohortWhatIf }
+                    'Vscode'            { Start-ThreadJob -ScriptBlock $vscodeSb    -ArgumentList $cohortWhatIf, $vscodeParserDefinition }
                     'Defender'          { Start-ThreadJob -ScriptBlock $defenderSb  -ArgumentList $cohortWhatIf, (Get-DefenderCommandPath) }
                     'Office365'         { Start-ThreadJob -ScriptBlock $office365Sb -ArgumentList $cohortWhatIf }
                     'PowerShellModules' { Start-ThreadJob -ScriptBlock $psModulesSb -ArgumentList $cohortWhatIf, $script:PackageTimeoutMinutes }

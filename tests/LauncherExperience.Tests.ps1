@@ -97,6 +97,14 @@ Describe 'Friendly launcher help' {
         $result.Text | Should -Match "Unknown command 'definitely-not-a-command'"
         $result.Text | Should -Match 'upd help'
     }
+
+    It 'describes the no-progress limit and reports total and stalled reboots in status' {
+        $result = Invoke-UpdCommand 'help'
+        $result.Text | Should -Match 'Consecutive reboots without verified progress; default 5'
+        $statusText = Get-FunctionText -Ast $launcherAst -Name 'Show-UpdStatus'
+        $statusText | Should -Match 'reboots .*RebootCount.*stalled .*NoProgressRebootCount'
+        $statusText | Should -Not -Match 'iteration .*MaxIterations'
+    }
 }
 
 Describe 'Safe fun and planning commands' {

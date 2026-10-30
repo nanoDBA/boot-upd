@@ -66,7 +66,9 @@ BeforeAll {
         'Test-WindowsUpdateServiceReady',
         'Test-WindowsUpdateConvergence',
         'Get-WindowsUpdateReofferedAfterSuccess',
+        'Get-BootUpdateSuccessfulKbArticleIds',
         'Get-WindowsUpdateInstallHistory',
+        'Get-VscodeExtensionUpdateSummary',
           'Format-NativeExitCode',
           'Get-InstallerExitSummary',
           'Get-ProcessTreeActivity',
@@ -2042,6 +2044,67 @@ Describe 'A watchdog probe backs off silently when it finds the mutex held' {
     }
 }
 
+Describe 'VS Code extension update results' {
+    It 'counts only confirmed successes and reports per-extension failures' {
+        $lines = @(
+            'Updating extensions: a, b, c',
+            "Error while updating extension 'a': getaddrinfo ENOTFOUND marketplace.visualstudio.com",
+            "Extension 'b' v1.2.3 was successfully updated."
+        )
+
+        $summary = Get-VscodeExtensionUpdateSummary -Lines $lines
+
+        $summary.Updated | Should -Be 1
+        $summary.Failed | Should -Be 1
+        $summary.Success | Should -BeFalse
+    }
+
+    It 'does not count an updating header as a successful update' {
+        $summary = Get-VscodeExtensionUpdateSummary -Lines @('Updating extensions: a, b, c')
+        $summary.Updated | Should -Be 0
+        $summary.Success | Should -BeTrue
+    }
+}
+
+Describe 'Progress fingerprints are stable across machine cultures and PowerShell 7.0' {
+    It 'uses the same fingerprint under English, Czech and Turkish cultures' {
+        $state = [pscustomobject]@{
+            ChocolateyDone=$true; DefenderDone=$true; Office365Done=$true
+            Summary=[pscustomobject]@{}; WingetUpdatedIds=@('Vendor.ch', 'Vendor.H', 'Vendor.I', 'Vendor.i')
+        }
+        $originalCulture = [cultureinfo]::CurrentCulture
+        try {
+            $fingerprints = foreach ($cultureName in @('en-US', 'cs-CZ', 'tr-TR')) {
+                [cultureinfo]::CurrentCulture = [cultureinfo]::GetCultureInfo($cultureName)
+                Get-BootUpdateProgressFingerprint -State $state
+            }
+            @($fingerprints | Select-Object -Unique).Count | Should -Be 1
+        } finally {
+            [cultureinfo]::CurrentCulture = $originalCulture
+        }
+    }
+
+    It 'does not treat repeated Winget counts as progress when the completed package set is unchanged' {
+        $state = [pscustomobject]@{
+            Summary=[pscustomobject]@{ Winget=1 }
+            WingetUpdatedIds=@('Vendor.Package')
+        }
+        $first = Get-BootUpdateProgressFingerprint -State $state
+        $state.Summary.Winget = 4
+        $samePackageAgain = Get-BootUpdateProgressFingerprint -State $state
+        $state.WingetUpdatedIds = @('Vendor.Package', 'Vendor.Other')
+        $newPackage = Get-BootUpdateProgressFingerprint -State $state
+
+        $samePackageAgain | Should -Be $first
+        $newPackage | Should -Not -Be $first
+    }
+
+    It 'uses hashing APIs available on the declared PowerShell 7.0 minimum' {
+        $text = Get-FunctionText $invokeAst 'Get-BootUpdateProgressFingerprint'
+        $text | Should -Not -Match '::HashData\(|::ToHexString\('
+    }
+}
+
 Describe 'Behavioral reboot state transitions' {
     It 'does not consume or clear reboot evidence in the same boot' {
         $state = [pscustomobject]@{ LastBootSessionId='boot-a'; Phase='Rebooting'; RebootCount=2; ExplicitRebootRequests=@('3010') }
@@ -2075,6 +2138,18 @@ Describe 'Behavioral reboot state transitions' {
         $actual = Update-BootUpdateStateForBootSession -State $state -CurrentBootSessionId 'boot-b'
         $actual.RebootCount | Should -Be 3
         $actual.ExplicitRebootRequests | Should -BeNullOrEmpty
+    }
+
+    It 'preserves the retry budget when a provider-phase reboot was not requested' {
+        $state = [pscustomobject]@{
+            LastBootSessionId='boot-a'; Phase='DriverFirmware'; RebootCount=2
+            ExplicitRebootRequests=@(); ConsecutiveRetryCount=2
+        }
+
+        $actual = Update-BootUpdateStateForBootSession -State $state -CurrentBootSessionId 'boot-b'
+
+        $actual.RebootCount | Should -Be 2
+        $actual.ConsecutiveRetryCount | Should -Be 2
     }
 }
 
@@ -4892,6 +4967,23 @@ Describe 'An update the machine says it installed and offers again is inventory,
             -SinceUtc $script:Boot).Count | Should -Be 0
     }
 
+    It 'returns only KBs that succeeded during this run for later install exclusions' {
+        $history = @(
+            (New-HistoryEntry -Title $script:Kb5007651 -ResultCode 2 -At $script:Boot.AddMinutes(6)),
+            (New-HistoryEntry -Title 'Security Update (KB5126052)' -ResultCode 3 -At $script:Boot.AddMinutes(7)),
+            (New-HistoryEntry -Title 'Older Update (KB5000001)' -ResultCode 2 -At $script:Boot.AddMinutes(-1))
+        )
+
+        @(Get-BootUpdateSuccessfulKbArticleIds -History $history -SinceUtc $script:Boot) |
+            Should -Be @('KB5007651')
+    }
+
+    It 'passes the run-scoped successful KB set to the WU install command' {
+        $text = Get-FunctionText $invokeAst 'Install-WindowsUpdates'
+        $text | Should -Match 'Get-BootUpdateSuccessfulKbArticleIds'
+        $text | Should -Match '\$params\.NotKBArticleID\s*=\s*\$successfulKbIds'
+    }
+
     It 'still accepts a genuinely Local-kind moment by converting it' {
         $localNow = [datetime]::SpecifyKind($script:Boot.AddMinutes(30).ToLocalTime(), [System.DateTimeKind]::Local)
         @(Get-WindowsUpdateReofferedAfterSuccess -Applicable @($script:Kb5007651) `
@@ -5369,7 +5461,7 @@ Describe 'Identity alone does not outrank an agreeing monotonic reading' {
 
         $observation.NewBoot | Should -BeTrue -Because 'legacy behaviour: no prior monotonic reading means identity alone still decides'
         $observation.Reason | Should -Be 'identity'
-        $observation.State.ConsecutiveRetryCount | Should -Be 0
+        $observation.State.ConsecutiveRetryCount | Should -Be 3 -Because 'an identity-only boot does not clear retry history unless the reboot was requested and counted'
         Should -Invoke Write-Log -Times 0 -ParameterFilter { $Message -match 'treating as clock jitter' }
     }
 

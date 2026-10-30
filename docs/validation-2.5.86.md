@@ -24,4 +24,4 @@ The host was not rebooted. The lab sign-in test rebooted only the disposable gue
 
 ## Limits
 
-This run did not test Windows 10, PowerShell 5.1-only bootstrap on this candidate, RDP, real user-installed app upgrades, or the remaining rows in the full VM matrix. The published live-bootstrap workflow runs when the GitHub release is published. No result should be read as a PASS for the overall VM matrix.
+This run did not test Windows 10, RDP, real user-installed app upgrades, or the remaining rows in the full VM matrix. No result should be read as a PASS for the overall VM matrix.
