@@ -6,6 +6,7 @@ param(
     [Alias('r','delay','reboot-delay')][ValidateRange(0,86400)][int]$RebootDelaySec = 0,
     [Alias('o','output-mode')][ValidateSet('Quiet','Normal','Verbose','Debug')][string]$OutputMode = 'Normal',
     [Alias('n','max-iterations')][ValidateRange(1,50)][int]$MaxIterations = 5,
+    [Alias('max-retry-passes')][ValidateRange(1,50)][int]$MaxRetryPasses = 5,
     [Alias('t','timeout','timeout-minutes','package-timeout-minutes')][ValidateRange(1,1440)][int]$PackageTimeoutMinutes = 30,
     [Alias('duration')][ValidateRange(2,60)][int]$DurationSeconds = 8,
     [Alias('s','StagedRollout')][switch]$Staged,
@@ -86,7 +87,8 @@ function Show-UpdHelp {
     @'
 
   UPD // Boot Update Cycle
-  Run as admin, walk away, come back to a verified configured patch pass.
+  Updates and repairs may request admin rights.
+  Help, plan, status, version, and previews do not.
 
   USAGE
     upd [run] [options]        Start an update cycle
@@ -99,7 +101,7 @@ function Show-UpdHelp {
     upd aws                    Update/repair AWS CLI v2 and AWS.Tools
     upd logs                   Export a sanitized compressed diagnostic bundle
     upd repair                 Recover launcher/core files, then refresh the bundle
-    upd bootstrap              Verify that the PowerShell 7 runtime is ready
+    upd bootstrap              Install PowerShell 7 if missing; otherwise upgrade it to the latest stable
     upd status                 Show checkpoint/task status
     upd uq [id|all]            Remove recorded Winget quarantine pins; default all
     upd version                Show the bundled updater version
@@ -116,7 +118,8 @@ function Show-UpdHelp {
     -ResumeAfterAttention       Retry a stopped provider failure after you have reviewed and fixed it
     -r, --delay <seconds>      Reboot countdown; default 0
     -o, --output-mode <mode>   Quiet | Normal | Verbose | Debug
-    -n, --max-iterations <n>   Consecutive reboots without verified progress; default 5
+    -n, --max-iterations <n>   Consecutive reboots without verified progress; default 5 (1-50)
+    --max-retry-passes <n>     Failed recovery passes in one boot; default 5 (1-50)
     -t, --timeout <minutes>    Per-provider hard timeout; default 30
     -s, --staged               Run one provider per checkpoint
     -ar, --aggressive-repair   Attempt repair/force reinstall for failed Winget packages
@@ -232,6 +235,7 @@ function Get-UpdDeployParameters {
         RebootDelaySec        = $RebootDelaySec
         OutputMode            = $OutputMode
         MaxIterations         = $MaxIterations
+        MaxRetryPasses        = $MaxRetryPasses
         PackageTimeoutMinutes = $PackageTimeoutMinutes
         NonInteractive        = $true
     }

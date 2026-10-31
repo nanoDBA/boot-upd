@@ -392,7 +392,7 @@ upd update    # refresh the verified source bundle without starting an update cy
 | **User update pass pending** | Machine work finished, but user-scoped work needs the saved user to sign in | Sign in as that user; do not "fix" it by deleting the checkpoint |
 | **Restart required** | Blocking evidence was confirmed and continuation was verified | Save work; boot-upd resumes automatically after Windows restarts |
 | **Needs attention** after a persistent provider failure | The run stopped so it would not keep retrying the same failure | Run `upd status`, then `upd logs`. Fix the reported problem, then resume deliberately with `upd run -ResumeAfterAttention` |
-| **Safety limit reached** | The reboot or same-boot recovery budget was exhausted | Run `upd status` and `upd logs`. After reviewing the checkpoint, rerun with the relevant limit raised (`-n` for stalled reboots or `-MaxRetryPasses` for same-boot recovery) |
+| **Safety limit reached** | The reboot or same-boot recovery budget was exhausted | Run `upd status` and `upd logs`. After reviewing the checkpoint, rerun with the relevant limit raised (`-n` for stalled reboots or `--max-retry-passes` for same-boot recovery) |
 
 If explicit `-ar` mode quarantines a repeatedly failing Winget package, the final screen says
 the selected update run finished **with skipped packages**—not that the machine is fully patched.
