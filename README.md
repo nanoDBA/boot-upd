@@ -265,10 +265,10 @@ Standalone `upd aws` output is captured in `BootUpdateCycle.aws.log`. These logs
 independently (three archives, 5 MB for core/AWS and 10 MB for provider detail) and the
 active and archived files receive NTFS compression when the volume supports it.
 
-Run `upd logs` (or `upd l`) to create a compressed diagnostic ZIP on the Desktop. It
-includes all three log streams. If identity, network, or path checks find material that
-should stay on the machine, the export stops instead of creating the ZIP. The full ZIP
-path is displayed and copied to the clipboard, ready to attach.
+Run `upd logs` (or `upd l`) and attach the ZIP it creates on your Desktop. It pulls together
+all three log streams. If redaction finds identity, network, or path details that should
+stay on the machine, the export stops. The full ZIP path appears on screen and is copied
+to the clipboard, so you don't have to go hunting for it.
 
 By default, `upd aws` verifies the current Amazon-signed modular modules, then removes validated
 older modular versions and legacy `AWSPowerShell*` version directories. Use
@@ -465,10 +465,10 @@ retain sanitized fingerprints. A real source/destination replacement is still bl
 
 ### Why did it restart more than once?
 
-Some updates expose more work only after a restart. There is no cap on total reboots. A reboot
-counts toward the stall limit only when the cycle verified no new phase or update; verified
-progress resets the count. boot-upd keeps completed phases and resumes unfinished work after
-Windows starts again.
+Some updates only show up after a restart. That's why a long patch run can reboot more than
+five times. The stall limit counts reboots with no newly completed phase or verified update;
+verified progress resets it. Total reboots aren't capped, and boot-upd keeps completed phases
+so it can pick up the unfinished work when Windows comes back.
 
 Cycles stopped at `Reboot limit` by v2.5.85 or earlier stay stopped after upgrading. Review the
 log, then run `upd -n <number>` with a value above that checkpoint's total reboot count to resume.
