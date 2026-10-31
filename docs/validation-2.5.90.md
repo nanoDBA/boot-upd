@@ -15,5 +15,6 @@ This release makes the existing same-boot recovery limit configurable through `u
 - User/SYSTEM boundary: **passed** (5.04 seconds).
 - Published-launcher upgrade from v2.5.43: **passed** (4.48 seconds).
 - GitHub quality, User/SYSTEM, and published-launcher checks: **passed**.
+  The first hosted quality attempt lost one Pester worker at the framework/container level without an assertion-level failure; rerunning the failed job passed.
 
 No VM row was run. The default retry limit is unchanged and the change only exposes the existing deployment setting through the launcher. The host was not rebooted.
