@@ -1,11 +1,11 @@
 # Boot Update Cycle — Release Notes
 
-**Latest published version:** v2.5.86
+**Latest published version:** v2.5.87
 **Status:** Released
 
 ---
 
-## v2.5.87 (unreleased)
+## v2.5.87 (2026-10-30)
 
 Chocolatey no longer gets sent into a DNS outage, and an app that has a file open gets another chance after a reboot. Two failures in a row used to be enough to call both cases permanent and stop the run; that was a bit eager.
 
