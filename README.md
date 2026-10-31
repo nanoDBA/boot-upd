@@ -134,7 +134,8 @@ configured channel manifest, updates only existing SSMS instances, and verifies 
 inventory afterward. It does not force SSMS to close. Busy installers, open SSMS,
 unreachable update sources, and unrecognized manifest formats leave the phase
 unfinished and use the cycle's bounded retry policy. Only a verified version increase
-counts as an SSMS update; a successful installer launch alone does not.
+counts as an SSMS update. Starting the installer isn't proof that SSMS changed; boot-upd
+checks the installed build afterward.
 Use `upd --skip-ssms` to skip native SSMS servicing for the cycle, including its
 reboot resumes. Winget and Chocolatey keep their existing package selection.
 
@@ -589,7 +590,8 @@ Package managers get killed if they're truly stuck, but busy installs are left a
 - **Hard timeout (configurable)**: Absolute ceiling regardless of activity
 - **Timed-out packages retry next boot**
 
-This means Visual Studio can install for 45 minutes (busy CPU = fine), but a hung winget source refresh gets killed in 5 minutes (zero CPU = stuck).
+Visual Studio can take 45 minutes if it's doing work. A Winget source refresh sitting at
+zero CPU for five minutes is considered stuck and gets killed. It has to actually be busy.
 
 ## Testing
 
