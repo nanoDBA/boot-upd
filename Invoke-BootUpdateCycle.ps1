@@ -85,6 +85,7 @@ param(
     [switch]$SkipBitLocker,
     [switch]$StagedRollout,           # Run one package manager per boot instead of all at once
     [switch]$AggressiveRepair,        # Opt in to repair/force-reinstall attempts for failed Winget packages
+    [switch]$ResumeAfterAttention,    # Explicitly resume after reviewing/fixing a persistent provider failure
     [switch]$Force,
     [ValidateScript({ $_ -eq '' -or $_ -match '^https://' })]
     [string]$WebhookUrl       = '',   # Teams/Slack/Discord incoming webhook URL
@@ -394,7 +395,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 7 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.87' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.88' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 Set-Variable -Name 'RebootSignalSettleSeconds' -Value 20 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 $script:ExplicitRebootRequests = [System.Collections.Generic.List[object]]::new()
 $script:LastPendingFileRenameOperations = @()
@@ -2293,11 +2294,14 @@ function Test-BootUpdateTerminalLimit {
         $State.LimitReason -like 'No-progress reboot limit *' -and [int]$State.NoProgressRebootCount -ge $MaxIterations
     $retryLimit = $State.Phase -in @('RetryLimitReached','LimitDisarmFailed') -and
         $State.LimitReason -like 'Same-boot recovery limit *' -and [int]$State.ConsecutiveRetryCount -ge $MaxRetryPasses
+    $manualAttention = $State.Phase -in @('AttentionRequired','AttentionDisarmFailed') -and
+        $State.LimitReason -like 'Persistent non-transient failure requires manual attention*'
     return [pscustomobject]@{
         Active=($legacyTotalRebootLimit -or $noProgressRebootLimit -or $retryLimit)
         LegacyTotalReboot=$legacyTotalRebootLimit
         NoProgressReboot=$noProgressRebootLimit
         SameBootRetry=$retryLimit
+        ManualAttention=$manualAttention
     }
 }
 
@@ -2571,6 +2575,26 @@ function Set-BootUpdateState {
                 }
             } else {
                 [System.IO.File]::Move($tmpPath, $script:StatePath)
+            }
+            if ($State.Phase -in @('AttentionRequired','AttentionDisarmFailed','LimitReached','LimitDisarmFailed','RetryLimitReached')) {
+                <# Keep the terminal disposition in both copies. The normal .bak is the previous
+                   checkpoint; that is useful during ordinary writes but can resurrect active
+                   work if the just-written terminal state is later damaged. #>
+                $backupPath = "$($script:StatePath).bak"
+                $backupTmpPath = '{0}.{1}.{2}.tmp' -f $backupPath, $PID, [guid]::NewGuid().ToString('N')
+                try {
+                    $backupStream = [System.IO.FileStream]::new(
+                        $backupTmpPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write,
+                        [System.IO.FileShare]::None, 4096, [System.IO.FileOptions]::WriteThrough
+                    )
+                    try {
+                        $backupStream.Write($bytes, 0, $bytes.Length)
+                        $backupStream.Flush($true)
+                    } finally { $backupStream.Dispose() }
+                    [System.IO.File]::Move($backupTmpPath, $backupPath, $true)
+                } finally {
+                    if (Test-Path -LiteralPath $backupTmpPath) { Remove-Item -LiteralPath $backupTmpPath -Force -ErrorAction SilentlyContinue }
+                }
             }
         } catch {
             Write-Log "Failed to promote state file: $_" -Level Error
@@ -8412,7 +8436,27 @@ function Invoke-BootUpdateCycle {
        every manual/scheduled launch. Raising the relevant budget is the explicit
        operator action that permits another attempt. #>
     $terminalLimit = Test-BootUpdateTerminalLimit -State $state -MaxIterations $MaxIterations -MaxRetryPasses $MaxRetryPasses
-    if ($terminalLimit.Active) {
+    if ($terminalLimit.ManualAttention -and -not $ResumeAfterAttention) {
+        $tasksDisarmed = $true
+        try { if (-not $WhatIfPreference) { Unregister-BootUpdateTask } }
+        catch { $tasksDisarmed = $false; Write-Log "Manual-attention checkpoint task cleanup still needs attention: $_" -Level Error }
+        $disposition = if ($tasksDisarmed) { 'Continuation tasks are verified absent.' } else { 'A continuation task may still be armed; manual removal is required.' }
+        Write-Log "Manual-attention checkpoint remains stopped. Rerun with -ResumeAfterAttention only after reviewing and fixing the recorded failure. $disposition" -Level Error
+        Show-CycleBanner -Title 'A T T E N T I O N   S T I L L   R E Q U I R E D' -AnsiColor "$([char]27)[31m" -Info @(
+            $state.LimitReason
+            'Review and fix the recorded provider failure before resuming.'
+            'To resume deliberately: upd run -ResumeAfterAttention'
+            $disposition
+            "Diagnostic state preserved: $($script:StatePath)"
+        )
+        exit 2
+    } elseif ($terminalLimit.ManualAttention -and $ResumeAfterAttention) {
+        Write-Log 'Operator explicitly resumed a manual-attention checkpoint after reviewing the recorded failure.' -Level Warn
+        $state.Phase = 'ResumeAfterAttention'
+        $state.LimitReason = $null
+        $state.LimitReachedAt = $null
+        Set-BootUpdateState -State $state
+    } elseif ($terminalLimit.Active) {
         $tasksDisarmed = $true
         try { if (-not $WhatIfPreference) { Unregister-BootUpdateTask } }
         catch { $tasksDisarmed = $false; Write-Log "Terminal checkpoint task cleanup still needs attention: $_" -Level Error }
