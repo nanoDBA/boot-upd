@@ -5895,6 +5895,7 @@ Describe 'Durable state checkpoint recovery' {
             $stopped = New-BootUpdateStateV2
             $stopped.Phase = 'AttentionRequired'
             $stopped.LimitReason = 'Persistent non-transient failure requires manual attention: Winget'
+            $stopped.LimitReachedAt = (Get-Date).ToUniversalTime().ToString('o')
             Set-TestBootUpdateState -State $stopped
             $backup = Get-Content -LiteralPath "$($script:StatePath).bak" -Raw | ConvertFrom-Json
             $backup.Phase | Should -Be 'AttentionRequired'
@@ -5912,8 +5913,102 @@ Describe 'Durable state checkpoint recovery' {
             $disarmTerminal.ManualAttention | Should -BeTrue
 
             $cycle = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
-            $cycle | Should -Match '\$terminalLimit\.ManualAttention -and -not \$ResumeAfterAttention'
-            $cycle | Should -Match 'upd run -ResumeAfterAttention'
+            $testRootLiteral = $testRoot.Replace("'", "''")
+            $recoveredStatePath = Join-Path $testRoot 'recovered-attention.json'
+            $eventPath = Join-Path $testRoot 'startup-events.txt'
+            $savedStatePath = Join-Path $testRoot 'saved-state.json'
+            $recovered | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $recoveredStatePath -Encoding utf8
+            $terminalFunction = Get-FunctionText $invokeAst 'Test-BootUpdateTerminalLimit'
+            $childTemplate = @'
+$ErrorActionPreference = 'Stop'
+$script:FixtureRoot = '__TEST_ROOT__'
+$script:StatePath = Join-Path $script:FixtureRoot 'state.json'
+$script:SavedStatePath = '__SAVED_STATE_PATH__'
+$script:EventPath = '__EVENT_PATH__'
+$script:MaxIterations = 5
+$script:MaxRetryPasses = 5
+$script:WatchdogIntervalMinutesClamped = $false
+$script:WatchdogIntervalMinutesClampedHigh = $false
+$script:MaintenanceWindowStart = -1
+$script:MaintenanceWindowEnd = -1
+$script:TuiInteractive = $false
+$script:OutputMode = 'Normal'
+$script:_splashShown = $true
+$script:ResumeAfterAttention = __RESUME_AFTER_ATTENTION__
+$script:ExplicitRebootRequests = [System.Collections.Generic.List[object]]::new()
+$script:TasksArmed = $true
+$WhatIfPreference = $false
+$script:TestState = Get-Content -LiteralPath '__STATE_PATH__' -Raw | ConvertFrom-Json
+function Invoke-LogRotation {}
+function Get-BootUpdateState { return $script:TestState }
+function Update-BootUpdateBootSession { param($State); [pscustomobject]@{ State=$State; NewBoot=$false; Reason='same boot'; DeltaIdentitySeconds=0; DeltaMonotonicSeconds=0 } }
+function Update-BootUpdateResumeIdentity { param($State,$IdentityName,$IdentitySid) }
+function Set-BootUpdateState { param($State); [IO.File]::WriteAllText($script:SavedStatePath, ($State | ConvertTo-Json -Depth 12), [Text.UTF8Encoding]::new($false)) }
+function Write-Log { param([string]$Message,[string]$Level,[string]$Visibility); Add-Content -LiteralPath $script:EventPath -Value "log|$Message" }
+function Unregister-BootUpdateTask { $script:TasksArmed = $false; Add-Content -LiteralPath $script:EventPath -Value "tasks-armed=$script:TasksArmed" }
+function Show-CycleBanner { param($Title,$AnsiColor,$Info); Add-Content -LiteralPath $script:EventPath -Value "banner|$Title|$($Info -join ' | ')" }
+function Test-BootUpdateOutputAtLeast { param($Minimum); return $false }
+function Show-CycleStartStatus { param($Verb,$SessionId,$Iteration,$RebootCount,$NoProgressRebootCount,$MaxIterations,$Context,$Window); Add-Content -LiteralPath $script:EventPath -Value 'cycle-start-reached'; exit 73 }
+__TERMINAL_FUNCTION__
+__CYCLE_FUNCTION__
+Invoke-BootUpdateCycle
+'@
+            foreach ($resumeAfterAttention in @($false, $true)) {
+                Remove-Item -LiteralPath $eventPath,$savedStatePath -Force -ErrorAction SilentlyContinue
+                $resumeLiteral = if ($resumeAfterAttention) { '$true' } else { '$false' }
+                $childScript = $childTemplate.Replace('__TEST_ROOT__', $testRootLiteral).
+                    Replace('__STATE_PATH__', $recoveredStatePath.Replace("'", "''")).
+                    Replace('__SAVED_STATE_PATH__', $savedStatePath.Replace("'", "''")).
+                    Replace('__EVENT_PATH__', $eventPath.Replace("'", "''")).
+                    Replace('__RESUME_AFTER_ATTENTION__', $resumeLiteral).
+                    Replace('__TERMINAL_FUNCTION__', $terminalFunction).
+                    Replace('__CYCLE_FUNCTION__', $cycle)
+                $childPath = Join-Path $testRoot "manual-attention-resume-$resumeAfterAttention.ps1"
+                [System.IO.File]::WriteAllText($childPath, $childScript, [System.Text.UTF8Encoding]::new($false))
+
+                $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+                $startInfo.FileName = Join-Path $PSHOME 'pwsh.exe'
+                $startInfo.UseShellExecute = $false
+                $startInfo.CreateNoWindow = $true
+                $startInfo.RedirectStandardOutput = $true
+                $startInfo.RedirectStandardError = $true
+                foreach ($argument in @('-NoLogo','-NoProfile','-NonInteractive','-File',$childPath)) {
+                    $null = $startInfo.ArgumentList.Add($argument)
+                }
+                $childProcess = [System.Diagnostics.Process]::new()
+                $childProcess.StartInfo = $startInfo
+                try {
+                    if (-not $childProcess.Start()) { throw 'Could not start isolated manual-attention test process.' }
+                    $stdoutTask = $childProcess.StandardOutput.ReadToEndAsync()
+                    $stderrTask = $childProcess.StandardError.ReadToEndAsync()
+                    if (-not $childProcess.WaitForExit(30000)) {
+                        $childProcess.Kill($true)
+                        $null = $childProcess.WaitForExit(5000)
+                        throw 'Manual-attention startup child exceeded the 30-second test timeout.'
+                    }
+                    $childProcess.WaitForExit()
+                    $childOutput = @($stdoutTask.GetAwaiter().GetResult(), $stderrTask.GetAwaiter().GetResult()) -join "`n"
+                    $childExitCode = $childProcess.ExitCode
+                } finally {
+                    $childProcess.Dispose()
+                }
+                $events = if (Test-Path -LiteralPath $eventPath) { Get-Content -LiteralPath $eventPath -Raw } else { '' }
+
+                if (-not $resumeAfterAttention) {
+                    $childExitCode | Should -Be 2 -Because $childOutput
+                    $events | Should -Match 'tasks-armed=False'
+                    $events | Should -Match 'Manual-attention checkpoint remains stopped'
+                    $events | Should -Not -Match 'cycle-start-reached' -Because 'the refusal exits before cycle start and all update providers'
+                } else {
+                    $childExitCode | Should -Be 73 -Because 'the sentinel exits at cycle start, before pre-flight or provider work'
+                    $events | Should -Not -Match 'tasks-armed=False'
+                    $events | Should -Match 'cycle-start-reached'
+                    $savedState = Get-Content -LiteralPath $savedStatePath -Raw | ConvertFrom-Json
+                    $savedState.Phase | Should -Be 'ResumeAfterAttention'
+                    $savedState.LimitReason | Should -BeNullOrEmpty
+                    $savedState.LimitReachedAt | Should -BeNullOrEmpty
+                }
+            }
         } finally {
             $script:StatePath = $oldStatePath
             Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
