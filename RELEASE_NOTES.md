@@ -1,10 +1,21 @@
 # Boot Update Cycle — Release Notes
 
-**Latest published version:** v2.5.88
+**Latest published version:** v2.5.89
 **Status:** Released
 
 ---
 
+## v2.5.89 (2026-10-31)
+
+The manual-attention stop from v2.5.88 now has a behavioral regression test for both ways the updater starts: staying stopped by default, and continuing only with `upd run -ResumeAfterAttention`. The test runs the real startup function in a disposable PowerShell process, with task removal and state writes stubbed so it never touches the host scheduler or runs an update.
+
+This release changes test coverage and version reporting; updater behavior is unchanged from v2.5.88.
+
+### Testing
+
+All 677 unit/process tests passed. The User/SYSTEM boundary and published-launcher upgrade gates passed locally and in CI. The [v2.5.89 validation report](docs/validation-2.5.89.md) has the details.
+
+---
 ## v2.5.88 (2026-10-31)
 
 If a package fails often enough, boot-upd stops and asks you to look at it. But when the main checkpoint was damaged, an older backup could bring the run back to life and send it after the same failure again. Both checkpoint copies now keep the manual stop. After you review and fix the reported problem, resume deliberately with `upd run -ResumeAfterAttention`.
