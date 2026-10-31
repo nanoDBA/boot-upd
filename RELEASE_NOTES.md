@@ -1,10 +1,19 @@
 # Boot Update Cycle — Release Notes
 
-**Latest published version:** v2.5.89
+**Latest published version:** v2.5.90
 **Status:** Released
 
 ---
 
+## v2.5.90 (2026-10-31)
+
+`upd --max-retry-passes <n>` now lets you set the same-boot recovery limit (1–50); the default stays at 5. The setting was already supported by the deployment scripts, but the `upd` launcher wasn't passing it through. `upd /?` now lists both retry limits, explains that `bootstrap` installs or upgrades PowerShell 7, and says which commands may request admin rights. The quick start names `upd.cmd` and Command Prompt.
+
+### Testing
+
+The 677 unit/process tests passed. The User/SYSTEM and published-launcher gates passed locally and in CI. `upd plan --max-retry-passes 8` displayed `MaxRetryPasses: 8` without running updates. No reboot was run. The default retry limit is unchanged, so no multi-reboot VM row was run; see the [v2.5.90 validation report](docs/validation-2.5.90.md).
+
+---
 ## v2.5.89 (2026-10-31)
 
 The manual-attention stop from v2.5.88 now has a behavioral regression test for both ways the updater starts: staying stopped by default, and continuing only with `upd run -ResumeAfterAttention`. The test runs the real startup function in a disposable PowerShell process, with task removal and state writes stubbed so it never touches the host scheduler or runs an update.
