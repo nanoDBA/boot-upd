@@ -89,6 +89,10 @@ Describe 'Friendly launcher help' {
         $result.Text | Should -Match 'upd bootstrap'
         $result.Text | Should -Match 'upd aws'
         $result.Text | Should -Match 'RUN OPTIONS'
+        $result.Text | Should -Match 'Updates and repairs may request admin rights'
+        $result.Text | Should -Match 'Help, plan, status, version, and previews do not'
+        $result.Text | Should -Match 'Install PowerShell 7 if missing; otherwise upgrade it to the latest stable'
+        $result.Text | Should -Match '--max-retry-passes <n>'
     }
 
     It 'rejects an unknown command and points back to help' {
@@ -116,13 +120,14 @@ Describe 'Safe fun and planning commands' {
     }
 
     It 'prints a rich plan without elevation, deployment, tasks, or reboots' {
-        $result = Invoke-UpdCommand 'plan --delay 120 --drivers --firmware --wsl --containers --allow-metered --restore-point --dotnet-tools --aws-tooling --skip-office365 --skip-ssms --output-mode Verbose --max-iterations 7 --timeout 45 --exclude Teams,OneDrive --include Git'
+        $result = Invoke-UpdCommand 'plan --delay 120 --drivers --firmware --wsl --containers --allow-metered --restore-point --dotnet-tools --aws-tooling --skip-office365 --skip-ssms --output-mode Verbose --max-iterations 7 --max-retry-passes 9 --timeout 45 --exclude Teams,OneDrive --include Git'
         $result.ExitCode | Should -Be 0
         $result.Text | Should -Match 'RebootDelaySec\s+: 120'
         $result.Text | Should -Match 'IncludeDriverUpdates\s+: True'
         $result.Text | Should -Match 'EnableDotnetTools\s+: True'
         $result.Text | Should -Match 'SkipSsms\s+: True'
         $result.Text | Should -Match 'OutputMode\s+: Verbose'
+        $result.Text | Should -Match 'MaxRetryPasses\s+: 9'
         $result.Text | Should -Match 'PLAN ONLY.*no elevation.*reboots'
     }
 
@@ -810,7 +815,8 @@ Describe 'upd bootstrap upgrades an installed PowerShell 7' {
     It 'invokes the bootstrap script with -Upgrade from the launcher''s bootstrap command' {
         $bootstrapCommand = [regex]::Match($launcherSource, "(?s)'bootstrap'\s*\{.*?\n    \}")
         $bootstrapCommand.Success | Should -BeTrue
-        $bootstrapCommand.Value | Should -Match 'runtime ready'
+        $help = Invoke-UpdCommand 'help'
+        $help.Text | Should -Match 'Install PowerShell 7 if missing; otherwise upgrade it to the latest stable'
         $bootstrapCommand.Value | Should -Match 'WindowsPowerShell\\v1\.0\\powershell\.exe'
         $bootstrapCommand.Value | Should -Match "'-Upgrade', '-CheckOnly'"
         $bootstrapCommand.Value | Should -Match 'if \(\$check\.ExitCode -ne 100\) \{ exit \$check\.ExitCode \}'
@@ -824,7 +830,7 @@ Describe 'upd bootstrap upgrades an installed PowerShell 7' {
 Describe 'Typed run option forwarding' {
     It 'exposes the documented deployment controls as typed parameters' {
         foreach ($parameter in @(
-            'OutputMode','MaxIterations','PackageTimeoutMinutes','StagedRollout','AggressiveRepair',
+            'OutputMode','MaxIterations','MaxRetryPasses','PackageTimeoutMinutes','StagedRollout','AggressiveRepair',
             'IncludeDriverUpdates','IncludeFirmwareUpdates','UpdateWsl','UpdateContainers',
             'AllowMetered','EnableRestorePoint','EnableDotnetTools','EnableAwsTooling',
             'SkipSsms','SkipDefender','SkipBitLocker','DisableSelfUpdate','ResumeAfterAttention','ExcludePatterns','IncludePatterns'
