@@ -11,7 +11,7 @@
 
 ### Testing
 
-The 677 unit/process tests passed. The User/SYSTEM and published-launcher gates passed locally and in CI. `upd plan --max-retry-passes 8` displayed `MaxRetryPasses: 8` without running updates. No reboot was run. The default retry limit is unchanged, so no multi-reboot VM row was run; see the [v2.5.90 validation report](docs/validation-2.5.90.md).
+All 677 unit/process tests passed. The User/SYSTEM and published-launcher gates passed locally and in CI. The exact README bootstrap passed fresh-install and legacy-repair tests on clean Windows PowerShell 5.1 VMs. `upd plan --max-retry-passes 8` displayed `MaxRetryPasses: 8` without running updates. No reboot was run. The default retry limit is unchanged, so no multi-reboot lab row was run; see the [v2.5.90 validation report](docs/validation-2.5.90.md).
 
 ---
 ## v2.5.89 (2026-10-31)

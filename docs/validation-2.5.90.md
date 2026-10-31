@@ -17,4 +17,4 @@ This release makes the existing same-boot recovery limit configurable through `u
 - GitHub quality, User/SYSTEM, and published-launcher checks: **passed**.
   The first hosted quality attempt lost one Pester worker at the framework/container level without an assertion-level failure; rerunning the failed job passed.
 
-No VM row was run. The default retry limit is unchanged and the change only exposes the existing deployment setting through the launcher. The host was not rebooted.
+No multi-reboot lab row was run: the default retry limit is unchanged, and this release only exposes the existing deployment setting through the launcher. The separate [release-triggered live bootstrap workflow](https://github.com/nanoDBA/boot-upd/actions/runs/41247716667) passed both clean Windows PowerShell 5.1 VM jobs: fresh install and legacy repair. The host was not rebooted.
