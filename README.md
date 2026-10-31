@@ -95,14 +95,14 @@ Switch with `BOOT_UPDATE_SPLASH_THEME=0|1|2`.
 
 ## Updater in action
 
-The default `Normal` view shows a summary, with the current operation in the animated `BOOT//PULSE` row:
+The default `Normal` view gives you the summary. The animated `BOOT//PULSE` row shows what it's doing:
 
 <img src="docs/img/updater-progress.png" alt="Boot Update Cycle resumed after reboot, reusing a verified Windows Update assessment and refreshing Defender in the compact Normal console view" width="900">
 
-The splash immediately marks restart status as **checking**. Before updates begin—and again after they finish—the Normal view displays a prominent **RESTART REQUIRED** or **RESTART NOT REQUIRED** result. If a restart is required, the screen also confirms that automatic continuation is armed.
+Restart status starts at **checking**. Before and after the updates, the Normal view tells you whether Windows needs a restart. If it does, the screen also confirms that automatic continuation is armed.
 
-The final screen tells you what finished, whether a restart is needed, what was skipped,
-and whether you need to do anything else:
+At the end, the screen lists what finished, what was skipped, whether Windows needs a restart,
+and whether anything still needs your attention:
 
 <img src="docs/img/updater-complete.png" alt="Boot Update Cycle configured patch pass verified completion screen" width="900">
 
@@ -140,8 +140,8 @@ reboot resumes. Winget and Chocolatey keep their existing package selection.
 
 ## Install details and compatibility
 
-The [quick-start command](#quick-start) is the shortest supported fresh-install,
-repair, and run path from an elevated Windows PowerShell session.
+Use the [quick-start command](#quick-start) for the shortest supported route to install,
+repair, and run boot-upd from elevated Windows PowerShell.
 
 If you prefer the downloaded bootstrap to remain visible in `%TEMP%` for inspection or
 troubleshooting, use the equivalent download-and-run form:
@@ -150,8 +150,8 @@ troubleshooting, use the equivalent download-and-run form:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -UseBasicParsing 'https://github.com/nanoDBA/boot-upd/releases/latest/download/Install-UpdCompat.ps1' -OutFile ([IO.Path]::Combine([IO.Path]::GetTempPath(),'Install-UpdCompat.ps1')); & ([IO.Path]::Combine([IO.Path]::GetTempPath(),'Install-UpdCompat.ps1')) -CommandArguments run"
 ```
 
-The short form verifies and installs the complete bundle first, then prompts for an `upd`
-command and options; press Enter to run with defaults. To automate it, replace
+The short form verifies and installs the complete bundle, then asks which `upd` command
+and options to run. Press Enter for the defaults. To automate it, replace
 `-PromptForArguments` with an explicit array such as
 `-CommandArguments @('run','--drivers','--delay','120')`.
 
@@ -257,18 +257,18 @@ update packages, or reboot Windows.
 
 ### Console views
 
-Interactive runs use a compact progress view by default: current phase, overall progress,
-phase results, warnings, and errors. The complete timestamped detail stream still goes to
+Interactive runs start with a compact progress view: current phase, overall progress,
+phase results, warnings, and errors. The full timestamped detail still goes to
 `BootUpdateCycle.log`. Raw Winget and Chocolatey output is retained separately in
 `BootUpdateCycle.providers.log` for troubleshooting without overwhelming the normal run log.
 Standalone `upd aws` output is captured in `BootUpdateCycle.aws.log`. These logs rotate
 independently (three archives, 5 MB for core/AWS and 10 MB for provider detail) and the
 active and archived files receive NTFS compression when the volume supports it.
 
-Run `upd logs` (or `upd l`) to create a compressed diagnostic ZIP on the Desktop. The
-export includes all three log streams and fails closed if its identity, network, or path
-redaction checks detect material that should not leave the machine. Its single absolute
-ZIP path is displayed and copied to the Windows clipboard for easy attachment.
+Run `upd logs` (or `upd l`) to create a compressed diagnostic ZIP on the Desktop. It
+includes all three log streams. If identity, network, or path checks find material that
+should stay on the machine, the export stops instead of creating the ZIP. The full ZIP
+path is displayed and copied to the clipboard, ready to attach.
 
 By default, `upd aws` verifies the current Amazon-signed modular modules, then removes validated
 older modular versions and legacy `AWSPowerShell*` version directories. Use
@@ -292,14 +292,14 @@ Use `upd demo 12` to preview the display without running updates.
 
 ### What happens
 
-1. Check disk space, network access, battery state, and other installers.
+1. Check disk space, network access, battery state, and whether another installer is running.
 2. Run the enabled update providers and save completed work.
-3. If Windows needs a restart, verify the resume tasks and reboot.
-4. Pick up unfinished work after reboot. User-only updates wait for a user session.
-5. Check for remaining updates and pending restarts, then check service health.
-6. Report what finished and what was skipped or still needs attention. Completed
-   cycles remove their continuation tasks and temporary state. Stops that need
-   attention keep the checkpoint for troubleshooting.
+3. If Windows needs a restart, verify the resume tasks, then restart.
+4. Pick up unfinished work afterward. User-only updates wait for a user session.
+5. Check for remaining updates, pending restarts, and service health.
+6. Report what finished, what was skipped, and what still needs attention. A completed
+   cycle removes its continuation tasks and temporary state. A stop that needs attention
+   keeps the checkpoint for troubleshooting.
 
 By default, boot-upd stops after 5 consecutive reboots without verified progress
 (`MaxIterations`) or 5 failed recovery passes in one boot (`MaxRetryPasses`). A
@@ -465,10 +465,10 @@ retain sanitized fingerprints. A real source/destination replacement is still bl
 
 ### Why did it restart more than once?
 
-Some updates reveal more applicable work only after reboot. Total reboots aren't capped. Only
-reboots with no newly completed phase or verified update count toward the stalled-reboot limit;
-any progress resets that count to zero. boot-upd preserves completed phases and resumes unfinished
-work after a new Windows boot session.
+Some updates expose more work only after a restart. There is no cap on total reboots. A reboot
+counts toward the stall limit only when the cycle verified no new phase or update; verified
+progress resets the count. boot-upd keeps completed phases and resumes unfinished work after
+Windows starts again.
 
 Cycles stopped at `Reboot limit` by v2.5.85 or earlier stay stopped after upgrading. Review the
 log, then run `upd -n <number>` with a value above that checkpoint's total reboot count to resume.
@@ -482,7 +482,8 @@ agree. If one changes, boot-upd checks Windows Update again.
 
 ### Why did a package get skipped?
 
-Normal mode leaves ordinary pins and unsupported inventory visible but does not override them.
+In Normal mode, boot-upd reports existing pins and unsupported package inventory but leaves
+them alone.
 With explicit `upd -ar`, one repeated, identical Winget failure may receive a bounded repair attempt
 and then a reversible blocking pin. Use `upd status` to see it and `upd uq Package.Id` to retry it.
 
@@ -592,7 +593,12 @@ This means Visual Studio can install for 45 minutes (busy CPU = fine), but a hun
 
 ## Testing
 
-Tests cover unit behavior, User/SYSTEM execution, and published-launcher compatibility separately. See [Testing Boot Update Cycle](docs/TESTING.md), the [v2.5.83 AWS repair validation](docs/validation-aws-repair-2.5.83.md), the [v2.5.86 validation report](docs/validation-2.5.86.md), the [v2.5.87 validation report](docs/validation-2.5.87.md), the [v2.5.88 validation report](docs/validation-2.5.88.md), and the [v2.5.89 validation report](docs/validation-2.5.89.md), or run `./tools/Invoke-TestGates.ps1` from an elevated PowerShell 7 console.
+The test gates run separately: unit/process, User/SYSTEM, and published-launcher compatibility.
+See [Testing Boot Update Cycle](docs/TESTING.md) and the validation reports for [v2.5.83 AWS
+repair](docs/validation-aws-repair-2.5.83.md), [v2.5.86](docs/validation-2.5.86.md),
+[v2.5.87](docs/validation-2.5.87.md), [v2.5.88](docs/validation-2.5.88.md), and
+[v2.5.89](docs/validation-2.5.89.md). To run the gates, use
+`./tools/Invoke-TestGates.ps1` from an elevated PowerShell 7 console.
 
 ## License
 
