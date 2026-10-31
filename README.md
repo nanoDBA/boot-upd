@@ -1,6 +1,6 @@
 # Boot Update Cycle
 
-**Run `upd` as admin. Let it handle the updates and reboots.**
+**Open Command Prompt as admin and run `upd.cmd`. Let it handle the updates and reboots.**
 
 `upd` updates Windows and your apps, saves its progress, and picks up where it left off
 after a reboot. It reports anything it couldn't finish.
@@ -27,13 +27,16 @@ first command:
 The installer verifies the runtime files against the release's SHA256 sidecars, then asks
 what to run. Press Enter (the default) to start `upd` now; type `plan` for a read-only
 preview, or `help` to browse commands. A normal run resumes after any required reboot.
-For later runs, the command is simply:
 
-```powershell
-upd          # update, reboot when required, and resume automatically
-upd status   # show the current checkpoint and continuation tasks
-upd logs     # create a sanitized support ZIP on the Desktop
-upd help     # commands, short aliases, and every option
+The installer runs in PowerShell. For later runs, open an elevated Command Prompt
+(`cmd.exe`) and run `upd.cmd`—that is the Windows batch launcher. Windows also lets
+you leave off `.cmd`, so these commands work too:
+
+```cmd
+upd          rem update, reboot when required, and resume automatically
+upd status   rem show the current checkpoint and continuation tasks
+upd logs     rem create a sanitized support ZIP on the Desktop
+upd help     rem commands, short aliases, and every option
 ```
 
 <a id="navigate"></a>
