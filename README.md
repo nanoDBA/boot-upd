@@ -230,7 +230,7 @@ has exited**. It verifies the installer against the hash embedded below, then th
 verifies and transactionally replaces the complete release bundle before forwarding `aws`:
 
 ```powershell
-$u='https://github.com/nanoDBA/boot-upd/releases/download/v2.5.88/Install-UpdCompat.ps1'; $f=Join-Path $env:TEMP 'Install-UpdCompat-v2.5.88.ps1'; Invoke-WebRequest $u -OutFile $f; if((Get-FileHash $f -Algorithm SHA256).Hash -ne '67662B3B02252FF6DE045FCDF28FB74D8DEB6FDA8080C46B1DAFC7BFBE54ABE3'){throw 'Compatibility installer hash mismatch'}; & $f -CommandArguments aws
+$u='https://github.com/nanoDBA/boot-upd/releases/download/v2.5.89/Install-UpdCompat.ps1'; $f=Join-Path $env:TEMP 'Install-UpdCompat-v2.5.89.ps1'; Invoke-WebRequest $u -OutFile $f; if((Get-FileHash $f -Algorithm SHA256).Hash -ne '67662B3B02252FF6DE045FCDF28FB74D8DEB6FDA8080C46B1DAFC7BFBE54ABE3'){throw 'Compatibility installer hash mismatch'}; & $f -CommandArguments aws
 ```
 
 Use this when the old launcher cannot update itself. It resolves the first `upd.cmd` on PATH,
@@ -592,7 +592,7 @@ This means Visual Studio can install for 45 minutes (busy CPU = fine), but a hun
 
 ## Testing
 
-Tests cover unit behavior, User/SYSTEM execution, and published-launcher compatibility separately. See [Testing Boot Update Cycle](docs/TESTING.md), the [v2.5.83 AWS repair validation](docs/validation-aws-repair-2.5.83.md), the [v2.5.86 validation report](docs/validation-2.5.86.md), the [v2.5.87 validation report](docs/validation-2.5.87.md), and the [v2.5.88 validation report](docs/validation-2.5.88.md), or run `./tools/Invoke-TestGates.ps1` from an elevated PowerShell 7 console.
+Tests cover unit behavior, User/SYSTEM execution, and published-launcher compatibility separately. See [Testing Boot Update Cycle](docs/TESTING.md), the [v2.5.83 AWS repair validation](docs/validation-aws-repair-2.5.83.md), the [v2.5.86 validation report](docs/validation-2.5.86.md), the [v2.5.87 validation report](docs/validation-2.5.87.md), the [v2.5.88 validation report](docs/validation-2.5.88.md), and the [v2.5.89 validation report](docs/validation-2.5.89.md), or run `./tools/Invoke-TestGates.ps1` from an elevated PowerShell 7 console.
 
 ## License
 
