@@ -5879,6 +5879,47 @@ Describe 'The re-offer message says the window it actually used' {
 }
 
 Describe 'Durable state checkpoint recovery' {
+    It 'keeps manual attention in the recovery copy and refuses implicit resumption' {
+        $oldStatePath = $script:StatePath
+        $testRoot = Join-Path ([System.IO.Path]::GetTempPath()) "BootUpdateAttention-$([guid]::NewGuid().ToString('N'))"
+        [System.IO.Directory]::CreateDirectory($testRoot) | Out-Null
+        try {
+            $script:StatePath = Join-Path $testRoot 'state.json'
+            $script:BootUpdateStateSchemaVersion = 7
+            $writerText = (Get-FunctionText $invokeAst 'Set-BootUpdateState') -replace 'function Set-BootUpdateState', 'function Set-TestBootUpdateState'
+            . ([scriptblock]::Create($writerText))
+            $active = New-BootUpdateStateV2
+            $active.Phase = 'FinalVerification'
+            Set-TestBootUpdateState -State $active
+
+            $stopped = New-BootUpdateStateV2
+            $stopped.Phase = 'AttentionRequired'
+            $stopped.LimitReason = 'Persistent non-transient failure requires manual attention: Winget'
+            Set-TestBootUpdateState -State $stopped
+            $backup = Get-Content -LiteralPath "$($script:StatePath).bak" -Raw | ConvertFrom-Json
+            $backup.Phase | Should -Be 'AttentionRequired'
+
+            [System.IO.File]::WriteAllBytes($script:StatePath, [byte[]]::new(4096))
+            $recovered = Get-BootUpdateState
+            $terminal = Test-BootUpdateTerminalLimit -State $recovered -MaxIterations 5 -MaxRetryPasses 5
+            $recovered.Phase | Should -Be 'AttentionRequired'
+            $terminal.ManualAttention | Should -BeTrue
+
+            $disarmFailure = New-BootUpdateStateV2
+            $disarmFailure.Phase = 'AttentionDisarmFailed'
+            $disarmFailure.LimitReason = 'Persistent non-transient failure requires manual attention: Winget; task removal failed'
+            $disarmTerminal = Test-BootUpdateTerminalLimit -State $disarmFailure -MaxIterations 5 -MaxRetryPasses 5
+            $disarmTerminal.ManualAttention | Should -BeTrue
+
+            $cycle = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
+            $cycle | Should -Match '\$terminalLimit\.ManualAttention -and -not \$ResumeAfterAttention'
+            $cycle | Should -Match 'upd run -ResumeAfterAttention'
+        } finally {
+            $script:StatePath = $oldStatePath
+            Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
     It 'loads both reboot budgets from the last good backup when the primary is zero-filled' {
         $oldStatePath = $script:StatePath
         $testRoot = Join-Path ([System.IO.Path]::GetTempPath()) "BootUpdateState-$([guid]::NewGuid().ToString('N'))"

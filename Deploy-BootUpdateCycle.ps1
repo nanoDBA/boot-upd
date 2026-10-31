@@ -19,6 +19,7 @@ param(
     [ValidateRange(1,1440)][int]$PackageTimeoutMinutes,
     [switch]$StagedRollout,
     [switch]$AggressiveRepair,
+    [switch]$ResumeAfterAttention,
     [switch]$IncludeDriverUpdates,
     [switch]$IncludeFirmwareUpdates,
     [switch]$UpdateWsl,
@@ -536,6 +537,7 @@ $invokeArgs = @{
     DisableSelfUpdate    = $Config.DisableSelfUpdate
     StagedRollout        = $Config.StagedRollout
     AggressiveRepair     = $Config.AggressiveRepair
+    ResumeAfterAttention = $ResumeAfterAttention
     NotifyEmail             = $Config.NotifyEmail
     SmtpServer              = $Config.SmtpServer
     MaintenanceWindowStart  = $Config.MaintenanceWindowStart

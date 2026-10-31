@@ -387,7 +387,7 @@ upd update    # refresh the verified source bundle without starting an update cy
 | **Recovery pass queued** | One or more phases did not verify; a near-term retry is armed | No action unless it keeps returning or reaches the safety limit |
 | **User update pass pending** | Machine work finished, but user-scoped work needs the saved user to sign in | Sign in as that user; do not "fix" it by deleting the checkpoint |
 | **Restart required** | Blocking evidence was confirmed and continuation was verified | Save work; boot-upd resumes automatically after Windows restarts |
-| **Needs attention** | A safety limit or persistent failure stopped the run | Run `upd status`, then `upd logs`; check the reported failure before retrying |
+| **Needs attention** | A safety limit or persistent failure stopped the run | Run `upd status`, then `upd logs`. Fix the reported failure before deliberately resuming with `upd run -ResumeAfterAttention` |
 
 If explicit `-ar` mode quarantines a repeatedly failing Winget package, the final screen says
 the selected update run finished **with skipped packages**—not that the machine is fully patched.
@@ -591,7 +591,7 @@ This means Visual Studio can install for 45 minutes (busy CPU = fine), but a hun
 
 ## Testing
 
-Tests cover unit behavior, User/SYSTEM execution, and published-launcher compatibility separately. See [Testing Boot Update Cycle](docs/TESTING.md), the [v2.5.83 AWS repair validation](docs/validation-aws-repair-2.5.83.md), the [v2.5.86 validation report](docs/validation-2.5.86.md), and the [v2.5.87 validation report](docs/validation-2.5.87.md), or run `./tools/Invoke-TestGates.ps1` from an elevated PowerShell 7 console.
+Tests cover unit behavior, User/SYSTEM execution, and published-launcher compatibility separately. See [Testing Boot Update Cycle](docs/TESTING.md), the [v2.5.83 AWS repair validation](docs/validation-aws-repair-2.5.83.md), the [v2.5.86 validation report](docs/validation-2.5.86.md), the [v2.5.87 validation report](docs/validation-2.5.87.md), and the [v2.5.88 validation report](docs/validation-2.5.88.md), or run `./tools/Invoke-TestGates.ps1` from an elevated PowerShell 7 console.
 
 ## License
 

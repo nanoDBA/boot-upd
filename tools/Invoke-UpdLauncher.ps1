@@ -10,6 +10,7 @@ param(
     [Alias('duration')][ValidateRange(2,60)][int]$DurationSeconds = 8,
     [Alias('s','StagedRollout')][switch]$Staged,
     [Alias('ar','aggressive-repair')][switch]$AggressiveRepair,
+    [switch]$ResumeAfterAttention,
     [Alias('drv','IncludeDriverUpdates')][switch]$Drivers,
     [Alias('fw','IncludeFirmwareUpdates')][switch]$Firmware,
     [Alias('w','UpdateWsl')][switch]$Wsl,
@@ -112,6 +113,7 @@ function Show-UpdHelp {
     /?  ?  /help  help  -h  --help  usage  --usage
 
   RUN OPTIONS
+    -ResumeAfterAttention       Retry a stopped provider failure after you have reviewed and fixed it
     -r, --delay <seconds>      Reboot countdown; default 0
     -o, --output-mode <mode>   Quiet | Normal | Verbose | Debug
     -n, --max-iterations <n>   Consecutive reboots without verified progress; default 5
@@ -240,7 +242,7 @@ function Get-UpdDeployParameters {
         SkipPip='SkipPip'; SkipNpm='SkipNpm'; SkipOffice365='SkipOffice365'; SkipSsms='SkipSsms'
         SkipPowerShellModules='SkipPowerShellModules'; SkipScoop='SkipScoop'; SkipVscode='SkipVscode'
         SkipDefender='SkipDefender'; SkipHealthCheck='SkipHealthCheck'; SkipBitLocker='SkipBitLocker'
-        DisableSelfUpdate='DisableSelfUpdate'
+        DisableSelfUpdate='DisableSelfUpdate'; ResumeAfterAttention='ResumeAfterAttention'
     }
     foreach ($entry in $switchMap.GetEnumerator()) {
         if ((Get-Variable -Name $entry.Key -ValueOnly)) { $result[$entry.Value] = $true }

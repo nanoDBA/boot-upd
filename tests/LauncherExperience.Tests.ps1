@@ -827,7 +827,7 @@ Describe 'Typed run option forwarding' {
             'OutputMode','MaxIterations','PackageTimeoutMinutes','StagedRollout','AggressiveRepair',
             'IncludeDriverUpdates','IncludeFirmwareUpdates','UpdateWsl','UpdateContainers',
             'AllowMetered','EnableRestorePoint','EnableDotnetTools','EnableAwsTooling',
-            'SkipSsms','SkipDefender','SkipBitLocker','DisableSelfUpdate','ExcludePatterns','IncludePatterns'
+            'SkipSsms','SkipDefender','SkipBitLocker','DisableSelfUpdate','ResumeAfterAttention','ExcludePatterns','IncludePatterns'
         )) {
             $deploySource | Should -Match ([regex]::Escape("`$$parameter"))
         }
@@ -839,6 +839,7 @@ Describe 'Typed run option forwarding' {
         foreach ($name in @('SkipSsms','SkipDefender','IncludeDriverUpdates','UpdateWsl','UpdateContainers','AllowMetered','SkipBitLocker','DisableSelfUpdate','AggressiveRepair')) {
             $deploySource | Should -Match ([regex]::Escape("Config.$name"))
         }
+        $deploySource | Should -Match 'ResumeAfterAttention = \$ResumeAfterAttention'
         $deploySource | Should -Match '-not \$Config\.DisableSelfUpdate'
         $deploySource | Should -Match '\$remoteVer -ge \$currentVer'
         $launcherSource | Should -Match "Alias\('ar','aggressive-repair'\)"
@@ -849,5 +850,6 @@ Describe 'Typed run option forwarding' {
         $deploySource | Should -Match 'PSBoundParameters\.ContainsKey\(''SkipSsms''\).*Config\.SkipSsms\s*=\s*\[bool\]\$SkipSsms'
         $deploySource | Should -Not -Match 'foreach \(\$name in @\([^)]*''SkipSsms'''
         (Get-FunctionText -Ast $launcherAst -Name 'Get-UpdDeployParameters') | Should -Match "SkipSsms='SkipSsms'"
+        (Get-FunctionText -Ast $launcherAst -Name 'Get-UpdDeployParameters') | Should -Match 'ResumeAfterAttention=''ResumeAfterAttention'''
     }
 }

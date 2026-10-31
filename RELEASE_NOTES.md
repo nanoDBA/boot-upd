@@ -1,10 +1,19 @@
 # Boot Update Cycle — Release Notes
 
-**Latest published version:** v2.5.87
+**Latest published version:** v2.5.88
 **Status:** Released
 
 ---
 
+## v2.5.88 (2026-10-31)
+
+If a package fails often enough, boot-upd stops and asks you to look at it. But when the main checkpoint was damaged, an older backup could bring the run back to life and send it after the same failure again. Both checkpoint copies now keep the manual stop. After you review and fix the reported problem, resume deliberately with `upd run -ResumeAfterAttention`.
+
+### Testing
+
+The full local unit/process, User/SYSTEM, and published-launcher gates passed. VM row A passed after three reboots. Row B reached `UserContextPending` after two reboots with Windows Update complete; it remains **PARTIAL** because we did not exercise the saved-user sign-in. See the [v2.5.88 validation report](docs/validation-2.5.88.md).
+
+---
 ## v2.5.87 (2026-10-30)
 
 Chocolatey no longer gets sent into a DNS outage, and an app that has a file open gets another chance after a reboot. Two failures in a row used to be enough to call both cases permanent and stop the run; that was a bit eager.
