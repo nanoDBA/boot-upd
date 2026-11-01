@@ -2098,7 +2098,7 @@ function Get-BootUpdateProgressFingerprint {
        again. Its stable completed-ID set below is the progress signal. #>
     $summaryNames = @(
         'Chocolatey','Ssms','WindowsUpdate','Pip','Npm','Office365',
-        'PowerShellModules','Scoop','DotnetTools','Vscode','Defender','DriverFirmware','Wsl','Containers'
+        'PowerShellModules','Scoop','DotnetTools','Vscode','Defender','DriverFirmware','Wsl','Containers','AiTools'
     )
     $verifiedCounts = [ordered]@{}
     foreach ($name in $summaryNames) {
@@ -3956,11 +3956,13 @@ function Invoke-PackageManagerWithTimeout {
     $outputFile = [System.IO.Path]::GetTempFileName()
     $sbText = $ScriptBlock.ToString()
     $argsJson = $ArgumentList | ConvertTo-Json -Compress -Depth 5
+    $argsText = if ($null -eq $argsJson) { '' } else { [string]$argsJson }
+    $argsBase64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($argsText))
     $childScript = @"
 `$sb = [scriptblock]::Create(@'
 $sbText
 '@)
-`$argList = (`'$argsJson`' | ConvertFrom-Json -NoEnumerate)
+`$argList = ([System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$argsBase64')) | ConvertFrom-Json -NoEnumerate)
 if (`$argList -isnot [array]) { `$argList = @(`$argList) }
 try {
     `$global:LASTEXITCODE = `$null
@@ -6245,10 +6247,20 @@ function Invoke-NpmGlobalUpdate {
     }
     <# npm outdated exits 1 whenever something is outdated; the JSON is the evidence. #>
     $outdatedText = (@(& $NpmPath outdated -g --json 2>$null) -join "`n").Trim()
+    $outdatedExit = $LASTEXITCODE
+    <# A registry or network failure is also JSON ({"error": {...}}) with exit 1; read as a
+       package list it became an "update" of a package named "error" that exited 0. Only
+       exit 0 or 1 with entries that carry a current version is an inventory. #>
+    $outdated = $null
     try {
-        $outdated = if ($outdatedText) { $outdatedText | ConvertFrom-Json -AsHashtable -ErrorAction Stop } else { @{} }
-    } catch {
-        $log.Add("[Error] npm outdated -g returned unreadable output: $($_.Exception.Message)")
+        if ($outdatedText) { $outdated = $outdatedText | ConvertFrom-Json -AsHashtable -ErrorAction Stop }
+        elseif ($outdatedExit -eq 0) { $outdated = @{} }
+    } catch { }
+    $malformed = $null -eq $outdated -or $outdated -isnot [System.Collections.IDictionary] -or $outdatedExit -notin @(0, 1) -or
+        $outdated.ContainsKey('error') -or @($outdated.Values | Where-Object { $_ -isnot [System.Collections.IDictionary] -or -not $_.ContainsKey('current') }).Count -gt 0
+    if ($malformed) {
+        $log.Add($outdatedText)
+        $log.Add("[Error] npm outdated -g did not return a package inventory (exit code $outdatedExit).")
         return @{ Success = $false; Count = 0; LogLines = $log.ToArray(); Deferred = @() }
     }
     $names = @($outdated.Keys | Sort-Object)
@@ -6266,7 +6278,7 @@ function Invoke-NpmGlobalUpdate {
             @($lines | Where-Object { $_ -match 'resource busy or locked|syscall (rename|unlink|rmdir)' }).Count -gt 0
         if ($locked) {
             $deferred.Add([pscustomobject]@{ Kind = 'in-use'; Count = 1; Detail = "$name (close the program using it, then run: npm update -g $name)" })
-            $log.Add("[Warn] npm: $name is in use by a running program and was left at its current version. Close that program, then run: npm update -g $name")
+            $log.Add("[Warn] [DEFERRED] npm: $name is in use by a running program and was left at its current version. Close that program, then run: npm update -g $name")
             continue
         }
         $success = $false
@@ -6309,11 +6321,13 @@ function Invoke-ScoopUpdate {
     $appExit = $LASTEXITCODE
     foreach ($line in $appLines) {
         if ([string]::IsNullOrWhiteSpace($line)) { continue }
-        if ($line -match "^Updating '[^']+' \(\S+ -> \S+\)" -or $line -match '^\s*\S+:\s+\S+\s+->\s+\S+') { $count++ }
+        <# "Updating 'x' (a -> b)" is printed before Scoop checks for running processes, so
+           only the completed install counts. #>
+        if ($line -match "^'[^']+' \([^)]+\) was installed successfully") { $count++ }
         if ($line -match 'instances of "([^"]+)" are still running') {
             $app = $Matches[1]
             $deferred.Add([pscustomobject]@{ Kind = 'in-use'; Count = 1; Detail = "$app (close it, then run: scoop update $app)" })
-            $log.Add("[Warn] Scoop: $app is running and was left at its current version. Close it, then run: scoop update $app")
+            $log.Add("[Warn] [DEFERRED] Scoop: $app is running and was left at its current version. Close it, then run: scoop update $app")
             continue
         }
         $log.Add($line)
@@ -6339,7 +6353,7 @@ function Invoke-AiToolSelfUpdate {
     param([string]$ClaudePath = '', [string]$HermesPath = '', [string]$UserProfile = $env:USERPROFILE, [switch]$IsWhatIf)
     $log = [System.Collections.Generic.List[string]]::new()
     $deferred = [System.Collections.Generic.List[object]]::new()
-    $count = 0; $success = $true
+    $count = 0
     $versionOf = { param($Path) "$(@(& $Path --version 2>$null)[0])".Trim() }
 
     $nativeClaude = $ClaudePath -and $UserProfile -and
@@ -6355,8 +6369,8 @@ function Invoke-AiToolSelfUpdate {
             $after = & $versionOf $ClaudePath
             if ($exitCode -ne 0) {
                 foreach ($line in $lines) { $log.Add($line) }
-                $success = $false
-                $log.Add("[Error] claude update exited with code $exitCode")
+                $deferred.Add([pscustomobject]@{ Kind = 'updater-unavailable'; Count = 1; Detail = "Claude Code (claude update exited $exitCode; run it yourself to see why)" })
+                $log.Add("[Warn] [DEFERRED] Claude Code: claude update exited with code $exitCode and stays at $after. Run claude update yourself to see why.")
             } elseif ($before -ne $after) {
                 $count++
                 $log.Add("Claude Code: updated $before -> $after.")
@@ -6372,16 +6386,23 @@ function Invoke-AiToolSelfUpdate {
             $check = @(& $HermesPath update --check 2>&1 | ForEach-Object { "$_" })
             $checkExit = $LASTEXITCODE
             if ($checkExit -ne 0) {
+                <# Exit 2 means Hermes is managed by its desktop app, Docker or Nix, which update it
+                   themselves; exit 1 is a non-git install or a fetch that failed. None of these is
+                   fixed by retrying this cycle, and none should stop it. #>
                 foreach ($line in $check) { $log.Add($line) }
-                $success = $false
-                $log.Add("[Error] hermes update --check exited with code $checkExit")
+                if ($checkExit -eq 2) {
+                    $log.Add('Hermes Agent: managed by its desktop app or container; that manager updates it.')
+                } else {
+                    $deferred.Add([pscustomobject]@{ Kind = 'updater-unavailable'; Count = 1; Detail = "Hermes Agent (hermes update --check exited $checkExit; run it yourself to see why)" })
+                    $log.Add("[Warn] [DEFERRED] Hermes Agent: hermes update --check exited with code $checkExit. Run hermes update --check yourself to see why.")
+                }
             } elseif (-not @($check | Where-Object { $_ -match '(?i)update available' }).Count) {
                 $log.Add("Hermes Agent: current ($(& $versionOf $HermesPath)).")
             } else {
                 $null = & $HermesPath update --list-venv-holders 2>$null
                 if ($LASTEXITCODE -eq 3) {
                     $deferred.Add([pscustomobject]@{ Kind = 'in-use'; Count = 1; Detail = 'Hermes Agent (stop its gateway or desktop app, then run: hermes update)' })
-                    $log.Add('[Warn] Hermes Agent: an update is available but its gateway or desktop app is running, so it was left as is. Stop it, then run: hermes update')
+                    $log.Add('[Warn] [DEFERRED] Hermes Agent: an update is available but its gateway or desktop app is running, so it was left as is. Stop it, then run: hermes update')
                 } else {
                     $before = & $versionOf $HermesPath
                     $lines = @(& $HermesPath update --yes 2>&1 | ForEach-Object { "$_" })
@@ -6389,8 +6410,8 @@ function Invoke-AiToolSelfUpdate {
                     $after = & $versionOf $HermesPath
                     if ($exitCode -ne 0) {
                         foreach ($line in $lines) { $log.Add($line) }
-                        $success = $false
-                        $log.Add("[Error] hermes update exited with code $exitCode")
+                        $deferred.Add([pscustomobject]@{ Kind = 'updater-unavailable'; Count = 1; Detail = "Hermes Agent (hermes update exited $exitCode; run it yourself to see why)" })
+                        $log.Add("[Warn] [DEFERRED] Hermes Agent: hermes update exited with code $exitCode. Run hermes update yourself to see why.")
                     } else {
                         if ($before -ne $after) {
                             $count++
@@ -6404,7 +6425,9 @@ function Invoke-AiToolSelfUpdate {
         }
     }
     if (-not $ClaudePath -and -not $HermesPath) { $log.Add('AI tools: no self-updating CLI found (Claude Code native install, Hermes Agent).') }
-    return @{ Success = $success; Count = $count; LogLines = $log.ToArray(); Deferred = $deferred.ToArray() }
+    <# Each tool's own updater owns its failures; they are deferred inventory with the reason,
+       so one tool cannot hold the rest of the machine's updates hostage. #>
+    return @{ Success = $true; Count = $count; LogLines = $log.ToArray(); Deferred = $deferred.ToArray() }
 }
 
 function New-BootUpdateProviderCoreScript {
@@ -6423,6 +6446,9 @@ $definition
 foreach (`$property in `$Parameters.PSObject.Properties) { `$splat[`$property.Name] = `$property.Value }
 `$result = $Function @splat
 'BOOTUPDATE_RESULT|' + (`$result | ConvertTo-Json -Depth 5 -Compress)
+<# The core already judged every native exit; a leftover code (npm EBUSY, or a 3010) must not
+   read as this child's exit or as a reboot request. #>
+`$global:LASTEXITCODE = 0
 "@)
 }
 
@@ -9543,7 +9569,9 @@ function Invoke-BootUpdateCycle {
                     Add-BootUpdateDeferredInventory -State $state -Provider $phaseName -Scope 'user' -Records @($jr.Deferred)
                 }
 
-                $replayedFailure = @($jr.LogLines | Where-Object { $_ -match '^\[Error\]|^\[Warn\].*(failed|timed out|timeout|error)' }).Count -gt 0
+                $replayedFailure = @($jr.LogLines | Where-Object {
+                    $_ -match '^\[Error\]|^\[Warn\].*(failed|timed out|timeout|error)' -and $_ -notmatch '^\[Warn\] \[DEFERRED\]'
+                }).Count -gt 0
                 $phaseSucceeded = $jobState -eq 'Completed' -and [bool]$jr.Success -and (-not $replayedFailure)
                 <# Preserve terminal-failure classification from cohort phases so the
                    completion disposition can stop retrying an unrecoverable failure. #>

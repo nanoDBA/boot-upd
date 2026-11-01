@@ -179,6 +179,18 @@ exit 0
         @($result.LogLines | Where-Object { $_ -match '^\[Error\]' }).Count | Should -Be 0
     }
 
+    It 'fails, rather than updating a package named "error", when the registry is unreachable' {
+        $offlineNpm = Join-Path $TestDrive 'npm-offline.ps1'
+        Set-Content -LiteralPath $offlineNpm -Value @'
+if ($args[0] -eq 'outdated') { '{ "error": { "code": "ENOTFOUND", "summary": "request failed" } }'; exit 1 }
+'should not run'; exit 0
+'@
+        $result = Invoke-NpmGlobalUpdate -NpmPath $offlineNpm
+        $result.Success | Should -BeFalse
+        $result.Count | Should -Be 0
+        @($result.LogLines | Where-Object { $_ -eq 'should not run' }).Count | Should -Be 0
+    }
+
     It 'still fails the phase for an npm error that is not a lock' {
         $brokenNpm = Join-Path $TestDrive 'npm-broken.ps1'
         Set-Content -LiteralPath $brokenNpm -Value @'
@@ -204,6 +216,7 @@ if ($args.Count -eq 1) {
 }
 Write-Host "Updating 'claude-code' (2.1.314 -> 2.1.316)"
 Write-Host "'claude-code' (2.1.316) was installed successfully!"
+Write-Host "Updating 'codex' (0.165.0 -> 0.166.0)"
 Write-Host 'ERROR The following instances of "codex" are still running. Close them and try again.'
 exit 1
 '@
@@ -214,6 +227,7 @@ exit 1
         $result.Deferred[0].Detail | Should -BeLike 'codex*'
         @($result.LogLines | Where-Object { $_ -match 'Update to version' }).Count | Should -Be 0
         @($result.LogLines | Where-Object { $_ -match "^Updating 'claude-code'" }).Count | Should -Be 1
+        @($result.LogLines | Where-Object { $_ -like '`[Warn`] `[DEFERRED`]*codex*' }).Count | Should -Be 1
     }
 }
 
@@ -244,6 +258,21 @@ if ($args -contains '--list-venv-holders') { '[{"pid": 1, "kind": "gateway"}]'; 
         $result.Success | Should -BeTrue
         $result.Count | Should -Be 1
         $result.LogLines | Should -Contain 'Claude Code: updated 2.1.314 (Claude Code) -> 2.1.316 (Claude Code).'
+    }
+
+    It 'defers, rather than fails, when an updater refuses or errors' {
+        $managedHermes = Join-Path $TestDrive 'hermes-managed.ps1'
+        Set-Content -LiteralPath $managedHermes -Value "if (`$args[0] -eq '--version') { 'Hermes Agent v1' ; exit 0 }; 'Managed by the desktop app'; exit 2"
+        $managed = Invoke-AiToolSelfUpdate -HermesPath $managedHermes -UserProfile $profileRoot
+        $managed.Success | Should -BeTrue
+        @($managed.Deferred).Count | Should -Be 0
+
+        $offlineHermes = Join-Path $TestDrive 'hermes-offline.ps1'
+        Set-Content -LiteralPath $offlineHermes -Value "if (`$args[0] -eq '--version') { 'Hermes Agent v1' ; exit 0 }; 'fetch failed'; exit 1"
+        $offline = Invoke-AiToolSelfUpdate -HermesPath $offlineHermes -UserProfile $profileRoot
+        $offline.Success | Should -BeTrue
+        $offline.Deferred[0].Kind | Should -Be 'updater-unavailable'
+        @($offline.LogLines | Where-Object { $_ -like '`[Warn`] `[DEFERRED`] Hermes*' }).Count | Should -Be 1
     }
 
     It 'leaves a package-managed Claude Code to its package manager' {
@@ -279,7 +308,7 @@ exit 1
         $result.Success | Should -BeTrue
         @($result.Deferred).Count | Should -Be 1
         $result.Deferred[0].Detail | Should -BeLike 'codex*'
-        @($result.LogLines | Where-Object { $_ -like '`[Warn`] Scoop: codex is running*' }).Count | Should -Be 1
+        @($result.LogLines | Where-Object { $_ -like '`[Warn`] `[DEFERRED`] Scoop: codex is running*' }).Count | Should -Be 1
     }
 
     It 'fails the phase when the child times out before reporting' {
