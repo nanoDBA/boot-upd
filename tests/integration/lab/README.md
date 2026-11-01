@@ -79,3 +79,10 @@ Each cost real time to find and is commented at the point it matters.
 - **Reboots are armed from real servicing state.** Enabling a restart-requiring optional
   feature sets CBS `RebootPending`, the signal the updater actually reads. `TelnetClient`
   does *not* require a restart and produces no signal.
+- **`-Launcher upd` runs the published release, not your working tree.** `upd.cmd` fetches
+  its launcher and bootstrap from the latest GitHub release, and that path installs the
+  released bundle. `-DisableSelfUpdate` does not stop it. Observed: the sync check passed on
+  the candidate, then the cycle ran the published orchestrator.
+  Test an unreleased change with `-Launcher deploy`. Whatever the launcher, compare
+  `InstalledOrchestratorHash` with `CandidateSourceHash` in `summary.json`; a row whose
+  hashes differ is not evidence for the candidate.

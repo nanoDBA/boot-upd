@@ -23,7 +23,7 @@ Fixes:
 - **Startup on a stopped checkpoint:** the log now records why the run stopped, instead of ending after the boot-session line.
 - **Diagnostics export:** npm package paths such as `node_modules\@scope\name` are kept readable. Microsoft Entra ID user SIDs (`S-1-12-…`) are now redacted.
 
-New phase, **AI tools:** runs `claude update` for a native Claude Code install and `hermes update` for Hermes Agent, and compares versions before and after. If Hermes' gateway or desktop app holds its environment, the update is deferred by name instead of forced. Winget, npm and Scoop installs of these tools stay with their own phases. Skip it with `upd --skip-ai-tools`.
+New phase, **AI tools:** runs `claude update` for a native Claude Code install and `hermes update` for Hermes Agent, and compares versions before and after. If Hermes' gateway or desktop app holds its environment, the update is deferred by name instead of forced. Winget, npm and Scoop installs of these tools stay with their own phases. A tool whose own updater fails or refuses is listed with the reason and never stops the cycle. Skip the phase with `upd --skip-ai-tools`.
 
 ---
 
