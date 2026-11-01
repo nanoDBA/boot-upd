@@ -21,6 +21,8 @@ Fixes:
 - **Winget inventory:** footer lines such as "2 upgrades available." were read as package rows. That produced an upgrade target named `available.` and "malformed row" warnings.
 - **Resume after attention:** an operator resume is no longer reported as "Recovery pass 2 of 5 after an unobserved stop".
 - **Startup on a stopped checkpoint:** the log now records why the run stopped, instead of ending after the boot-session line.
+- **Queued passes survive a dead run:** when one pass queued the next, the follow-up task carried a single one-shot retry. If that run died before it could re-arm, for example while Windows Update was upgrading PowerShell 7 underneath it, nothing ran again until the next boot or sign-in. The watchdog probe now stays armed through that hand-off.
+- **Emergency stop:** `Unregister-BootUpdateTask.ps1` removed only `BootUpdateCycle`. The SYSTEM fallback task survived and resumed the stopped cycle at the next boot or watchdog probe. It now removes both tasks.
 - **Diagnostics export:** npm package paths such as `node_modules\@scope\name` are kept readable. Microsoft Entra ID user SIDs (`S-1-12-…`) are now redacted.
 
 New phase, **AI tools:** runs `claude update` for a native Claude Code install and `hermes update` for Hermes Agent, and compares versions before and after. If Hermes' gateway or desktop app holds its environment, the update is deferred by name instead of forced. Winget, npm and Scoop installs of these tools stay with their own phases. A tool whose own updater fails or refuses is listed with the reason and never stops the cycle. Skip the phase with `upd --skip-ai-tools`.

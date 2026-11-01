@@ -321,11 +321,13 @@ checkpoint rules, Windows Update verification, and retry limits.
 
 The resume chain otherwise only fires at boot or logon, which leaves a gap: a pass killed on a
 machine that neither reboots nor signs in again would never be resumed. While a cycle is in flight,
-both continuation tasks also carry a repeating trigger that starts a watchdog probe every
-`WatchdogIntervalMinutes` (default 15, floor 2, no off switch). A probe that finds the cycle's mutex
-held exits at once, unchanged; one that finds it free or abandoned becomes the recovery pass. Any
-pass resumed this way charges the retry budget once and is disclosed in the completion summary and
-repair plan without changing the convergence claim.
+and while one pass has queued the next, both continuation tasks also carry a repeating trigger
+that starts a watchdog probe every `WatchdogIntervalMinutes` (default 15, floor 2, no off switch).
+A probe that finds the cycle's mutex held exits at once, unchanged; one that finds it free or
+abandoned becomes the recovery pass. A pass resumed this way after dying mid-run charges the retry
+budget once and is disclosed in the completion summary and repair plan without changing the
+convergence claim. A probe that picks up a queued pass whose first run died before starting work
+runs it as queued. Waiting for a saved user's next sign-in never carries a probe.
 
 ### Reliability lineage
 
@@ -366,7 +368,7 @@ Package managers are auto-detected. Missing ones are skipped with a warning.
 | `Deploy-BootUpdateCycle.ps1` | Deploys scripts to ProgramData + runs first iteration |
 | `Invoke-BootUpdateCycle.ps1` | The orchestrator — runs all updates, manages reboots |
 | `Register-BootUpdateTask.ps1` | Standalone task registration (alternative to Deploy) |
-| `Unregister-BootUpdateTask.ps1` | Emergency stop — removes the scheduled task |
+| `Unregister-BootUpdateTask.ps1` | Emergency stop — removes both scheduled tasks |
 | `Repair-AwsTooling.ps1` | Optional AWS CLI v2 + module maintenance |
 | `Export-BootUpdateDiagnostics.ps1` | Sanitized, compressed diagnostic bundle export |
 | `tools/Initialize-BootUpdateWebhook.ps1` | Securely configures a notification webhook outside Git and task arguments |
