@@ -7384,12 +7384,13 @@ function Register-BootUpdateTaskForReboot {
        ISO-8601 duration ("P3650D") that Task Scheduler is documented to accept, where
        MaxValue serializes to a degenerate near-max value; ten years outlives any real
        gap between updater runs. #>
-    $watchdogTrigger = if ($InFlightWatchdog -and -not $LogonOnly) {
+    $armWatchdog = [bool]$InFlightWatchdog -and -not $LogonOnly
+    $watchdogTrigger = if ($armWatchdog) {
         New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes($script:WatchdogIntervalMinutes) `
             -RepetitionInterval (New-TimeSpan -Minutes $script:WatchdogIntervalMinutes) `
             -RepetitionDuration (New-TimeSpan -Days 3650)
     } else { $null }
-    $fallbackWatchdogTrigger = if ($InFlightWatchdog -and -not $LogonOnly) {
+    $fallbackWatchdogTrigger = if ($armWatchdog) {
         New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes($script:WatchdogIntervalMinutes + 3) `
             -RepetitionInterval (New-TimeSpan -Minutes $script:WatchdogIntervalMinutes) `
             -RepetitionDuration (New-TimeSpan -Days 3650)
@@ -7502,7 +7503,7 @@ function Register-BootUpdateTaskForReboot {
            stops repeating is as dangerous as a deliberate stop that starts repeating. #>
         $actualRepetitionIntervals = @($task.Triggers | Where-Object { $_.Repetition -and -not [string]::IsNullOrEmpty($_.Repetition.Interval) } |
             ForEach-Object { [System.Xml.XmlConvert]::ToTimeSpan($_.Repetition.Interval) })
-        if ($InFlightWatchdog -and -not $LogonOnly) {
+        if ($armWatchdog) {
             $expectedRepetitionInterval = New-TimeSpan -Minutes $script:WatchdogIntervalMinutes
             if ($actualRepetitionIntervals -notcontains $expectedRepetitionInterval) {
                 throw "Resume task '$registeredName' is missing the in-flight watchdog repetition trigger (expected every $($script:WatchdogIntervalMinutes) minute(s))."
@@ -7521,7 +7522,7 @@ function Register-BootUpdateTaskForReboot {
             throw "Could not remove the SYSTEM fallback while waiting for the saved user's next sign-in."
         }
     }
-    $watchdogNote = if ($InFlightWatchdog -and -not $LogonOnly) { "; watchdog probe every $($script:WatchdogIntervalMinutes) minute(s)" } else { '' }
+    $watchdogNote = if ($armWatchdog) { "; watchdog probe every $($script:WatchdogIntervalMinutes) minute(s)" } else { '' }
     $retryNote = if ($LogonOnly) { 'saved-user logon only' } else { '3 retries, 2-minute interval' }
     Write-Log "Resume chain verified: $($registeredTaskNames -join ', ') ($retryNote)$watchdogNote."
     return $registeredTaskNames.ToArray()
