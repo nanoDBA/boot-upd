@@ -22,14 +22,16 @@
     Safe to run even if nothing is running — it just cleans up whatever exists.
 
 .PARAMETER TaskName
-    Name of the scheduled task to remove. Default: 'BootUpdateCycle'
+    Scheduled tasks to remove. Default: both continuation tasks, 'BootUpdateCycle' and
+    'BootUpdateCycleFallback'. Removing only the first leaves the SYSTEM fallback, which
+    resumes the cycle at the next boot or watchdog probe.
 
 .PARAMETER CleanupLogs
     Also remove log and state files.
 
 .EXAMPLE
     .\Unregister-BootUpdateTask.ps1
-    Removes the scheduled task only.
+    Removes both scheduled tasks only.
 
 .EXAMPLE
     .\Unregister-BootUpdateTask.ps1 -CleanupLogs
@@ -37,30 +39,32 @@
 #>
 [CmdletBinding(SupportsShouldProcess)]
 param(
-    [string]$TaskName = 'BootUpdateCycle',
+    [string[]]$TaskName = @('BootUpdateCycle', 'BootUpdateCycleFallback'),
     [switch]$CleanupLogs
 )
 
 $ErrorActionPreference = 'Stop'
 
-$task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+foreach ($name in $TaskName) {
+    $task = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
 
-if ($task) {
-    if ($task.State -eq 'Running') {
-        Write-Host "Stopping running task '$TaskName'..."
-        if ($PSCmdlet.ShouldProcess($TaskName, 'Stop scheduled task')) {
-            Stop-ScheduledTask -TaskName $TaskName
+    if ($task) {
+        if ($task.State -eq 'Running') {
+            Write-Host "Stopping running task '$name'..."
+            if ($PSCmdlet.ShouldProcess($name, 'Stop scheduled task')) {
+                Stop-ScheduledTask -TaskName $name
+            }
+        }
+
+        Write-Host "Removing scheduled task '$name'..."
+        if ($PSCmdlet.ShouldProcess($name, 'Unregister scheduled task')) {
+            Unregister-ScheduledTask -TaskName $name -Confirm:$false
+            Write-Host "Task '$name' removed." -ForegroundColor Green
         }
     }
-
-    Write-Host "Removing scheduled task '$TaskName'..."
-    if ($PSCmdlet.ShouldProcess($TaskName, 'Unregister scheduled task')) {
-        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
-        Write-Host "Task '$TaskName' removed." -ForegroundColor Green
+    else {
+        Write-Host "Task '$name' not found." -ForegroundColor Yellow
     }
-}
-else {
-    Write-Host "Task '$TaskName' not found." -ForegroundColor Yellow
 }
 
 if ($CleanupLogs) {
