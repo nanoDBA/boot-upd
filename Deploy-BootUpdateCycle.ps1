@@ -34,6 +34,7 @@ param(
     [switch]$SkipSsms,
     [switch]$SkipPowerShellModules,
     [switch]$SkipScoop,
+    [switch]$SkipAiTools,
     [switch]$SkipVscode,
     [switch]$SkipDefender,
     [switch]$SkipHealthCheck,
@@ -82,6 +83,7 @@ $Config = @{
     SkipAwsTooling        = $true   # Set $false to enable AWS CLI/module repair
     SkipPowerShellModules = $false  # Set $true to skip PowerShell module updates
     SkipScoop             = $false  # Set $true to skip Scoop package updates
+    SkipAiTools           = $false  # Set $true to skip self-updating AI CLIs (Claude Code native, Hermes)
     SkipDotnetTools       = $true   # OFF by default - can break SDK-dependent builds!
     SkipVscode            = $false  # Set $true to skip VS Code extension updates
     SkipDefender          = $false  # Set $true to skip Defender signature updates
@@ -139,7 +141,7 @@ if ($PSBoundParameters.ContainsKey('MaxRetryPasses')) { $Config.MaxRetryPasses =
 if ($PSBoundParameters.ContainsKey('MaxUserIdentityWaits')) { $Config.MaxUserIdentityWaits = $MaxUserIdentityWaits }
 if ($PSBoundParameters.ContainsKey('WatchdogIntervalMinutes')) { $Config.WatchdogIntervalMinutes = $WatchdogIntervalMinutes }
 if ($PSBoundParameters.ContainsKey('PackageTimeoutMinutes')) { $Config.PackageTimeoutMin = $PackageTimeoutMinutes }
-foreach ($name in @('StagedRollout','AggressiveRepair','IncludeDriverUpdates','IncludeFirmwareUpdates','UpdateWsl','UpdateContainers','AllowMetered','SkipPip','SkipNpm','SkipOffice365','SkipPowerShellModules','SkipScoop','SkipVscode','SkipDefender','SkipHealthCheck','SkipBitLocker','DisableSelfUpdate')) {
+foreach ($name in @('StagedRollout','AggressiveRepair','IncludeDriverUpdates','IncludeFirmwareUpdates','UpdateWsl','UpdateContainers','AllowMetered','SkipPip','SkipNpm','SkipOffice365','SkipPowerShellModules','SkipScoop','SkipAiTools','SkipVscode','SkipDefender','SkipHealthCheck','SkipBitLocker','DisableSelfUpdate')) {
     if ($PSBoundParameters.ContainsKey($name)) { $Config[$name] = $true }
 }
 if ($PSBoundParameters.ContainsKey('SkipSsms')) { $Config.SkipSsms = [bool]$SkipSsms }
@@ -190,6 +192,30 @@ function Set-BootUpdateInstallDirectoryAcl {
     ))
     $acl.SetOwner($administrators)
     Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
+function Reset-BootUpdateCycleState {
+    <# `upd run` starts a fresh cycle; -ResumeAfterAttention keeps the stopped checkpoint.
+       Both copies must go: stopped states are written to the primary and its .bak, so
+       deleting only the primary let the updater recover the old stop from the backup and
+       refuse every later run (v2.5.88 to v2.5.90). Returns the previous stop reason, if any. #>
+    param(
+        [Parameter(Mandatory)][string]$InstallDirectory,
+        [switch]$KeepCheckpoint
+    )
+    $statePath = Join-Path $InstallDirectory 'BootUpdateCycle.state.json'
+    $stateFiles = @($statePath, "$statePath.bak") | Where-Object { Test-Path -LiteralPath $_ }
+    if ($KeepCheckpoint -or -not $stateFiles) { return $null }
+    $previousStop = $null
+    foreach ($file in $stateFiles) {
+        try {
+            $previousStop = [string](Get-Content -LiteralPath $file -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop).LimitReason
+            break
+        } catch { }
+    }
+    $stateFiles | Remove-Item -Force
+    if ([string]::IsNullOrWhiteSpace($previousStop)) { return $null }
+    return $previousStop
 }
 
 function Set-BootUpdateWebhookSecret {
@@ -494,10 +520,13 @@ foreach ($tn in @('BootUpdateCycle', 'BootUpdateCycleFallback')) {
 }
 
 <# Reset state on re-deploy (fresh cycle) #>
-$statePath = Join-Path $installDir 'BootUpdateCycle.state.json'
-if (Test-Path $statePath) {
-    Remove-Item $statePath -Force
-    Write-Host "Reset state file (starting fresh cycle)"
+$hadState = Test-Path -Path (Join-Path $installDir 'BootUpdateCycle.state.json*')
+$previousStop = Reset-BootUpdateCycleState -InstallDirectory $installDir -KeepCheckpoint:$ResumeAfterAttention
+if ($ResumeAfterAttention) {
+    Write-Host 'Keeping the stopped checkpoint (-ResumeAfterAttention).'
+} elseif ($hadState) {
+    if ($previousStop) { Write-Host "Previous cycle stopped: $previousStop" -ForegroundColor Yellow }
+    Write-Host 'Reset state file (starting fresh cycle)'
 }
 
 Write-Host "Deployed scripts to: $installDir" -ForegroundColor Green
@@ -523,6 +552,7 @@ $invokeArgs = @{
     SkipAwsTooling       = $Config.SkipAwsTooling
     SkipPowerShellModules = $Config.SkipPowerShellModules
     SkipScoop            = $Config.SkipScoop
+    SkipAiTools          = $Config.SkipAiTools
     SkipDotnetTools      = $Config.SkipDotnetTools
     SkipVscode           = $Config.SkipVscode
     SkipDefender         = $Config.SkipDefender
@@ -739,6 +769,7 @@ function Register-ScheduledTaskNow {
     if ($Config.SkipAwsTooling)       { $taskArgs += '-SkipAwsTooling' }
     if ($Config.SkipPowerShellModules){ $taskArgs += '-SkipPowerShellModules' }
     if ($Config.SkipScoop)            { $taskArgs += '-SkipScoop' }
+    if ($Config.SkipAiTools)          { $taskArgs += '-SkipAiTools' }
     if ($Config.SkipDotnetTools)      { $taskArgs += '-SkipDotnetTools' }
     if ($Config.SkipVscode)           { $taskArgs += '-SkipVscode' }
     if ($Config.SkipDefender)         { $taskArgs += '-SkipDefender' }

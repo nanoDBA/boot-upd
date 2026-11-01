@@ -5,6 +5,28 @@
 
 ---
 
+## Unreleased
+
+Since v2.5.88, a cycle that stopped for attention or at a safety limit could not be restarted. Running `upd` deleted the main checkpoint but not its backup. Both copies held the stop, so the updater recovered it, logged "Primary state file is unusable", and exited. On the two machines behind this fix, one MuseScore installer failure and one locked npm module kept every later run from updating anything. Running `upd` now starts a fresh cycle again; `upd run -ResumeAfterAttention` still continues the stopped one.
+
+These cases no longer stop a cycle:
+
+- **npm:** global packages update one at a time. A package whose files are held open by a running program (an MCP server, for example) stays at its current version and is listed by name, instead of rolling back every other npm update and using up the same-boot retries.
+- **Defender security intelligence (KB2267602):** Microsoft republishes it every few hours with a new version in the title. A newer copy offered after one installed in the same run now counts as a re-offer, not as unfinished work.
+- **Winget download 404:** a package whose installer link the publisher hasn't published yet is listed as "installer download unavailable" and tried on the next run. It used to show as "1 attempted, 0 failed", and then the cycle stopped for attention with no package named.
+
+Fixes:
+
+- **Scoop:** prints through `Write-Host`, which the updater never captured, so every run reported "0 package(s) updated" no matter what happened. Its output and update count are now recorded. Apps Scoop won't update while they're running are listed by name. The bucket changelog no longer fills the log.
+- **Winget inventory:** footer lines such as "2 upgrades available." were read as package rows. That produced an upgrade target named `available.` and "malformed row" warnings.
+- **Resume after attention:** an operator resume is no longer reported as "Recovery pass 2 of 5 after an unobserved stop".
+- **Startup on a stopped checkpoint:** the log now records why the run stopped, instead of ending after the boot-session line.
+- **Diagnostics export:** npm package paths such as `node_modules\@scope\name` are kept readable. Microsoft Entra ID user SIDs (`S-1-12-…`) are now redacted.
+
+New phase, **AI tools:** runs `claude update` for a native Claude Code install and `hermes update` for Hermes Agent, and compares versions before and after. If Hermes' gateway or desktop app holds its environment, the update is deferred by name instead of forced. Winget, npm and Scoop installs of these tools stay with their own phases. Skip it with `upd --skip-ai-tools`.
+
+---
+
 ## v2.5.90 (2026-10-31)
 
 `upd --max-retry-passes <n>` now lets you set the same-boot recovery limit (1–50); the default stays at 5. The setting was already supported by the deployment scripts, but the `upd` launcher wasn't passing it through. `upd /?` now lists both retry limits, explains that `bootstrap` installs or upgrades PowerShell 7, and says which commands may request admin rights. The quick start names `upd.cmd` and Command Prompt.

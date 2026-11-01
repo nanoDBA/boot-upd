@@ -28,6 +28,7 @@ param(
     [Alias('no-ssms','skip-ssms')][switch]$SkipSsms,
     [Alias('no-psm','skip-power-shell-modules')][switch]$SkipPowerShellModules,
     [Alias('no-scoop','skip-scoop')][switch]$SkipScoop,
+    [Alias('no-ai','skip-ai-tools')][switch]$SkipAiTools,
     [Alias('no-code','skip-vscode')][switch]$SkipVscode,
     [Alias('no-def','skip-defender')][switch]$SkipDefender,
     [Alias('no-check','skip-health-check')][switch]$SkipHealthCheck,
@@ -141,6 +142,7 @@ function Show-UpdHelp {
     --skip-ssms                Skip native SSMS updates
     --skip-power-shell-modules Skip PowerShell modules
     --skip-scoop               Skip Scoop
+    --skip-ai-tools            Skip Claude Code (native install) and Hermes Agent self-updates
     --skip-vscode              Skip VS Code extensions
     --skip-defender            Skip Defender signatures
     --skip-health-check        Skip service verification (completion is downgraded)
@@ -244,7 +246,7 @@ function Get-UpdDeployParameters {
         Wsl='UpdateWsl'; Containers='UpdateContainers'; AllowMetered='AllowMetered'
         RestorePoint='EnableRestorePoint'; DotnetTools='EnableDotnetTools'; AwsTooling='EnableAwsTooling'
         SkipPip='SkipPip'; SkipNpm='SkipNpm'; SkipOffice365='SkipOffice365'; SkipSsms='SkipSsms'
-        SkipPowerShellModules='SkipPowerShellModules'; SkipScoop='SkipScoop'; SkipVscode='SkipVscode'
+        SkipPowerShellModules='SkipPowerShellModules'; SkipScoop='SkipScoop'; SkipAiTools='SkipAiTools'; SkipVscode='SkipVscode'
         SkipDefender='SkipDefender'; SkipHealthCheck='SkipHealthCheck'; SkipBitLocker='SkipBitLocker'
         DisableSelfUpdate='DisableSelfUpdate'; ResumeAfterAttention='ResumeAfterAttention'
     }

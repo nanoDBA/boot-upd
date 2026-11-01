@@ -73,6 +73,7 @@ param(
     [switch]$SkipAwsTooling,
     [switch]$SkipPowerShellModules,
     [switch]$SkipScoop,
+    [switch]$SkipAiTools,
     [switch]$SkipDotnetTools = $true,
     [switch]$SkipVscode,
     [switch]$SkipDefender,                # Defender signature update (default: runs)
@@ -326,6 +327,7 @@ $script:SkipSsms              = $SkipSsms
 $script:SkipAwsTooling        = $SkipAwsTooling
 $script:SkipPowerShellModules = $SkipPowerShellModules
 $script:SkipScoop             = $SkipScoop
+$script:SkipAiTools           = $SkipAiTools
 $script:SkipDotnetTools       = $SkipDotnetTools
 $script:SkipVscode            = $SkipVscode
 $script:SkipDefender          = $SkipDefender
@@ -1082,6 +1084,10 @@ function Get-WingetInventoryPackageIds {
     $malformedRows = 0
     foreach ($row in ($normalized | Select-Object -Skip ($headerIndex + 1))) {
         if ([string]::IsNullOrWhiteSpace($row) -or $row -match '^\s*-{3,}\s*$') { continue }
+        <# Winget's footer sentences ("2 upgrades available.", "1 package(s) have ...") are
+           not rows. Read by column they produced the target "available." and "malformed
+           row" warnings whenever the Name column was narrow. #>
+        if ($row -match '^\s*\d+\s+(upgrades?\s+available|package\(s\)\s)' -or $row -match '^\s*The following packages\b') { continue }
         if ($row.Length -le $idColStart) { continue }
         $idField = if ($nextColOffset -gt $idColStart) {
             $row.Substring($idColStart, [math]::Min($nextColOffset - $idColStart, $row.Length - $idColStart)).Trim()
@@ -1123,6 +1129,7 @@ function Get-WingetOutputSummary {
     $staleAbsent = [Collections.Generic.List[object]]::new()
     $scopeBlocked = [Collections.Generic.List[object]]::new()
     $portableModified = [Collections.Generic.List[object]]::new()
+    $downloadUnavailable = [Collections.Generic.List[object]]::new()
     $successfulIds = [Collections.Generic.List[string]]::new()
     $failureContext = [Collections.Generic.List[string]]::new()
     foreach ($rawLine in $Lines) {
@@ -1171,6 +1178,19 @@ function Get-WingetOutputSummary {
             $portableModified.Add([pscustomobject]@{
                 Name=$currentName; Id=$currentId; ObservedVersion=$currentVersion
             })
+        } elseif ($line -match '^(0x8019[0-9A-Fa-f]{4})\s*:\s*(.+?)\.?$') {
+            <# 0x8019xxxx is an HTTP status from the installer download (0x80190194 is 404).
+               The manifest points at a file the publisher has not published (or has moved);
+               nothing on this machine can fix that, and the publisher usually corrects it
+               within hours, so the package is deferred to the next run, not retried. #>
+            $hex = '0x' + $Matches[1].Substring(2).ToUpperInvariant()
+            $downloadUnavailable.Add([pscustomobject]@{
+                Name=$currentName; Id=$currentId; ObservedVersion=$currentVersion
+                Code=[long][Convert]::ToUInt32($hex.Substring(2), 16); Hex=$hex
+                Reason=$Matches[2].Trim()
+            })
+            $currentId = ''
+            $failureContext.Clear()
         } elseif ($line -match '^(\d+) package\(s\) have pins') {
             $pinned = [int]$Matches[1]
         } elseif ($line -match '^(\d+) package\(s\) have version numbers that cannot be determined') {
@@ -1193,11 +1213,12 @@ function Get-WingetOutputSummary {
         StaleAbsent=$staleAbsent.ToArray()
         ScopeBlocked=$scopeBlocked.ToArray()
         PortableModified=$portableModified.ToArray()
+        DownloadUnavailable=$downloadUnavailable.ToArray()
         SuccessfulIds=$successfulIds.ToArray()
         Targeted=[bool]$TargetPackageId
         Recognized=($attempted -gt 0 -or $updated -gt 0 -or $pinned -gt 0 -or $unknown -gt 0 -or
             $technologyBlocked -gt 0 -or $noApplicable -or $failures.Count -gt 0 -or $staleAbsent.Count -gt 0 -or
-            $scopeBlocked.Count -gt 0 -or $portableModified.Count -gt 0)
+            $scopeBlocked.Count -gt 0 -or $portableModified.Count -gt 0 -or $downloadUnavailable.Count -gt 0)
     }
 }
 
@@ -1220,8 +1241,9 @@ function Test-WingetExitReconciled {
     $staleCount = @($Summary.StaleAbsent).Count
     $scopeBlockedCount = @($Summary.ScopeBlocked).Count
     $portableModifiedCount = @($Summary.PortableModified).Count
+    $downloadUnavailableCount = if ($Summary.PSObject.Properties['DownloadUnavailable']) { @($Summary.DownloadUnavailable).Count } else { 0 }
     $deferredCount = [int]$Summary.Pinned + [int]$Summary.Unknown + [int]$Summary.TechnologyBlocked
-    $accounted = $staleCount + $scopeBlockedCount + $portableModifiedCount + $deferredCount
+    $accounted = $staleCount + $scopeBlockedCount + $portableModifiedCount + $downloadUnavailableCount + $deferredCount
     $attempted = [int]$Summary.Attempted
     <# A targeted run always attempts exactly its one package, and Winget's own
        "no applicable upgrade" verdict accounts for it. Bulk runs get neither
@@ -1602,13 +1624,14 @@ function Get-WingetDeferredInventoryRecords {
     <# Deferred-inventory ledger records for one scope, summed across its summaries: one
        for a bulk `--all` run, one per package for a targeted run. #>
     param([object[]]$Summaries = @())
-    $counts = [ordered]@{ Pinned=0; UnknownVersion=0; TechnologyBlocked=0; ScopeBlocked=0; PortableModified=0 }
+    $counts = [ordered]@{ Pinned=0; UnknownVersion=0; TechnologyBlocked=0; ScopeBlocked=0; PortableModified=0; DownloadUnavailable=0 }
     foreach ($summary in @($Summaries | Where-Object { $_ })) {
         $counts.Pinned += [int]$summary.Pinned
         $counts.UnknownVersion += [int]$summary.Unknown
         $counts.TechnologyBlocked += [int]$summary.TechnologyBlocked
         $counts.ScopeBlocked += @($summary.ScopeBlocked).Count
         $counts.PortableModified += @($summary.PortableModified).Count
+        if ($summary.PSObject.Properties['DownloadUnavailable']) { $counts.DownloadUnavailable += @($summary.DownloadUnavailable).Count }
     }
     return @($counts.Keys | Where-Object { $counts[$_] -gt 0 } |
         ForEach-Object { [pscustomobject]@{ Kind = $_; Count = $counts[$_] } })
@@ -1641,7 +1664,8 @@ function Write-WingetScopeSummary {
         $staleSuffix = if ($stalePresentation.Unresolved) { ", $($stalePresentation.Unresolved) stale record(s) need attention" } else { '' }
         $blockedSuffix = if ($summary.ScopeBlocked.Count) { ", $($summary.ScopeBlocked.Count) blocked by elevation scope" } else { '' }
         $modifiedSuffix = if ($summary.PortableModified.Count) { ", $($summary.PortableModified.Count) portable package(s) modified" } else { '' }
-        Write-Log "Winget ${Scope}: $($summary.Attempted) attempted, $($summary.Updated) updated, $($summary.Failures.Count) failed$staleSuffix$blockedSuffix$modifiedSuffix." -Level $level
+        $downloadSuffix = if ($summary.DownloadUnavailable.Count) { ", $($summary.DownloadUnavailable.Count) installer download(s) unavailable" } else { '' }
+        Write-Log "Winget ${Scope}: $($summary.Attempted) attempted, $($summary.Updated) updated, $($summary.Failures.Count) failed$staleSuffix$blockedSuffix$modifiedSuffix$downloadSuffix." -Level $level
     } else {
         Write-Log "Winget ${Scope}: provider finished without recognizable English summary output; raw transcript retained for verification." -Level Warn
     }
@@ -1667,12 +1691,17 @@ function Write-WingetScopeSummary {
             Write-Log "[user] Reinstall it cleanly with winget uninstall and winget install for the package named '$([string]$modified.Name)'; its id did not parse as a Winget identifier." -Level Warn
         }
     }
+    foreach ($unavailable in $summary.DownloadUnavailable) {
+        $identity = if ($unavailable.Id) { "$($unavailable.Name) [$($unavailable.Id)]" } else { [string]$unavailable.Name }
+        Write-Log "[DOWNLOAD] $identity could not be downloaded: the publisher's server answered $($unavailable.Hex) ($($unavailable.Reason)). The Winget manifest is ahead of the publisher; this run defers it and the next run tries again." -Level Warn
+    }
     $notes = @()
     if ($summary.Pinned) { $notes += "$($summary.Pinned) pinned" }
     if ($summary.Unknown) { $notes += "$($summary.Unknown) unknown-version" }
     if ($summary.TechnologyBlocked) { $notes += "$($summary.TechnologyBlocked) install-technology blocked" }
     if ($summary.ScopeBlocked.Count) { $notes += "$($summary.ScopeBlocked.Count) elevation-scope blocked" }
     if ($summary.PortableModified.Count) { $notes += "$($summary.PortableModified.Count) portable-modified" }
+    if ($summary.DownloadUnavailable.Count) { $notes += "$($summary.DownloadUnavailable.Count) installer download unavailable" }
     if ($notes.Count) { Write-Log "Winget ${Scope}: deferred inventory — $($notes -join ', ')." -Level Warn }
     <# Record the observation in cycle state so the pass that finishes the cycle can qualify
        its completion claim (ADR-0003). This runs on every canonical scope summary, so a
@@ -2025,7 +2054,7 @@ function Set-BootUpdateRebootCheckpoint {
     $phaseFlags = @(
         'WingetDone','ChocolateyDone','SsmsDone','WindowsUpdateDone','AwsToolingDone','PipDone','NpmDone',
         'Office365Done','PowerShellModulesDone','ScoopDone','DotnetToolsDone','VscodeDone',
-        'DefenderDone','DriverFirmwareDone','WslDone','ContainersDone'
+        'DefenderDone','DriverFirmwareDone','WslDone','ContainersDone','AiToolsDone'
     )
     $completedFlags = @($phaseFlags | Where-Object { [bool]$State.$_ })
     $State.LastRebootSignals = $SignalKey
@@ -2061,7 +2090,7 @@ function Get-BootUpdateProgressFingerprint {
     $phaseFlags = @(
         'WingetDone','ChocolateyDone','SsmsDone','WindowsUpdateDone','AwsToolingDone','PipDone','NpmDone',
         'Office365Done','PowerShellModulesDone','ScoopDone','DotnetToolsDone','VscodeDone',
-        'DefenderDone','DriverFirmwareDone','WslDone','ContainersDone'
+        'DefenderDone','DriverFirmwareDone','WslDone','ContainersDone','AiToolsDone'
     )
     [string[]]$completed = @($phaseFlags | Where-Object { [bool]$State.$_ })
     [Array]::Sort($completed, [StringComparer]::Ordinal)
@@ -2331,6 +2360,7 @@ function New-BootUpdateStateV2 {
         DriverFirmwareDone    = $false
         WslDone               = $false
         ContainersDone        = $false
+        AiToolsDone           = $false
         LastPreflightNetworkOk = $null
         LastPreflightNetworkAt = $null
         LastRebootSignals     = $null
@@ -2364,7 +2394,7 @@ function New-BootUpdateStateV2 {
         Summary               = [pscustomobject]@{
             Winget = 0; Chocolatey = 0; Ssms = 0; WindowsUpdate = 0; Pip = 0; Npm = 0; Office365 = 0
             PowerShellModules = 0; Scoop = 0; DotnetTools = 0; Vscode = 0
-            Defender = 0; DriverFirmware = 0; Wsl = 0; Containers = 0
+            Defender = 0; DriverFirmware = 0; Wsl = 0; Containers = 0; AiTools = 0
             HealthFailed = 0; ActionsTriggered = 0
         }
     }
@@ -2445,7 +2475,7 @@ function Update-BootUpdateStateSchema {
     if ($props -notcontains 'UnobservedStops') { $State | Add-Member -NotePropertyName 'UnobservedStops' -NotePropertyValue @() -Force }
     else { $State.UnobservedStops = @($State.UnobservedStops | Where-Object { $null -ne $_ }) }
     if ($props -notcontains 'WindowsUpdateZeroEvidence') { $State | Add-Member -NotePropertyName 'WindowsUpdateZeroEvidence' -NotePropertyValue $null -Force }
-    foreach ($f in @('SsmsDone','WindowsUpdateDone','AwsToolingDone','PowerShellModulesDone','ScoopDone','DotnetToolsDone','VscodeDone','DefenderDone','DriverFirmwareDone','WslDone','ContainersDone')) {
+    foreach ($f in @('SsmsDone','WindowsUpdateDone','AwsToolingDone','PowerShellModulesDone','ScoopDone','DotnetToolsDone','VscodeDone','DefenderDone','DriverFirmwareDone','WslDone','ContainersDone','AiToolsDone')) {
         if ($props -notcontains $f) { $State | Add-Member -NotePropertyName $f -NotePropertyValue $false -Force }
     }
 
@@ -2464,7 +2494,7 @@ function Update-BootUpdateStateSchema {
         $State.Summary = [pscustomobject]@{
             Winget = 0; Chocolatey = 0; Ssms = 0; WindowsUpdate = 0; Pip = 0; Npm = 0; Office365 = 0
             PowerShellModules = 0; Scoop = 0; DotnetTools = 0; Vscode = 0
-            Defender = 0; DriverFirmware = 0; Wsl = 0; Containers = 0
+            Defender = 0; DriverFirmware = 0; Wsl = 0; Containers = 0; AiTools = 0
             HealthFailed = 0; ActionsTriggered = 0
         }
     } elseif ($State.Summary -is [hashtable]) {
@@ -2478,11 +2508,12 @@ function Update-BootUpdateStateSchema {
             DotnetTools = [int]($ht['DotnetTools'] ?? 0); Vscode = [int]($ht['Vscode'] ?? 0)
             Defender = [int]($ht['Defender'] ?? 0); DriverFirmware = [int]($ht['DriverFirmware'] ?? 0)
             Wsl = [int]($ht['Wsl'] ?? 0); Containers = [int]($ht['Containers'] ?? 0)
+            AiTools = [int]($ht['AiTools'] ?? 0)
             HealthFailed = [int]($ht['HealthFailed'] ?? 0); ActionsTriggered = [int]($ht['ActionsTriggered'] ?? 0)
         }
     } else {
         $sp = $State.Summary.PSObject.Properties.Name
-        foreach ($k in @('Ssms','PowerShellModules','Scoop','DotnetTools','Vscode','Defender','DriverFirmware','Wsl','Containers')) {
+        foreach ($k in @('Ssms','PowerShellModules','Scoop','DotnetTools','Vscode','Defender','DriverFirmware','Wsl','Containers','AiTools')) {
             if ($sp -notcontains $k) { $State.Summary | Add-Member -NotePropertyName $k -NotePropertyValue 0 -Force }
         }
         if ($null -eq $State.Summary.HealthFailed) {
@@ -2632,7 +2663,7 @@ function Test-CrashRecovery {
         Winget='WingetDone'; Chocolatey='ChocolateyDone'; Ssms='SsmsDone'; WindowsUpdate='WindowsUpdateDone'
         AwsTooling='AwsToolingDone'; Pip='PipDone'; Npm='NpmDone'; Office365='Office365Done'
         PowerShellModules='PowerShellModulesDone'; Scoop='ScoopDone'; DotnetTools='DotnetToolsDone'; Vscode='VscodeDone'
-        Defender='DefenderDone'; DriverFirmware='DriverFirmwareDone'; Wsl='WslDone'; Containers='ContainersDone'
+        Defender='DefenderDone'; DriverFirmware='DriverFirmwareDone'; Wsl='WslDone'; Containers='ContainersDone'; AiTools='AiToolsDone'
     }
     <# 'ParallelCohort' is one durable sentinel for the whole cohort. A killed cohort must
        consume one retry for the resumed pass, while the individual *Done flags continue to
@@ -2678,6 +2709,11 @@ function Test-CrashRecovery {
                    because the previous pass stopped at the limit on purpose, not because it
                    died; charging here would spend the newly granted retry before it ran. #>
                 Write-Log "Previous pass stopped at a safety limit during [$($State.LastPhaseStarted)] at [$time] and the limit was raised; nothing crashed. Re-running that phase." -Level Info
+            }
+            'ResumeAfterAttention' {
+                <# Same reasoning: the stop was deliberate. Charging it read as "Recovery pass 2
+                   of 5 after an unobserved stop" on the first pass the operator asked for. #>
+                Write-Log "Previous pass stopped for manual attention during [$($State.LastPhaseStarted)] at [$time] and was resumed by the operator; nothing crashed. Re-running that phase." -Level Info
             }
             default {
                 $alreadyChargedThisPass = @($State.UnobservedStops | Where-Object {
@@ -5539,8 +5575,15 @@ function Get-WindowsUpdateReofferedAfterSuccess {
     $since = & $asUtc $SinceUtc
     $succeeded = @($History | Where-Object { $_ -and [int]$_.ResultCode -eq 2 -and
         (& $asUtc $_.InstalledAt) -ge $since })
+    <# Match without the "(Version ...)" suffix. Defender security intelligence (KB2267602) is
+       republished every few hours under the same KB with a new version in its title: the
+       install step already skips it by KB once it succeeded in this run, so an exact-title
+       match here read the newer copy as outstanding work and retried it until the same-boot
+       recovery limit stopped the cycle. #>
+    $identityOf = { param($Title) ([string]$Title -replace '\s*\(Version [^)]*\)', '').Trim() }
     $records = foreach ($title in @($Applicable | Where-Object { $_ })) {
-        $installs = @($succeeded | Where-Object { [string]$_.Title -eq [string]$title })
+        $identity = & $identityOf $title
+        $installs = @($succeeded | Where-Object { (& $identityOf $_.Title) -eq $identity })
         if (-not $installs.Count) { continue }
         $latest = ($installs | Sort-Object { [datetime]$_.InstalledAt } | Select-Object -Last 1)
         $kb = if ($title -match '(?i)\b(KB\d{6,7})\b') { $Matches[1] } else { $null }
@@ -6184,23 +6227,264 @@ function Update-PipPackages {
     return @{ Success = (-not $failed); Count = $count }
 }
 
+function Invoke-NpmGlobalUpdate {
+    <# Updates outdated npm global packages one at a time. A single `npm update -g` is one
+       transaction: when a running program holds a package's files (an MCP server or CLI that
+       is open), the rename fails with EBUSY and every other package stays old too, and the
+       same-boot retries cannot succeed while the program runs. One package per call isolates
+       that package, which is recorded as deferred by name instead of failing the phase.
+       Self-contained so the parallel cohort can run it from its definition in a thread job.
+       Returns @{ Success; Count; LogLines; Deferred }. #>
+    param([Parameter(Mandatory)][string]$NpmPath, [switch]$IsWhatIf)
+    $log = [System.Collections.Generic.List[string]]::new()
+    $deferred = [System.Collections.Generic.List[object]]::new()
+    $log.Add('Updating npm global packages...')
+    if ($IsWhatIf) {
+        $log.Add('  [WHATIF] Would run: npm update -g <package> for each outdated global package')
+        return @{ Success = $true; Count = 0; LogLines = $log.ToArray(); Deferred = @() }
+    }
+    <# npm outdated exits 1 whenever something is outdated; the JSON is the evidence. #>
+    $outdatedText = (@(& $NpmPath outdated -g --json 2>$null) -join "`n").Trim()
+    try {
+        $outdated = if ($outdatedText) { $outdatedText | ConvertFrom-Json -AsHashtable -ErrorAction Stop } else { @{} }
+    } catch {
+        $log.Add("[Error] npm outdated -g returned unreadable output: $($_.Exception.Message)")
+        return @{ Success = $false; Count = 0; LogLines = $log.ToArray(); Deferred = @() }
+    }
+    $names = @($outdated.Keys | Sort-Object)
+    if ($names.Count -eq 0) {
+        $log.Add('npm: global packages are current.')
+        return @{ Success = $true; Count = 0; LogLines = $log.ToArray(); Deferred = @() }
+    }
+    $count = 0; $success = $true
+    foreach ($name in $names) {
+        $lines = @(& $NpmPath update -g $name 2>&1 | ForEach-Object { "$_" })
+        $exitCode = $LASTEXITCODE
+        foreach ($line in $lines) { $log.Add($line) }
+        if ($exitCode -eq 0) { $count++; continue }
+        $locked = @($lines | Where-Object { $_ -match '\bnpm (error|ERR!) code (EBUSY|EPERM)\b' }).Count -gt 0 -and
+            @($lines | Where-Object { $_ -match 'resource busy or locked|syscall (rename|unlink|rmdir)' }).Count -gt 0
+        if ($locked) {
+            $deferred.Add([pscustomobject]@{ Kind = 'in-use'; Count = 1; Detail = "$name (close the program using it, then run: npm update -g $name)" })
+            $log.Add("[Warn] npm: $name is in use by a running program and was left at its current version. Close that program, then run: npm update -g $name")
+            continue
+        }
+        $success = $false
+        $log.Add("[Error] npm update -g $name exited with code $exitCode")
+    }
+    $log.Add("npm: $count package(s) updated.")
+    return @{ Success = $success; Count = $count; LogLines = $log.ToArray(); Deferred = $deferred.ToArray() }
+}
+
+function Invoke-ScoopUpdate {
+    <# Refreshes Scoop buckets, then updates every app. Scoop reports through Write-Host (the
+       information stream), so capturing only 2>&1 kept none of its output and every run
+       logged "0 package(s) updated" whatever Scoop did. Scoop also refuses to update an app
+       while one of its processes runs; that app is recorded as deferred by name rather than
+       retried in the same boot. Bucket changelog lines are dropped: they list every manifest
+       change in the bucket, not what this machine installed.
+       Self-contained so the parallel cohort can run it from its definition in a thread job.
+       Returns @{ Success; Count; LogLines; Deferred }. #>
+    param([Parameter(Mandatory)][string]$ScoopPath, [switch]$IsWhatIf)
+    $log = [System.Collections.Generic.List[string]]::new()
+    $deferred = [System.Collections.Generic.List[object]]::new()
+    $log.Add('Updating Scoop...')
+    if ($IsWhatIf) {
+        $log.Add('  [WHATIF] Would run: scoop update && scoop update *')
+        return @{ Success = $true; Count = 0; LogLines = $log.ToArray(); Deferred = @() }
+    }
+    $toText = { param($Item) ([string]$Item) -replace "$([char]27)\[[0-9;]*m", '' }
+    $success = $true
+    $metaLines = @(& $ScoopPath update *>&1 | ForEach-Object { & $toText $_ })
+    $metaExit = $LASTEXITCODE
+    foreach ($line in $metaLines) {
+        if ($line -match '^\s*\*\s+[0-9a-f]{7,}\s') { continue }
+        if (-not [string]::IsNullOrWhiteSpace($line)) { $log.Add($line) }
+    }
+    if ($metaExit -ne 0) { $success = $false; $log.Add("[Error] Scoop metadata update exited with code $metaExit") }
+
+    $log.Add('Updating all Scoop packages...')
+    $count = 0
+    $appLines = @(& $ScoopPath update '*' *>&1 | ForEach-Object { & $toText $_ })
+    $appExit = $LASTEXITCODE
+    foreach ($line in $appLines) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        if ($line -match "^Updating '[^']+' \(\S+ -> \S+\)" -or $line -match '^\s*\S+:\s+\S+\s+->\s+\S+') { $count++ }
+        if ($line -match 'instances of "([^"]+)" are still running') {
+            $app = $Matches[1]
+            $deferred.Add([pscustomobject]@{ Kind = 'in-use'; Count = 1; Detail = "$app (close it, then run: scoop update $app)" })
+            $log.Add("[Warn] Scoop: $app is running and was left at its current version. Close it, then run: scoop update $app")
+            continue
+        }
+        $log.Add($line)
+    }
+    $otherErrors = @($appLines | Where-Object { $_ -match '^ERROR ' -and $_ -notmatch 'are still running' })
+    if ($appExit -ne 0 -and ($otherErrors.Count -gt 0 -or $deferred.Count -eq 0)) {
+        $success = $false
+        $log.Add("[Error] Scoop package update exited with code $appExit")
+    }
+    $log.Add("Scoop: $count package(s) updated.")
+    return @{ Success = $success; Count = $count; LogLines = $log.ToArray(); Deferred = $deferred.ToArray() }
+}
+
+function Invoke-AiToolSelfUpdate {
+    <# Updates AI command-line tools whose own updater is the supported upgrade path and that
+       no package-manager phase owns: Claude Code's native install (under ~\.local\bin) and
+       Hermes Agent. Winget, npm and Scoop installs of these tools are left to those phases.
+       Versions are read before and after, so the count is what changed rather than what an
+       updater printed. A Hermes install whose environment is held by a running gateway or
+       desktop backend is deferred by name; forcing past its guard can strand it half-updated.
+       Self-contained so the parallel cohort can run it from its definition in a thread job.
+       Returns @{ Success; Count; LogLines; Deferred }. #>
+    param([string]$ClaudePath = '', [string]$HermesPath = '', [string]$UserProfile = $env:USERPROFILE, [switch]$IsWhatIf)
+    $log = [System.Collections.Generic.List[string]]::new()
+    $deferred = [System.Collections.Generic.List[object]]::new()
+    $count = 0; $success = $true
+    $versionOf = { param($Path) "$(@(& $Path --version 2>$null)[0])".Trim() }
+
+    $nativeClaude = $ClaudePath -and $UserProfile -and
+        $ClaudePath.StartsWith((Join-Path $UserProfile '.local\bin'), [System.StringComparison]::OrdinalIgnoreCase)
+    if ($ClaudePath -and -not $nativeClaude) {
+        $log.Add("Claude Code: installed by a package manager ($ClaudePath); that provider updates it.")
+    } elseif ($nativeClaude) {
+        if ($IsWhatIf) { $log.Add('  [WHATIF] Would run: claude update') }
+        else {
+            $before = & $versionOf $ClaudePath
+            $lines = @(& $ClaudePath update 2>&1 | ForEach-Object { "$_" })
+            $exitCode = $LASTEXITCODE
+            $after = & $versionOf $ClaudePath
+            if ($exitCode -ne 0) {
+                foreach ($line in $lines) { $log.Add($line) }
+                $success = $false
+                $log.Add("[Error] claude update exited with code $exitCode")
+            } elseif ($before -ne $after) {
+                $count++
+                $log.Add("Claude Code: updated $before -> $after.")
+            } else {
+                $log.Add("Claude Code: current ($after).")
+            }
+        }
+    }
+
+    if ($HermesPath) {
+        if ($IsWhatIf) { $log.Add('  [WHATIF] Would run: hermes update --yes') }
+        else {
+            $check = @(& $HermesPath update --check 2>&1 | ForEach-Object { "$_" })
+            $checkExit = $LASTEXITCODE
+            if ($checkExit -ne 0) {
+                foreach ($line in $check) { $log.Add($line) }
+                $success = $false
+                $log.Add("[Error] hermes update --check exited with code $checkExit")
+            } elseif (-not @($check | Where-Object { $_ -match '(?i)update available' }).Count) {
+                $log.Add("Hermes Agent: current ($(& $versionOf $HermesPath)).")
+            } else {
+                $null = & $HermesPath update --list-venv-holders 2>$null
+                if ($LASTEXITCODE -eq 3) {
+                    $deferred.Add([pscustomobject]@{ Kind = 'in-use'; Count = 1; Detail = 'Hermes Agent (stop its gateway or desktop app, then run: hermes update)' })
+                    $log.Add('[Warn] Hermes Agent: an update is available but its gateway or desktop app is running, so it was left as is. Stop it, then run: hermes update')
+                } else {
+                    $before = & $versionOf $HermesPath
+                    $lines = @(& $HermesPath update --yes 2>&1 | ForEach-Object { "$_" })
+                    $exitCode = $LASTEXITCODE
+                    $after = & $versionOf $HermesPath
+                    if ($exitCode -ne 0) {
+                        foreach ($line in $lines) { $log.Add($line) }
+                        $success = $false
+                        $log.Add("[Error] hermes update exited with code $exitCode")
+                    } else {
+                        if ($before -ne $after) {
+                            $count++
+                            $log.Add("Hermes Agent: updated $before -> $after.")
+                        } else {
+                            $log.Add("Hermes Agent: update finished; version unchanged ($after).")
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (-not $ClaudePath -and -not $HermesPath) { $log.Add('AI tools: no self-updating CLI found (Claude Code native install, Hermes Agent).') }
+    return @{ Success = $success; Count = $count; LogLines = $log.ToArray(); Deferred = $deferred.ToArray() }
+}
+
+function New-BootUpdateProviderCoreScript {
+    <# Wraps a self-contained provider core (Invoke-NpmGlobalUpdate, Invoke-ScoopUpdate,
+       Invoke-AiToolSelfUpdate) for Invoke-BootUpdateBackgroundOperation, so the staged path
+       keeps the child-process timeout and progress pump. The core's result comes back as
+       one BOOTUPDATE_RESULT JSON line. #>
+    param([Parameter(Mandatory)][string]$Function)
+    $definition = (Get-Command $Function -CommandType Function).Definition
+    return [scriptblock]::Create(@"
+param(`$Parameters)
+function $Function {
+$definition
+}
+`$splat = @{}
+foreach (`$property in `$Parameters.PSObject.Properties) { `$splat[`$property.Name] = `$property.Value }
+`$result = $Function @splat
+'BOOTUPDATE_RESULT|' + (`$result | ConvertTo-Json -Depth 5 -Compress)
+"@)
+}
+
+function ConvertFrom-BootUpdateProviderCoreOutput {
+    <# Reads the BOOTUPDATE_RESULT line written by a New-BootUpdateProviderCoreScript run. A
+       missing line (timeout, crash) is a failed phase with whatever output the child left. #>
+    param([Parameter(Mandatory)][hashtable]$Run, [Parameter(Mandatory)][string]$Name)
+    $line = @($Run.Output | Where-Object { "$_" -like 'BOOTUPDATE_RESULT|*' }) | Select-Object -Last 1
+    if ($Run.TimedOut -or -not $line) {
+        $reason = if ($Run.TimedOut) { 'timed out' } else { 'stopped without a result' }
+        return @{ Success = $false; Count = 0; Deferred = @()
+            LogLines = @(@($Run.Output | ForEach-Object { "$_" }) + "[Error] $Name $reason.") }
+    }
+    $result = ([string]$line).Substring('BOOTUPDATE_RESULT|'.Length) | ConvertFrom-Json
+    return @{ Success = [bool]$result.Success; Count = [int]$result.Count
+        LogLines = @($result.LogLines); Deferred = @($result.Deferred | Where-Object { $_ }) }
+}
+
+function Update-AiTools {
+    [CmdletBinding(SupportsShouldProcess)]
+    param()
+    if ([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value -eq 'S-1-5-18') {
+        Write-Log 'AI tools skipped: SYSTEM context (user-scoped).' -Level Warn
+        return @{ Success = $true; Count = 0 }
+    }
+    $parameters = [pscustomobject]@{
+        ClaudePath = [string](Get-Command claude -CommandType Application -EA SilentlyContinue | Select-Object -First 1).Source
+        HermesPath = [string](Get-Command hermes -CommandType Application -EA SilentlyContinue | Select-Object -First 1).Source
+        IsWhatIf   = -not $PSCmdlet.ShouldProcess('AI tools', 'Run claude update and hermes update')
+    }
+    $run = Invoke-BootUpdateBackgroundOperation -Name 'Updating AI tools' -Status 'claude update / hermes update is running' `
+        -TimeoutMinutes $script:PackageTimeoutMinutes -ScriptBlock (New-BootUpdateProviderCoreScript -Function 'Invoke-AiToolSelfUpdate') `
+        -ArgumentList @($parameters)
+    $result = ConvertFrom-BootUpdateProviderCoreOutput -Run $run -Name 'AI tools update'
+    Write-BootUpdateResultLines -Lines $result.LogLines
+    Add-BootUpdateDeferredInventory -State $script:CurrentState -Provider 'AiTools' -Scope 'user' -Records @($result.Deferred)
+    return @{ Success = $result.Success; Count = $result.Count }
+}
+
+function Write-BootUpdateResultLines {
+    <# Replays log lines collected away from the parent thread. A leading [Warn] or [Error]
+       tag sets the level and is removed. #>
+    param([string[]]$Lines = @())
+    foreach ($line in $Lines) {
+        $level = if ($line -match '^\[Warn\]') { 'Warn' } elseif ($line -match '^\[Error\]') { 'Error' } else { 'Info' }
+        Write-Log ($line -replace '^\[(Warn|Error)\]\s*', '') -Level $level
+    }
+}
+
 function Update-NpmPackages {
     [CmdletBinding(SupportsShouldProcess)]
     param()
     $npm = Get-Command npm -EA SilentlyContinue
     if (-not $npm) { Write-Log 'npm not found, skipping.' -Level Warn; return @{ Success = $true; Count = 0 } }
-    Write-Log 'Updating npm global packages...'
-    $count = 0
-    if ($PSCmdlet.ShouldProcess('npm', 'Run npm update -g')) {
-        $result = Invoke-BootUpdateBackgroundOperation -Name 'Updating npm packages' `
-            -Status 'npm update -g is running' -TimeoutMinutes $script:PackageTimeoutMinutes `
-            -ScriptBlock { param($Path) & $Path update -g 2>&1 } -ArgumentList @($npm.Source)
-        $result.Output | ForEach-Object { if ($_ -match 'added|updated') { $count++ }; Write-Log $_ }
-        if ($result.Failed -or $result.TimedOut) { Write-Log 'npm update failed or timed out.' -Level Error; return @{ Success = $false; Count = $count } }
-    } else {
-        Write-Log '  [WHATIF] Would run: npm update -g'
-    }
-    return @{ Success = $true; Count = $count }
+    $parameters = [pscustomobject]@{ NpmPath = $npm.Source; IsWhatIf = -not $PSCmdlet.ShouldProcess('npm', 'Update outdated global packages') }
+    $run = Invoke-BootUpdateBackgroundOperation -Name 'Updating npm packages' -Status 'npm global package updates are running' `
+        -TimeoutMinutes $script:PackageTimeoutMinutes -ScriptBlock (New-BootUpdateProviderCoreScript -Function 'Invoke-NpmGlobalUpdate') `
+        -ArgumentList @($parameters)
+    $result = ConvertFrom-BootUpdateProviderCoreOutput -Run $run -Name 'npm update'
+    Write-BootUpdateResultLines -Lines $result.LogLines
+    Add-BootUpdateDeferredInventory -State $script:CurrentState -Provider 'Npm' -Scope 'user' -Records @($result.Deferred)
+    return @{ Success = $result.Success; Count = $result.Count }
 }
 
 function Update-Office365 {
@@ -6407,34 +6691,14 @@ function Update-ScoopPackages {
     if ($isSystem) { Write-Log 'Scoop skipped: SYSTEM context (user-scoped).' -Level Warn; return @{ Success = $true; Count = 0 } }
     $scoop = Get-Command scoop -EA SilentlyContinue
     if (-not $scoop) { Write-Log 'Scoop not found, skipping.' -Level Warn; return @{ Success = $true; Count = 0 } }
-    Write-Log 'Updating Scoop...'
-    if ($PSCmdlet.ShouldProcess('Scoop', 'Run scoop update and scoop update *')) {
-        try {
-            $scoopSelf = Invoke-BootUpdateBackgroundOperation -Name 'Updating Scoop' `
-                -Status 'Scoop metadata update is running' -TimeoutMinutes $script:PackageTimeoutMinutes `
-                -ScriptBlock { param($Path) & $Path update 2>&1 } -ArgumentList @($scoop.Source)
-            $scoopSelf.Output | ForEach-Object { Write-Log $_ }
-            if ($scoopSelf.Failed -or $scoopSelf.TimedOut) {
-                Write-Log 'Scoop metadata update failed or timed out.' -Level Error
-                return @{ Success = $false; Count = 0 }
-            }
-            Write-Log 'Updating all Scoop packages...'
-            $count = 0
-            $result = Invoke-BootUpdateBackgroundOperation -Name 'Updating Scoop packages' `
-                -Status 'Scoop package updates are running' -TimeoutMinutes $script:PackageTimeoutMinutes `
-                -ScriptBlock { param($Path) & $Path update '*' 2>&1 } -ArgumentList @($scoop.Source)
-            $result.Output | ForEach-Object {
-                if ($_ -match '^\s*\S+:\s+\S+\s+->\s+\S+') { $count++ }
-                Write-Log $_
-            }
-            if ($result.Failed -or $result.TimedOut) { Write-Log 'Scoop package updates failed or timed out.' -Level Error; return @{ Success = $false; Count = $count } }
-            Write-Log "Scoop: $count package(s) updated."
-            return @{ Success = $true; Count = $count }
-        } catch { Write-Log "Scoop error: $_" -Level Error; return @{ Success = $false; Count = 0 } }
-    } else {
-        Write-Log '  [WHATIF] Would run: scoop update && scoop update *'
-        return @{ Success = $true; Count = 0 }
-    }
+    $parameters = [pscustomobject]@{ ScoopPath = $scoop.Source; IsWhatIf = -not $PSCmdlet.ShouldProcess('Scoop', 'Run scoop update and scoop update *') }
+    $run = Invoke-BootUpdateBackgroundOperation -Name 'Updating Scoop' -Status 'Scoop bucket and app updates are running' `
+        -TimeoutMinutes $script:PackageTimeoutMinutes -ScriptBlock (New-BootUpdateProviderCoreScript -Function 'Invoke-ScoopUpdate') `
+        -ArgumentList @($parameters)
+    $result = ConvertFrom-BootUpdateProviderCoreOutput -Run $run -Name 'Scoop update'
+    Write-BootUpdateResultLines -Lines $result.LogLines
+    Add-BootUpdateDeferredInventory -State $script:CurrentState -Provider 'Scoop' -Scope 'user' -Records @($result.Deferred)
+    return @{ Success = $result.Success; Count = $result.Count }
 }
 
 function Update-DotnetTools {
@@ -7039,6 +7303,7 @@ function Register-BootUpdateTaskForReboot {
     if ($script:SkipAwsTooling)       { $taskArgs += '-SkipAwsTooling' }
     if ($script:SkipPowerShellModules){ $taskArgs += '-SkipPowerShellModules' }
     if ($script:SkipScoop)            { $taskArgs += '-SkipScoop' }
+    if ($script:SkipAiTools)          { $taskArgs += '-SkipAiTools' }
     if ($script:SkipDotnetTools)      { $taskArgs += '-SkipDotnetTools' }
     if ($script:SkipVscode)           { $taskArgs += '-SkipVscode' }
     if ($script:SkipDefender)         { $taskArgs += '-SkipDefender' }
@@ -8309,7 +8574,7 @@ function Apply-RemoteConfig {
         'ExcludePatterns', 'IncludePatterns', 'NotificationLevel',
         'MaxIterations', 'MaxRetryPasses', 'RebootDelaySec', 'PackageTimeoutMinutes',
         'MaintenanceWindowStart', 'MaintenanceWindowEnd',
-        'SkipPip', 'SkipNpm', 'SkipScoop', 'SkipDotnetTools', 'SkipVscode',
+        'SkipPip', 'SkipNpm', 'SkipScoop', 'SkipAiTools', 'SkipDotnetTools', 'SkipVscode',
         'SkipPowerShellModules', 'SkipOffice365', 'SkipSsms', 'SkipAwsTooling',
         'SkipDefender', 'SkipBitLocker', 'SkipRestorePoint', 'SkipHealthCheck',
         'IncludeDriverUpdates', 'IncludeFirmwareUpdates',
@@ -8387,6 +8652,7 @@ function Get-BootUpdateLaunchContract {
         if ($script:SkipAwsTooling)        { 'AWS' }
         if ($script:SkipPowerShellModules) { 'PowerShellModules' }
         if ($script:SkipScoop)             { 'Scoop' }
+        if ($script:SkipAiTools)           { 'AiTools' }
         if ($script:SkipDotnetTools)       { 'DotnetTools' }
         if ($script:SkipVscode)            { 'VSCode' }
         if ($script:SkipDefender)          { 'Defender' }
@@ -8441,11 +8707,11 @@ function Invoke-BootUpdateCycle {
         try { if (-not $WhatIfPreference) { Unregister-BootUpdateTask } }
         catch { $tasksDisarmed = $false; Write-Log "Manual-attention checkpoint task cleanup still needs attention: $_" -Level Error }
         $disposition = if ($tasksDisarmed) { 'Continuation tasks are verified absent.' } else { 'A continuation task may still be armed; manual removal is required.' }
-        Write-Log "Manual-attention checkpoint remains stopped. Rerun with -ResumeAfterAttention only after reviewing and fixing the recorded failure. $disposition" -Level Error
+        Write-Log "Manual-attention checkpoint remains stopped. Run upd to start a fresh cycle, or upd run -ResumeAfterAttention to continue this one. $disposition" -Level Error
         Show-CycleBanner -Title 'A T T E N T I O N   S T I L L   R E Q U I R E D' -AnsiColor "$([char]27)[31m" -Info @(
             $state.LimitReason
-            'Review and fix the recorded provider failure before resuming.'
-            'To resume deliberately: upd run -ResumeAfterAttention'
+            'Start a fresh cycle: upd'
+            'Continue this cycle after fixing the failure: upd run -ResumeAfterAttention'
             $disposition
             "Diagnostic state preserved: $($script:StatePath)"
         )
@@ -8463,8 +8729,9 @@ function Invoke-BootUpdateCycle {
         $limitGuidance = if ($terminalLimit.LegacyTotalReboot) {
             "This checkpoint was stopped by the pre-v2.5.86 total reboot limit and stays stopped. Review its log, then rerun with -MaxIterations greater than $($state.RebootCount) to resume under the no-progress limit."
         } else {
-            'Review the preserved evidence before raising the stalled-reboot or retry limit.'
+            'Run upd to start a fresh cycle.'
         }
+        Write-Log "Stopped checkpoint left unchanged: $($state.LimitReason) $limitGuidance" -Level Error
         Show-CycleBanner -Title 'A T T E N T I O N   S T I L L   R E Q U I R E D' -AnsiColor "$([char]27)[31m" -Info @(
             $(if ($terminalLimit.LegacyTotalReboot) { $limitGuidance } else { $state.LimitReason })
             $(if ($tasksDisarmed) { 'Continuation tasks are verified absent.' } else { 'A continuation task may still be armed; manual removal is required.' })
@@ -8693,6 +8960,7 @@ function Invoke-BootUpdateCycle {
         @{ Name='Pip';               Flag='PipDone';               Key='Pip';               Skip=[bool]$SkipPip;                              Action={ Update-PipPackages } }
         @{ Name='Npm';               Flag='NpmDone';               Key='Npm';               Skip=[bool]$SkipNpm;                              Action={ Update-NpmPackages } }
         @{ Name='Scoop';             Flag='ScoopDone';             Key='Scoop';             Skip=[bool]$SkipScoop; Defer=$isSystemCtx; UserCompletionDeferred=$isSystemCtx; Action={ Update-ScoopPackages } }
+        @{ Name='AiTools';           Flag='AiToolsDone';           Key='AiTools';           Skip=[bool]$SkipAiTools; Defer=$isSystemCtx; UserCompletionDeferred=$isSystemCtx; Action={ Update-AiTools } }
         @{ Name='DotnetTools';       Flag='DotnetToolsDone';       Key='DotnetTools';       Skip=[bool]$SkipDotnetTools;                      Action={ Update-DotnetTools } }
         @{ Name='Vscode';            Flag='VscodeDone';            Key='Vscode';            Skip=[bool]$SkipVscode; Defer=$isSystemCtx; UserCompletionDeferred=$isSystemCtx; Action={ Update-VscodeExtensions } }
         @{ Name='Defender';          Flag='DefenderDone';          Key='Defender';          Skip=[bool]$SkipDefender;                         Action={ Update-DefenderSignatures } }
@@ -8943,49 +9211,45 @@ function Invoke-BootUpdateCycle {
                 return @{ Phase='Pip'; Success=$success; Count=$count; LogLines=$log.ToArray() }
             }
 
+            $npmDefinition = (Get-Command Invoke-NpmGlobalUpdate).Definition
             $npmSb = {
-                param($IsWhatIf)
-                $log = [System.Collections.Generic.List[string]]::new()
-                $count = 0; $success = $true
+                param($IsWhatIf, $NpmDefinition)
                 $npm = Get-Command npm -ErrorAction SilentlyContinue
-                if (-not $npm) { $log.Add('[Warn] npm not found, skipping.'); return @{ Phase='Npm'; Success=$true; Count=0; LogLines=$log.ToArray() } }
-                $log.Add('Updating npm global packages...')
-                if ($IsWhatIf) {
-                    $log.Add('  [WHATIF] Would run: npm update -g')
-                    return @{ Phase='Npm'; Success=$true; Count=0; LogLines=$log.ToArray() }
-                }
+                if (-not $npm) { return @{ Phase='Npm'; Success=$true; Count=0; LogLines=@('[Warn] npm not found, skipping.') } }
                 try {
-                    & npm update -g 2>&1 | ForEach-Object { if ($_ -match 'added|updated') { $count++ }; $log.Add($_.ToString()) }
-                    if ($LASTEXITCODE -ne 0) { $success = $false; $log.Add("[Error] npm update exited with code $LASTEXITCODE") }
-                } catch { $success = $false; $log.Add("[Error] npm: $_") }
-                return @{ Phase='Npm'; Success=$success; Count=$count; LogLines=$log.ToArray() }
+                    . ([scriptblock]::Create("function Invoke-NpmGlobalUpdate {`n$NpmDefinition`n}"))
+                    $r = Invoke-NpmGlobalUpdate -NpmPath $npm.Source -IsWhatIf:$IsWhatIf
+                    return @{ Phase='Npm'; Success=$r.Success; Count=$r.Count; LogLines=$r.LogLines; Deferred=$r.Deferred }
+                } catch { return @{ Phase='Npm'; Success=$false; Count=0; LogLines=@("[Error] npm: $_") } }
             }
 
+            $scoopDefinition = (Get-Command Invoke-ScoopUpdate).Definition
             $scoopSb = {
-                param($IsWhatIf)
-                $log = [System.Collections.Generic.List[string]]::new()
-                $count = 0; $success = $true
+                param($IsWhatIf, $ScoopDefinition)
                 $isSystem = ([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value -eq 'S-1-5-18')
-                if ($isSystem) { $log.Add('[Warn] Scoop skipped: SYSTEM context (user-scoped).'); return @{ Phase='Scoop'; Success=$true; Count=0; LogLines=$log.ToArray() } }
+                if ($isSystem) { return @{ Phase='Scoop'; Success=$true; Count=0; LogLines=@('[Warn] Scoop skipped: SYSTEM context (user-scoped).') } }
                 $scoop = Get-Command scoop -ErrorAction SilentlyContinue
-                if (-not $scoop) { $log.Add('[Warn] Scoop not found, skipping.'); return @{ Phase='Scoop'; Success=$true; Count=0; LogLines=$log.ToArray() } }
-                $log.Add('Updating Scoop...')
-                if ($IsWhatIf) {
-                    $log.Add('  [WHATIF] Would run: scoop update && scoop update *')
-                    return @{ Phase='Scoop'; Success=$true; Count=0; LogLines=$log.ToArray() }
+                if (-not $scoop) { return @{ Phase='Scoop'; Success=$true; Count=0; LogLines=@('[Warn] Scoop not found, skipping.') } }
+                try {
+                    . ([scriptblock]::Create("function Invoke-ScoopUpdate {`n$ScoopDefinition`n}"))
+                    $r = Invoke-ScoopUpdate -ScoopPath $scoop.Source -IsWhatIf:$IsWhatIf
+                    return @{ Phase='Scoop'; Success=$r.Success; Count=$r.Count; LogLines=$r.LogLines; Deferred=$r.Deferred }
+                } catch { return @{ Phase='Scoop'; Success=$false; Count=0; LogLines=@("[Error] Scoop: $_") } }
+            }
+
+            $aiToolsDefinition = (Get-Command Invoke-AiToolSelfUpdate).Definition
+            $aiToolsSb = {
+                param($IsWhatIf, $AiToolsDefinition)
+                if ([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value -eq 'S-1-5-18') {
+                    return @{ Phase='AiTools'; Success=$true; Count=0; LogLines=@('[Warn] AI tools skipped: SYSTEM context (user-scoped).') }
                 }
                 try {
-                    & scoop update 2>&1 | ForEach-Object { $log.Add($_.ToString()) }
-                    if ($LASTEXITCODE -ne 0) { $success = $false; $log.Add("[Error] Scoop metadata update exited with code $LASTEXITCODE") }
-                    $log.Add('Updating all Scoop packages...')
-                    & scoop update * 2>&1 | ForEach-Object {
-                        if ($_ -match '^\s*\S+:\s+\S+\s+->\s+\S+') { $count++ }
-                        $log.Add($_.ToString())
-                    }
-                    if ($LASTEXITCODE -ne 0) { $success = $false; $log.Add("[Error] Scoop package update exited with code $LASTEXITCODE") }
-                    $log.Add("Scoop: $count package(s) updated.")
-                } catch { $success = $false; $log.Add("[Error] Scoop: $_") }
-                return @{ Phase='Scoop'; Success=$success; Count=$count; LogLines=$log.ToArray() }
+                    . ([scriptblock]::Create("function Invoke-AiToolSelfUpdate {`n$AiToolsDefinition`n}"))
+                    $r = Invoke-AiToolSelfUpdate -IsWhatIf:$IsWhatIf `
+                        -ClaudePath ([string](Get-Command claude -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1).Source) `
+                        -HermesPath ([string](Get-Command hermes -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1).Source)
+                    return @{ Phase='AiTools'; Success=$r.Success; Count=$r.Count; LogLines=$r.LogLines; Deferred=$r.Deferred }
+                } catch { return @{ Phase='AiTools'; Success=$false; Count=0; LogLines=@("[Error] AI tools: $_") } }
             }
 
             $dotnetSb = {
@@ -9219,8 +9483,9 @@ function Invoke-BootUpdateCycle {
             foreach ($cp in $pendingCohort) {
                 $job = switch ($cp.Name) {
                     'Pip'               { Start-ThreadJob -ScriptBlock $pipSb       -ArgumentList $cohortExcludePatterns, $cohortWhatIf, $script:IncludePatterns }
-                    'Npm'               { Start-ThreadJob -ScriptBlock $npmSb       -ArgumentList $cohortWhatIf }
-                    'Scoop'             { Start-ThreadJob -ScriptBlock $scoopSb     -ArgumentList $cohortWhatIf }
+                    'Npm'               { Start-ThreadJob -ScriptBlock $npmSb       -ArgumentList $cohortWhatIf, $npmDefinition }
+                    'Scoop'             { Start-ThreadJob -ScriptBlock $scoopSb     -ArgumentList $cohortWhatIf, $scoopDefinition }
+                    'AiTools'           { Start-ThreadJob -ScriptBlock $aiToolsSb   -ArgumentList $cohortWhatIf, $aiToolsDefinition }
                     'DotnetTools'       { Start-ThreadJob -ScriptBlock $dotnetSb    -ArgumentList $cohortWhatIf }
                     'Vscode'            { Start-ThreadJob -ScriptBlock $vscodeSb    -ArgumentList $cohortWhatIf, $vscodeParserDefinition }
                     'Defender'          { Start-ThreadJob -ScriptBlock $defenderSb  -ArgumentList $cohortWhatIf, (Get-DefenderCommandPath) }
@@ -9271,12 +9536,11 @@ function Invoke-BootUpdateCycle {
                 if ($phaseName -eq 'Vscode' -and $jr.PSObject.Properties.Name -contains 'ProviderLines') {
                     Write-ProviderTranscript -Provider Vscode -Lines @($jr.ProviderLines)
                 }
-                foreach ($line in $jr.LogLines) {
-                    $lvl = if ($line -match '^\[Warn\]') { 'Warn' }
-                          elseif ($line -match '^\[Error\]') { 'Error' }
-                          else { 'Info' }
-                    $cleanLine = $line -replace '^\[(Warn|Error)\]\s*', ''
-                    Write-Log $cleanLine -Level $lvl
+                Write-BootUpdateResultLines -Lines @($jr.LogLines)
+                <# A provider that reports deferrals (a program holding its files) replaces its
+                   earlier record, so a clean re-run clears what it deferred before. #>
+                if ($jr -is [hashtable] -and $jr.ContainsKey('Deferred')) {
+                    Add-BootUpdateDeferredInventory -State $state -Provider $phaseName -Scope 'user' -Records @($jr.Deferred)
                 }
 
                 $replayedFailure = @($jr.LogLines | Where-Object { $_ -match '^\[Error\]|^\[Warn\].*(failed|timed out|timeout|error)' }).Count -gt 0
