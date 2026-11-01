@@ -37,6 +37,34 @@ Describe 'Sanitized diagnostic export' {
         $safe | Should -Match '<REDACTED>|<PATH>|<EMAIL>|<URL>|<IP>|<SID>|<REGISTRY_PATH>'
     }
 
+    It 'redacts Microsoft Entra ID (S-1-12-*) SIDs and keeps the short well-known SID readable' {
+        $raw = 'Scheduled task registered: BootUpdateCycle (S-1-12-1-1111111111-2222222222-3333333333-4444444444 at logon) runs as S-1-5-18'
+        $safe = Protect-BootUpdateDiagnosticText -Text $raw
+        $safe | Should -Not -Match 'S-1-12'
+        $safe | Should -Match 'BootUpdateCycle \(<SID> at logon\)'
+        $safe | Should -Match 'runs as S-1-5-18'
+        { Assert-BootUpdateDiagnosticIsSanitized -Text $safe } | Should -Not -Throw
+        { Assert-BootUpdateDiagnosticIsSanitized -Text $raw } | Should -Throw
+    }
+
+    It 'keeps npm package paths readable while redacting the user profile and real DOMAIN\USER accounts' {
+        $raw = @'
+npm error path C:\Users\jdoe\AppData\Roaming\npm\node_modules\@wonderwhy-er\desktop-commander\dist
+[Info] CONTOSO\jdoe started the update on WORKSTATION01
+'@
+        $values = @('C:\Users\jdoe','jdoe','WORKSTATION01')
+        $safe = Protect-BootUpdateDiagnosticText -Text $raw -SensitiveValues $values
+        $safe | Should -Match ([regex]::Escape('node_modules\@wonderwhy-er\desktop-commander\dist'))
+        $safe | Should -Not -Match 'jdoe|WORKSTATION01|C:\\'
+        $safe | Should -Not -Match '<DOMAIN>\\<USER>\\'
+        { Assert-BootUpdateDiagnosticIsSanitized -Text $safe -SensitiveValues $values } | Should -Not -Throw
+    }
+
+    It 'still turns an unlisted DOMAIN\USER account in prose into a placeholder' {
+        $safe = Protect-BootUpdateDiagnosticText -Text 'Task owner is CONTOSO\jdoe (interactive)'
+        $safe | Should -Be 'Task owner is <DOMAIN>\<USER> (interactive)'
+    }
+
     It 'retains safe pending-cleanup provenance while redacting the underlying path' {
         $raw = '[Warn] Pending-file cleanup advisory [after updates]: EdgeUpdateCleanup=1, DropboxRecoveryCleanup=2; id=0123456789AB. Source C:\Program Files\Dropbox\secret.exe'
         $safe = Protect-BootUpdateDiagnosticText -Text $raw
