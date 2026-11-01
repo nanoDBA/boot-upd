@@ -368,7 +368,7 @@ Package managers are auto-detected. Missing ones are skipped with a warning.
 | `Deploy-BootUpdateCycle.ps1` | Deploys scripts to ProgramData + runs first iteration |
 | `Invoke-BootUpdateCycle.ps1` | The orchestrator — runs all updates, manages reboots |
 | `Register-BootUpdateTask.ps1` | Standalone task registration (alternative to Deploy) |
-| `Unregister-BootUpdateTask.ps1` | Emergency stop — removes the scheduled task |
+| `Unregister-BootUpdateTask.ps1` | Emergency stop — removes both scheduled tasks |
 | `Repair-AwsTooling.ps1` | Optional AWS CLI v2 + module maintenance |
 | `Export-BootUpdateDiagnostics.ps1` | Sanitized, compressed diagnostic bundle export |
 | `tools/Initialize-BootUpdateWebhook.ps1` | Securely configures a notification webhook outside Git and task arguments |

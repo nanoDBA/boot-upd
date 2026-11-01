@@ -70,3 +70,8 @@ A probe that picks up a queued pass is not charged as a recovery. The run that d
 the state, so the state still says the pass was queued deliberately, and that is the pass that
 runs. If PowerShell stays broken, every probe fails the same way. That costs one failed launch per
 interval and changes nothing, and the first probe after a repair resumes the cycle.
+
+Still open: a dated hand-off (`-RetryAt`, used before a cancelable restart and for a maintenance
+window) and the boot and logon triggers carry no probe. A run they start that dies before its own
+checkpoint, for example during the same PowerShell upgrade right after a servicing reboot, waits
+for the next boot or sign-in, as before.

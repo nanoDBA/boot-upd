@@ -69,8 +69,10 @@ param(
     Run as Administrator in PowerShell 7+
     Requires: Invoke-BootUpdateCycle.ps1 in the same directory
 
-    To REMOVE (emergency stop):
-    Unregister-ScheduledTask -TaskName 'BootUpdateCycle' -Confirm:$false
+    To REMOVE (emergency stop), remove BOTH continuation tasks; the SYSTEM fallback
+    alone resumes the cycle. Unregister-BootUpdateTask.ps1 in the repository does the same:
+    Get-ScheduledTask -TaskName 'BootUpdateCycle','BootUpdateCycleFallback' -ErrorAction SilentlyContinue |
+        Unregister-ScheduledTask -Confirm:$false
     Remove-Item "$env:ProgramData\BootUpdateCycle" -Recurse -Force
 #>
 
