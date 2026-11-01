@@ -7300,7 +7300,8 @@ function Register-BootUpdateTaskForReboot {
         <# Task B: only the resume-checkpoint arm (before update phases) passes this. Adds a
            repeating -Once trigger to each registered task so an in-flight cycle that dies
            without ever reporting still gets probed periodically; see Enter-BootUpdateMutex
-           for why a probe that finds the mutex held is a normal, silent no-op. #>
+           for why a probe that finds the mutex held is a normal, silent no-op. -RetrySoon
+           arms the same trigger, so a queued pass that dies is probed as well. #>
         [switch]$InFlightWatchdog,
         <# Once machine servicing is done but a known user's phases remain, leave only
            that user's logon trigger armed. No SYSTEM retry or watchdog is useful here. #>
@@ -7383,8 +7384,16 @@ function Register-BootUpdateTaskForReboot {
        3650 days (not [TimeSpan]::MaxValue) for RepetitionDuration: it renders as a clean
        ISO-8601 duration ("P3650D") that Task Scheduler is documented to accept, where
        MaxValue serializes to a degenerate near-max value; ten years outlives any real
-       gap between updater runs. #>
-    $armWatchdog = [bool]$InFlightWatchdog -and -not $LogonOnly
+       gap between updater runs.
+
+       A -RetrySoon hand-off keeps the watchdog too. It queues another pass, which is not a
+       deliberate stop, and the one-shot retry alone covers only a run that launches and
+       lives long enough to re-arm. Lab rows B and B2 (2026-11-01) lost that run twice to a
+       PowerShell 7 MSI upgrade, at launch and mid-startup, and Task Scheduler's restart
+       policy retries neither. A healthy queued run re-registers within minutes, which moves
+       the first probe out again, so the probe only fires when that run died. The saved-user
+       logon wait (-LogonOnly) still never repeats; see ADR 0006. #>
+    $armWatchdog = ([bool]$InFlightWatchdog -or [bool]$RetrySoon) -and -not $LogonOnly
     $watchdogTrigger = if ($armWatchdog) {
         New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes($script:WatchdogIntervalMinutes) `
             -RepetitionInterval (New-TimeSpan -Minutes $script:WatchdogIntervalMinutes) `
@@ -7523,7 +7532,10 @@ function Register-BootUpdateTaskForReboot {
         }
     }
     $watchdogNote = if ($armWatchdog) { "; watchdog probe every $($script:WatchdogIntervalMinutes) minute(s)" } else { '' }
-    $retryNote = if ($LogonOnly) { 'saved-user logon only' } else { '3 retries, 2-minute interval' }
+    <# RestartCount retries a task Task Scheduler could not launch. A pwsh that starts and then
+       dies counts as a completed run, so the note says launch retries; the watchdog covers the
+       rest. #>
+    $retryNote = if ($LogonOnly) { 'saved-user logon only' } else { '3 launch retries, 2-minute interval' }
     Write-Log "Resume chain verified: $($registeredTaskNames -join ', ') ($retryNote)$watchdogNote."
     return $registeredTaskNames.ToArray()
 }

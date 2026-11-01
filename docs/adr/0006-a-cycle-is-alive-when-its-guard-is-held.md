@@ -48,3 +48,25 @@ continues as the recovery pass — the abandoned-mutex path already existed for 
   hangs inside those steps holds the guard with no repeating trigger armed. Accepted for now:
   those steps are bounded by their own timeouts, and arming before pre-flight would register
   tasks on a machine that pre-flight may be about to reject.
+
+## Amendment (2026-11-01): a queued pass keeps the probe
+
+The repeating trigger was armed only at the in-flight checkpoint, and every hand-off that queued
+another pass (`-RetrySoon`) replaced it with one one-shot trigger per task. The queued run then
+had to launch and live long enough to reach its own checkpoint. On lab row B it did neither,
+twice: a PowerShell 7 MSI upgrade from Windows Update removed `pwsh.dll` as the SYSTEM fallback
+launched (`0x8000809A`), and on the rerun replaced PowerShell under a run that had already started
+(`0xE0434352`). Task Scheduler recorded both as completed, so its restart policy never fired, and
+the cycle sat until the next boot or sign-in.
+
+A queued pass is not a deliberate stop, so `-RetrySoon` now arms the same repeating trigger. A
+healthy queued run re-registers the tasks within minutes, which moves the first probe out again;
+the probe only fires when that run died. The saved-user logon wait still never repeats, for the
+reason in the first consequence above. This narrows the residual gap only for death: a queued
+pass that dies before its checkpoint is now probed, but one that hangs there still holds the
+guard, and the probe backs off as designed.
+
+A probe that picks up a queued pass is not charged as a recovery. The run that died never touched
+the state, so the state still says the pass was queued deliberately, and that is the pass that
+runs. If PowerShell stays broken, every probe fails the same way. That costs one failed launch per
+interval and changes nothing, and the first probe after a repair resumes the cycle.

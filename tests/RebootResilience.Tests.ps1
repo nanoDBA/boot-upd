@@ -2029,8 +2029,33 @@ Describe 'In-flight watchdog scheduling' {
         @($allTriggers | Where-Object { $_.Repetition -and -not [string]::IsNullOrEmpty($_.Repetition.Interval) }) | Should -BeNullOrEmpty
     }
 
-    It 'registers no repeating trigger with -RetrySoon' {
-        { Register-BootUpdateTaskForReboot -RetrySoon } | Should -Not -Throw
+    It 'keeps the watchdog through a -RetrySoon hand-off, alongside the two-minute retry' {
+        <# Lab rows B and B2, 2026-11-01: a pass queued the next one with -RetrySoon, which
+           replaced the in-flight watchdog with one one-shot trigger per task. The queued
+           SYSTEM run then died before it could re-arm anything: once at launch while a
+           PowerShell 7 MSI upgrade had pwsh.dll missing (0x8000809A), once mid-startup when
+           the same upgrade replaced it underneath (0xE0434352). Task Scheduler's restart
+           policy covers neither, so the cycle sat until the next boot or sign-in. A queued
+           pass is not a deliberate stop; it keeps its watchdog. #>
+        Mock Get-Date { [datetime]'2026-11-01T12:17:00' }
+
+        Register-BootUpdateTaskForReboot -RetrySoon
+
+        foreach ($name in 'BootUpdateCycle', 'BootUpdateCycleFallback') {
+            $triggers = @($script:CapturedTasks[$name].Trigger)
+            $repeating = @($triggers | Where-Object { $_.Repetition -and -not [string]::IsNullOrEmpty($_.Repetition.Interval) })
+            $oneShot = @($triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskTimeTrigger' -and -not ($_.Repetition -and $_.Repetition.Interval) })
+            $repeating.Count | Should -Be 1 -Because "$name must still be probed if the queued run dies"
+            $repeating[0].Repetition.Interval | Should -Be 'PT15M'
+            $oneShot.Count | Should -Be 1 -Because "$name keeps its near-term retry"
+        }
+        $primaryRetry = @($script:CapturedTasks['BootUpdateCycle'].Trigger | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskTimeTrigger' -and -not $_.Repetition.Interval })[0]
+        [datetime]$primaryRetry.StartBoundary | Should -Be ([datetime]'2026-11-01T12:19:00')
+    }
+
+    It 'still registers no repeating trigger for the saved-user logon wait, even when a retry was asked for' {
+        Register-BootUpdateTaskForReboot -RetrySoon
+        Register-BootUpdateTaskForReboot -LogonOnly
 
         $allTriggers = @($script:CapturedTasks.Values | ForEach-Object { $_.Trigger })
         @($allTriggers | Where-Object { $_.Repetition -and -not [string]::IsNullOrEmpty($_.Repetition.Interval) }) | Should -BeNullOrEmpty
