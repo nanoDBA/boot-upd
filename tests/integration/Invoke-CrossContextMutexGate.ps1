@@ -102,7 +102,7 @@ function Invoke-SystemWorker {
     if ($Release) { $argument += @('-ReleasePath',('"{0}"' -f $Release)) }
     $action = New-ScheduledTaskAction -Execute $pwsh -Argument ($argument -join ' ')
     $system = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-    $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 2)
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 2)
     Register-ScheduledTask -TaskName $taskName -Action $action -Principal $system -Settings $settings -Force | Out-Null
     Start-ScheduledTask -TaskName $taskName
 }

@@ -82,6 +82,16 @@ Describe 'Claude Code project compatibility' {
         $testGate | Should -Match '\$gateExitCode\s*=\s*\$LASTEXITCODE'
     }
 
+    It 'lets host gate tasks start on battery power' {
+        <# Task Scheduler's defaults refuse to start a task on battery: it sits Queued and the
+           gate times out waiting for its worker. A laptop unplugged on 2026-11-02 failed the
+           User/SYSTEM gate three times that way, with no assertion involved. #>
+        foreach ($gate in 'Invoke-CrossContextMutexGate.ps1', 'Invoke-SavedUserSessionGate.ps1') {
+            $source = Get-Content (Join-Path $repoRoot "tests\integration\$gate") -Raw
+            $source | Should -Match 'New-ScheduledTaskSettingsSet\s+-AllowStartIfOnBatteries\s+-DontStopIfGoingOnBatteries' -Because $gate
+        }
+    }
+
     It 'leaves Claude a durable Winget 1605 convergence breadcrumb' {
         $claude = Get-Content $claudePath -Raw
         $updaterRule = Get-Content (Join-Path $rulesRoot 'powershell-updater-safety.md') -Raw
