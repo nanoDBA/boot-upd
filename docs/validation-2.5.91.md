@@ -22,7 +22,9 @@ A headless row with queued user work is PARTIAL by definition. User-scope work w
 - Pester unit/process: **705 passed, 0 failed** (93.45 seconds).
 - User/SYSTEM boundary: **passed** (10.47 seconds).
 - Published-launcher upgrade from v2.5.43: **passed** (6.37 seconds).
-- GitHub quality, User/SYSTEM, and published-launcher checks passed on #122 and #123.
+- GitHub quality, User/SYSTEM, and published-launcher checks passed on #122, #123 and #125, and on the master push.
+- Live bootstrap (release-triggered): the exact README command passed fresh-install and legacy-repair runs on clean Windows PowerShell 5.1 VMs.
+- Release assets: downloaded again after publishing. All 10 match their SHA256 sidecars, `upd.cmd` is CRLF throughout, and both version markers read 2.5.91.
 
 The User/SYSTEM gate first failed three times on an unplugged laptop. The gate's SYSTEM worker task used Task Scheduler's default settings, which never start a task on battery. The task sat `Queued` and the gate timed out after 20 seconds with no assertion failing. The two host-side gates (User/SYSTEM and saved-user session) now allow battery start, and a test checks it. The lab guests have no battery, and their tasks already set it.
 
