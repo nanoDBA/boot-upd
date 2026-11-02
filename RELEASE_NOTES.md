@@ -29,7 +29,7 @@ New phase, **AI tools:** runs `claude update` for a native Claude Code install a
 
 ### Testing
 
-All 705 unit/process tests passed, and the User/SYSTEM and published-launcher gates passed. Interactive lab row A passed on the merged code. The headless rows ended PARTIAL, as expected: machine updates finished and user work waited for the saved user's next sign-in. In one of them, the queued pass was killed on purpose, and the watchdog probe restarted it. Two test-gate fixes were made along the way: the host gates now run on battery power, and the published-launcher gate no longer races the adoption helper. See the [v2.5.91 validation report](docs/validation-2.5.91.md).
+All 705 unit/process tests passed, and the User/SYSTEM and published-launcher gates passed. The exact README bootstrap passed fresh-install and legacy-repair runs on clean Windows PowerShell 5.1 VMs. Interactive lab row A passed on the merged code. The headless rows ended PARTIAL, as expected: machine updates finished and user work waited for the saved user's next sign-in. In one of them, the queued pass was killed on purpose, and the watchdog probe restarted it. Two test-gate fixes were made along the way: the host gates now run on battery power, and the published-launcher gate no longer races the adoption helper. See the [v2.5.91 validation report](docs/validation-2.5.91.md).
 
 ---
 
