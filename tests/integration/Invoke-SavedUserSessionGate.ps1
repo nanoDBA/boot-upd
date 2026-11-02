@@ -55,7 +55,7 @@ try {
     $arguments='-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -Mode Probe -FixturePath "{1}"' -f $probe,$fixtureFile
     $action=New-ScheduledTaskAction -Execute (Get-Process -Id $PID).Path -Argument $arguments
     $owner=New-ScheduledTaskPrincipal -UserId SYSTEM -LogonType ServiceAccount -RunLevel Highest
-    $settings=New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 2)
+    $settings=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 2)
     Register-ScheduledTask -TaskName $taskName -Action $action -Principal $owner -Settings $settings -Force | Out-Null
     Start-ScheduledTask -TaskName $taskName
     $deadline=(Get-Date).AddSeconds(45)

@@ -36,11 +36,10 @@ try {
     if ((Get-FileHash $target -Algorithm SHA256).Hash -ne $expected) {
         throw 'Final upd.cmd does not match the candidate launcher.'
     }
-    foreach ($sidecar in "$next.sha256","$next.baseline") {
-        if (Test-Path $sidecar) { throw "Compatibility adoption left $sidecar behind." }
-    }
-    # The legacy helper removes the sidecars before writing its terminal log line.
-    # Wait for that final write so cleanup cannot race an otherwise successful gate.
+    # The legacy helper deletes upd.cmd.next first, then the sidecars, then writes its
+    # terminal log line. Check the sidecars only after that line: checking them as soon as
+    # .next disappeared failed a successful adoption once (2026-11-02) by catching the
+    # helper between the two deletions.
     $adoptionLog = Join-Path $root 'upd.cmd.adoption.log'
     $logDeadline = [datetime]::UtcNow.AddSeconds(10)
     while ([datetime]::UtcNow -lt $logDeadline) {
@@ -53,6 +52,9 @@ try {
     if (-not (Test-Path -LiteralPath $adoptionLog) -or
         (Get-Content -LiteralPath $adoptionLog -Raw) -notmatch 'completed') {
         throw 'Compatibility adoption did not publish its terminal completion record.'
+    }
+    foreach ($sidecar in "$next.sha256","$next.baseline") {
+        if (Test-Path $sidecar) { throw "Compatibility adoption left $sidecar behind." }
     }
     [pscustomobject]@{ Gate='published-launcher-upgrade'; From=$FromTag; Result='passed'; CandidateHash=$expected } |
         ConvertTo-Json
