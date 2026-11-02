@@ -1,11 +1,11 @@
 # Boot Update Cycle — Release Notes
 
-**Latest published version:** v2.5.90
+**Latest published version:** v2.5.91
 **Status:** Released
 
 ---
 
-## Unreleased
+## v2.5.91 (2026-11-02)
 
 Since v2.5.88, a cycle that stopped for attention or at a safety limit could not be restarted. Running `upd` deleted the main checkpoint but not its backup. Both copies held the stop, so the updater recovered it, logged "Primary state file is unusable", and exited. On the two machines behind this fix, one MuseScore installer failure and one locked npm module kept every later run from updating anything. Running `upd` now starts a fresh cycle again; `upd run -ResumeAfterAttention` still continues the stopped one.
 
@@ -26,6 +26,10 @@ Fixes:
 - **Diagnostics export:** npm package paths such as `node_modules\@scope\name` are kept readable. Microsoft Entra ID user SIDs (`S-1-12-…`) are now redacted.
 
 New phase, **AI tools:** runs `claude update` for a native Claude Code install and `hermes update` for Hermes Agent, and compares versions before and after. If Hermes' gateway or desktop app holds its environment, the update is deferred by name instead of forced. Winget, npm and Scoop installs of these tools stay with their own phases. A tool whose own updater fails or refuses is listed with the reason and never stops the cycle. Skip the phase with `upd --skip-ai-tools`.
+
+### Testing
+
+All 705 unit/process tests passed, and the User/SYSTEM and published-launcher gates passed. Interactive lab row A passed on the merged code. The headless rows ended PARTIAL, as expected: machine updates finished and user work waited for the saved user's next sign-in. In one of them, the queued pass was killed on purpose, and the watchdog probe restarted it. Two test-gate fixes were made along the way: the host gates now run on battery power, and the published-launcher gate no longer races the adoption helper. See the [v2.5.91 validation report](docs/validation-2.5.91.md).
 
 ---
 
