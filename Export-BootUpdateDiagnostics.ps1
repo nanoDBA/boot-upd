@@ -81,7 +81,7 @@ function Protect-BootUpdateDiagnosticText {
     foreach ($value in $SensitiveValues) {
         $safe = $safe -replace [regex]::Escape($value), '<REDACTED>'
     }
-    $safe = $safe -replace '(?i)S-1-5-(?:\d+-){1,14}\d+', '<SID>'
+    $safe = $safe -replace '(?i)S-1-\d+-(?:\d+-){1,14}\d+', '<SID>'
     $safe = $safe -replace '(?i)\b[0-9A-F]{8}(?:-[0-9A-F]{4}){3}-[0-9A-F]{12}\b', '<GUID>'
     $safe = $safe -replace '(?i)\b(?:[0-9A-F]{2}[:-]){5}[0-9A-F]{2}\b', '<MAC>'
     $safe = $safe -replace '(?i)\b(?:\d{1,3}\.){3}\d{1,3}\b', '<IP>'
@@ -92,7 +92,9 @@ function Protect-BootUpdateDiagnosticText {
     # Fail toward privacy: an absolute drive path consumes the remainder of its
     # line. Diagnostic level/code/timestamp data before the path is preserved.
     $safe = $safe -replace '(?i)(?<![A-Z0-9_])[A-Z]:\\[^\r\n]+', '<PATH>'
-    $safe = $safe -replace '(?i)\b[A-Z0-9._-]+\\[A-Z0-9.$_-]+\b', '<DOMAIN>\<USER>'
+    # DOMAIN\USER only as a standalone token: not a path segment (preceded by a
+    # backslash) and not part of an npm scope or dotted/hyphenated name.
+    $safe = $safe -replace '(?i)(?<![\\@\w.$-])[A-Z0-9._-]+\\[A-Z0-9.$_-]+\b', '<DOMAIN>\<USER>'
     return $safe
 }
 
@@ -310,7 +312,7 @@ function Assert-BootUpdateDiagnosticIsSanitized {
         }
     }
     foreach ($pattern in @(
-        '(?i)S-1-5-(?:\d+-){1,14}\d+',
+        '(?i)S-1-\d+-(?:\d+-){1,14}\d+',
         '(?i)\b[A-Z]:\\',
         '(?i)\\\\',
         '(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b'

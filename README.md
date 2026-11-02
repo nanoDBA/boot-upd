@@ -121,15 +121,16 @@ and whether anything still needs your attention:
 | 4 | **Windows Update** | On | Security, Critical, Definition updates (excludes SQL Server) |
 | 5 | **AWS Tooling** | Off | Optional CLI v2 + AWS.Tools repair |
 | 6 | **pip** | On | All outdated global packages |
-| 7 | **npm** | On | All global packages |
+| 7 | **npm** | On | Outdated global packages, one at a time; a package held open by a running program is deferred by name |
 | 8 | **Office 365** | On | Click-to-Run silent update |
 | 9 | **PowerShell Modules** | On | Installed modules via PSResourceGet when available, with compatible fallback behavior |
-| 10 | **Scoop** | On | User-scoped; skipped under SYSTEM |
-| 11 | **.NET Global Tools** | **Off** | High risk — can break SDK-dependent builds |
-| 12 | **VS Code Extensions** | On | User-scoped; skipped under SYSTEM |
-| 13 | **Microsoft Defender** | On | Signature refresh through `MpCmdRun.exe` |
-| 14 | **Drivers / firmware** | **Off** | Explicit opt-in with `-drv` / `-fw` |
-| 15 | **WSL / containers** | **Off** | Explicit opt-in; user-context work resumes at logon |
+| 10 | **Scoop** | On | User-scoped; skipped under SYSTEM. Apps that are running are deferred by name |
+| 11 | **AI command-line tools** | On | `claude update` for a native Claude Code install and `hermes update` for Hermes Agent; user-scoped. Winget, npm or Scoop installs stay with those phases |
+| 12 | **.NET Global Tools** | **Off** | High risk — can break SDK-dependent builds |
+| 13 | **VS Code Extensions** | On | User-scoped; skipped under SYSTEM |
+| 14 | **Microsoft Defender** | On | Signature refresh through `MpCmdRun.exe` |
+| 15 | **Drivers / firmware** | **Off** | Explicit opt-in with `-drv` / `-fw` |
+| 16 | **WSL / containers** | **Off** | Explicit opt-in; user-context work resumes at logon |
 
 SSMS 22 has its own servicing path, so a package manager reporting no updates is not
 the final SSMS check. The SSMS phase compares installed build versions with the
@@ -303,7 +304,8 @@ Use `upd demo 12` to preview the display without running updates.
 5. Check for remaining updates, pending restarts, and service health.
 6. Report what finished, what was skipped, and what still needs attention. A completed
    cycle removes its continuation tasks and temporary state. A stop that needs attention
-   keeps the checkpoint for troubleshooting.
+   keeps the checkpoint for troubleshooting until you run `upd` again, which starts a
+   fresh cycle.
 
 By default, boot-upd stops after 5 consecutive reboots without verified progress
 (`MaxIterations`) or 5 failed recovery passes in one boot (`MaxRetryPasses`). A
@@ -391,8 +393,8 @@ upd update    # refresh the verified source bundle without starting an update cy
 | **Recovery pass queued** | One or more phases did not verify; a near-term retry is armed | No action unless it keeps returning or reaches the safety limit |
 | **User update pass pending** | Machine work finished, but user-scoped work needs the saved user to sign in | Sign in as that user; do not "fix" it by deleting the checkpoint |
 | **Restart required** | Blocking evidence was confirmed and continuation was verified | Save work; boot-upd resumes automatically after Windows restarts |
-| **Needs attention** after a persistent provider failure | The run stopped so it would not keep retrying the same failure | Run `upd status`, then `upd logs`. Fix the reported problem, then resume deliberately with `upd run -ResumeAfterAttention` |
-| **Safety limit reached** | The reboot or same-boot recovery budget was exhausted | Run `upd status` and `upd logs`. After reviewing the checkpoint, rerun with the relevant limit raised (`-n` for stalled reboots or `--max-retry-passes` for same-boot recovery) |
+| **Needs attention** after a persistent provider failure | The run stopped so it would not keep retrying the same failure | Run `upd status`, then `upd logs`. Running `upd` again starts a fresh cycle that retries everything. To continue the stopped cycle after fixing the problem, use `upd run -ResumeAfterAttention` |
+| **Safety limit reached** | The reboot or same-boot recovery budget was exhausted | Run `upd status` and `upd logs`. Running `upd` again starts a fresh cycle |
 
 If explicit `-ar` mode quarantines a repeatedly failing Winget package, the final screen says
 the selected update run finished **with skipped packages**—not that the machine is fully patched.
@@ -551,6 +553,7 @@ $Config = @{
     SkipAwsTooling        = $true   # Off by default
     SkipPowerShellModules = $false
     SkipScoop             = $false
+    SkipAiTools           = $false
     SkipDotnetTools       = $true   # Off by default — high risk
     SkipVscode            = $false
 }
