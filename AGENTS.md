@@ -1,5 +1,7 @@
 # Agent Instructions
 
+New to this repository? Read [docs/agents/agent-handoff.md](docs/agents/agent-handoff.md) first. It lists the source-of-truth documents in reading order and the mistakes past agents made here.
+
 This project uses **bd** (beads) for issue tracking.
 
 On Windows, run tracker commands through `./tools/Invoke-Beads.ps1` so the central Dolt password is retrieved directly from Windows Credential Manager and cleared after each invocation. The command tables use `bd` as shorthand. Run `./tools/Invoke-Beads.ps1 prime` for full workflow context.

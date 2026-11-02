@@ -36,3 +36,6 @@ upd.cmd.bak
 
 # Agent worktrees (transient, created by Claude Code)
 .claude/worktrees/
+
+# upd logs
+.updlogs
