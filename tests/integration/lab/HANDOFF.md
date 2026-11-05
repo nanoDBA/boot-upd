@@ -101,7 +101,9 @@ For the headless row, select its configured guest/checkpoint and change the row
 parameters to `Row='B-review'`, `ArmReboots=2`, `Launcher='deploy'`,
 `SystemContext=$true`, and `DeployArgs='-MaxUserIdentityWaits 1 -DisableSelfUpdate'`.
 Keep the PowerShell job's owning process alive. `Receive-Job -Wait` waits for the
-result; use `host-timeline.txt` for progress without repeatedly dumping raw logs.
+result; use `host-timeline.txt` for progress without repeatedly dumping raw logs, and
+`BootUpdateCycle.live.log` (the guest log, appended poll by poll) when the updater's own
+lines are wanted before collection or from a guest that never came back.
 A lost host process releases its lease but does not stop guest tasks. Inspect and
 collect evidence before shutting down or restoring that guest.
 

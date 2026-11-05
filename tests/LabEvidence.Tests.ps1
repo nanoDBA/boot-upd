@@ -36,3 +36,28 @@ Describe 'A verified sign-in does not hide outstanding provider work' {
         Get-BootUpdLabContinuationResult -Verified $true -CleanupVerified $true -CompletionLine '' | Should -Be 'FAIL'
     }
 }
+
+Describe 'The guest log is copied to the host as it grows' {
+    BeforeEach { $script:live = Join-Path $TestDrive ('live-' + [guid]::NewGuid().ToString('N') + '.log') }
+    It 'appends only the new lines and returns the count for the next poll' {
+        $known = Add-BootUpdLabLiveLog -Path $live -KnownCount 0 -GuestCount 2 -NewLines @('a','b')
+        $known | Should -Be 2
+        $known = Add-BootUpdLabLiveLog -Path $live -KnownCount $known -GuestCount 3 -NewLines @('c')
+        $known | Should -Be 3
+        @(Get-Content $live) | Should -Be @('a','b','c')
+    }
+    It 'writes nothing for a poll that saw no new lines' {
+        $null = Add-BootUpdLabLiveLog -Path $live -KnownCount 0 -GuestCount 1 -NewLines @('a')
+        $null = Add-BootUpdLabLiveLog -Path $live -KnownCount 1 -GuestCount 1 -NewLines @()
+        @(Get-Content $live) | Should -Be @('a')
+    }
+    It 'marks a guest log that shrank instead of running two logs together' {
+        $null = Add-BootUpdLabLiveLog -Path $live -KnownCount 0 -GuestCount 3 -NewLines @('old1','old2','old3')
+        $known = Add-BootUpdLabLiveLog -Path $live -KnownCount 3 -GuestCount 1 -NewLines @('new1')
+        $known | Should -Be 1
+        $content = @(Get-Content $live)
+        $content.Count | Should -Be 5
+        $content[3] | Should -Match '^# \d{2}:\d{2}:\d{2} guest log shrank from 3 to 1 lines'
+        $content[4] | Should -Be 'new1'
+    }
+}

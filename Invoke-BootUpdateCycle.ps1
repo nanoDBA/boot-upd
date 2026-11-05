@@ -296,6 +296,9 @@ $script:WindowsUpdateOnlineAssessmentTtlHours = 6
 $script:HistoryPath           = Join-Path $PSScriptRoot 'BootUpdateCycle.history.json'
 $script:MaxLogSizeMB          = 5
 $script:MaxHistoryEntries     = 50
+<# How often the parallel cohort names the phases still running. Five minutes bounds a
+   29-minute cohort to six lines; a once-a-second cadence is what bd -9pu7 is about. #>
+$script:CohortHeartbeatSeconds = 300
 $script:PackageTimeoutMinutes = $PackageTimeoutMinutes
 $script:RebootDelaySec        = $RebootDelaySec
 $script:MaxIterations         = $MaxIterations
@@ -8704,6 +8707,76 @@ function Get-BootUpdateLaunchContract {
     return "Launch contract | Mode: $mode | Origin: $origin | Scope: $scope | Output: $($script:OutputMode) | Flags: $flagText | Skips: $skipText | Filters: include=$(@($script:IncludePatterns).Count),exclude=$(@($script:ExcludePatterns).Count)"
 }
 
+function Complete-BootUpdateCohortPhase {
+    <# Settles one parallel-cohort thread job: replays the lines the job collected, records
+       its outcome in $State, and logs a DONE or FAILED line carrying the phase's own elapsed
+       time, measured from the StartedAt the launcher stamped on the job to the job's end.
+
+       The caller invokes this the moment a poll sees the job finish. Until bd -3j5n every
+       job was settled only after the slowest one, so the log showed the cohort's opening
+       line and then nothing for the whole cohort (29 minutes on a 2026-11-02 run), the DONE
+       lines carried no duration, and a process killed mid-cohort lost every line, because
+       they existed only in job memory.
+
+       Returns $true or $false for a job that completed, so the caller can count the phase;
+       returns $null for a job that did not complete (still running at the cohort deadline,
+       Failed, Stopped). That job's flag is left false so the next pass reruns it. #>
+    param(
+        [Parameter(Mandatory)]$Job,
+        [Parameter(Mandatory)][hashtable]$PhaseDefinition,
+        [Parameter(Mandatory)]$State,
+        [Parameter(Mandatory)][int]$PhaseNum,
+        [Parameter(Mandatory)][int]$TotalPhases
+    )
+    $phaseName = [string]$Job.PhaseName
+    $jr = $null
+    try { $jr = Receive-Job -Job $Job -ErrorAction SilentlyContinue } catch { }
+    $jobState = [string]$Job.State
+    $endedAt = if ($Job.PSEndTime) { [datetime]$Job.PSEndTime } else { Get-Date }
+    $startedAt = if ($Job.StartedAt) { [datetime]$Job.StartedAt } elseif ($Job.PSBeginTime) { [datetime]$Job.PSBeginTime } else { $endedAt }
+    $elapsed = $endedAt - $startedAt
+    $minutes = [math]::Round($elapsed.TotalMinutes, 1)
+    Remove-Job -Job $Job -Force -ErrorAction SilentlyContinue
+
+    if ($null -eq $jr -or $jobState -ne 'Completed') {
+        Write-Log "[$phaseName] Thread job did not complete (state: $jobState) after $minutes min — leaving pending for retry" -Level Error
+        $State.($PhaseDefinition.Flag) = $false
+        return $null
+    }
+
+    <# Replay log lines through Write-Log on the parent thread #>
+    if ($phaseName -eq 'Vscode' -and $jr.PSObject.Properties.Name -contains 'ProviderLines') {
+        Write-ProviderTranscript -Provider Vscode -Lines @($jr.ProviderLines)
+    }
+    Write-BootUpdateResultLines -Lines @($jr.LogLines)
+    <# A provider that reports deferrals (a program holding its files) replaces its
+       earlier record, so a clean re-run clears what it deferred before. #>
+    if ($jr -is [hashtable] -and $jr.ContainsKey('Deferred')) {
+        Add-BootUpdateDeferredInventory -State $State -Provider $phaseName -Scope 'user' -Records @($jr.Deferred)
+    }
+
+    $replayedFailure = @($jr.LogLines | Where-Object {
+        $_ -match '^\[Error\]|^\[Warn\].*(failed|timed out|timeout|error)' -and $_ -notmatch '^\[Warn\] \[DEFERRED\]'
+    }).Count -gt 0
+    $phaseSucceeded = [bool]$jr.Success -and (-not $replayedFailure)
+    <# Preserve terminal-failure classification from cohort phases so the
+       completion disposition can stop retrying an unrecoverable failure. #>
+    $PhaseDefinition.TerminalFailure = [bool]$jr.TerminalFailure
+    $PhaseDefinition.AttentionDetails = @($jr.AttentionDetails)
+    $State.($PhaseDefinition.Flag) = $phaseSucceeded
+    if ($PhaseDefinition.Key -and $jr.Count) {
+        $State.Summary.($PhaseDefinition.Key) += $jr.Count
+    }
+    if ($jr.Triggered) { $State.Summary.ActionsTriggered += [int]$jr.Triggered }
+
+    Write-PhaseResult -Num $PhaseNum -Total $TotalPhases -Name $phaseName -Success $phaseSucceeded -Minutes $elapsed.TotalMinutes -Count $jr.Count
+    Write-Log "<<< [parallel] $phaseName - $(if ($phaseSucceeded) { 'DONE' } else { 'FAILED; RETRY PENDING' }) ($minutes min, $($jr.Count) pkg)" -Level $(if ($phaseSucceeded) { 'Info' } else { 'Error' }) -Visibility Debug
+    if ($phaseSucceeded) { Write-EventLogEntry -EventId 1004 -Message "$phaseName complete: $($jr.Count) packages in $minutes min (parallel cohort)" }
+    <# After<Phase> hook — fired on the parent thread as each result is settled. #>
+    Invoke-PhaseHook -EventName "After$phaseName"
+    return $phaseSucceeded
+}
+
 function Invoke-BootUpdateCycle {
     if ($script:WatchdogIntervalMinutesClamped) {
         Write-Log "WatchdogIntervalMinutes was below the 2-minute floor; clamped to 2." -Level Warn
@@ -9169,7 +9242,7 @@ function Invoke-BootUpdateCycle {
            Each is launched as a Start-ThreadJob.  Because thread jobs run in a separate runspace,
            the parent's function definitions are unavailable, so each job carries a self-contained
            scriptblock.  Log lines are accumulated in the result and replayed on the parent thread
-           via Write-Log after all jobs complete.  State is written ONCE atomically after the cohort.
+           via Write-Log the moment each job finishes.  State is written ONCE atomically after the cohort.
 
            Crash-recovery: phases already marked Done in $state are skipped (not re-launched). #>
 
@@ -9517,7 +9590,8 @@ function Invoke-BootUpdateCycle {
                Thread jobs run in isolated runspaces so Invoke-PhaseHook cannot be called from inside them. #>
             foreach ($cp in $pendingCohort) { Invoke-PhaseHook -EventName "Before$($cp.Name)" }
 
-            <# Launch one ThreadJob per enabled pending phase #>
+            <# Launch one ThreadJob per enabled pending phase. Each job carries the moment it
+               started so its DONE line can report the phase's own duration, not the cohort's. #>
             $cohortJobs = [System.Collections.Generic.List[object]]::new()
             foreach ($cp in $pendingCohort) {
                 $job = switch ($cp.Name) {
@@ -9533,79 +9607,53 @@ function Invoke-BootUpdateCycle {
                 }
                 if ($job) {
                     $job | Add-Member -NotePropertyName 'PhaseName' -NotePropertyValue $cp.Name -Force
+                    $job | Add-Member -NotePropertyName 'StartedAt' -NotePropertyValue (Get-Date) -Force
                     $cohortJobs.Add($job)
+                    Write-Log ">>> [parallel] $($cp.Name) - STARTING" -Visibility Debug
                 }
             }
 
-            <# Wait for all cohort jobs; timeout = sum of individual ceilings (count * PackageTimeoutMinutes) #>
+            <# Settle each job the moment a poll sees it finish (Complete-BootUpdateCohortPhase
+               explains why), and name the phases still running every CohortHeartbeatSeconds so
+               a reader - or a lab row tailing the guest log - can see where the time goes.
+               Timeout = sum of individual ceilings (count * PackageTimeoutMinutes); once it
+               passes, every unsettled job is settled as it stands, so a job still running is
+               logged as not complete and left pending for the next pass. #>
             $cohortTimeoutSec = [math]::Max($cohortTimeoutSec, $script:PackageTimeoutMinutes * 60 * $pendingCohort.Count)
+            $cohortSettled = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
             if ($cohortJobs.Count -gt 0) {
                 $cohortDeadline = [datetime]::UtcNow.AddSeconds($cohortTimeoutSec)
+                $nextHeartbeat = (Get-Date).AddSeconds($script:CohortHeartbeatSeconds)
                 do {
-                    $finished = @($cohortJobs | Where-Object { $_.State -in @('Completed','Failed','Stopped') }).Count
-                    $overallDone = $phaseNum + $finished
+                    $pastDeadline = [datetime]::UtcNow -ge $cohortDeadline
+                    $ready = @($cohortJobs | Where-Object {
+                        (-not $cohortSettled.Contains($_.PhaseName)) -and ($pastDeadline -or $_.State -in @('Completed','Failed','Stopped'))
+                    })
+                    foreach ($job in $ready) {
+                        $phaseDefn = $parallelCohort | Where-Object { $_.Name -eq $job.PhaseName } | Select-Object -First 1
+                        $outcome = Complete-BootUpdateCohortPhase -Job $job -PhaseDefinition $phaseDefn -State $state `
+                            -PhaseNum ($phaseNum + 1) -TotalPhases $enabledPhases.Count
+                        if ($null -ne $outcome) { $phaseNum++ }
+                        $null = $cohortSettled.Add($job.PhaseName)
+                    }
+                    $finished = $cohortSettled.Count
+                    if ($finished -eq $cohortJobs.Count) { break }
                     $overallPercent = if ($enabledPhases.Count -gt 0) {
-                        [math]::Min(99, [math]::Floor(($overallDone / $enabledPhases.Count) * 100))
+                        [math]::Min(99, [math]::Floor(($phaseNum / $enabledPhases.Count) * 100))
                     } else { 99 }
                     Write-BootUpdateProgress -Activity 'Parallel update cohort' `
                         -Status "$finished/$($cohortJobs.Count) phases complete" -PercentComplete $overallPercent
-                    if ($finished -eq $cohortJobs.Count) { break }
+                    if ((Get-Date) -ge $nextHeartbeat) {
+                        $running = @($cohortJobs | Where-Object { -not $cohortSettled.Contains($_.PhaseName) } | ForEach-Object { $_.PhaseName }) -join ', '
+                        Write-Log "--- Parallel cohort: $finished/$($cohortJobs.Count) done after $([math]::Round(((Get-Date) - $cohortStart).TotalMinutes, 1)) min; still running: $running ---" -Visibility Debug
+                        $nextHeartbeat = (Get-Date).AddSeconds($script:CohortHeartbeatSeconds)
+                    }
                     Wait-BootUpdateUiInterval -Seconds 1 -Activity 'Parallel update cohort' `
                         -Status "$finished/$($cohortJobs.Count) phases complete" -PercentComplete $overallPercent
-                } while ([datetime]::UtcNow -lt $cohortDeadline)
+                } while (-not $pastDeadline)
             }
 
-            <# Collect results, replay logs, update state — one atomic write at the end #>
-            foreach ($job in $cohortJobs) {
-                $phaseName = $job.PhaseName
-                $phaseDefn = $parallelCohort | Where-Object { $_.Name -eq $phaseName } | Select-Object -First 1
-
-                $jr = $null
-                try { $jr = Receive-Job -Job $job -ErrorAction SilentlyContinue } catch { }
-                $jobState = $job.State
-                Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
-
-                if ($null -eq $jr -or $jobState -ne 'Completed') {
-                    Write-Log "[$phaseName] Thread job did not complete (state: $jobState) — leaving pending for retry" -Level Error
-                    $state.($phaseDefn.Flag) = $false
-                    continue
-                }
-
-                <# Replay log lines through Write-Log on the parent thread #>
-                if ($phaseName -eq 'Vscode' -and $jr.PSObject.Properties.Name -contains 'ProviderLines') {
-                    Write-ProviderTranscript -Provider Vscode -Lines @($jr.ProviderLines)
-                }
-                Write-BootUpdateResultLines -Lines @($jr.LogLines)
-                <# A provider that reports deferrals (a program holding its files) replaces its
-                   earlier record, so a clean re-run clears what it deferred before. #>
-                if ($jr -is [hashtable] -and $jr.ContainsKey('Deferred')) {
-                    Add-BootUpdateDeferredInventory -State $state -Provider $phaseName -Scope 'user' -Records @($jr.Deferred)
-                }
-
-                $replayedFailure = @($jr.LogLines | Where-Object {
-                    $_ -match '^\[Error\]|^\[Warn\].*(failed|timed out|timeout|error)' -and $_ -notmatch '^\[Warn\] \[DEFERRED\]'
-                }).Count -gt 0
-                $phaseSucceeded = $jobState -eq 'Completed' -and [bool]$jr.Success -and (-not $replayedFailure)
-                <# Preserve terminal-failure classification from cohort phases so the
-                   completion disposition can stop retrying an unrecoverable failure. #>
-                $phaseDefn.TerminalFailure = [bool]$jr.TerminalFailure
-                $phaseDefn.AttentionDetails = @($jr.AttentionDetails)
-                $state.($phaseDefn.Flag) = $phaseSucceeded
-                if ($phaseDefn.Key -and $jr.Count) {
-                    $state.Summary.($phaseDefn.Key) += $jr.Count
-                }
-                if ($jr.Triggered) { $state.Summary.ActionsTriggered += [int]$jr.Triggered }
-
-                $phaseNum++
-                $elapsed = (Get-Date) - $cohortStart
-                Write-PhaseResult -Num $phaseNum -Total $enabledPhases.Count -Name $phaseName -Success $phaseSucceeded -Minutes $elapsed.TotalMinutes -Count $jr.Count
-                Write-Log "<<< [parallel] $phaseName - $(if ($phaseSucceeded) { 'DONE' } else { 'FAILED; RETRY PENDING' }) ($($jr.Count) pkg)" -Level $(if ($phaseSucceeded) { 'Info' } else { 'Error' }) -Visibility Debug
-                if ($phaseSucceeded) { Write-EventLogEntry -EventId 1004 -Message "$phaseName complete: $($jr.Count) packages (parallel cohort)" }
-                <# After<Phase> hook — fired on the parent thread as each result is collected (approximate order). #>
-                Invoke-PhaseHook -EventName "After$phaseName"
-            }
-
-            <# Atomic state write — one write covers all five cohort phases #>
+            <# Atomic state write — one write covers all cohort phases #>
             $state.LastPhaseStarted = $null; $state.LastPhaseTimestamp = $null; $state.Phase = 'CohortDone'
             Set-BootUpdateState -State $state
 

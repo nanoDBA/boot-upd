@@ -398,6 +398,14 @@ $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
    on one or several guests' host-timeline.txt is a live view that costs no agent at all. #>
 $timelinePath = Join-Path $evidenceDir 'host-timeline.txt'
 function Add-Timeline { param([string]$Line) Add-Content -LiteralPath $timelinePath -Value $Line }
+<# The guest's updater log, appended poll by poll as it grows. BootUpdateCycle.log in the
+   evidence directory is still the authoritative copy, taken whole at collection time; this
+   one exists for the rows that never get there. A guest that dies, hangs, or loses its
+   network keeps its log on a disk nobody can read, and the timeline's one trailing line per
+   poll was all that survived of it. Each poll ships only the lines added since the last
+   one, so the cost does not grow with the log. #>
+$liveLogPath = Join-Path $evidenceDir 'BootUpdateCycle.live.log'
+$knownLogLines = 0
 $complete = $false
 $injected = $false
 $maxConsent = 0
@@ -408,8 +416,8 @@ $injectArmed = [bool]($InjectWhen -and $InjectAction)
 if ($injectArmed) { Say "injection armed on /$InjectWhen/" }
 while ((Get-Date) -lt $deadline) {
     try {
-        $r = Invoke-Command -VMName $VMName -Credential $cred -ErrorAction Stop -ArgumentList $InjectWhen -ScriptBlock {
-            param($Pattern)
+        $r = Invoke-Command -VMName $VMName -Credential $cred -ErrorAction Stop -ArgumentList $InjectWhen, $knownLogLines -ScriptBlock {
+            param($Pattern, $KnownLines)
             $log = 'C:\ProgramData\BootUpdateCycle\BootUpdateCycle.log'
             <# @() OUTSIDE the if, not inside it. `$x = if (...) { @('one') }` assigns the
                STRING, because the statement's output is enumerated on the way out, and a
@@ -445,11 +453,15 @@ while ((Get-Date) -lt $deadline) {
                 Pwsh     = Test-Path 'C:\Program Files\PowerShell\7\pwsh.exe'
                 Last     = if ($lines.Count) { ($lines[-1] -replace '\s+', ' ').Trim() } else { '' }
                 Matched  = if ($Pattern) { @($lines | Where-Object { $_ -match $Pattern }).Count -gt 0 } else { $false }
+                <# Lines the host has not seen. A log shorter than last time was rotated or
+                   recreated, so the whole new file goes back and the host marks the break. #>
+                NewLines = @(if ($lines.Count -gt $KnownLines) { $lines[$KnownLines..($lines.Count - 1)] } elseif ($lines.Count -lt $KnownLines) { $lines })
             }
         }
         $maxConsent = [math]::Max($maxConsent, [int]$r.Consent)
         if ($r.Pwsh) { $pwshSeen = $true }
         Add-Timeline (("{0} passes={1} lines={2} tasks={3} :: {4}" -f (Get-Date -Format 'HH:mm:ss'), $r.Passes, $r.Lines, $r.Tasks, $r.Last))
+        $knownLogLines = Add-BootUpdLabLiveLog -Path $liveLogPath -KnownCount $knownLogLines -GuestCount $r.Lines -NewLines @($r.NewLines)
         if ($injectArmed -and -not $injectAttempted -and $r.Matched) {
             Say "injecting on match at $(Get-Date -Format 'HH:mm:ss')"
             Add-Timeline (("{0} INJECTED on /{1}/" -f (Get-Date -Format 'HH:mm:ss'), $InjectWhen))

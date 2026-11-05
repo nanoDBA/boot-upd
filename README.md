@@ -264,7 +264,10 @@ update packages, or reboot Windows.
 
 Interactive runs start with a compact progress view: current phase, overall progress,
 phase results, warnings, and errors. The full timestamped detail still goes to
-`BootUpdateCycle.log`. Raw Winget and Chocolatey output is retained separately in
+`BootUpdateCycle.log`, where every phase, including each one in the parallel group, logs
+`STARTING` when it begins and `DONE (x min, n pkg)` the moment it ends; while the parallel
+group runs, a line every five minutes names the phases still going. Raw Winget and
+Chocolatey output is retained separately in
 `BootUpdateCycle.providers.log` for troubleshooting without overwhelming the normal run log.
 Standalone `upd aws` output is captured in `BootUpdateCycle.aws.log`. These logs rotate
 independently (three archives, 5 MB for core/AWS and 10 MB for provider detail) and the
