@@ -2697,8 +2697,9 @@ Describe 'Terminal pip interpreter failure' {
     }
 
     It 'propagates cohort terminal failures to the completion disposition' {
-        $invokeSource | Should -Match ([regex]::Escape('$phaseDefn.TerminalFailure = [bool]$jr.TerminalFailure'))
-        $invokeSource | Should -Match ([regex]::Escape('$phaseDefn.AttentionDetails = @($jr.AttentionDetails)'))
+        $settle = Get-FunctionText $invokeAst 'Complete-BootUpdateCohortPhase'
+        $settle | Should -Match ([regex]::Escape('$PhaseDefinition.TerminalFailure = [bool]$jr.TerminalFailure'))
+        $settle | Should -Match ([regex]::Escape('$PhaseDefinition.AttentionDetails = @($jr.AttentionDetails)'))
         $result = Resolve-BootUpdateCompletionDisposition -IncompletePhases @(
             @{ Name='Pip'; UserCompletionDeferred=$false; TerminalFailure=$true; AttentionDetails=@('Python interpreter') }
         )
@@ -3032,9 +3033,14 @@ Describe 'Evidence-backed completion' {
     }
 
     It 'requires completed thread jobs and structured success' {
-        $text = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
-        $text | Should -Match "jobState -ne 'Completed'"
-        $text | Should -Match 'phaseSucceeded = \$jobState -eq ''Completed''.*jr\.Success'
+        <# The cohort settles each job through Complete-BootUpdateCohortPhase; a job that is
+           not Completed returns before any success claim, and success needs the structured
+           Success flag, not just a finished job. #>
+        $cycle = Get-FunctionText $invokeAst 'Invoke-BootUpdateCycle'
+        $cycle | Should -Match 'Complete-BootUpdateCohortPhase -Job \$job'
+        $settle = Get-FunctionText $invokeAst 'Complete-BootUpdateCohortPhase'
+        $settle | Should -Match "if \(\`$null -eq \`$jr -or \`$jobState -ne 'Completed'\)"
+        $settle | Should -Match 'phaseSucceeded = \[bool\]\$jr\.Success -and \(-not \$replayedFailure\)'
     }
 }
 

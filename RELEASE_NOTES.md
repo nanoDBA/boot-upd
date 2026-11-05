@@ -5,6 +5,12 @@
 
 ---
 
+## Unreleased
+
+The parallel group (pip, npm, Scoop, AI tools, .NET tools, VS Code, Defender, Office, PowerShell modules) now logs as it goes. Each phase writes `STARTING` when its job launches and `DONE (x min, n pkg)` the moment it finishes, in the same form as the sequential phases, and every five minutes the group names the phases still running. Before this, the group's output appeared only after its slowest phase, with no durations: on a 2026-11-02 run nothing in the logs could say which phase took 29 of the cycle's 36 minutes, and a process killed during the group lost the lines entirely.
+
+Lab rows keep a running copy of the guest's updater log on the host (`BootUpdateCycle.live.log`), appended on every poll. A guest that dies or drops off the network before collection used to leave only one trailing line per poll in `host-timeline.txt`.
+
 ## v2.5.91 (2026-11-02)
 
 Since v2.5.88, a cycle that stopped for attention or at a safety limit could not be restarted. Running `upd` deleted the main checkpoint but not its backup. Both copies held the stop, so the updater recovered it, logged "Primary state file is unusable", and exited. On the two machines behind this fix, one MuseScore installer failure and one locked npm module kept every later run from updating anything. Running `upd` now starts a fresh cycle again; `upd run -ResumeAfterAttention` still continues the stopped one.

@@ -25,8 +25,11 @@ suite and caught only by a lab row.
 
 Always run as a background job. Never poll a row's progress by re-invoking a check in a loop —
 `host-timeline.txt` in the evidence directory is append-as-it-happens and is the thing to tail
-if a live view is wanted. When the job finishes, read `summary.json` first, then grep
-`BootUpdateCycle.log` for:
+if a live view is wanted. `BootUpdateCycle.live.log` beside it is the guest's updater log,
+appended poll by poll; it is what remains of a guest that dies or goes unreachable before
+collection, and it is the file to tail for the updater's own lines (parallel phases log
+`STARTING`, `DONE (x min, n pkg)` and a five-minute "still running" heartbeat as they happen).
+When the job finishes, read `summary.json` first, then grep `BootUpdateCycle.log` for:
 
 ```
 CYCLE (STARTED|RESUMED|COMPLETE)|new Windows boot session|recovery limit|Deferred inventory|No interactive user
