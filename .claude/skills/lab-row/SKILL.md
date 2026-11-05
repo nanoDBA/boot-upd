@@ -103,6 +103,10 @@ appears at the moment the row cares about, not one that could also match on an e
   session that thinks it is still capture time and behaves non-deterministically after restore.
 - **The tree-sync path deletes the guest copy before copying**, so a file removed on the host
   cannot survive on the guest while the orchestrator hash still matches.
+- **Do not edit the row's source tree while it syncs.** The harness hashes the file list when
+  the row starts and re-hashes the orchestrator after the copy, so a version bump landing in
+  the same worktree mid-sync fails both rows with "Orchestrator hash mismatch" (v2.5.92).
+  Run rows from a detached worktree pinned at the commit under test and edit elsewhere.
 - **"The credential is invalid" from PowerShell Direct usually means the guest password expired**,
   not that the stored credential is wrong. Windows' 42-day default outlives checkpoints, and a
   restored guest syncs its clock to the host. Look before rotating anything: capture the console
