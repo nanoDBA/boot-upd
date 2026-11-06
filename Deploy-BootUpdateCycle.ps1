@@ -17,11 +17,13 @@ param(
     [ValidateRange(1,500)][int]$MaxUserIdentityWaits,
     [ValidateRange(2,1440)][int]$WatchdogIntervalMinutes,
     [ValidateRange(1,1440)][int]$PackageTimeoutMinutes,
+    [ValidateRange(30,1440)][int]$FeatureUpdateTimeoutMinutes,
     [switch]$StagedRollout,
     [switch]$AggressiveRepair,
     [switch]$ResumeAfterAttention,
     [switch]$IncludeDriverUpdates,
     [switch]$IncludeFirmwareUpdates,
+    [switch]$SkipFeatureUpdates,
     [switch]$UpdateWsl,
     [switch]$UpdateContainers,
     [switch]$AllowMetered,
@@ -95,6 +97,8 @@ $Config = @{
     AggressiveRepair      = $false  # Explicit opt-in: attempt Winget repair/force reinstall for failures
     IncludeDriverUpdates  = $false  # Opt in to Windows driver updates
     IncludeFirmwareUpdates = $false # Opt in to firmware updates
+    SkipFeatureUpdates    = $false  # Set $true to leave Windows feature updates (new Windows versions) to Windows Update
+    FeatureUpdateTimeoutMin = 240   # Hard timeout for the Windows Update phase when a feature update is applicable
     UpdateWsl             = $false  # Opt in to WSL kernel/distribution updates
     UpdateContainers      = $false  # Opt in to Docker/Podman image refresh
     AllowMetered          = $false  # Permit metered network use
@@ -143,7 +147,8 @@ if ($PSBoundParameters.ContainsKey('MaxRetryPasses')) { $Config.MaxRetryPasses =
 if ($PSBoundParameters.ContainsKey('MaxUserIdentityWaits')) { $Config.MaxUserIdentityWaits = $MaxUserIdentityWaits }
 if ($PSBoundParameters.ContainsKey('WatchdogIntervalMinutes')) { $Config.WatchdogIntervalMinutes = $WatchdogIntervalMinutes }
 if ($PSBoundParameters.ContainsKey('PackageTimeoutMinutes')) { $Config.PackageTimeoutMin = $PackageTimeoutMinutes }
-foreach ($name in @('StagedRollout','AggressiveRepair','IncludeDriverUpdates','IncludeFirmwareUpdates','UpdateWsl','UpdateContainers','AllowMetered','SkipPip','SkipNpm','SkipOffice365','SkipPowerShellModules','SkipScoop','SkipAiTools','SkipVscode','SkipDefender','SkipHealthCheck','SkipBitLocker','DisableSelfUpdate')) {
+if ($PSBoundParameters.ContainsKey('FeatureUpdateTimeoutMinutes')) { $Config.FeatureUpdateTimeoutMin = $FeatureUpdateTimeoutMinutes }
+foreach ($name in @('StagedRollout','AggressiveRepair','IncludeDriverUpdates','IncludeFirmwareUpdates','SkipFeatureUpdates','UpdateWsl','UpdateContainers','AllowMetered','SkipPip','SkipNpm','SkipOffice365','SkipPowerShellModules','SkipScoop','SkipAiTools','SkipVscode','SkipDefender','SkipHealthCheck','SkipBitLocker','DisableSelfUpdate')) {
     if ($PSBoundParameters.ContainsKey($name)) { $Config[$name] = $true }
 }
 if ($PSBoundParameters.ContainsKey('SkipSsms')) { $Config.SkipSsms = [bool]$SkipSsms }
@@ -545,6 +550,7 @@ $invokeArgs = @{
     MaxUserIdentityWaits = $Config.MaxUserIdentityWaits
     WatchdogIntervalMinutes = $Config.WatchdogIntervalMinutes
     PackageTimeoutMinutes = $Config.PackageTimeoutMin
+    FeatureUpdateTimeoutMinutes = $Config.FeatureUpdateTimeoutMin
     RebootDelaySec       = $Config.RebootDelaySec
     OutputMode           = $Config.OutputMode
     SkipPip              = $Config.SkipPip
@@ -560,6 +566,7 @@ $invokeArgs = @{
     SkipDefender         = $Config.SkipDefender
     IncludeDriverUpdates = $Config.IncludeDriverUpdates
     IncludeFirmwareUpdates = $Config.IncludeFirmwareUpdates
+    SkipFeatureUpdates   = $Config.SkipFeatureUpdates
     UpdateWsl            = $Config.UpdateWsl
     UpdateContainers     = $Config.UpdateContainers
     SkipRestorePoint     = $Config.SkipRestorePoint
@@ -760,6 +767,7 @@ function Register-ScheduledTaskNow {
         "-MaxUserIdentityWaits $($Config.MaxUserIdentityWaits)"
         "-WatchdogIntervalMinutes $($Config.WatchdogIntervalMinutes)"
         "-PackageTimeoutMinutes $($Config.PackageTimeoutMin)"
+        "-FeatureUpdateTimeoutMinutes $($Config.FeatureUpdateTimeoutMin)"
         "-RebootDelaySec $($Config.RebootDelaySec)"
         "-OutputMode $($Config.OutputMode)"
     )
@@ -777,6 +785,7 @@ function Register-ScheduledTaskNow {
     if ($Config.SkipDefender)         { $taskArgs += '-SkipDefender' }
     if ($Config.IncludeDriverUpdates) { $taskArgs += '-IncludeDriverUpdates' }
     if ($Config.IncludeFirmwareUpdates) { $taskArgs += '-IncludeFirmwareUpdates' }
+    if ($Config.SkipFeatureUpdates)   { $taskArgs += '-SkipFeatureUpdates' }
     if ($Config.UpdateWsl)            { $taskArgs += '-UpdateWsl' }
     if ($Config.UpdateContainers)     { $taskArgs += '-UpdateContainers' }
     if ($Config.SkipRestorePoint)     { $taskArgs += '-SkipRestorePoint' }

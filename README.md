@@ -118,7 +118,7 @@ and whether anything still needs your attention:
 | 1 | **Winget** | On | User + machine scope; ARSO resumes user scope after reboot, with a delayed SYSTEM safety net |
 | 2 | **Chocolatey** | On | `choco upgrade all -y` |
 | 3 | **SQL Server Management Studio 22** | On | Native Visual Studio Installer update for each existing instance, after package managers; preserves its configured channel and source |
-| 4 | **Windows Update** | On | Security, Critical, Definition updates (excludes SQL Server) |
+| 4 | **Windows Update** | On | Everything Windows Update would install on its own, plus feature updates (new Windows versions) unless `--skip-feature-updates`; excludes SQL Server; drivers stay opt-in |
 | 5 | **AWS Tooling** | Off | Optional CLI v2 + AWS.Tools repair |
 | 6 | **pip** | On | All outdated global packages |
 | 7 | **npm** | On | Outdated global packages, one at a time; a package held open by a running program is deferred by name |
@@ -209,6 +209,8 @@ upd --staged --output-mode Verbose
 upd --wsl --containers --allow-metered
 upd -ar                          Opt in to aggressive Winget repair/reinstall attempts
 upd --exclude Teams,OneDrive --skip-office365
+upd --skip-feature-updates       Leave new Windows versions to Windows Update's own schedule
+upd --feature-timeout 360        Allow six hours for a feature update instead of four
 ```
 
 Short forms keep everyday commands light: `upd d 12`, `upd f`, `upd p -drv -r 120`,
@@ -490,6 +492,24 @@ The new no-progress limit takes over after that.
 A clean online assessment can be reused for up to six hours across reboots only when the local
 Windows Update catalog, configured scope, update source, and servicing-history fingerprints still
 agree. If one changes, boot-upd checks Windows Update again.
+
+### What does the Windows Update phase install?
+
+The same set Windows Update would install on its own if you left the machine alone: every
+software update it has marked for installation, whatever category Microsoft files it under.
+Feature updates (a new Windows version such as 26H2) are included as well, even while Windows
+Update still lists them as optional, unless you pass `--skip-feature-updates`. Drivers and
+firmware stay opt-in (`--drivers`, `--firmware`). SQL Server updates and anything matching
+`--exclude` are left alone.
+
+Everything Windows Update offers and the phase does not take is named in the log with the
+reason (`Windows Update offers outside scope: ...`), so a new kind of update is visible the
+first time it appears rather than silently skipped. Up to v2.5.92 the phase took only
+Security, Critical and Definition updates, and feature updates were never offered to it.
+
+A feature update is a long install. When one is in scope the Windows Update phase gets
+`--feature-timeout` minutes (default 240) instead of the per-provider `--timeout`, and the
+machine reboots at least once more while Windows finishes the upgrade.
 
 ### Why did a package get skipped?
 

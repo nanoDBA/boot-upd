@@ -8,6 +8,7 @@ param(
     [Alias('n','max-iterations')][ValidateRange(1,50)][int]$MaxIterations = 5,
     [Alias('max-retry-passes')][ValidateRange(1,50)][int]$MaxRetryPasses = 5,
     [Alias('t','timeout','timeout-minutes','package-timeout-minutes')][ValidateRange(1,1440)][int]$PackageTimeoutMinutes = 30,
+    [Alias('feature-timeout','feature-update-timeout-minutes')][ValidateRange(30,1440)][int]$FeatureUpdateTimeoutMinutes = 240,
     [Alias('duration')][ValidateRange(2,60)][int]$DurationSeconds = 8,
     [Alias('s','StagedRollout')][switch]$Staged,
     [Alias('ar','aggressive-repair')][switch]$AggressiveRepair,
@@ -31,6 +32,7 @@ param(
     [Alias('no-ai','skip-ai-tools')][switch]$SkipAiTools,
     [Alias('no-code','skip-vscode')][switch]$SkipVscode,
     [Alias('no-def','skip-defender')][switch]$SkipDefender,
+    [Alias('no-fu','skip-feature-updates')][switch]$SkipFeatureUpdates,
     [Alias('no-check','skip-health-check')][switch]$SkipHealthCheck,
     [Alias('no-bl','skip-bit-locker')][switch]$SkipBitLocker,
     [Alias('nu','no-update','disable-self-update')][switch]$DisableSelfUpdate,
@@ -122,6 +124,7 @@ function Show-UpdHelp {
     -n, --max-iterations <n>   Consecutive reboots without verified progress; default 5 (1-50)
     --max-retry-passes <n>     Failed recovery passes in one boot; default 5 (1-50)
     -t, --timeout <minutes>    Per-provider hard timeout; default 30
+    --feature-timeout <minutes> Windows Update budget when a feature update (new Windows version) installs; default 240
     -s, --staged               Run one provider per checkpoint
     -ar, --aggressive-repair   Attempt repair/force reinstall for failed Winget packages
     -drv, --drivers            Include Windows driver updates
@@ -145,6 +148,7 @@ function Show-UpdHelp {
     --skip-ai-tools            Skip Claude Code (native install) and Hermes Agent self-updates
     --skip-vscode              Skip VS Code extensions
     --skip-defender            Skip Defender signatures
+    --skip-feature-updates     Leave new Windows versions (feature updates) to Windows Update's own schedule
     --skip-health-check        Skip service verification (completion is downgraded)
     --skip-bit-locker          Do not suspend BitLocker for an orchestrated reboot
     --disable-self-update      Do not check GitHub releases
@@ -239,6 +243,7 @@ function Get-UpdDeployParameters {
         MaxIterations         = $MaxIterations
         MaxRetryPasses        = $MaxRetryPasses
         PackageTimeoutMinutes = $PackageTimeoutMinutes
+        FeatureUpdateTimeoutMinutes = $FeatureUpdateTimeoutMinutes
         NonInteractive        = $true
     }
     $switchMap = [ordered]@{
@@ -247,7 +252,7 @@ function Get-UpdDeployParameters {
         RestorePoint='EnableRestorePoint'; DotnetTools='EnableDotnetTools'; AwsTooling='EnableAwsTooling'
         SkipPip='SkipPip'; SkipNpm='SkipNpm'; SkipOffice365='SkipOffice365'; SkipSsms='SkipSsms'
         SkipPowerShellModules='SkipPowerShellModules'; SkipScoop='SkipScoop'; SkipAiTools='SkipAiTools'; SkipVscode='SkipVscode'
-        SkipDefender='SkipDefender'; SkipHealthCheck='SkipHealthCheck'; SkipBitLocker='SkipBitLocker'
+        SkipDefender='SkipDefender'; SkipFeatureUpdates='SkipFeatureUpdates'; SkipHealthCheck='SkipHealthCheck'; SkipBitLocker='SkipBitLocker'
         DisableSelfUpdate='DisableSelfUpdate'; ResumeAfterAttention='ResumeAfterAttention'
     }
     foreach ($entry in $switchMap.GetEnumerator()) {

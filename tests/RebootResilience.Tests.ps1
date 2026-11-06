@@ -55,6 +55,11 @@ BeforeAll {
         'Update-BootUpdateStagedRetryCount',
         'Get-NextMaintenanceWindowStart',
         'Get-WindowsUpdateVerificationScope',
+        'Get-WindowsUpdateOfferScanScriptBlock',
+        'ConvertFrom-WindowsUpdateOfferScanOutput',
+        'Select-WindowsUpdateOffer',
+        'Invoke-WindowsUpdateOfferScan',
+        'Write-WindowsUpdateOfferLog',
         'Get-WindowsUpdateEnvironmentFingerprint',
         'Remove-WindowsUpdateAssessmentCache',
         'Set-WindowsUpdateAssessmentCache',
@@ -1925,9 +1930,10 @@ Describe 'In-flight watchdog scheduling' {
             $script:CapturedTasks.Remove('BootUpdateCycleFallback') | Out-Null
         }
 
-        foreach ($name in @('SkipPip','SkipNpm','SkipOffice365','SkipSsms','SkipAwsTooling','SkipPowerShellModules','SkipScoop','SkipDotnetTools','SkipVscode','SkipDefender','IncludeDriverUpdates','IncludeFirmwareUpdates','UpdateWsl','UpdateContainers','SkipRestorePoint','SkipHealthCheck','SkipBitLocker','AllowMetered','DisableSelfUpdate','StagedRollout','AggressiveRepair')) {
+        foreach ($name in @('SkipPip','SkipNpm','SkipOffice365','SkipSsms','SkipAwsTooling','SkipPowerShellModules','SkipScoop','SkipDotnetTools','SkipVscode','SkipDefender','SkipFeatureUpdates','IncludeDriverUpdates','IncludeFirmwareUpdates','UpdateWsl','UpdateContainers','SkipRestorePoint','SkipHealthCheck','SkipBitLocker','AllowMetered','DisableSelfUpdate','StagedRollout','AggressiveRepair')) {
             Set-Variable -Scope Script -Name $name -Value $false
         }
+        $script:FeatureUpdateTimeoutMinutes = 240
         $script:OutputMode = 'Normal'
         $script:IncludePatterns = @()
         $script:ExcludePatterns = @()
@@ -2775,7 +2781,7 @@ Describe 'Behavioral Windows Update convergence' {
     It 'reports remaining applicable updates' {
         Mock Get-WindowsUpdateEnvironmentFingerprint { 'fingerprint' }
         Mock Set-WindowsUpdateAssessmentCache {}
-        Mock Invoke-BootUpdateBackgroundOperation { [pscustomobject]@{ Output=@('BOOTUPDATE_APPLICABLE|id-1|7|Update','BOOTUPDATE_SCAN_COMPLETE|1'); Failed=$false; TimedOut=$false } }
+        Mock Invoke-BootUpdateBackgroundOperation { [pscustomobject]@{ Output=@('BOOTUPDATE_OFFER|id-1|7|1|Installation||0|0|Security Updates|Update','BOOTUPDATE_SCAN_COMPLETE|1'); Failed=$false; TimedOut=$false } }
         $result = Test-WindowsUpdateConvergence
         $result.Verified | Should -BeTrue
         $result.Count | Should -Be 1
@@ -2791,7 +2797,7 @@ Describe 'Behavioral Windows Update convergence' {
         $title = 'Update for Windows Security platform - KB5007651 (Version 10.0.29628.1000)'
         Mock Get-WindowsUpdateEnvironmentFingerprint { 'fingerprint' }
         Mock Set-WindowsUpdateAssessmentCache {}
-        Mock Invoke-BootUpdateBackgroundOperation { [pscustomobject]@{ Output=@("BOOTUPDATE_APPLICABLE|id-1|204|$title",'BOOTUPDATE_SCAN_COMPLETE|1'); Failed=$false; TimedOut=$false } }
+        Mock Invoke-BootUpdateBackgroundOperation { [pscustomobject]@{ Output=@("BOOTUPDATE_OFFER|id-1|204|1|Installation|KB5007651|0|0|Updates|$title",'BOOTUPDATE_SCAN_COMPLETE|1'); Failed=$false; TimedOut=$false } }
         Mock Get-WindowsUpdateInstallHistory {
             @([pscustomobject]@{ Title = $title; ResultCode = 2; InstalledAt = $script:TestBootInstant.AddMinutes(20) })
         }
@@ -2826,7 +2832,7 @@ Describe 'Behavioral Windows Update convergence' {
 
     It 'withholds verification when the completion count disagrees with update records' {
         Mock Invoke-BootUpdateBackgroundOperation { [pscustomobject]@{
-            Output=@('BOOTUPDATE_APPLICABLE|id-1|7|Update','BOOTUPDATE_SCAN_COMPLETE|0')
+            Output=@('BOOTUPDATE_OFFER|id-1|7|1|Installation||0|0|Security Updates|Update','BOOTUPDATE_SCAN_COMPLETE|0')
             Failed=$false; TimedOut=$false
         } }
         (Test-WindowsUpdateConvergence).Verified | Should -BeFalse
@@ -2909,11 +2915,15 @@ Describe 'Cross-session Windows Update assessment cache' {
     }
 
     It 'bounds offline WUA work and requires a count-matched completion contract' {
-        $text = Get-FunctionText $invokeAst 'Invoke-WindowsUpdateOfflineAssessment'
-        $text | Should -Match 'Invoke-BootUpdateBackgroundOperation'
-        $text | Should -Match 'TimeoutMinutes'
-        $text | Should -Match 'BOOTUPDATE_SCAN_COMPLETE'
-        $text | Should -Match '\$declared -ne \$records.Count'
+        $assessment = Get-FunctionText $invokeAst 'Invoke-WindowsUpdateOfflineAssessment'
+        $assessment | Should -Match 'Invoke-WindowsUpdateOfferScan -Scope \$Scope'
+        $assessment | Should -Match 'TimeoutMinutes \(\[math\]::Min\(5, \$script:PackageTimeoutMinutes\)\)'
+        $assessment | Should -Not -Match '-Online' -Because 'the reconciliation asks the local catalog only'
+        $scan = Get-FunctionText $invokeAst 'Invoke-WindowsUpdateOfferScan'
+        $scan | Should -Match 'Invoke-BootUpdateBackgroundOperation'
+        $parser = Get-FunctionText $invokeAst 'ConvertFrom-WindowsUpdateOfferScanOutput'
+        $parser | Should -Match 'BOOTUPDATE_SCAN_COMPLETE'
+        $parser | Should -Match '\$declared -ne \$records.Count'
     }
 
     It 'fingerprints registered update services as well as policy and history' {
@@ -2923,11 +2933,11 @@ Describe 'Cross-session Windows Update assessment cache' {
         $text | Should -Match 'ServiceID'
     }
 
-    It 'uses a count-preserving identity fallback for PSWindowsUpdate result shapes' {
-        $text = Get-FunctionText $invokeAst 'Test-WindowsUpdateConvergence'
-        $text | Should -Match '\$_.Identity'
-        $text | Should -Match 'identity-unavailable'
-        $text | Should -Match 'RevisionNumber'
+    It 'reads update identity from the Windows Update Agent, not from PSWindowsUpdate result shapes' {
+        $worker = (Get-WindowsUpdateOfferScanScriptBlock).ToString()
+        $worker | Should -Match 'Identity\.UpdateID'
+        $worker | Should -Match 'Identity\.RevisionNumber'
+        $worker | Should -Not -Match 'Get-WindowsUpdate\b' -Because 'the scan is a read-only WUA search and does not need the module'
     }
 
     It 'does not delete assessment evidence during WhatIf' {
@@ -5867,9 +5877,9 @@ Describe 'The convergence check returns one shape, whichever way it returns' {
         $result.Unexplained | Should -Be 0
     }
 
-    It 'gives the unavailable-module return the same shape, with nothing claimed as known' {
+    It 'gives the failed-scan return the same shape, with nothing claimed as known' {
         Mock Test-WindowsUpdateZeroEvidence { $false }
-        Mock Get-Module { $null }
+        Mock Invoke-BootUpdateBackgroundOperation { [pscustomobject]@{ Output=@(); Failed=$true; TimedOut=$false } }
 
         $result = Test-WindowsUpdateConvergence
 
