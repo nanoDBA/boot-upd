@@ -5,6 +5,20 @@
 
 ---
 
+## Unreleased
+
+Windows feature updates now install. A machine on Windows 11 25H2 that Windows Update was offering 26H2 ran the updater daily and reported Windows Update converged every time, while Settings kept showing the new version as available. Two things hid it. The phase asked PSWindowsUpdate for three categories only (Security, Critical, Definition), and feature updates live in a fourth. Even with that category added nothing would have appeared: the Windows Update Agent treats every search as "updates marked for installation" unless told otherwise, and a feature update a machine may take but has not yet been pushed is marked optional. The prefetch, the install and the final convergence scan all shared that blind spot, so they agreed with each other.
+
+- **Scope is defined once and written in Windows Update's own terms.** The phase now asks for every software update Windows Update would install itself, in any category, plus optional feature updates. That one definition drives the background download, the install and the final scan. Drivers stay with the opt-in `--drivers` / `--firmware` phase, SQL Server stays excluded, and `--exclude` patterns still apply to titles.
+- **`--skip-feature-updates`** leaves new Windows versions to Windows Update's own schedule. The rest of the phase is unchanged.
+- **`--feature-timeout <minutes>`** (default 240) is the Windows Update budget when a feature update is in scope. A feature update is a new Windows version; the old 30-minute per-provider budget would have killed it mid-install, and the updater's idle clock cannot see work that happens inside TrustedInstaller.
+- **The log names what it leaves alone.** Before installing, and again at the final scan, the phase lists what Windows Update offered: in-scope items with size and download state, and each out-of-scope item with the reason (driver, optional, excluded by pattern, installed earlier this run). An update Microsoft starts offering in a new shape is visible the first time, not after weeks of "converged".
+- **Nothing to install, nothing called.** When the pre-install scan finds nothing in scope the install call is skipped and the result counts as the same zero-work evidence a scan would have produced.
+
+### Testing
+
+Verified read-only on the machine that reported the problem: the new scope criteria return the 26H2 feature update through the Windows Update Agent (online and from the local catalog) and through PSWindowsUpdate, and the previous category filter returns nothing for it. No feature update has yet been installed by the updater itself; a lab row with a feature update in scope is **not run** and is tracked for the next release that ships this.
+
 ## v2.5.92 (2026-11-05)
 
 The parallel group (pip, npm, Scoop, AI tools, .NET tools, VS Code, Defender, Office, PowerShell modules) now logs as it goes. Each phase writes `STARTING` when its job launches and `DONE (x min, n pkg)` the moment it finishes, in the same form as the sequential phases, and every five minutes the group names the phases still running. Before this, the group's output appeared only after its slowest phase, with no durations: on a 2026-11-02 run nothing in the logs could say which phase took 29 of the cycle's 36 minutes, and a process killed during the group lost the lines entirely.

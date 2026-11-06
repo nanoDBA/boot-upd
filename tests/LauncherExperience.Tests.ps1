@@ -831,7 +831,7 @@ Describe 'Typed run option forwarding' {
     It 'exposes the documented deployment controls as typed parameters' {
         foreach ($parameter in @(
             'OutputMode','MaxIterations','MaxRetryPasses','PackageTimeoutMinutes','StagedRollout','AggressiveRepair',
-            'IncludeDriverUpdates','IncludeFirmwareUpdates','UpdateWsl','UpdateContainers',
+            'IncludeDriverUpdates','IncludeFirmwareUpdates','SkipFeatureUpdates','FeatureUpdateTimeoutMinutes','UpdateWsl','UpdateContainers',
             'AllowMetered','EnableRestorePoint','EnableDotnetTools','EnableAwsTooling',
             'SkipSsms','SkipDefender','SkipBitLocker','DisableSelfUpdate','ResumeAfterAttention','ExcludePatterns','IncludePatterns'
         )) {
@@ -842,9 +842,11 @@ Describe 'Typed run option forwarding' {
     It 'keeps structured pattern arrays and new switches in both direct and scheduled paths' {
         $deploySource | Should -Match 'IncludePatternsBase64'
         $deploySource | Should -Match 'ExcludePatternsBase64'
-        foreach ($name in @('SkipSsms','SkipDefender','IncludeDriverUpdates','UpdateWsl','UpdateContainers','AllowMetered','SkipBitLocker','DisableSelfUpdate','AggressiveRepair')) {
+        foreach ($name in @('SkipSsms','SkipDefender','SkipFeatureUpdates','IncludeDriverUpdates','UpdateWsl','UpdateContainers','AllowMetered','SkipBitLocker','DisableSelfUpdate','AggressiveRepair')) {
             $deploySource | Should -Match ([regex]::Escape("Config.$name"))
         }
+        $deploySource | Should -Match ([regex]::Escape('FeatureUpdateTimeoutMinutes = $Config.FeatureUpdateTimeoutMin'))
+        $deploySource | Should -Match ([regex]::Escape('"-FeatureUpdateTimeoutMinutes $($Config.FeatureUpdateTimeoutMin)"'))
         $deploySource | Should -Match 'ResumeAfterAttention = \$ResumeAfterAttention'
         $deploySource | Should -Match '-not \$Config\.DisableSelfUpdate'
         $deploySource | Should -Match '\$remoteVer -ge \$currentVer'

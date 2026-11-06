@@ -33,6 +33,14 @@
 .PARAMETER PackageTimeoutMinutes
     Hard timeout ceiling per package manager.  Default 30.
 
+.PARAMETER FeatureUpdateTimeoutMinutes
+    Hard timeout for the Windows Update phase when a feature update (a new Windows
+    version) is applicable. Default 240. Never below PackageTimeoutMinutes.
+
+.PARAMETER SkipFeatureUpdates
+    Leave feature updates to Windows Update's own schedule. By default a feature update
+    that Windows Update offers this machine installs like any other update.
+
 .PARAMETER RebootDelaySec
     Seconds before forced reboot (no user abort window).  Default 0 (immediate, forced).
 
@@ -79,6 +87,9 @@ param(
     [switch]$SkipDefender,                # Defender signature update (default: runs)
     [switch]$IncludeDriverUpdates,        # Driver updates via PSWindowsUpdate (default: opt-in, off)
     [switch]$IncludeFirmwareUpdates,      # Firmware updates via PSWindowsUpdate (default: opt-in, off)
+    [switch]$SkipFeatureUpdates,          # Leave Windows feature updates (new Windows versions) to Windows Update's own schedule
+    [ValidateRange(30,1440)]
+    [int]$FeatureUpdateTimeoutMinutes = 240,  # Hard timeout for the Windows Update phase when a feature update is in scope
     [switch]$UpdateWsl,                   # WSL kernel + distro updates (default: opt-in, off)
     [switch]$UpdateContainers,            # Docker/Podman image refresh + prune (default: opt-in, off)
     [switch]$SkipRestorePoint,
@@ -336,6 +347,8 @@ $script:SkipVscode            = $SkipVscode
 $script:SkipDefender          = $SkipDefender
 $script:IncludeDriverUpdates  = $IncludeDriverUpdates
 $script:IncludeFirmwareUpdates = $IncludeFirmwareUpdates
+$script:SkipFeatureUpdates    = $SkipFeatureUpdates
+$script:FeatureUpdateTimeoutMinutes = $FeatureUpdateTimeoutMinutes
 $script:UpdateWsl             = $UpdateWsl
 $script:UpdateContainers      = $UpdateContainers
 $script:SkipRestorePoint      = $SkipRestorePoint
@@ -4774,13 +4787,202 @@ function Test-WindowsUpdateServiceReady {
     return $false
 }
 
+<# The Windows Update scope is one WUA search-criteria string, built here and nowhere else.
+
+   Until v2.5.92 the scope was PSWindowsUpdate's -RootCategories post-filter: an allowlist of
+   Security, Critical and Definition updates. A feature update ("Windows 11, version 26H2",
+   category Upgrades) never matched it. Adding Upgrades to the list would not have helped:
+   WUA implies DeploymentAction='Installation' for every search that does not say otherwise,
+   and a feature update a device may take but is not yet pushed is offered as
+   'OptionalInstallation', so a default search never returns it; PSWindowsUpdate's own
+   Upgrades filter also returned nothing for it. Every scan in the cycle shared the same
+   blind spot, so the install, the prefetch and the final convergence check all agreed, and
+   the cycle reported convergence while a new Windows version sat unoffered.
+
+   The scope now says what Windows Update itself would install (software with
+   DeploymentAction='Installation', whatever its category) plus optional feature updates
+   unless -SkipFeatureUpdates. Drivers are Type='Driver' and stay with the opt-in
+   driver/firmware phase. Scope membership is decided by this string in every place that
+   asks (scan, prefetch, install), and whatever Windows Update offers outside it is logged by
+   name through Select-WindowsUpdateOffer, so the next thing Microsoft offers in a new shape
+   is visible instead of silent. The Upgrades classification GUID is Microsoft's published
+   constant and is the only category reference left in the scope. #>
+$script:WindowsUpdateUpgradesCategoryId = '3689bdc8-b205-4af4-8d4a-a63924c5e9d5'
 function Get-WindowsUpdateVerificationScope {
     $excludedTitle = ((@('SQL') + ($script:ExcludePatterns | ForEach-Object { [regex]::Escape($_) })) -join '|')
-    $categories = @('Security Updates','Critical Updates','Definition Updates')
+    $includeFeatureUpdates = -not [bool]$script:SkipFeatureUpdates
+    $base = "IsInstalled=0 and IsHidden=0 and Type='Software'"
+    $criteria = "($base and DeploymentAction='Installation')"
+    if ($includeFeatureUpdates) {
+        $criteria += " or ($base and DeploymentAction='OptionalInstallation' and CategoryIDs contains '$script:WindowsUpdateUpgradesCategoryId')"
+    }
     return [pscustomobject]@{
-        ExcludedTitle = $excludedTitle
-        Categories = $categories
-        Signature = "notTitle=$excludedTitle;categories=$(($categories | Sort-Object) -join ',')"
+        ExcludedTitle         = $excludedTitle
+        IncludeFeatureUpdates = $includeFeatureUpdates
+        Criteria              = $criteria
+        Signature             = "notTitle=$excludedTitle;software=installation$(if ($includeFeatureUpdates) { '+optional-feature-updates' })"
+    }
+}
+
+function Get-WindowsUpdateOfferScanScriptBlock {
+    <# The scan worker. It runs in a child pwsh through Invoke-BootUpdateBackgroundOperation
+       and lists what Windows Update offers twice: everything (both deployment actions, all
+       types) and the configured scope, marking each offer with whether the scope criteria
+       selected it. Membership comes from the same criteria string the prefetch and the
+       install hand to PSWindowsUpdate, so this scan cannot disagree with the install about
+       what is in scope, and the parent can name what was offered and left alone.
+       Field order: UpdateID|RevisionNumber|InScope|DeploymentAction|KB|IsDownloaded|SizeMB|Categories|Title. #>
+    return {
+        param($ScopeCriteria, $Online)
+        try {
+            $session = New-Object -ComObject Microsoft.Update.Session
+            $searcher = $session.CreateUpdateSearcher()
+            $searcher.Online = [bool]$Online
+            $inScope = @{}
+            $scoped = $searcher.Search([string]$ScopeCriteria)
+            for ($i = 0; $i -lt $scoped.Updates.Count; $i++) {
+                $inScope[[string]$scoped.Updates.Item($i).Identity.UpdateID] = $true
+            }
+            $all = $searcher.Search("(IsInstalled=0 and IsHidden=0 and DeploymentAction='Installation') or (IsInstalled=0 and IsHidden=0 and DeploymentAction='OptionalInstallation')")
+            $count = 0
+            for ($i = 0; $i -lt $all.Updates.Count; $i++) {
+                $update = $all.Updates.Item($i)
+                $categories = @()
+                for ($c = 0; $c -lt $update.Categories.Count; $c++) {
+                    $categories += ([string]$update.Categories.Item($c).Name -replace '[|;]', ' ')
+                }
+                $kb = ''
+                try { if ($update.KBArticleIDs.Count -gt 0) { $kb = 'KB' + [string]$update.KBArticleIDs.Item(0) } } catch { }
+                $action = switch ([int]$update.DeploymentAction) {
+                    1 { 'Installation' } 2 { 'Uninstallation' } 3 { 'Detection' } 4 { 'OptionalInstallation' }
+                    default { "Action$([int]$update.DeploymentAction)" }
+                }
+                $sizeMB = 0
+                try { $sizeMB = [int][math]::Ceiling([double]$update.MaxDownloadSize / 1MB) } catch { }
+                $selected = if ($inScope.ContainsKey([string]$update.Identity.UpdateID)) { 1 } else { 0 }
+                $downloaded = if ($update.IsDownloaded) { 1 } else { 0 }
+                $count++
+                "BOOTUPDATE_OFFER|$($update.Identity.UpdateID)|$($update.Identity.RevisionNumber)|$selected|$action|$kb|$downloaded|$sizeMB|$($categories -join ';')|$(([string]$update.Title) -replace '[|]', ' ')"
+            }
+            "BOOTUPDATE_SCAN_COMPLETE|$count"
+        } catch { "BOOTUPDATE_ERROR|$($_.Exception.Message)" }
+    }
+}
+
+function ConvertFrom-WindowsUpdateOfferScanOutput {
+    <# Turns the scan worker's lines into offer records, or into Verified=$false when the
+       worker did not finish, threw, or its completion count disagrees with its records.
+       @($null) has one element and a blank title once became an update in an earlier
+       scanner; a record needs every field and a non-blank title before it counts. #>
+    param(
+        [object[]]$Output = @(),
+        [bool]$Failed = $false,
+        [bool]$TimedOut = $false,
+        [string]$TimeoutDetail = 'scan timed out'
+    )
+    $lines = @($Output | Where-Object { $null -ne $_ } | ForEach-Object { $_.ToString() })
+    $records = @($lines | Where-Object { $_ -match '^BOOTUPDATE_OFFER\|[^|]+\|\d+\|[01]\|[^|]*\|[^|]*\|[01]\|\d+\|[^|]*\|\S' })
+    $errors = @($lines | Where-Object { $_ -match '^BOOTUPDATE_ERROR\|' })
+    $markers = @($lines | Where-Object { $_ -match '^BOOTUPDATE_SCAN_COMPLETE\|(\d+)$' })
+    $declared = if ($markers.Count -eq 1 -and $markers[0] -match '^BOOTUPDATE_SCAN_COMPLETE\|(\d+)$') { [int]$Matches[1] } else { -1 }
+    if ($Failed -or $TimedOut -or $errors.Count -or $markers.Count -ne 1 -or $declared -ne $records.Count) {
+        $why = if ($errors.Count) { $errors[0] -replace '^BOOTUPDATE_ERROR\|','' }
+               elseif ($TimedOut) { $TimeoutDetail }
+               else { 'scan completion contract failed' }
+        return [pscustomobject]@{ Verified=$false; Offers=@(); Error=$why }
+    }
+    $offers = @($records | ForEach-Object {
+        $fields = $_ -split '\|', 10
+        [pscustomobject]@{
+            UpdateID         = $fields[1]
+            RevisionNumber   = [int]$fields[2]
+            InScope          = ($fields[3] -eq '1')
+            DeploymentAction = $fields[4]
+            KB               = $fields[5]
+            IsDownloaded     = ($fields[6] -eq '1')
+            SizeMB           = [int]$fields[7]
+            Categories       = @($fields[8] -split ';' | Where-Object { $_ })
+            Title            = $fields[9]
+        }
+    })
+    return [pscustomobject]@{ Verified=$true; Offers=$offers; Error=$null }
+}
+
+function Select-WindowsUpdateOffer {
+    <# Splits scan offers into the work this cycle will do (Applicable) and what it leaves
+       alone (OutOfScope), each with a reason a reader can act on. Scope membership was
+       decided by the criteria string; this layer adds the title exclusions and the KBs
+       already installed during this run, and names a reason for everything left out. #>
+    param(
+        [object[]]$Offers = @(),
+        [Parameter(Mandatory)][object]$Scope,
+        [string[]]$SkipKbArticleIds = @()
+    )
+    $applicable = [System.Collections.Generic.List[object]]::new()
+    $outOfScope = [System.Collections.Generic.List[object]]::new()
+    foreach ($offer in @($Offers | Where-Object { $null -ne $_ })) {
+        $categories = @($offer.Categories)
+        $isFeatureUpdate = $categories -contains 'Upgrades'
+        $reason = $null
+        if ($Scope.ExcludedTitle -and [string]$offer.Title -match $Scope.ExcludedTitle) {
+            $reason = 'excluded by title pattern'
+        } elseif ($offer.KB -and $SkipKbArticleIds -contains [string]$offer.KB) {
+            $reason = 'installed successfully earlier in this run'
+        } elseif (-not [bool]$offer.InScope) {
+            $reason = if ($categories -contains 'Drivers') { 'driver; opt in with -IncludeDriverUpdates or -IncludeFirmwareUpdates' }
+                      elseif ($isFeatureUpdate) { 'feature update; -SkipFeatureUpdates is set' }
+                      elseif ([string]$offer.DeploymentAction -eq 'OptionalInstallation') { 'optional; Windows Update does not install it on its own either' }
+                      else { "deployment action $($offer.DeploymentAction)" }
+        }
+        $record = [pscustomobject]@{
+            UpdateID = [string]$offer.UpdateID; RevisionNumber = [int]$offer.RevisionNumber
+            Title = [string]$offer.Title; KB = [string]$offer.KB
+            Categories = $categories; DeploymentAction = [string]$offer.DeploymentAction
+            IsDownloaded = [bool]$offer.IsDownloaded; SizeMB = [int]$offer.SizeMB
+            IsFeatureUpdate = $isFeatureUpdate; Reason = $reason
+        }
+        if ($reason) { $outOfScope.Add($record) } else { $applicable.Add($record) }
+    }
+    return [pscustomobject]@{
+        Applicable       = @($applicable)
+        OutOfScope       = @($outOfScope)
+        HasFeatureUpdate = [bool](@($applicable | Where-Object { $_.IsFeatureUpdate }).Count)
+    }
+}
+
+function Invoke-WindowsUpdateOfferScan {
+    <# One read-only scan of what Windows Update offers, bounded and run out of process.
+       Online=$false asks the local catalog only, which is what the cached-assessment
+       reconciliation wants; the install pre-scan and the final convergence check go online. #>
+    param(
+        [Parameter(Mandatory)][object]$Scope,
+        [switch]$Online,
+        [string]$Name = 'Scanning Windows Update offers',
+        [string]$Status = 'Windows Update scan is running',
+        [double]$TimeoutMinutes = $script:PackageTimeoutMinutes
+    )
+    $operation = Invoke-BootUpdateBackgroundOperation -Name $Name -Status $Status -TimeoutMinutes $TimeoutMinutes `
+        -ScriptBlock (Get-WindowsUpdateOfferScanScriptBlock) -ArgumentList @([string]$Scope.Criteria, [bool]$Online)
+    return ConvertFrom-WindowsUpdateOfferScanOutput -Output @($operation.Output) -Failed ([bool]$operation.Failed) `
+        -TimedOut ([bool]$operation.TimedOut) -TimeoutDetail "$Name timed out"
+}
+
+function Write-WindowsUpdateOfferLog {
+    <# Names what Windows Update offered. In-scope offers are the phase's work and log at
+       Normal; offers left alone log at Normal too, except drivers, which are a documented
+       opt-in and would otherwise repeat on every machine with a vendor driver pending. #>
+    param([Parameter(Mandatory)][object]$Selection, [string]$Context = 'Windows Update')
+    foreach ($offer in @($Selection.Applicable | Where-Object { $null -ne $_ })) {
+        $kind = if ($offer.IsFeatureUpdate) { 'feature update' } elseif (@($offer.Categories).Count) { @($offer.Categories)[0] } else { 'update' }
+        $detail = @($kind, ([string]$offer.DeploymentAction).ToLowerInvariant())
+        if ($offer.SizeMB -ge 1024) { $detail += ('up to {0:N1} GB' -f ($offer.SizeMB / 1024)) }
+        elseif ($offer.SizeMB -gt 0) { $detail += "up to $($offer.SizeMB) MB" }
+        if ($offer.IsDownloaded) { $detail += 'downloaded' }
+        Write-Log "$Context offers: $($offer.Title) ($($detail -join ', '))"
+    }
+    foreach ($offer in @($Selection.OutOfScope | Where-Object { $null -ne $_ })) {
+        $line = "$Context offers outside scope: $($offer.Title) ($(@($offer.Categories) -join ', ')) - $($offer.Reason)"
+        if (@($offer.Categories) -contains 'Drivers') { Write-Log $line -Visibility Verbose } else { Write-Log $line }
     }
 }
 
@@ -4856,44 +5058,15 @@ function Set-WindowsUpdateAssessmentCache {
 
 function Invoke-WindowsUpdateOfflineAssessment {
     param([Parameter(Mandatory)][object]$Scope)
-    $operation = Invoke-BootUpdateBackgroundOperation -Name 'Reconciling cached Windows Update assessment' `
-        -Status 'Checking the local Windows Update catalog' -TimeoutMinutes ([math]::Min(5, $script:PackageTimeoutMinutes)) `
-        -ScriptBlock {
-            param($Categories,$ExcludedTitle)
-            try {
-                $session = New-Object -ComObject Microsoft.Update.Session
-                $searcher = $session.CreateUpdateSearcher()
-                $searcher.Online = $false
-                $result = $searcher.Search('IsInstalled=0 and IsHidden=0')
-                $count = 0
-                for ($i=0; $i -lt $result.Updates.Count; $i++) {
-                    $update = $result.Updates.Item($i)
-                    $categoryNames = @()
-                    for ($categoryIndex=0; $categoryIndex -lt $update.Categories.Count; $categoryIndex++) {
-                        $categoryNames += [string]$update.Categories.Item($categoryIndex).Name
-                    }
-                    if (-not ($categoryNames | Where-Object { $Categories -contains $_ })) { continue }
-                    if ($ExcludedTitle -and $update.Title -match $ExcludedTitle) { continue }
-                    $count++
-                    "BOOTUPDATE_APPLICABLE|$($update.Identity.UpdateID)|$($update.Identity.RevisionNumber)|$($update.Title)"
-                }
-                "BOOTUPDATE_SCAN_COMPLETE|$count"
-            } catch { "BOOTUPDATE_ERROR|$($_.Exception.Message)" }
-        } -ArgumentList @($Scope.Categories,$Scope.ExcludedTitle)
-    $records = @($operation.Output | Where-Object { $_ -match '^BOOTUPDATE_APPLICABLE\|[^|]+\|\d+\|\S' })
-    $errors = @($operation.Output | Where-Object { $_ -match '^BOOTUPDATE_ERROR\|' })
-    $markers = @($operation.Output | Where-Object { $_ -match '^BOOTUPDATE_SCAN_COMPLETE\|(\d+)$' })
-    $declared = if ($markers.Count -eq 1 -and $markers[0] -match '^BOOTUPDATE_SCAN_COMPLETE\|(\d+)$') { [int]$Matches[1] } else { -1 }
-    if ($operation.Failed -or $operation.TimedOut -or $errors.Count -or $markers.Count -ne 1 -or $declared -ne $records.Count) {
-        return [pscustomobject]@{ Verified=$false; Updates=@(); Error=$(if($errors){$errors[0] -replace '^BOOTUPDATE_ERROR\|',''}elseif($operation.TimedOut){'offline assessment timed out'}else{'offline assessment completion contract failed'}) }
+    $scan = Invoke-WindowsUpdateOfferScan -Scope $Scope -Name 'Reconciling cached Windows Update assessment' `
+        -Status 'Checking the local Windows Update catalog' -TimeoutMinutes ([math]::Min(5, $script:PackageTimeoutMinutes))
+    if (-not $scan.Verified) {
+        $why = if ($scan.Error -match 'timed out$') { 'offline assessment timed out' } else { $scan.Error }
+        return [pscustomobject]@{ Verified=$false; Updates=@(); Error=$why }
     }
-    $updates = @($records | ForEach-Object {
-        $fields = $_ -split '\|',4
-        [pscustomobject]@{
-            UpdateID=$fields[1]
-            RevisionNumber=[int]$fields[2]
-            Title=$fields[3]
-        }
+    $selection = Select-WindowsUpdateOffer -Offers $scan.Offers -Scope $Scope
+    $updates = @($selection.Applicable | ForEach-Object {
+        [pscustomobject]@{ UpdateID=$_.UpdateID; RevisionNumber=$_.RevisionNumber; Title=$_.Title }
     })
     return [pscustomobject]@{ Verified=$true; Updates=$updates; Error=$null }
 }
@@ -5388,9 +5561,10 @@ function Install-WindowsUpdates {
     $verificationScope = Get-WindowsUpdateVerificationScope
     $params = @{
         AcceptAll = $true; Install = $true; NotTitle = $verificationScope.ExcludedTitle
-        RootCategories = $verificationScope.Categories
+        Criteria = $verificationScope.Criteria
         AutoReboot = $false; Confirm = $false; IgnoreReboot = $true
     }
+    $installTimeoutMinutes = $script:PackageTimeoutMinutes
     $count = 0; $failed = $false
     if ($PSCmdlet.ShouldProcess('Windows Update', 'Install available updates')) {
         <# The prior observation stops being authoritative as soon as a new
@@ -5416,30 +5590,51 @@ function Install-WindowsUpdates {
                 $params.NotKBArticleID = $successfulKbIds
                 Write-Log "Windows Update: skipping KBs already installed successfully during this run: $($successfulKbIds -join ', ')."
             }
-            $result = Invoke-BootUpdateBackgroundOperation -Name 'Installing Windows Updates' `
-                -Status 'Windows Update scan and installation are running' `
-                -TimeoutMinutes $script:PackageTimeoutMinutes -ScriptBlock {
-                    param($UpdateParams)
-                    try {
-                        Import-Module PSWindowsUpdate -Force
-                        $updateHashtable = @{}
-                        foreach ($property in $UpdateParams.PSObject.Properties) {
-                            $updateHashtable[$property.Name] = $property.Value
-                        }
-                        Get-WindowsUpdate @updateHashtable -Verbose 4>&1 | ForEach-Object { $_.ToString() }
+            <# A read-only scan of the configured scope comes first. It decides three things
+               the install call cannot: whether there is anything to install (no PSWindowsUpdate
+               call for nothing), how long the install may take (a feature update is a new
+               Windows version and gets -FeatureUpdateTimeoutMinutes, not the per-package
+               budget; the child process waits on COM while TrustedInstaller works, so its own
+               CPU clock cannot tell a long install from a hang), and what Windows Update
+               offered that this cycle leaves alone, logged by name. #>
+            $scan = Invoke-WindowsUpdateOfferScan -Scope $verificationScope -Online -Name 'Scanning Windows Update offers' `
+                -Status 'Windows Update scan is running' -TimeoutMinutes $script:PackageTimeoutMinutes
+            if (-not $scan.Verified) { throw "the pre-install scan did not complete ($($scan.Error))" }
+            $selection = Select-WindowsUpdateOffer -Offers $scan.Offers -Scope $verificationScope -SkipKbArticleIds $successfulKbIds
+            Write-WindowsUpdateOfferLog -Selection $selection
+            if ($selection.HasFeatureUpdate) {
+                $installTimeoutMinutes = [math]::Max([int]$script:FeatureUpdateTimeoutMinutes, [int]$script:PackageTimeoutMinutes)
+                Write-Log "Windows Update: a feature update is in scope; the install budget is $installTimeoutMinutes min instead of $($script:PackageTimeoutMinutes)."
+            }
+            if (@($selection.Applicable).Count -eq 0) {
+                Write-Log 'Windows Update: nothing applicable in the configured scope; the install call is not needed.'
+                $result = @{ Output = @(); Failed = $false; TimedOut = $false }
+                $postSearchZero = $true
+            } else {
+                $result = Invoke-BootUpdateBackgroundOperation -Name 'Installing Windows Updates' `
+                    -Status 'Windows Update scan and installation are running' `
+                    -TimeoutMinutes $installTimeoutMinutes -ScriptBlock {
+                        param($UpdateParams)
                         try {
-                            if ((New-Object -ComObject Microsoft.Update.SystemInfo -ErrorAction Stop).RebootRequired) {
-                                'BOOTUPDATE_WU_REBOOT|Microsoft.Update.SystemInfo'
+                            Import-Module PSWindowsUpdate -Force
+                            $updateHashtable = @{}
+                            foreach ($property in $UpdateParams.PSObject.Properties) {
+                                $updateHashtable[$property.Name] = $property.Value
                             }
-                        } catch { }
-                    } catch {
-                        "BOOTUPDATE_ERROR|$($_.Exception.Message)"
-                    }
-                } -ArgumentList (,$params)
-            $postSearchZero = $false
-            $installSummary = Get-WindowsUpdateInstallOutputSummary -Lines $result.Output
-            $count = $installSummary.Installed
-            $postSearchZero = $installSummary.PostSearchZero
+                            Get-WindowsUpdate @updateHashtable -Verbose 4>&1 | ForEach-Object { $_.ToString() }
+                            try {
+                                if ((New-Object -ComObject Microsoft.Update.SystemInfo -ErrorAction Stop).RebootRequired) {
+                                    'BOOTUPDATE_WU_REBOOT|Microsoft.Update.SystemInfo'
+                                }
+                            } catch { }
+                        } catch {
+                            "BOOTUPDATE_ERROR|$($_.Exception.Message)"
+                        }
+                    } -ArgumentList (,$params)
+                $installSummary = Get-WindowsUpdateInstallOutputSummary -Lines $result.Output
+                $count = $installSummary.Installed
+                $postSearchZero = $installSummary.PostSearchZero
+            }
             foreach ($item in $result.Output) {
                 $line = $item.ToString()
                 if ($line -eq 'System.__ComObject') { continue }
@@ -5495,7 +5690,7 @@ function Install-WindowsUpdates {
             }
         } catch { }
     } else {
-        Write-Log '  [WHATIF] Would run: Get-WindowsUpdate (install all, exclude SQL)'
+        Write-Log "  [WHATIF] Would run: Get-WindowsUpdate -Install (scope: $($verificationScope.Signature))"
     }
     return @{ Success = (-not $failed); Count = $count }
 }
@@ -5633,55 +5828,30 @@ function Test-WindowsUpdateConvergence {
         $script:CurrentState.WindowsUpdateZeroEvidence = $null
         Set-BootUpdateState -State $script:CurrentState
     }
-    if (-not (Get-Module -ListAvailable PSWindowsUpdate)) {
+    $scan = Invoke-WindowsUpdateOfferScan -Scope $verificationScope -Online -Name 'Verifying Windows Update convergence' `
+        -Status 'Final read-only Windows Update scan is running' -TimeoutMinutes $script:PackageTimeoutMinutes
+    if (-not $scan.Verified) {
+        Write-Log "Final WU scan error: $($scan.Error)" -Level Error
         <# Count and Unexplained are both -1 here for the same reason: not zero, not known.
            Verified=$false already forces the caller to withhold, and a 0 would read as
            "nothing outstanding" to anyone reading the object on its own. #>
-        return [pscustomobject]@{ Verified=$false; Count=-1; Reoffered=@(); Unexplained=-1; Detail='PSWindowsUpdate is unavailable for the final scan' }
+        return [pscustomobject]@{ Verified=$false; Count=-1; Reoffered=@(); Unexplained=-1; Detail='scan failed' }
     }
-    $result = Invoke-BootUpdateBackgroundOperation -Name 'Verifying Windows Update convergence' `
-        -Status 'Final read-only Windows Update scan is running' -TimeoutMinutes $script:PackageTimeoutMinutes `
-        -ScriptBlock {
-            param($ExcludedTitle)
-            try {
-                Import-Module PSWindowsUpdate -Force
-                $applicable = @(Get-WindowsUpdate -NotTitle $ExcludedTitle `
-                    -RootCategories @('Security Updates','Critical Updates','Definition Updates') `
-                    -IgnoreReboot -Confirm:$false -ErrorAction Stop) | Where-Object { $null -ne $_ }
-                $applicable | ForEach-Object {
-                        $identity = $_.Identity
-                        $updateId = if ($_.PSObject.Properties.Name -contains 'UpdateID' -and $_.UpdateID) { $_.UpdateID } elseif ($identity -and $identity.UpdateID) { $identity.UpdateID } else { 'identity-unavailable' }
-                        $revision = if ($_.PSObject.Properties.Name -contains 'RevisionNumber' -and $null -ne $_.RevisionNumber) { [int]$_.RevisionNumber } elseif ($identity -and $null -ne $identity.RevisionNumber) { [int]$identity.RevisionNumber } else { 0 }
-                        "BOOTUPDATE_APPLICABLE|$updateId|$revision|$($_.Title)"
-                    }
-                "BOOTUPDATE_SCAN_COMPLETE|$($applicable.Count)"
-            } catch { "BOOTUPDATE_ERROR|$($_.Exception.Message)" }
-        } -ArgumentList @($verificationScope.ExcludedTitle)
-    <# @($null) contains one element in PowerShell. Older scan workers therefore
-       emitted BOOTUPDATE_APPLICABLE|| for a clean, empty result. Require a real
-       title after the second delimiter so that sentinel cannot become an update. #>
-    $updates = @($result.Output | Where-Object { $_ -match '^BOOTUPDATE_APPLICABLE\|[^|]+\|\d+\|\S' })
-    $errors = @($result.Output | Where-Object { $_ -match '^BOOTUPDATE_ERROR\|' })
-    $completionMarkers = @($result.Output | Where-Object { $_ -match '^BOOTUPDATE_SCAN_COMPLETE\|(\d+)$' })
-    foreach ($line in $updates) { Write-Log "Final WU scan: $($line -replace '^BOOTUPDATE_APPLICABLE\|','')" -Level Warn }
-    foreach ($line in $errors) { Write-Log "Final WU scan error: $($line -replace '^BOOTUPDATE_ERROR\|','')" -Level Error }
-    $declaredCount = if ($completionMarkers.Count -eq 1 -and $completionMarkers[0] -match '^BOOTUPDATE_SCAN_COMPLETE\|(\d+)$') { [int]$Matches[1] } else { -1 }
-    $verified = -not $result.Failed -and -not $result.TimedOut -and $errors.Count -eq 0 -and
-        $completionMarkers.Count -eq 1 -and $declaredCount -eq $updates.Count
-    if ($verified) {
-        $identities = @($updates | ForEach-Object {
-            $fields = $_ -split '\|', 4
-            [pscustomobject]@{ UpdateID=$fields[1]; RevisionNumber=[int]$fields[2] }
-        })
-        Set-WindowsUpdateAssessmentCache -Scope $verificationScope -ApplicableUpdates $identities
-    }
+    $selection = Select-WindowsUpdateOffer -Offers $scan.Offers -Scope $verificationScope
+    Write-WindowsUpdateOfferLog -Selection ([pscustomobject]@{ Applicable=@(); OutOfScope=$selection.OutOfScope }) -Context 'Final WU scan'
+    $updates = @($selection.Applicable)
+    foreach ($offer in $updates) { Write-Log "Final WU scan: $($offer.UpdateID)|$($offer.RevisionNumber)|$($offer.Title)" -Level Warn }
+    $verified = $true
+    Set-WindowsUpdateAssessmentCache -Scope $verificationScope -ApplicableUpdates @($updates | ForEach-Object {
+        [pscustomobject]@{ UpdateID=$_.UpdateID; RevisionNumber=$_.RevisionNumber }
+    })
     <# Separate the updates that are outstanding from the ones the machine says it already
        installed successfully in this boot and is offering again. Only the former are work.
        Classification is attempted only on a verified scan: guessing about an unverified one
        would turn a scan failure into a qualified claim. #>
     $reoffered = @()
     if ($verified -and $updates.Count -gt 0) {
-        $titles = @($updates | ForEach-Object { ($_ -split '\|', 4)[3] })
+        $titles = @($updates | ForEach-Object { $_.Title })
         <# The window is THIS RUN, not this boot.
 
            It was the boot instant, and lab row B on the second guest showed why that is
@@ -7322,6 +7492,7 @@ function Register-BootUpdateTaskForReboot {
         "-MaxUserIdentityWaits $($script:MaxUserIdentityWaits)"
         "-WatchdogIntervalMinutes $($script:WatchdogIntervalMinutes)"
         "-PackageTimeoutMinutes $($script:PackageTimeoutMinutes)"
+        "-FeatureUpdateTimeoutMinutes $($script:FeatureUpdateTimeoutMinutes)"
         "-RebootDelaySec $($script:RebootDelaySec)"
         "-OutputMode $($script:OutputMode)"
     )
@@ -7339,6 +7510,7 @@ function Register-BootUpdateTaskForReboot {
     if ($script:SkipDefender)         { $taskArgs += '-SkipDefender' }
     if ($script:IncludeDriverUpdates) { $taskArgs += '-IncludeDriverUpdates' }
     if ($script:IncludeFirmwareUpdates) { $taskArgs += '-IncludeFirmwareUpdates' }
+    if ($script:SkipFeatureUpdates)   { $taskArgs += '-SkipFeatureUpdates' }
     if ($script:UpdateWsl)            { $taskArgs += '-UpdateWsl' }
     if ($script:UpdateContainers)     { $taskArgs += '-UpdateContainers' }
     if ($script:SkipRestorePoint)     { $taskArgs += '-SkipRestorePoint' }
@@ -8619,7 +8791,7 @@ function Apply-RemoteConfig {
         'SkipPip', 'SkipNpm', 'SkipScoop', 'SkipAiTools', 'SkipDotnetTools', 'SkipVscode',
         'SkipPowerShellModules', 'SkipOffice365', 'SkipSsms', 'SkipAwsTooling',
         'SkipDefender', 'SkipBitLocker', 'SkipRestorePoint', 'SkipHealthCheck',
-        'IncludeDriverUpdates', 'IncludeFirmwareUpdates',
+        'IncludeDriverUpdates', 'IncludeFirmwareUpdates', 'SkipFeatureUpdates', 'FeatureUpdateTimeoutMinutes',
         'UpdateWsl', 'UpdateContainers', 'AllowMetered', 'DisableSelfUpdate',
         'StagedRollout', 'AggressiveRepair', 'OutputMode', 'WatchdogIntervalMinutes'
     )
@@ -8698,6 +8870,7 @@ function Get-BootUpdateLaunchContract {
         if ($script:SkipDotnetTools)       { 'DotnetTools' }
         if ($script:SkipVscode)            { 'VSCode' }
         if ($script:SkipDefender)          { 'Defender' }
+        if ($script:SkipFeatureUpdates)    { 'FeatureUpdates' }
         if ($script:SkipRestorePoint)      { 'RestorePoint' }
         if ($script:SkipHealthCheck)       { 'HealthCheck' }
         if ($script:SkipBitLocker)         { 'BitLocker' }
@@ -9015,14 +9188,13 @@ function Invoke-BootUpdateCycle {
     if (-not $script:StagedRollout -and -not $WhatIfPreference -and -not $state.WindowsUpdateDone -and
         (Get-Module -ListAvailable PSWindowsUpdate) -and $wuServiceRunningForPrefetch) {
         try {
-            $prefetchNotTitle = ((@('SQL') + ($script:ExcludePatterns | ForEach-Object { [regex]::Escape($_) })) -join '|')
+            $prefetchScope = Get-WindowsUpdateVerificationScope
             $script:WuPrefetchJob = Start-Job -ScriptBlock {
-                param($NotTitle)
+                param($NotTitle, $Criteria)
                 Import-Module PSWindowsUpdate -Force
-                Get-WindowsUpdate -AcceptAll -Download -NotTitle $NotTitle `
-                    -RootCategories @('Security Updates','Critical Updates','Definition Updates') `
+                Get-WindowsUpdate -AcceptAll -Download -NotTitle $NotTitle -Criteria $Criteria `
                     -IgnoreReboot -Confirm:$false 2>&1 | ForEach-Object { $_.ToString() }
-            } -ArgumentList $prefetchNotTitle
+            } -ArgumentList $prefetchScope.ExcludedTitle, $prefetchScope.Criteria
             Write-Log 'Windows Update prefetch: scan + download started in background (install stays sequential).'
         } catch {
             Write-Log "Windows Update prefetch failed to start (non-fatal): $_" -Level Warn
