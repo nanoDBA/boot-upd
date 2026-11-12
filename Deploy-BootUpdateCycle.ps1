@@ -763,10 +763,10 @@ function Start-PersistentHeaderLogTail {
 
 <# Helper: Register scheduled task for non-direct mode #>
 function Register-ScheduledTaskNow {
-    <# The task runs the pwsh.exe running this script, by its real path: an MSIX pwsh is on
-       PATH only as a per-user alias that SYSTEM does not have. See Get-BootUpdatePwshPath in
-       Invoke-BootUpdateCycle.ps1. #>
-    $pwshPath = [Environment]::ProcessPath
+    <# The task runs the pwsh.exe in $PSHOME: an MSIX pwsh is on PATH only as a per-user alias
+       that SYSTEM does not have, and the process path of an alias-started pwsh is the alias.
+       See Get-BootUpdatePwshPath in Invoke-BootUpdateCycle.ps1. #>
+    $pwshPath = Join-Path $PSHOME 'pwsh.exe'
 
     $taskArgs = @(
         '-NoProfile', '-ExecutionPolicy Bypass'

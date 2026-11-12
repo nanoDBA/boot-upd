@@ -4,9 +4,12 @@ boot-upd installs PowerShell 7 one way: Microsoft's MSIX bundle from the PowerSh
 page, checked against the release's `hashes.sha256` and its Microsoft signature, and
 provisioned for the whole machine with `Add-AppxProvisionedPackage -Online`. Everything in
 boot-upd that starts PowerShell 7 (continuation tasks, the Deploy task, child processes, the
-self-update relaunch, the launcher's elevation) uses the executable already running, by its
-full path (`Get-BootUpdatePwshPath`, `[Environment]::ProcessPath`). It never asks for `pwsh` by
-name.
+self-update relaunch, the launcher's elevation) uses `pwsh.exe` in `$PSHOME`, the folder the
+running PowerShell lives in (`Get-BootUpdatePwshPath`). It never asks for `pwsh` by name.
+The first version of this change used `[Environment]::ProcessPath`; lab row A showed that a
+pwsh started through the alias reports the alias as its process path, inside the starting
+user's profile, and every continuation task, the SYSTEM fallback included, was registered
+with it.
 
 PowerShell 7.7 shipped on 2026-11-10 with no MSI. Microsoft had announced the MSI's deprecation
 in April: 7.6 LTS is the last line that ships one, and WinGet's `Microsoft.PowerShell` 7.7
@@ -21,8 +24,8 @@ The executable itself does run as SYSTEM. On lab-b (Windows 11 LTSC, build 26100
 7.7.0 provisioned machine-wide, a SYSTEM scheduled task that named the alias failed with
 "not recognized", and one that named
 `C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\pwsh.exe` ran
-7.7.0, started a ThreadJob and wrote to ProgramData. Naming the running executable works for
-every install method, and on an MSI machine it is the same path as before.
+7.7.0, started a ThreadJob and wrote to ProgramData. `$PSHOME\pwsh.exe` is that executable
+for every install method, and on an MSI machine it is the same path as before.
 
 ## Considered options
 

@@ -930,3 +930,35 @@ Describe 'Typed run option forwarding' {
         (Get-FunctionText -Ast $launcherAst -Name 'Get-UpdDeployParameters') | Should -Match 'ResumeAfterAttention=''ResumeAfterAttention'''
     }
 }
+
+Describe 'PowerShell 7 is started from $PSHOME, never from the process path or by name' {
+    <# Lab row A, 2026-11-12: started through upd.cmd, pwsh ran via the per-user MSIX alias, and
+       [Environment]::ProcessPath returned that alias inside the user's profile. Every
+       continuation task, the SYSTEM fallback included, was registered with it. #>
+    BeforeAll {
+        $root = Split-Path $PSScriptRoot -Parent
+        $sources = @{}
+        foreach ($rel in 'Invoke-BootUpdateCycle.ps1','Deploy-BootUpdateCycle.ps1','tools/Invoke-UpdLauncher.ps1','Repair-AwsTooling.ps1') {
+            $sources[$rel] = Get-Content -LiteralPath (Join-Path $root $rel) -Raw
+        }
+        $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $root 'Invoke-BootUpdateCycle.ps1'), [ref]$null, [ref]$null)
+        $fn = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-BootUpdatePwshPath' }, $true)
+        . ([scriptblock]::Create($fn.Extent.Text))
+    }
+
+    It 'resolves the runtime to pwsh.exe in $PSHOME' {
+        Get-BootUpdatePwshPath | Should -Be (Join-Path $PSHOME 'pwsh.exe')
+    }
+
+    It 'never launches the process path in any script' {
+        foreach ($rel in $sources.Keys) {
+            $sources[$rel] | Should -Not -Match '\(\[Environment\]::ProcessPath\)|=\s*\[Environment\]::ProcessPath|\{\s*\[Environment\]::ProcessPath' -Because $rel
+            $sources[$rel] | Should -Not -Match '&\s+pwsh\s|Get-Command pwsh\)\.Source' -Because $rel
+        }
+    }
+
+    It 'registers the Deploy task with $PSHOME\pwsh.exe' {
+        $sources['Deploy-BootUpdateCycle.ps1'] | Should -Match "\`$pwshPath = Join-Path \`$PSHOME 'pwsh\.exe'"
+        $sources['Invoke-BootUpdateCycle.ps1'] | Should -Match '(?s)function Register-BootUpdateTaskForReboot.*?\$pwshPath = Get-BootUpdatePwshPath'
+    }
+}
