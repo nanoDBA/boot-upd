@@ -237,7 +237,7 @@ has exited**. It verifies the installer against the hash embedded below, then th
 verifies and transactionally replaces the complete release bundle before forwarding `aws`:
 
 ```powershell
-$u='https://github.com/nanoDBA/boot-upd/releases/download/v2.5.92/Install-UpdCompat.ps1'; $f=Join-Path $env:TEMP 'Install-UpdCompat-v2.5.92.ps1'; Invoke-WebRequest $u -OutFile $f; if((Get-FileHash $f -Algorithm SHA256).Hash -ne '67662B3B02252FF6DE045FCDF28FB74D8DEB6FDA8080C46B1DAFC7BFBE54ABE3'){throw 'Compatibility installer hash mismatch'}; & $f -CommandArguments aws
+$u='https://github.com/nanoDBA/boot-upd/releases/download/v2.5.93/Install-UpdCompat.ps1'; $f=Join-Path $env:TEMP 'Install-UpdCompat-v2.5.93.ps1'; Invoke-WebRequest $u -OutFile $f; if((Get-FileHash $f -Algorithm SHA256).Hash -ne '67662B3B02252FF6DE045FCDF28FB74D8DEB6FDA8080C46B1DAFC7BFBE54ABE3'){throw 'Compatibility installer hash mismatch'}; & $f -CommandArguments aws
 ```
 
 Use this when the old launcher cannot update itself. It resolves the first `upd.cmd` on PATH,
@@ -382,7 +382,7 @@ Package managers are auto-detected. Missing ones are skipped with a warning.
 | `tools/Invoke-UpdBootstrap.ps1` | Stable raw-argument preflight and verified current-launcher handoff |
 | `tools/Invoke-UpdLauncher.ps1` | Typed commands, compact aliases, UAC boundary, and runtime-bundle updates |
 | `tools/Install-UpdCompat.ps1` | One-time repair bridge for historical batch parsers |
-| `tools/Install-PowerShell7.ps1` | Windows PowerShell 5.1-compatible PS7 bootstrap |
+| `tools/Install-PowerShell7.ps1` | Windows PowerShell 5.1-compatible PowerShell 7 installer: machine-wide MSIX, run by `upd bootstrap` and after each finished cycle |
 | `Deploy-BootUpdateCycle.ps1` | Deploys scripts to ProgramData + runs first iteration |
 | `Invoke-BootUpdateCycle.ps1` | The orchestrator — runs all updates, manages reboots |
 | `Register-BootUpdateTask.ps1` | Standalone task registration (alternative to Deploy) |
@@ -644,7 +644,8 @@ See [Testing Boot Update Cycle](docs/TESTING.md) and the validation reports for 
 repair](docs/validation-aws-repair-2.5.83.md), [v2.5.86](docs/validation-2.5.86.md),
 [v2.5.87](docs/validation-2.5.87.md), [v2.5.88](docs/validation-2.5.88.md),
 [v2.5.89](docs/validation-2.5.89.md), [v2.5.90](docs/validation-2.5.90.md),
-[v2.5.91](docs/validation-2.5.91.md), and [v2.5.92](docs/validation-2.5.92.md). To run the gates, use
+[v2.5.91](docs/validation-2.5.91.md), [v2.5.92](docs/validation-2.5.92.md), and
+[v2.5.93](docs/validation-2.5.93.md). To run the gates, use
 `./tools/Invoke-TestGates.ps1` from an elevated PowerShell 7 console.
 
 ## License
