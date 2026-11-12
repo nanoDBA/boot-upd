@@ -3955,6 +3955,21 @@ function Wait-ProcessWithIdleTimeout {
     }
 }
 
+function Get-BootUpdatePwshPath {
+    <# The PowerShell 7 runtime is the pwsh.exe running this script, named by its real path.
+       Not `pwsh` by name: an MSIX install puts pwsh on PATH only as a per-user app execution
+       alias, and SYSTEM (the continuation tasks, the headless fallback) has no alias at all.
+       The executable itself runs as SYSTEM when started by its full path (lab-b, 2026-11-12,
+       PowerShell 7.7.0 provisioned machine-wide). [Environment]::ProcessPath is that path for
+       every install method, so a child process or a task always gets the runtime the parent
+       already proved works in this context. #>
+    $current = [Environment]::ProcessPath
+    if ($current -and [IO.Path]::GetFileName($current) -ieq 'pwsh.exe') { return $current }
+    $command = Get-Command pwsh.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($command) { return $command.Source }
+    return (Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe')
+}
+
 function Invoke-PackageManagerWithTimeout {
     param(
         [Parameter(Mandatory)][string]$Name,
@@ -3965,8 +3980,7 @@ function Invoke-PackageManagerWithTimeout {
         [int[]]$IncompleteRebootExitCodes = @(),
         [switch]$DeferExitCodeReporting
     )
-    $pwshPath = (Get-Command pwsh -EA SilentlyContinue)?.Source
-    if (-not $pwshPath) { $pwshPath = Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe' }
+    $pwshPath = Get-BootUpdatePwshPath
     if (-not (Test-Path $pwshPath)) { throw "pwsh not found for '$Name'" }
 
     $outputFile = [System.IO.Path]::GetTempFileName()
@@ -4122,8 +4136,8 @@ function Update-WingetPackages {
 if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-File -FilePath '$($tmpOut -replace "'","''")' -Encoding UTF8 -Append }
 "@
                 $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($childScript))
-                $pw = (Get-Command pwsh -ErrorAction SilentlyContinue)?.Source
-                if (-not $pw) { $pw = Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe' }
+                <# A ThreadJob runs in this process, so ProcessPath is the runtime (see Get-BootUpdatePwshPath). #>
+                $pw = [Environment]::ProcessPath
                 $proc = $null
                 $startFailed = $false
                 try {
@@ -7009,7 +7023,8 @@ function Repair-AwsTooling {
                 -TimeoutMinutes $script:PackageTimeoutMinutes `
                 -ScriptBlock {
                     param($Path)
-                    & pwsh -NoProfile -NonInteractive -File $Path -Mode Remediate 2>&1
+                    <# This block runs in a child pwsh: its own path is the runtime, alias or not. #>
+                    & ([Environment]::ProcessPath) -NoProfile -NonInteractive -File $Path -Mode Remediate 2>&1
                     "BOOTUPDATE_EXIT|$LASTEXITCODE"
                 } -ArgumentList @($awsScript)
             $exitCode = -1
@@ -7207,6 +7222,33 @@ function Get-NextMaintenanceWindowStart {
 #endregion
 
 #region Task Management
+function Start-PowerShellRuntimeUpgrade {
+    <# PowerShell 7 is the one package this cycle cannot update from inside itself: the cycle
+       runs on it and its continuation tasks name its path. A cycle that has finished, with
+       its tasks retired, hands the upgrade to a detached Windows PowerShell host that waits
+       for this process to exit. The installer checks the release page itself and does
+       nothing when PowerShell is current, so this costs one API call on most runs. #>
+    $installer = @(
+        (Join-Path $PSScriptRoot 'Install-PowerShell7.ps1'),
+        (Join-Path $PSScriptRoot 'tools\Install-PowerShell7.ps1')
+    ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+    if (-not $installer) {
+        Write-Log 'PowerShell runtime: Install-PowerShell7.ps1 is not deployed; skipping the PowerShell upgrade check.' -Level Warn
+        return
+    }
+    $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $log = Join-Path $script:InstallDir 'PowerShellRuntimeUpgrade.log'
+    try {
+        $null = Start-Process -FilePath $windowsPowerShell -WindowStyle Hidden `
+            -RedirectStandardOutput $log -RedirectStandardError "$log.err" -ArgumentList @(
+                '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $installer),
+                '-Upgrade', '-WaitForProcessId', $PID)
+        Write-Log "PowerShell runtime: checking for a newer PowerShell 7 after this cycle exits (log: $log)."
+    } catch {
+        Write-Log "PowerShell runtime: could not start the upgrade check: $($_.Exception.Message)" -Level Warn
+    }
+}
+
 function Unregister-BootUpdateTask {
     foreach ($taskName in @('BootUpdateCycle', 'BootUpdateCycleFallback')) {
         if (Get-ScheduledTask -TaskName $taskName -EA SilentlyContinue) {
@@ -7481,8 +7523,7 @@ function Register-BootUpdateTaskForReboot {
         [switch]$LogonOnly
     )
     $taskName = 'BootUpdateCycle'
-    $pwshPath = (Get-Command pwsh -EA SilentlyContinue).Source
-    if (-not $pwshPath) { $pwshPath = "$env:ProgramFiles\PowerShell\7\pwsh.exe" }
+    $pwshPath = Get-BootUpdatePwshPath
     $scriptPath = Join-Path $PSScriptRoot 'Invoke-BootUpdateCycle.ps1'
     $taskArgs = @(
         '-NoProfile', '-ExecutionPolicy Bypass'
@@ -8705,7 +8746,7 @@ function Update-OrchestratorSelf {
         $handoffMarker = "v1:${PID}:$([guid]::NewGuid().ToString('N'))"
         try {
             [Environment]::SetEnvironmentVariable($handoffName, $handoffMarker, 'Process')
-            & pwsh -NoProfile -File $livePath @relaunchArgs
+            & (Get-BootUpdatePwshPath) -NoProfile -File $livePath @relaunchArgs
             $replacementExitCode = $LASTEXITCODE
         } finally {
             [Environment]::SetEnvironmentVariable($handoffName, $previousHandoff, 'Process')
@@ -10223,6 +10264,7 @@ function Invoke-BootUpdateCycle {
             if ($leftoverTasks -or (Test-Path -LiteralPath $script:StatePath) -or (Test-Path -LiteralPath "$($script:StatePath).bak")) {
                 throw "Terminal cleanup verification failed; refusing the verified completion banner. Tasks: $($leftoverTasks -join ', ')"
             }
+            Start-PowerShellRuntimeUpgrade
             $completionToast = Get-BootUpdateCompletionNotification -TotalVerified $total -DurationMinutes $durMin `
                 -QuarantineCount $(if ($hasWingetQuarantine) { @($wingetQuarantines).Count } else { 0 }) `
                 -DeferredInventory $(if ($hasDeferredInventory) { $deferredInventory } else { @() })

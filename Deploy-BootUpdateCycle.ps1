@@ -463,6 +463,13 @@ foreach ($companion in @('Repair-AwsTooling.ps1','Export-BootUpdateDiagnostics.p
         Write-Host "Deployed: $companion"
     }
 }
+<# The PowerShell 7 installer sits beside the orchestrator, which runs it after a finished
+   cycle (Start-PowerShellRuntimeUpgrade). #>
+$ps7Installer = Join-Path $PSScriptRoot 'tools\Install-PowerShell7.ps1'
+if (Test-Path -LiteralPath $ps7Installer) {
+    Copy-Item -LiteralPath $ps7Installer -Destination (Join-Path $installDir 'Install-PowerShell7.ps1') -Force
+    Write-Host 'Deployed: Install-PowerShell7.ps1'
+}
 
 <# Deploy uninstall helper script #>
 $uninstallScript = @'
@@ -756,8 +763,10 @@ function Start-PersistentHeaderLogTail {
 
 <# Helper: Register scheduled task for non-direct mode #>
 function Register-ScheduledTaskNow {
-    $pwshPath = (Get-Command pwsh -EA SilentlyContinue).Source
-    if (-not $pwshPath) { $pwshPath = "$env:ProgramFiles\PowerShell\7\pwsh.exe" }
+    <# The task runs the pwsh.exe running this script, by its real path: an MSIX pwsh is on
+       PATH only as a per-user alias that SYSTEM does not have. See Get-BootUpdatePwshPath in
+       Invoke-BootUpdateCycle.ps1. #>
+    $pwshPath = [Environment]::ProcessPath
 
     $taskArgs = @(
         '-NoProfile', '-ExecutionPolicy Bypass'

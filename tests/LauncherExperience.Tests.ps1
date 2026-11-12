@@ -42,7 +42,7 @@ BeforeAll {
         return $function.Extent.Text
     }
 
-    foreach ($name in @('Get-PowerShell7LatestStableVersion','Get-PowerShell7UpgradeDecision')) {
+    foreach ($name in @('Get-PowerShell7LatestStableVersion','Get-PowerShell7UpgradeDecision','ConvertFrom-PowerShell7HashFile','Select-PowerShell7LegacyEntry')) {
         . ([scriptblock]::Create((Get-FunctionText -Ast $ps7BootstrapAst -Name $name)))
     }
 
@@ -666,10 +666,10 @@ exit 0
         ($output -join "`n") | Should -Match 'pwsh\.exe'
     }
 
-    It 'uses supported install routes and validates the MSI publisher' {
+    It 'uses the supported MSIX route and validates the bundle publisher' {
         $ps7BootstrapSource | Should -Match '#requires -Version 5\.1'
         $ps7BootstrapSource | Should -Match "'Microsoft\.PowerShell'"
-        $ps7BootstrapSource | Should -Match 'PowerShell/PowerShell/releases\?per_page=20'
+        $ps7BootstrapSource | Should -Match 'PowerShell/PowerShell/releases\?per_page=30'
         $ps7BootstrapSource | Should -Match 'Get-AuthenticodeSignature'
         $ps7BootstrapSource | Should -Match "Status -ne 'Valid'"
         $ps7BootstrapSource | Should -Match 'O=Microsoft Corporation'
@@ -728,37 +728,95 @@ Describe 'upd bootstrap upgrades an installed PowerShell 7' {
         (Get-PowerShell7UpgradeDecision -InstalledVersion '7.5.0' -LatestVersion '7.4.6').NeedsUpgrade | Should -BeFalse
     }
 
-    It 'skips draft and prerelease GitHub releases when finding the latest stable MSI' {
-        Mock -CommandName Invoke-RestMethod -MockWith {
-            @(
-                [pscustomobject]@{ draft=$false; prerelease=$true; tag_name='v7.4.7-preview.1'; assets=@(
-                    [pscustomobject]@{ name='PowerShell-7.4.7-preview.1-win-x64.msi'; browser_download_url='https://example.invalid/preview.msi' }
-                ) }
-                [pscustomobject]@{ draft=$true; prerelease=$false; tag_name='v7.4.6'; assets=@(
-                    [pscustomobject]@{ name='PowerShell-7.4.6-win-x64.msi'; browser_download_url='https://example.invalid/draft.msi' }
-                ) }
-                [pscustomobject]@{ draft=$false; prerelease=$false; tag_name='v7.4.5'; assets=@(
-                    [pscustomobject]@{ name='PowerShell-7.4.5-win-x64.msi'; browser_download_url='https://example.invalid/stable.msi' }
-                ) }
-            )
-        }
-        $latest = Get-PowerShell7LatestStableVersion -Architecture 'x64'
-        $latest.Version | Should -Be ([version]'7.4.5')
-        $latest.Asset.name | Should -Be 'PowerShell-7.4.5-win-x64.msi'
+    It 'treats any non-MSIX PowerShell 7 as needing the move to MSIX, whatever its version' {
+        $decision = Get-PowerShell7UpgradeDecision -InstalledVersion '7.6.10' -LatestVersion '7.7.0' -Legacy
+        $decision.NeedsUpgrade | Should -BeTrue
+        $decision.Message | Should -Match 'MSI install, which Microsoft no longer ships'
+        (Get-PowerShell7UpgradeDecision -InstalledVersion '7.8.0' -LatestVersion '7.7.0' -Legacy).NeedsUpgrade | Should -BeTrue
     }
 
-    It 'skips a stable release that lacks a matching architecture MSI asset' {
+    It 'picks the highest stable version that has an MSIX bundle and checksums, not the first listed' {
+        <# 2026-11-10: 7.6.10 was published beside 7.7.0. The old MSI lookup took the first
+           release with an MSI, which was 7.6.10, so 7.7 was never offered. #>
         Mock -CommandName Invoke-RestMethod -MockWith {
+            $hashes = [pscustomobject]@{ name='hashes.sha256'; browser_download_url='https://example.invalid/hashes' }
             @(
-                [pscustomobject]@{ draft=$false; prerelease=$false; tag_name='v7.4.6'; assets=@(
-                    [pscustomobject]@{ name='PowerShell-7.4.6-win-arm64.msi'; browser_download_url='https://example.invalid/arm64.msi' }
+                [pscustomobject]@{ draft=$false; prerelease=$false; tag_name='v7.6.10'; assets=@(
+                    [pscustomobject]@{ name='PowerShell-7.6.10-win-x64.msi'; browser_download_url='https://example.invalid/7610.msi' }
+                    [pscustomobject]@{ name='PowerShell-7.6.10.msixbundle'; browser_download_url='https://example.invalid/7610.msixbundle' }
+                    $hashes
                 ) }
-                [pscustomobject]@{ draft=$false; prerelease=$false; tag_name='v7.4.5'; assets=@(
-                    [pscustomobject]@{ name='PowerShell-7.4.5-win-x64.msi'; browser_download_url='https://example.invalid/x64.msi' }
+                [pscustomobject]@{ draft=$false; prerelease=$false; tag_name='v7.7.0'; assets=@(
+                    [pscustomobject]@{ name='PowerShell-7.7.0-win-x64.zip'; browser_download_url='https://example.invalid/770.zip' }
+                    [pscustomobject]@{ name='PowerShell-7.7.0.msixbundle'; browser_download_url='https://example.invalid/770.msixbundle' }
+                    $hashes
                 ) }
             )
         }
-        (Get-PowerShell7LatestStableVersion -Architecture 'x64').Version | Should -Be ([version]'7.4.5')
+        $latest = Get-PowerShell7LatestStableVersion
+        $latest.Version | Should -Be ([version]'7.7.0')
+        $latest.Asset.name | Should -Be 'PowerShell-7.7.0.msixbundle'
+        $latest.HashAsset.name | Should -Be 'hashes.sha256'
+    }
+
+    It 'skips drafts, prereleases and releases missing the bundle or the checksum file' {
+        Mock -CommandName Invoke-RestMethod -MockWith {
+            $hashes = [pscustomobject]@{ name='hashes.sha256'; browser_download_url='https://example.invalid/hashes' }
+            @(
+                [pscustomobject]@{ draft=$false; prerelease=$true; tag_name='v7.8.0-preview.1'; assets=@(
+                    [pscustomobject]@{ name='PowerShell-7.8.0-preview.1.msixbundle'; browser_download_url='https://example.invalid/p.msixbundle' }; $hashes) }
+                [pscustomobject]@{ draft=$true; prerelease=$false; tag_name='v7.7.2'; assets=@(
+                    [pscustomobject]@{ name='PowerShell-7.7.2.msixbundle'; browser_download_url='https://example.invalid/d.msixbundle' }; $hashes) }
+                [pscustomobject]@{ draft=$false; prerelease=$false; tag_name='v7.7.1'; assets=@(
+                    [pscustomobject]@{ name='PowerShell-7.7.1.msixbundle'; browser_download_url='https://example.invalid/nohash.msixbundle' }) }
+                [pscustomobject]@{ draft=$false; prerelease=$false; tag_name='v7.7.0'; assets=@(
+                    [pscustomobject]@{ name='PowerShell-7.7.0.msixbundle'; browser_download_url='https://example.invalid/ok.msixbundle' }; $hashes) }
+            )
+        }
+        (Get-PowerShell7LatestStableVersion).Version | Should -Be ([version]'7.7.0')
+    }
+
+    It 'finds the newest MSI for Windows that cannot take the MSIX, which is the 7.6 line' {
+        Mock -CommandName Invoke-RestMethod -MockWith {
+            $hashes = [pscustomobject]@{ name='hashes.sha256'; browser_download_url='https://example.invalid/hashes' }
+            @(
+                [pscustomobject]@{ draft=$false; prerelease=$false; tag_name='v7.7.0'; assets=@(
+                    [pscustomobject]@{ name='PowerShell-7.7.0.msixbundle'; browser_download_url='https://example.invalid/770.msixbundle' }; $hashes) }
+                [pscustomobject]@{ draft=$false; prerelease=$false; tag_name='v7.6.10'; assets=@(
+                    [pscustomobject]@{ name='PowerShell-7.6.10-win-arm64.msi'; browser_download_url='https://example.invalid/arm.msi' }
+                    [pscustomobject]@{ name='PowerShell-7.6.10-win-x64.msi'; browser_download_url='https://example.invalid/x64.msi' }; $hashes) }
+                [pscustomobject]@{ draft=$false; prerelease=$false; tag_name='v7.5.13'; assets=@(
+                    [pscustomobject]@{ name='PowerShell-7.5.13-win-x64.msi'; browser_download_url='https://example.invalid/7513.msi' }) }
+            )
+        }
+        $latest = Get-PowerShell7LatestStableVersion -Package Msi -Architecture x64
+        $latest.Version | Should -Be ([version]'7.6.10')
+        $latest.Package | Should -Be 'Msi'
+        $latest.Asset.name | Should -Be 'PowerShell-7.6.10-win-x64.msi'
+        $ps7BootstrapSource | Should -Match "if \(\[Environment\]::OSVersion\.Version\.Build -lt 17763\) \{ return \`$false \}"
+        $ps7BootstrapSource | Should -Match "InstallationType -ne 'Server Core'"
+    }
+
+    It 'reads the bundle hash from the release checksum file' {
+        $text = "7c74e03b20a75b59715847439d046a6214b1863ee79b187872980f139bb4a05f *PowerShell-7.7.0-win-x64.zip`r`n" +
+                "e00c349858c2d273f29485541ece91617b435accdd5e3f156d68d5cb97740022 *PowerShell-7.7.0.msixbundle`r`n"
+        ConvertFrom-PowerShell7HashFile -Text $text -FileName 'PowerShell-7.7.0.msixbundle' |
+            Should -Be 'E00C349858C2D273F29485541ECE91617B435ACCDD5E3F156D68D5CB97740022'
+        { ConvertFrom-PowerShell7HashFile -Text $text -FileName 'PowerShell-7.7.1.msixbundle' } | Should -Throw '*no entry*'
+    }
+
+    It 'finds the deprecated MSI and its Microsoft Update bundle, bundle first, and nothing else' {
+        $entries = @(
+            [pscustomobject]@{ PSChildName='{5417B253-1A6D-4638-BC94-743A6EC2E6F4}'; DisplayName='PowerShell 7-x64'; DisplayVersion='7.6.9.0'; WindowsInstaller=1; UninstallString='MsiExec.exe /X{5417B253-1A6D-4638-BC94-743A6EC2E6F4}' }
+            [pscustomobject]@{ PSChildName='{2f3d8eae-0153-446e-8adf-1a3ef35c591f}'; DisplayName='PowerShell 7.6.9.0-x64'; DisplayVersion='7.6.9.0'; WindowsInstaller=$null; UninstallString='"C:\ProgramData\Package Cache\{2f3d8eae-0153-446e-8adf-1a3ef35c591f}\PowerShell-7.6.9-win-x64.exe"  /uninstall' }
+            [pscustomobject]@{ PSChildName='{11111111-2222-3333-4444-555555555555}'; DisplayName='PowerShell 7-preview-x64'; DisplayVersion='7.7.0.5'; WindowsInstaller=1; UninstallString='MsiExec.exe /X{11111111-2222-3333-4444-555555555555}' }
+            [pscustomobject]@{ PSChildName='Example'; DisplayName='Example App'; DisplayVersion='1.0'; WindowsInstaller=1; UninstallString='MsiExec.exe /X{x}' }
+        )
+        $legacy = @(Select-PowerShell7LegacyEntry -Entries $entries)
+        $legacy.Count | Should -Be 2
+        $legacy[0].Kind | Should -Be 'Bundle'
+        $legacy[1].Kind | Should -Be 'Msi'
+        $legacy[1].ProductCode | Should -Be '{5417B253-1A6D-4638-BC94-743A6EC2E6F4}'
     }
 
     It 'keeps the byte-for-byte early exit when -Upgrade is absent' {
@@ -782,34 +840,45 @@ Describe 'upd bootstrap upgrades an installed PowerShell 7' {
             Should -BeGreaterThan $ps7BootstrapSource.IndexOf('-Elevated" -f $PSCommandPath')
     }
 
-    It 'reuses one MSI installer function from both the fresh-install and upgrade routes' {
-        ($ps7BootstrapSource | Select-String -Pattern 'Install-PowerShell7FromMsi' -AllMatches).Matches.Count |
-            Should -BeGreaterOrEqual 3
-        $ps7BootstrapSource | Should -Match 'function Install-PowerShell7FromMsi'
+    It 'installs only the machine-wide MSIX, from both the fresh-install and upgrade routes' {
+        <# Source shape by necessity: provisioning and msiexec cannot run in a unit test. #>
+        ($ps7BootstrapSource | Select-String -Pattern 'Complete-PowerShell7Install -Release' -AllMatches).Matches.Count |
+            Should -Be 2
+        $ps7BootstrapSource | Should -Match 'Add-AppxProvisionedPackage -Online -PackagePath \$bundlePath -SkipLicense'
+        $ps7BootstrapSource | Should -Match 'Add-AppxPackage -Path \$bundlePath -DeferRegistrationWhenPackagesAreInUse'
+        $ps7BootstrapSource | Should -Not -Match 'ForceApplicationShutdown|ForceTargetApplicationShutdown'
+        <# WinGet is no longer an install route: for 7.7 it installs a per-user MSIX only. The
+           MSI survives solely as the fallback inside Install-PowerShell7FromMsi. #>
+        $ps7BootstrapSource | Should -Not -Match "--installer-type|'install','--id'|'upgrade','--id'|winget\.exe|\`$winget"
+        ([regex]::Matches($ps7BootstrapSource, "'/i'")).Count | Should -Be 1
+        $ps7BootstrapSource | Should -Match "(?s)if \(\`$Release\.Package -eq 'Msi'\) \{.*?Install-PowerShell7FromMsi -Release \`$Release"
+        ([regex]::Matches($ps7BootstrapSource, 'Install-PowerShell7FromMsi -Release')).Count | Should -Be 1
+        $ps7BootstrapSource | Should -Match 'Get-FileHash -LiteralPath \$bundlePath -Algorithm SHA256'
     }
 
-    It 'keeps Restart Manager out of the in-place MSI upgrade and logs the installer verbosely' {
-        <# Source shape by necessity (ADR-0005 style): the assertion is about the msiexec
-           command line and the package lifetime, which a behavioural test could only see by
-           running msiexec. #>
+    It 'removes the old MSI only after the MSIX starts, with Restart Manager off' {
+        $ps7BootstrapSource | Should -Match '(?s)function Complete-PowerShell7Install.*?Install-PowerShell7Msix -Release.*?Remove-PowerShell7LegacyInstall'
+        $ps7BootstrapSource | Should -Match '(?s)function Install-PowerShell7Msix.*?Get-PowerShell7InstalledVersion -PwshPath \$installed\.PwshPath'
         $ps7BootstrapSource | Should -Match 'MSIRESTARTMANAGERCONTROL=Disable'
-        $ps7BootstrapSource | Should -Match 'Import-Module \(Join-Path \$PSHOME ''Modules\\Microsoft\.PowerShell\.Security''\)'
-        $ps7BootstrapSource | Should -Match "'/l\*v'"
-        $ps7BootstrapSource | Should -Match 'Installer log: \$msiLog'
-        <# The package must outlive the transaction: no Remove-Item of the temp directory
-           inside the finally block, only after a successful exit code. #>
-        ([regex]::Matches($ps7BootstrapSource, 'Remove-Item -LiteralPath \$tempDirectory')).Count | Should -Be 1
-        $ps7BootstrapSource | Should -Match '(?s)ExitCode -notin @\(0,3010\)[^\n]*\n\s*Remove-Item -LiteralPath \$tempDirectory'
-        $ps7BootstrapSource | Should -Match 'Deliberately NOT deleting the package here'
+        $ps7BootstrapSource | Should -Match "'/x', \`$entry\.ProductCode, '/qn', '/norestart'"
+    }
+
+    It 'never changes the runtime under a running cycle and reports a check with exit 100' {
+        $ps7BootstrapSource | Should -Match "Get-ScheduledTask -TaskName 'BootUpdateCycle','BootUpdateCycleFallback'"
+        $ps7BootstrapSource | Should -Match '(?s)if \(Test-BootUpdateCycleActive\) \{.*?exit 3'
+        $ps7BootstrapSource.IndexOf('if (Test-BootUpdateCycleActive) {') |
+            Should -BeLessThan $ps7BootstrapSource.IndexOf('$installed = Complete-PowerShell7Install -Release $latest')
         $ps7BootstrapSource | Should -Match 'if \(\$CheckOnly\) \{'
         $ps7BootstrapSource | Should -Match 'exit 100'
+        $ps7BootstrapSource | Should -Match "PowerShell \`$installedVersion -> \`$\(\`$installed\.Version\) installed\."
     }
 
-    It 'reports a pending restart only when the MSI route itself required one' {
-        <# Source shape by necessity: the 3010 branch is reachable only after a real msiexec. #>
-        $ps7BootstrapSource | Should -Match "PowerShell \`$installedVersion -> \`$newVersion installed\."
-        $ps7BootstrapSource | Should -Match 'A restart is pending before the new version is fully in place\.'
-        $ps7BootstrapSource | Should -Match '\$msiExitCode -eq 3010'
+    It 'starts the upgrade after a verified completion, never during a preview or a pass' {
+        $completion = [regex]::Match($invokeSource, '(?s)Terminal cleanup verification failed.*?Send-CompletionNotification').Value
+        $completion | Should -Match 'Start-PowerShellRuntimeUpgrade'
+        $invokeSource | Should -Match "'-Upgrade', '-WaitForProcessId', \`$PID"
+        ([regex]::Matches($invokeSource, '(?m)^\s*Start-PowerShellRuntimeUpgrade\s*$')).Count | Should -Be 1
+        $deploySource | Should -Match "Join-Path \`$installDir 'Install-PowerShell7\.ps1'"
     }
 
     It 'invokes the bootstrap script with -Upgrade from the launcher''s bootstrap command' {

@@ -288,7 +288,11 @@ $moduleProof = Invoke-Command -VMName $VMName -Credential $cred -ErrorAction Sto
         }
         ConvertTo-Json -InputObject @($proof)
     }
-    & 'C:\Program Files\PowerShell\7\pwsh.exe' -NoProfile -ExecutionPolicy Bypass -Command $probe
+    <# The guest's PowerShell 7: the provisioned MSIX (by full path; it has no alias for
+       SYSTEM) or the older MSI install. #>
+    $guestPwsh = @(@(Get-AppxPackage -AllUsers -Name Microsoft.PowerShell -ErrorAction SilentlyContinue | Where-Object PublisherId -eq '8wekyb3d8bbwe' | Sort-Object { [version]$_.Version } -Descending | ForEach-Object { Join-Path $_.InstallLocation 'pwsh.exe' }) + 'C:\Program Files\PowerShell\7\pwsh.exe' | Where-Object { Test-Path -LiteralPath $_ })[0]
+    if (-not $guestPwsh) { throw 'PowerShell 7 is not installed in the guest' }
+    & $guestPwsh -NoProfile -ExecutionPolicy Bypass -Command $probe
     if ($LASTEXITCODE -ne 0) { throw 'Module prerequisite probe failed under PowerShell 7' }
 }
 $moduleProof | Set-Content (Join-Path $evidenceDir 'module-prerequisites.json')
@@ -360,7 +364,9 @@ Invoke-Command -VMName $VMName -Credential $cred -ArgumentList $GuestUser, ([boo
         $inner = '& "C:\Lab\boot-upd\Deploy-BootUpdateCycle.ps1" -NonInteractive -OutputMode Normal EXTRA_ARGS *>&1 | Tee-Object -FilePath C:\Lab\deploy-output.txt'
         $inner = $inner.Replace('EXTRA_ARGS', $Extra)
         $argument = '-NoProfile -ExecutionPolicy Bypass -Command "' + $inner.Replace('"', '\"') + '"'
-        New-ScheduledTaskAction -Execute 'C:\Program Files\PowerShell\7\pwsh.exe' `
+        $guestPwsh = @(@(Get-AppxPackage -AllUsers -Name Microsoft.PowerShell -ErrorAction SilentlyContinue | Where-Object PublisherId -eq '8wekyb3d8bbwe' | Sort-Object { [version]$_.Version } -Descending | ForEach-Object { Join-Path $_.InstallLocation 'pwsh.exe' }) + 'C:\Program Files\PowerShell\7\pwsh.exe' | Where-Object { Test-Path -LiteralPath $_ })[0]
+        if (-not $guestPwsh) { $guestPwsh = 'C:\Program Files\PowerShell\7\pwsh.exe' }
+        New-ScheduledTaskAction -Execute $guestPwsh `
             -Argument $argument `
             -WorkingDirectory 'C:\Lab\boot-upd'
     }
@@ -380,7 +386,7 @@ $launchProbe = Invoke-Command -VMName $VMName -Credential $cred -ScriptBlock {
     [pscustomobject]@{
         Result  = (Get-ScheduledTaskInfo -TaskName 'Lab-RunDeploy').LastTaskResult
         State   = (Get-ScheduledTask     -TaskName 'Lab-RunDeploy').State
-        HasPwsh = Test-Path 'C:\Program Files\PowerShell\7\pwsh.exe'
+        HasPwsh = [bool](@(@(Get-AppxPackage -AllUsers -Name Microsoft.PowerShell -ErrorAction SilentlyContinue | Where-Object PublisherId -eq '8wekyb3d8bbwe' | Sort-Object { [version]$_.Version } -Descending | ForEach-Object { Join-Path $_.InstallLocation 'pwsh.exe' }) + 'C:\Program Files\PowerShell\7\pwsh.exe' | Where-Object { Test-Path -LiteralPath $_ })[0])
     }
 }
 if ($launchProbe.State -ne 'Running' -and $launchProbe.Result -ne 0 -and $launchProbe.Result -ne 267009) {
@@ -450,7 +456,7 @@ while ((Get-Date) -lt $deadline) {
                 StateFileExists = Test-Path 'C:\ProgramData\BootUpdateCycle\BootUpdateCycle.state.json'
                 <# consent.exe is the UAC consent dialog itself, so counting it counts real prompts rather than inferring them from a log. #>
                 Consent  = @(Get-Process consent -ErrorAction SilentlyContinue).Count
-                Pwsh     = Test-Path 'C:\Program Files\PowerShell\7\pwsh.exe'
+                Pwsh     = [bool](@(@(Get-AppxPackage -AllUsers -Name Microsoft.PowerShell -ErrorAction SilentlyContinue | Where-Object PublisherId -eq '8wekyb3d8bbwe' | Sort-Object { [version]$_.Version } -Descending | ForEach-Object { Join-Path $_.InstallLocation 'pwsh.exe' }) + 'C:\Program Files\PowerShell\7\pwsh.exe' | Where-Object { Test-Path -LiteralPath $_ })[0])
                 Last     = if ($lines.Count) { ($lines[-1] -replace '\s+', ' ').Trim() } else { '' }
                 Matched  = if ($Pattern) { @($lines | Where-Object { $_ -match $Pattern }).Count -gt 0 } else { $false }
                 <# Lines the host has not seen. A log shorter than last time was rotated or

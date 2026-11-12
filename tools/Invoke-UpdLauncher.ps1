@@ -233,7 +233,8 @@ function Start-UpdLegacyBatchAdoption {
     )
     # Publish queued before spawning: the worker may finish before Start-Process returns.
     Set-Content -LiteralPath $workerLog -Value "$(Get-Date -Format o) Legacy launcher adoption queued." -Encoding utf8
-    $null = Start-Process -FilePath (Get-Command pwsh).Source -WindowStyle Hidden -ArgumentList $arguments
+    <# This pwsh by its real path, not `pwsh` by name (an MSIX alias is per-user). #>
+    $null = Start-Process -FilePath ([Environment]::ProcessPath) -WindowStyle Hidden -ArgumentList $arguments
 }
 
 function Get-UpdDeployParameters {
@@ -437,7 +438,7 @@ function Invoke-UpdElevated {
     $json = ConvertTo-Json -InputObject @($CanonicalArguments) -Compress
     $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
     $quotedScript = '"{0}"' -f $PSCommandPath
-    $process = Start-Process -FilePath (Get-Command pwsh).Source -Verb RunAs -Wait -PassThru -ArgumentList @(
+    $process = Start-Process -FilePath ([Environment]::ProcessPath) -Verb RunAs -Wait -PassThru -ArgumentList @(
         '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $quotedScript,
         '-EncodedArguments', $encoded
     )
@@ -601,12 +602,11 @@ switch ($Command.ToLowerInvariant()) {
     'version' { Write-Host "Boot Update Cycle v$(Get-UpdVersion)"; exit 0 }
     'bootstrap' {
         Write-Host "PowerShell $($PSVersionTable.PSVersion) runtime ready: $((Get-Process -Id $PID).Path)" -ForegroundColor Green
-        <# Two steps, both under Windows PowerShell 5.1 rather than in this process: the
-           installer replaces the pwsh.exe this launcher runs on, and Restart Manager closes
-           every pwsh.exe (and Ctrl+Cs its console) while doing so. Step 1 is a fast check that
-           runs synchronously and reports. Step 2, only when the check returns 100, hands the
-           real upgrade to a detached, hidden host whose output goes to a log file, then this
-           launcher exits before the installer starts closing PowerShell. #>
+        <# Two steps, both under Windows PowerShell 5.1 rather than in this process: moving
+           off the old MSI uninstalls the pwsh.exe this launcher may be running on. Step 1 is
+           a fast check that runs synchronously and reports. Step 2, only when the check
+           returns 100, hands the real upgrade to a detached, hidden host whose output goes to
+           a log file, and this launcher exits. #>
         $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
         $check = Start-Process -FilePath $windowsPowerShell -Wait -PassThru -NoNewWindow `
             -ArgumentList @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $ps7BootstrapPath), '-Upgrade', '-CheckOnly')
@@ -617,8 +617,8 @@ switch ($Command.ToLowerInvariant()) {
         $null = Start-Process -FilePath $windowsPowerShell -WindowStyle Hidden -PassThru `
             -RedirectStandardOutput $upgradeLog -RedirectStandardError $upgradeErrorLog `
             -ArgumentList @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $ps7BootstrapPath), '-Upgrade')
-        Write-Host 'Upgrading PowerShell 7 in the background. The installer closes every running PowerShell 7 window,' -ForegroundColor Yellow
-        Write-Host "including this one; progress and the result are written to $upgradeLog (errors to $upgradeErrorLog). Run 'upd version' afterwards." -ForegroundColor Yellow
+        Write-Host 'Upgrading PowerShell 7 in the background. Open PowerShell 7 windows keep running; new ones start the new version.' -ForegroundColor Yellow
+        Write-Host "Progress and the result are written to $upgradeLog (errors to $upgradeErrorLog). Run 'upd version' afterwards." -ForegroundColor Yellow
         exit 0
     }
     'status' { Show-UpdStatus; exit 0 }

@@ -126,18 +126,25 @@ if (-not $ready) { throw "Guest never reached a desktop within $InstallTimeoutMi
    than as output - the run looks like it started and produced nothing. That cost a full
    40-minute row before anyone asked what the task had actually executed.
 
-   Installed with Microsoft's own install-powershell.ps1 rather than a pinned MSI URL, so the
-   guest tracks the current release instead of an asset path that rots. #>
+   Installed with the updater's own tools\Install-PowerShell7.ps1, so the guest gets
+   PowerShell exactly the way a machine running upd does: the current release's MSIX,
+   provisioned machine-wide. (Microsoft's install-powershell.ps1 -UseMSI stopped working at
+   7.7, which ships no MSI.) #>
 Say 'installing PowerShell 7'
-Invoke-Command -VMName $Name -Credential $cred -ScriptBlock {
-    $ProgressPreference = 'SilentlyContinue'
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    Invoke-WebRequest -Uri 'https://aka.ms/install-powershell.ps1' -OutFile "$env:TEMP\install-powershell.ps1" -UseBasicParsing
-    & "$env:TEMP\install-powershell.ps1" -UseMSI -Quiet
-} | Out-Null
+$installer = Join-Path $PSScriptRoot '..\..\..\tools\Install-PowerShell7.ps1'
+$session = New-PSSession -VMName $Name -Credential $cred
+try {
+    Invoke-Command -Session $session -ScriptBlock { New-Item -ItemType Directory -Path 'C:\Lab' -Force | Out-Null }
+    Copy-Item -LiteralPath $installer -Destination 'C:\Lab\Install-PowerShell7.ps1' -ToSession $session -Force
+    Invoke-Command -Session $session -ScriptBlock {
+        & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File 'C:\Lab\Install-PowerShell7.ps1'
+        if ($LASTEXITCODE -ne 0) { throw "Install-PowerShell7.ps1 exited $LASTEXITCODE" }
+    } | Out-Null
+} finally { Remove-PSSession $session }
 
 $pwshPath = Invoke-Command -VMName $Name -Credential $cred -ScriptBlock {
-    if (Test-Path 'C:\Program Files\PowerShell\7\pwsh.exe') { (& 'C:\Program Files\PowerShell\7\pwsh.exe' -NoProfile -Command '$PSVersionTable.PSVersion.ToString()') } else { $null }
+    $pwsh = @(@(Get-AppxPackage -AllUsers -Name Microsoft.PowerShell -ErrorAction SilentlyContinue | Where-Object PublisherId -eq '8wekyb3d8bbwe' | Sort-Object { [version]$_.Version } -Descending | ForEach-Object { Join-Path $_.InstallLocation 'pwsh.exe' }) + 'C:\Program Files\PowerShell\7\pwsh.exe' | Where-Object { Test-Path -LiteralPath $_ })[0]
+    if ($pwsh) { (& $pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()') } else { $null }
 }
 if (-not $pwshPath) { throw 'PowerShell 7 did not install; the guest cannot run the updater.' }
 Say "PowerShell $pwshPath installed"

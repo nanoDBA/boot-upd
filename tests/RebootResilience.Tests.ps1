@@ -1896,6 +1896,7 @@ Describe 'In-flight watchdog scheduling' {
         <# Test-ArsoAvailable is a real dependency (registry reads only, EA Ignore — safe to
            run for real) that isn't in the shared loader list; load it the ordinary way. #>
         . ([scriptblock]::Create((Get-FunctionText $invokeAst 'Test-ArsoAvailable')))
+        . ([scriptblock]::Create((Get-FunctionText $invokeAst 'Get-BootUpdatePwshPath')))
         $watchdogFunctionPath = Join-Path $TestDrive 'Register-BootUpdateTaskForReboot.ps1'
         Set-Content -LiteralPath $watchdogFunctionPath -Value (Get-FunctionText $invokeAst 'Register-BootUpdateTaskForReboot') -Encoding utf8
         . $watchdogFunctionPath
