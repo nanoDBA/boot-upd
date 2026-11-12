@@ -51,7 +51,8 @@ this tool for, which is to take the feature update now rather than wait for the 
 - The scope has a single textual representation. Tests pin that no `-RootCategories` or
   category literal returns to the phase, and the rule file says why.
 - A feature update is a new Windows version, not a package. The install phase scans first and,
-  when a feature update is in scope, runs under `-FeatureUpdateTimeoutMinutes` (default 240)
+  when a feature update or a Windows cumulative update is in scope, runs under
+  `-FeatureUpdateTimeoutMinutes` (default 240)
   instead of the per-provider budget. The child process waits on COM while TrustedInstaller
   works, so the CPU-based idle clock (ADR-0005) cannot tell a long install from a hang; the
   budget is the only protection, and it has to fit the work.

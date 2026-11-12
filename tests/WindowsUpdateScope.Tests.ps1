@@ -175,6 +175,20 @@ Describe 'Offers are selected with a reason for everything left alone' {
         ($script:LogLines | Where-Object Message -like '*Cumulative Update Preview*').Message | Should -Match 'outside scope'
     }
 
+    It 'marks Windows cumulative updates, in either title style, as OS updates and nothing else' {
+        $offers = @(
+            [pscustomobject]@{ UpdateID='a'; RevisionNumber=1; Title='2026-09 Security Update (KB5129195) (26100.9457)'; KB='KB5129195'; Categories=@('Security Updates'); DeploymentAction='Installation'; IsDownloaded=$false; SizeMB=92365; InScope=$true }
+            [pscustomobject]@{ UpdateID='b'; RevisionNumber=1; Title='2026-11 Cumulative Update for Windows 11 Version 25H2 (KB5066835)'; KB='KB5066835'; Categories=@('Security Updates'); DeploymentAction='Installation'; IsDownloaded=$false; SizeMB=900; InScope=$true }
+            [pscustomobject]@{ UpdateID='c'; RevisionNumber=1; Title='2026-10 .NET Framework Security Update (KB5127690)'; KB='KB5127690'; Categories=@('Security Updates'); DeploymentAction='Installation'; IsDownloaded=$false; SizeMB=185; InScope=$true }
+            [pscustomobject]@{ UpdateID='d'; RevisionNumber=1; Title='Security Intelligence Update for Microsoft Defender Antivirus - KB2267602 (Version 1.463.271.0)'; KB='KB2267602'; Categories=@('Definition Updates'); DeploymentAction='Installation'; IsDownloaded=$false; SizeMB=1536; InScope=$true }
+        )
+        $selection = Select-WindowsUpdateOffer -Offers $offers -Scope (Get-WindowsUpdateVerificationScope)
+        @($selection.Applicable | Where-Object IsOsUpdate | ForEach-Object KB) | Should -Be @('KB5129195', 'KB5066835')
+        $selection.HasOsUpdate | Should -BeTrue
+        $selection.HasFeatureUpdate | Should -BeFalse
+        (Select-WindowsUpdateOffer -Offers @($offers[2], $offers[3]) -Scope (Get-WindowsUpdateVerificationScope)).HasOsUpdate | Should -BeFalse
+    }
+
     It 'handles an empty scan and a null offer without inventing work' {
         $selection = Select-WindowsUpdateOffer -Offers @($null) -Scope (Get-WindowsUpdateVerificationScope)
         @($selection.Applicable).Count | Should -Be 0
@@ -201,10 +215,10 @@ Describe 'The install phase scans first, then budgets by what it found' {
         $install | Should -Match 'throw "the pre-install scan did not complete' -Because 'an unverified scan is a phase failure, not a free pass'
     }
 
-    It 'raises the hard timeout to the feature-update budget only when a feature update is in scope' {
+    It 'raises the hard timeout to the long budget only when a feature or cumulative update is in scope' {
         $install = Get-FunctionText 'Install-WindowsUpdates'
         $install | Should -Match '\$installTimeoutMinutes = \$script:PackageTimeoutMinutes'
-        $install | Should -Match '(?s)if \(\$selection\.HasFeatureUpdate\) \{.*?\$installTimeoutMinutes = \[math\]::Max\(\[int\]\$script:FeatureUpdateTimeoutMinutes, \[int\]\$script:PackageTimeoutMinutes\)'
+        $install | Should -Match '(?s)if \(\$selection\.HasOsUpdate\) \{.*?\$installTimeoutMinutes = \[math\]::Max\(\[int\]\$script:FeatureUpdateTimeoutMinutes, \[int\]\$script:PackageTimeoutMinutes\)'
         $install | Should -Match '-TimeoutMinutes \$installTimeoutMinutes -ScriptBlock'
     }
 

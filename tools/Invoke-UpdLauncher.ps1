@@ -124,7 +124,7 @@ function Show-UpdHelp {
     -n, --max-iterations <n>   Consecutive reboots without verified progress; default 5 (1-50)
     --max-retry-passes <n>     Failed recovery passes in one boot; default 5 (1-50)
     -t, --timeout <minutes>    Per-provider hard timeout; default 30
-    --feature-timeout <minutes> Windows Update budget when a feature update (new Windows version) installs; default 240
+    --feature-timeout <minutes> Windows Update budget when a feature or cumulative update installs; default 240
     -s, --staged               Run one provider per checkpoint
     -ar, --aggressive-repair   Attempt repair/force reinstall for failed Winget packages
     -drv, --drivers            Include Windows driver updates

@@ -210,7 +210,7 @@ upd --wsl --containers --allow-metered
 upd -ar                          Opt in to aggressive Winget repair/reinstall attempts
 upd --exclude Teams,OneDrive --skip-office365
 upd --skip-feature-updates       Leave new Windows versions to Windows Update's own schedule
-upd --feature-timeout 360        Allow six hours for a feature update instead of four
+upd --feature-timeout 360        Allow six hours for a feature or cumulative update instead of four
 ```
 
 Short forms keep everyday commands light: `upd d 12`, `upd f`, `upd p -drv -r 120`,
@@ -520,9 +520,11 @@ reason (`Windows Update offers outside scope: ...`), so a new kind of update is 
 first time it appears rather than silently skipped. Up to v2.5.92 the phase took only
 Security, Critical and Definition updates, and feature updates were never offered to it.
 
-A feature update is a long install. When one is in scope the Windows Update phase gets
-`--feature-timeout` minutes (default 240) instead of the per-provider `--timeout`, and the
-machine reboots at least once more while Windows finishes the upgrade.
+Feature updates and Windows cumulative updates are long installs. When either is in scope the
+Windows Update phase gets `--feature-timeout` minutes (default 240) instead of the per-provider
+`--timeout`, and the machine reboots at least once more while Windows finishes. Up to v2.5.92
+the category filter also left cumulative updates out: on a lab guest it reported Windows Update
+converged with the September cumulative security update still offered.
 
 ### Why did a package get skipped?
 
