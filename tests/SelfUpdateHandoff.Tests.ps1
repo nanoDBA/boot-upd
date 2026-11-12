@@ -204,7 +204,7 @@ Describe 'Update-OrchestratorSelf mutex handoff structure' {
     It 'waits synchronously for the child before restoring the handoff environment' {
         $updateSelfText | Should -Match (
             '(?s)SetEnvironmentVariable\(\$handoffName, \$handoffMarker, ''Process''\)' +
-            '.*?& pwsh -NoProfile -File \$livePath @relaunchArgs.*?finally.*?' +
+            '.*?& \(Get-BootUpdatePwshPath\) -NoProfile -File \$livePath @relaunchArgs.*?finally.*?' +
             'SetEnvironmentVariable\(\$handoffName, \$previousHandoff, ''Process''\)'
         )
     }

@@ -3955,6 +3955,21 @@ function Wait-ProcessWithIdleTimeout {
     }
 }
 
+function Get-BootUpdatePwshPath {
+    <# The PowerShell 7 runtime is the pwsh.exe running this script, named by its real path.
+       Not `pwsh` by name: an MSIX install puts pwsh on PATH only as a per-user app execution
+       alias, and SYSTEM (the continuation tasks, the headless fallback) has no alias at all.
+       The executable itself runs as SYSTEM when started by its full path (lab-b, 2026-11-12,
+       PowerShell 7.7.0 provisioned machine-wide). [Environment]::ProcessPath is that path for
+       every install method, so a child process or a task always gets the runtime the parent
+       already proved works in this context. #>
+    $current = [Environment]::ProcessPath
+    if ($current -and [IO.Path]::GetFileName($current) -ieq 'pwsh.exe') { return $current }
+    $command = Get-Command pwsh.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($command) { return $command.Source }
+    return (Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe')
+}
+
 function Invoke-PackageManagerWithTimeout {
     param(
         [Parameter(Mandatory)][string]$Name,
@@ -3965,8 +3980,7 @@ function Invoke-PackageManagerWithTimeout {
         [int[]]$IncompleteRebootExitCodes = @(),
         [switch]$DeferExitCodeReporting
     )
-    $pwshPath = (Get-Command pwsh -EA SilentlyContinue)?.Source
-    if (-not $pwshPath) { $pwshPath = Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe' }
+    $pwshPath = Get-BootUpdatePwshPath
     if (-not (Test-Path $pwshPath)) { throw "pwsh not found for '$Name'" }
 
     $outputFile = [System.IO.Path]::GetTempFileName()
@@ -4122,8 +4136,8 @@ function Update-WingetPackages {
 if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-File -FilePath '$($tmpOut -replace "'","''")' -Encoding UTF8 -Append }
 "@
                 $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($childScript))
-                $pw = (Get-Command pwsh -ErrorAction SilentlyContinue)?.Source
-                if (-not $pw) { $pw = Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe' }
+                <# A ThreadJob runs in this process, so ProcessPath is the runtime (see Get-BootUpdatePwshPath). #>
+                $pw = [Environment]::ProcessPath
                 $proc = $null
                 $startFailed = $false
                 try {
@@ -7009,7 +7023,8 @@ function Repair-AwsTooling {
                 -TimeoutMinutes $script:PackageTimeoutMinutes `
                 -ScriptBlock {
                     param($Path)
-                    & pwsh -NoProfile -NonInteractive -File $Path -Mode Remediate 2>&1
+                    <# This block runs in a child pwsh: its own path is the runtime, alias or not. #>
+                    & ([Environment]::ProcessPath) -NoProfile -NonInteractive -File $Path -Mode Remediate 2>&1
                     "BOOTUPDATE_EXIT|$LASTEXITCODE"
                 } -ArgumentList @($awsScript)
             $exitCode = -1
@@ -7481,8 +7496,7 @@ function Register-BootUpdateTaskForReboot {
         [switch]$LogonOnly
     )
     $taskName = 'BootUpdateCycle'
-    $pwshPath = (Get-Command pwsh -EA SilentlyContinue).Source
-    if (-not $pwshPath) { $pwshPath = "$env:ProgramFiles\PowerShell\7\pwsh.exe" }
+    $pwshPath = Get-BootUpdatePwshPath
     $scriptPath = Join-Path $PSScriptRoot 'Invoke-BootUpdateCycle.ps1'
     $taskArgs = @(
         '-NoProfile', '-ExecutionPolicy Bypass'
@@ -8705,7 +8719,7 @@ function Update-OrchestratorSelf {
         $handoffMarker = "v1:${PID}:$([guid]::NewGuid().ToString('N'))"
         try {
             [Environment]::SetEnvironmentVariable($handoffName, $handoffMarker, 'Process')
-            & pwsh -NoProfile -File $livePath @relaunchArgs
+            & (Get-BootUpdatePwshPath) -NoProfile -File $livePath @relaunchArgs
             $replacementExitCode = $LASTEXITCODE
         } finally {
             [Environment]::SetEnvironmentVariable($handoffName, $previousHandoff, 'Process')

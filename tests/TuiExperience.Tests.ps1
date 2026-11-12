@@ -303,6 +303,7 @@ Describe 'Animated progress behavior' {
             'Test-BootUpdateInstallerMutexHeld',
             'Wait-BootUpdateInstallerMutex',
             'Wait-ProcessWithIdleTimeout',
+            'Get-BootUpdatePwshPath',
             'Invoke-PackageManagerWithTimeout',
             'Invoke-BootUpdateBackgroundOperation'
         )) {

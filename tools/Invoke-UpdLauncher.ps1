@@ -233,7 +233,8 @@ function Start-UpdLegacyBatchAdoption {
     )
     # Publish queued before spawning: the worker may finish before Start-Process returns.
     Set-Content -LiteralPath $workerLog -Value "$(Get-Date -Format o) Legacy launcher adoption queued." -Encoding utf8
-    $null = Start-Process -FilePath (Get-Command pwsh).Source -WindowStyle Hidden -ArgumentList $arguments
+    <# This pwsh by its real path, not `pwsh` by name (an MSIX alias is per-user). #>
+    $null = Start-Process -FilePath ([Environment]::ProcessPath) -WindowStyle Hidden -ArgumentList $arguments
 }
 
 function Get-UpdDeployParameters {
@@ -437,7 +438,7 @@ function Invoke-UpdElevated {
     $json = ConvertTo-Json -InputObject @($CanonicalArguments) -Compress
     $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
     $quotedScript = '"{0}"' -f $PSCommandPath
-    $process = Start-Process -FilePath (Get-Command pwsh).Source -Verb RunAs -Wait -PassThru -ArgumentList @(
+    $process = Start-Process -FilePath ([Environment]::ProcessPath) -Verb RunAs -Wait -PassThru -ArgumentList @(
         '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $quotedScript,
         '-EncodedArguments', $encoded
     )

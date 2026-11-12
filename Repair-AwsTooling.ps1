@@ -521,7 +521,11 @@ catch {
 }
 '@
         
-        $engine = if (Get-Command pwsh.exe -ErrorAction SilentlyContinue) { 'pwsh.exe' } else { 'powershell.exe' }
+        <# Under pwsh, the child runs on this same pwsh by its real path (an MSIX alias is
+           per-user and absent for SYSTEM). Under Windows PowerShell, prefer pwsh when on PATH. #>
+        $engine = if ($PSVersionTable.PSEdition -eq 'Core') { [Environment]::ProcessPath }
+                  elseif (Get-Command pwsh.exe -ErrorAction SilentlyContinue) { 'pwsh.exe' }
+                  else { 'powershell.exe' }
         # The verification program is deliberately substantial and exceeds the
         # Windows process command-line limit when Base64-encoded. Execute it from
         # a random temporary file instead; it contains code only, never secrets.
