@@ -521,9 +521,9 @@ catch {
 }
 '@
         
-        <# Under pwsh, the child runs on this same pwsh by its real path (an MSIX alias is
-           per-user and absent for SYSTEM). Under Windows PowerShell, prefer pwsh when on PATH. #>
-        $engine = if ($PSVersionTable.PSEdition -eq 'Core') { [Environment]::ProcessPath }
+        <# Under pwsh, the child runs on this same pwsh from $PSHOME (an MSIX alias is per-user
+           and absent for SYSTEM). Under Windows PowerShell, prefer pwsh when on PATH. #>
+        $engine = if ($PSVersionTable.PSEdition -eq 'Core') { Join-Path $PSHOME 'pwsh.exe' }
                   elseif (Get-Command pwsh.exe -ErrorAction SilentlyContinue) { 'pwsh.exe' }
                   else { 'powershell.exe' }
         # The verification program is deliberately substantial and exceeds the

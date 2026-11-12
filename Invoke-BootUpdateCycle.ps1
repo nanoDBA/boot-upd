@@ -3956,15 +3956,17 @@ function Wait-ProcessWithIdleTimeout {
 }
 
 function Get-BootUpdatePwshPath {
-    <# The PowerShell 7 runtime is the pwsh.exe running this script, named by its real path.
-       Not `pwsh` by name: an MSIX install puts pwsh on PATH only as a per-user app execution
-       alias, and SYSTEM (the continuation tasks, the headless fallback) has no alias at all.
-       The executable itself runs as SYSTEM when started by its full path (lab-b, 2026-11-12,
-       PowerShell 7.7.0 provisioned machine-wide). [Environment]::ProcessPath is that path for
-       every install method, so a child process or a task always gets the runtime the parent
-       already proved works in this context. #>
-    $current = [Environment]::ProcessPath
-    if ($current -and [IO.Path]::GetFileName($current) -ieq 'pwsh.exe') { return $current }
+    <# The PowerShell 7 runtime is the pwsh.exe in $PSHOME, the folder this PowerShell runs
+       from. Not `pwsh` by name: an MSIX install puts pwsh on PATH only as a per-user app
+       execution alias, and SYSTEM (the continuation tasks, the headless fallback) has no
+       alias at all. Not [Environment]::ProcessPath either: started through the alias, that is
+       the alias itself, inside the starting user's profile (lab row A, 2026-11-12: every task
+       was registered with C:\Users\<user>\AppData\Local\Microsoft\WindowsApps\...\pwsh.exe,
+       which the SYSTEM fallback cannot run). $PSHOME is the package folder for the MSIX,
+       Program Files\PowerShell\7 for the MSI, and the unpacked folder for a ZIP, and the
+       executable there runs as SYSTEM (lab-b, 2026-11-12, PowerShell 7.7.0). #>
+    $home7 = Join-Path $PSHOME 'pwsh.exe'
+    if (Test-Path -LiteralPath $home7) { return $home7 }
     $command = Get-Command pwsh.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($command) { return $command.Source }
     return (Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe')
@@ -4136,8 +4138,8 @@ function Update-WingetPackages {
 if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-File -FilePath '$($tmpOut -replace "'","''")' -Encoding UTF8 -Append }
 "@
                 $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($childScript))
-                <# A ThreadJob runs in this process, so ProcessPath is the runtime (see Get-BootUpdatePwshPath). #>
-                $pw = [Environment]::ProcessPath
+                <# A ThreadJob runs in this process, so $PSHOME is the runtime's folder (see Get-BootUpdatePwshPath). #>
+                $pw = Join-Path $PSHOME 'pwsh.exe'
                 $proc = $null
                 $startFailed = $false
                 try {
@@ -7023,8 +7025,8 @@ function Repair-AwsTooling {
                 -TimeoutMinutes $script:PackageTimeoutMinutes `
                 -ScriptBlock {
                     param($Path)
-                    <# This block runs in a child pwsh: its own path is the runtime, alias or not. #>
-                    & ([Environment]::ProcessPath) -NoProfile -NonInteractive -File $Path -Mode Remediate 2>&1
+                    <# This block runs in a child pwsh: its $PSHOME is the runtime's folder. #>
+                    & (Join-Path $PSHOME 'pwsh.exe') -NoProfile -NonInteractive -File $Path -Mode Remediate 2>&1
                     "BOOTUPDATE_EXIT|$LASTEXITCODE"
                 } -ArgumentList @($awsScript)
             $exitCode = -1
