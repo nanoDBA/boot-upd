@@ -84,7 +84,10 @@ $parameters = @{
     Row = 'A-review'
     ArmReboots = 3
     Launcher = 'upd'
-    DeployArgs = 'run -DisableSelfUpdate'
+    <# --no-update, not -DisableSelfUpdate: upd.cmd only recognises -nu, --no-update and
+       --disable-self-update, and otherwise refreshes itself from the latest published
+       release before the launcher sees any argument, replacing the synced source. #>
+    DeployArgs = 'run --no-update'
     TimeoutMinutes = 50
 }
 $harness = (Resolve-Path ./tests/integration/lab/Invoke-LabRow.ps1).Path

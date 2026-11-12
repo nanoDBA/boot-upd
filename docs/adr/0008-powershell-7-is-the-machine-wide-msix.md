@@ -6,10 +6,12 @@ provisioned for the whole machine with `Add-AppxProvisionedPackage -Online`. Eve
 boot-upd that starts PowerShell 7 (continuation tasks, the Deploy task, child processes, the
 self-update relaunch, the launcher's elevation) uses `pwsh.exe` in `$PSHOME`, the folder the
 running PowerShell lives in (`Get-BootUpdatePwshPath`). It never asks for `pwsh` by name.
-The first version of this change used `[Environment]::ProcessPath`; lab row A showed that a
-pwsh started through the alias reports the alias as its process path, inside the starting
-user's profile, and every continuation task, the SYSTEM fallback included, was registered
-with it.
+`Get-Command pwsh` is exactly what must not be used: for an MSIX install it resolves to the
+per-user alias inside the user's profile. A lab row that accidentally ran v2.5.92 on an MSIX
+guest registered every continuation task, the SYSTEM fallback included, with that alias.
+(`[Environment]::ProcessPath`, which the first version of this change used, reports the real
+package path even when pwsh was started through the alias; `$PSHOME` is used because it names
+the install folder directly.)
 
 PowerShell 7.7 shipped on 2026-11-10 with no MSI. Microsoft had announced the MSI's deprecation
 in April: 7.6 LTS is the last line that ships one, and WinGet's `Microsoft.PowerShell` 7.7

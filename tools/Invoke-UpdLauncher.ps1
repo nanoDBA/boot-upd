@@ -438,7 +438,7 @@ function Invoke-UpdElevated {
     $json = ConvertTo-Json -InputObject @($CanonicalArguments) -Compress
     $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
     $quotedScript = '"{0}"' -f $PSCommandPath
-    <# $PSHOME, not the process path: an alias in this user's profile is not the elevated account's. #>
+    <# $PSHOME, not `pwsh` by name: an alias in this user's profile is not the elevated account's. #>
     $process = Start-Process -FilePath (Join-Path $PSHOME 'pwsh.exe') -Verb RunAs -Wait -PassThru -ArgumentList @(
         '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $quotedScript,
         '-EncodedArguments', $encoded

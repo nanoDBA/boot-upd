@@ -3957,14 +3957,13 @@ function Wait-ProcessWithIdleTimeout {
 
 function Get-BootUpdatePwshPath {
     <# The PowerShell 7 runtime is the pwsh.exe in $PSHOME, the folder this PowerShell runs
-       from. Not `pwsh` by name: an MSIX install puts pwsh on PATH only as a per-user app
-       execution alias, and SYSTEM (the continuation tasks, the headless fallback) has no
-       alias at all. Not [Environment]::ProcessPath either: started through the alias, that is
-       the alias itself, inside the starting user's profile (lab row A, 2026-11-12: every task
-       was registered with C:\Users\<user>\AppData\Local\Microsoft\WindowsApps\...\pwsh.exe,
-       which the SYSTEM fallback cannot run). $PSHOME is the package folder for the MSIX,
-       Program Files\PowerShell\7 for the MSI, and the unpacked folder for a ZIP, and the
-       executable there runs as SYSTEM (lab-b, 2026-11-12, PowerShell 7.7.0). #>
+       from: the package folder for the MSIX, Program Files\PowerShell\7 for the MSI, the
+       unpacked folder for a ZIP. The executable there runs as SYSTEM (lab-b, 2026-11-12,
+       PowerShell 7.7.0). Not `pwsh` by name: an MSIX install puts pwsh on PATH only as a
+       per-user app execution alias, Get-Command pwsh resolves to that alias inside the
+       user's profile, and SYSTEM (the continuation tasks, the headless fallback) has none.
+       v2.5.92 on an MSIX guest registered every continuation task, the SYSTEM fallback
+       included, with C:\Users\<user>\AppData\Local\Microsoft\WindowsApps\...\pwsh.exe. #>
     $home7 = Join-Path $PSHOME 'pwsh.exe'
     if (Test-Path -LiteralPath $home7) { return $home7 }
     $command = Get-Command pwsh.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1

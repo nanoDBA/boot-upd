@@ -932,9 +932,9 @@ Describe 'Typed run option forwarding' {
 }
 
 Describe 'PowerShell 7 is started from $PSHOME, never from the process path or by name' {
-    <# Lab row A, 2026-11-12: started through upd.cmd, pwsh ran via the per-user MSIX alias, and
-       [Environment]::ProcessPath returned that alias inside the user's profile. Every
-       continuation task, the SYSTEM fallback included, was registered with it. #>
+    <# 2026-11-12: v2.5.92 on an MSIX guest resolved pwsh with Get-Command, which returns the
+       per-user alias inside the user's profile, and registered every continuation task, the
+       SYSTEM fallback included, with it. $PSHOME names the install folder directly. #>
     BeforeAll {
         $root = Split-Path $PSScriptRoot -Parent
         $sources = @{}

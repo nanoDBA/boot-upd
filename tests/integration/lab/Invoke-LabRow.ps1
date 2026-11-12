@@ -605,8 +605,13 @@ $summary = [pscustomobject]@{
     RebootsObservedOS = $bootsDuringRun.Count
     RebootAccountingAgrees = if ($null -eq $claimed) { $null } else { $claimed -eq $bootsDuringRun.Count }
     CollectedAtUtc   = $evidence.CollectedAtUtc
-    CandidateSourceHash = $evidence.CandidateSourceHash
+    <# The candidate is the host's frozen source, not the guest copy read at collection: a
+       launcher that self-updates on the guest replaces both guest copies with the published
+       release, and comparing the two would then report a match for code that never ran
+       (2026-11-12, two "row A" runs of v2.5.93 executed v2.5.92). #>
+    CandidateSourceHash = $(if ($hostHash) { $hostHash } else { $evidence.CandidateSourceHash })
     InstalledOrchestratorHash = $evidence.InstalledOrchestratorHash
+    InstalledIsCandidate = $(if ($hostHash) { $evidence.InstalledOrchestratorHash -eq $hostHash } else { $null })
     StateFileRemains = $evidence.StateFileExists
     TasksRemaining   = $evidence.TasksRemaining
     WaitingForSavedUser = Test-LabSavedUserWaitEvidence @waitEvidence
