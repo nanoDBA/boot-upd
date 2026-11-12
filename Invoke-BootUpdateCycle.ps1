@@ -7222,6 +7222,33 @@ function Get-NextMaintenanceWindowStart {
 #endregion
 
 #region Task Management
+function Start-PowerShellRuntimeUpgrade {
+    <# PowerShell 7 is the one package this cycle cannot update from inside itself: the cycle
+       runs on it and its continuation tasks name its path. A cycle that has finished, with
+       its tasks retired, hands the upgrade to a detached Windows PowerShell host that waits
+       for this process to exit. The installer checks the release page itself and does
+       nothing when PowerShell is current, so this costs one API call on most runs. #>
+    $installer = @(
+        (Join-Path $PSScriptRoot 'Install-PowerShell7.ps1'),
+        (Join-Path $PSScriptRoot 'tools\Install-PowerShell7.ps1')
+    ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+    if (-not $installer) {
+        Write-Log 'PowerShell runtime: Install-PowerShell7.ps1 is not deployed; skipping the PowerShell upgrade check.' -Level Warn
+        return
+    }
+    $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $log = Join-Path $script:InstallDir 'PowerShellRuntimeUpgrade.log'
+    try {
+        $null = Start-Process -FilePath $windowsPowerShell -WindowStyle Hidden `
+            -RedirectStandardOutput $log -RedirectStandardError "$log.err" -ArgumentList @(
+                '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $installer),
+                '-Upgrade', '-WaitForProcessId', $PID)
+        Write-Log "PowerShell runtime: checking for a newer PowerShell 7 after this cycle exits (log: $log)."
+    } catch {
+        Write-Log "PowerShell runtime: could not start the upgrade check: $($_.Exception.Message)" -Level Warn
+    }
+}
+
 function Unregister-BootUpdateTask {
     foreach ($taskName in @('BootUpdateCycle', 'BootUpdateCycleFallback')) {
         if (Get-ScheduledTask -TaskName $taskName -EA SilentlyContinue) {
@@ -10237,6 +10264,7 @@ function Invoke-BootUpdateCycle {
             if ($leftoverTasks -or (Test-Path -LiteralPath $script:StatePath) -or (Test-Path -LiteralPath "$($script:StatePath).bak")) {
                 throw "Terminal cleanup verification failed; refusing the verified completion banner. Tasks: $($leftoverTasks -join ', ')"
             }
+            Start-PowerShellRuntimeUpgrade
             $completionToast = Get-BootUpdateCompletionNotification -TotalVerified $total -DurationMinutes $durMin `
                 -QuarantineCount $(if ($hasWingetQuarantine) { @($wingetQuarantines).Count } else { 0 }) `
                 -DeferredInventory $(if ($hasDeferredInventory) { $deferredInventory } else { @() })

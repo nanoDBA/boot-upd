@@ -15,7 +15,17 @@ Windows feature updates now install. A machine on Windows 11 25H2 that Windows U
 - **The log names what it leaves alone.** Before installing, and again at the final scan, the phase lists what Windows Update offered: in-scope items with size and download state, and each out-of-scope item with the reason (driver, optional, excluded by pattern, installed earlier this run). An update Microsoft starts offering in a new shape is visible the first time, not after weeks of "converged".
 - **Nothing to install, nothing called.** When the pre-install scan finds nothing in scope the install call is skipped and the result counts as the same zero-work evidence a scan would have produced.
 
+PowerShell 7.7 now installs. Microsoft released it on 2026-11-10 without an MSI; 7.6 LTS is the last line that ships one. boot-upd's upgrade check looked for the newest release with an MSI and found 7.6.10, published two minutes before 7.7.0, so `upd bootstrap` kept saying PowerShell was already current.
+
+- **PowerShell 7 is installed one way: Microsoft's MSIX, machine-wide.** The bundle comes from the PowerShell release page, is checked against the release's SHA-256 list and its Microsoft signature, and is provisioned for every account on the machine. WinGet is no longer used to install PowerShell: for 7.7 it installs the MSIX for the current user only.
+- **The old MSI is replaced.** Once the MSIX is installed and starts, the MSI install and the Microsoft Update package that services it are removed. Open PowerShell windows keep running.
+- **PowerShell is upgraded after every finished cycle.** A completed cycle checks for a newer PowerShell 7 and installs it once the cycle has exited, logging to `PowerShellRuntimeUpgrade.log` in the install folder. It never changes PowerShell while a cycle is in progress. `upd bootstrap` still does the same on demand.
+- **Child processes and tasks run PowerShell by its real path.** An MSIX `pwsh` is on PATH only as a per-user alias, and SYSTEM, which runs the continuation tasks, has none. Every place boot-upd starts PowerShell now uses the running executable's full path, which works as SYSTEM.
+- **Windows Server 2016 and Server Core keep the MSI.** They cannot install the MSIX, so they get the signed PowerShell 7.6 LTS MSI, the last line Microsoft ships that way.
+
 ### Testing
+
+PowerShell 7.7: on lab guest lab-b, a SYSTEM scheduled task ran the new installer against a 7.6.5 MSI install while a PowerShell from that MSI was busy. The installer exited 0, the MSI and its PATH entry were gone, the busy process was still running, 7.7.0 was provisioned, and a SYSTEM task ran 7.7.0 by full path, including a ThreadJob. A second run reported nothing to do. Lab rows for full cycles on the MSIX runtime are reported in the PR. Building a brand-new lab guest with the changed `New-LabGuest.ps1` is **not run**, and so is the MSI fallback on Windows Server 2016.
 
 Verified read-only on the machine that reported the problem: the new scope criteria return the 26H2 feature update through the Windows Update Agent (online and from the local catalog) and through PSWindowsUpdate, and the previous category filter returns nothing for it. No feature update has yet been installed by the updater itself; a lab row with a feature update in scope is **not run** and is tracked for the next release that ships this.
 

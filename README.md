@@ -194,8 +194,8 @@ upd aws                          Update/repair AWS CLI v2 and AWS.Tools
 upd logs                         Export a sanitized diagnostic ZIP to the Desktop
 upd repair                       Recover missing/corrupt launcher and core files
 upd bootstrap                    Install PowerShell 7 if missing, or upgrade it to the latest
-                                  stable release (Winget, or the signed MSI where Winget is
-                                  absent), then show help
+                                  stable release (Microsoft's signed MSIX, machine-wide), then
+                                  show help
 upd version                      Show the bundled version
 upd status                       Show resume tasks and checkpoint state
 upd uq                           Remove every recorded Winget quarantine pin
@@ -245,17 +245,30 @@ stages outside cloud storage, preserves a rollback snapshot, detects sync races,
 only runtime files. It deliberately does not use a mutable gist or `iex`.
 
 Windows PowerShell 5.1 is supported as a bootstrap host. On an operational command,
-`upd.cmd` installs PowerShell 7 side-by-side using WinGet when available, or a
-Microsoft Authenticode-validated MSI on older Windows Server systems, then relaunches
-the PS7 updater. Help and version remain read-only; preview/plan/status commands ask
-the user to run `upd bootstrap` rather than silently installing anything. The updater
-itself remains PowerShell 7-only so `Start-ThreadJob` and `ForEach-Object -Parallel`
-execution are preserved. On Winget-less machines such as Windows Server 2016, the
-installed PowerShell 7 engine is upgraded only when you run `upd bootstrap`; there is
-no in-cycle step for it yet. The upgrade runs in the background because the installer
-closes every running PowerShell 7 window, the launcher's own included; the result is
-written to `%TEMP%\boot-upd-pwsh-upgrade.log` (errors to the `.err.log` sibling) and
-`upd version` shows the new engine afterwards.
+`upd.cmd` installs PowerShell 7 side-by-side, then relaunches the PS7 updater. Help and
+version remain read-only; preview/plan/status commands ask the user to run
+`upd bootstrap` rather than silently installing anything. The updater itself remains
+PowerShell 7-only so `Start-ThreadJob` and `ForEach-Object -Parallel` execution are
+preserved.
+
+PowerShell 7 is installed one way: Microsoft's MSIX bundle from the PowerShell release
+page, checked against the release's SHA-256 list and its Microsoft signature, and
+provisioned machine-wide so every account has it. Microsoft ships no MSI from 7.7 on, and
+WinGet installs the MSIX for the current user only. The updater runs PowerShell by the
+executable's full path rather than by `pwsh`, because an MSIX `pwsh` is on PATH only as a
+per-user alias and SYSTEM, which runs the continuation tasks, has none.
+
+- **Upgrades happen after a cycle.** When a cycle finishes and its tasks are gone, it
+  starts a check for a newer PowerShell 7 that runs once the cycle has exited. The result
+  is in `PowerShellRuntimeUpgrade.log` beside the installed updater. `upd bootstrap` does
+  the same on demand and writes `%TEMP%\boot-upd-pwsh-upgrade.log`. The runtime never
+  changes while a cycle is in progress.
+- **An existing MSI install is replaced.** After the MSIX is installed and starts, the old
+  MSI (and the Microsoft Update package that services it) is uninstalled. PowerShell
+  windows that are already open keep running; files still in use go at the next restart.
+- **Older Windows keeps the MSI.** Windows older than build 17763 (Windows Server 2016)
+  and Server Core cannot install the MSIX. They get the signed PowerShell 7.6 LTS MSI,
+  the last line Microsoft ships that way.
 
 Run `upd help` for the complete list, including provider opt-ins, skip switches,
 timeouts, iteration limits, health/BitLocker controls, include/exclude filters, and
@@ -355,7 +368,7 @@ upd 120    # 2-minute countdown — users can cancel with: shutdown /a
 
 ## Requirements
 
-- **Windows 10/11 and Windows Server 2016** (on Server 2016, `upd.cmd` installs PowerShell 7 through the signed MSI when Winget is unavailable)
+- **Windows 10/11 and Windows Server 2016** (Windows Server 2016 and Server Core get the PowerShell 7.6 LTS MSI; everything newer gets the current release as an MSIX)
 - **PowerShell 7+ runtime** (`upd.cmd` can install it side-by-side from Windows PowerShell 5.1)
 - **Administrator privileges**
 

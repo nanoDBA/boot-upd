@@ -463,6 +463,13 @@ foreach ($companion in @('Repair-AwsTooling.ps1','Export-BootUpdateDiagnostics.p
         Write-Host "Deployed: $companion"
     }
 }
+<# The PowerShell 7 installer sits beside the orchestrator, which runs it after a finished
+   cycle (Start-PowerShellRuntimeUpgrade). #>
+$ps7Installer = Join-Path $PSScriptRoot 'tools\Install-PowerShell7.ps1'
+if (Test-Path -LiteralPath $ps7Installer) {
+    Copy-Item -LiteralPath $ps7Installer -Destination (Join-Path $installDir 'Install-PowerShell7.ps1') -Force
+    Write-Host 'Deployed: Install-PowerShell7.ps1'
+}
 
 <# Deploy uninstall helper script #>
 $uninstallScript = @'
