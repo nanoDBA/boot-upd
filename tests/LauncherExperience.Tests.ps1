@@ -1252,6 +1252,25 @@ Describe 'PowerShell MSIX task references survive package version changes' {
         $plan.Actions[0].Execute | Should -Be 'C:\Program Files\PowerShell\7\pwsh.exe'
     }
 
+    It 'handles scheduled task actions with no argument string' {
+        $migrationAst | Should -Not -BeNullOrEmpty
+        if (-not $migrationAst) { return }
+        . ([scriptblock]::Create($migrationAst.Extent.Text))
+        $task = [pscustomobject]@{
+            Principal = [pscustomobject]@{ UserId='SYSTEM'; LogonType='ServiceAccount' }
+            Actions = @([pscustomobject]@{ Execute='C:\Windows\System32\cmd.exe'; Argument=''; WorkingDirectory='' })
+        }
+
+        $plan = Get-PowerShell7TaskActionMigration -Task $task `
+            -LegacyPwshPath 'C:\Program Files\PowerShell\7\pwsh.exe' `
+            -SystemPwshPath 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.1.0_x64__8wekyb3d8bbwe\pwsh.exe' `
+            -UserPwshAlias 'C:\Users\Sample\AppData\Local\Microsoft\WindowsApps\pwsh.exe'
+
+        $plan.Changed | Should -BeFalse
+        $plan.Actions[0].Execute | Should -Be 'C:\Windows\System32\cmd.exe'
+        $plan.Actions[0].Argument | Should -Be ''
+    }
+
     It 'logs only the runtime path from task arguments, not unrelated argument text' {
         $summaryAst | Should -Not -BeNullOrEmpty
         if (-not $summaryAst) { return }

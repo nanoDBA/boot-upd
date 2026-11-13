@@ -101,7 +101,7 @@ function Get-PowerShell7TaskActionMigration {
 }
 
 function Convert-PowerShell7RuntimeReference {
-    param([Parameter(Mandatory)][string]$Text, [Parameter(Mandatory)][string]$LegacyPwshPath,
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text, [Parameter(Mandatory)][string]$LegacyPwshPath,
           [Parameter(Mandatory)][string]$SystemPwshPath)
     $legacyDirectory = Split-Path -Parent $LegacyPwshPath
     $systemDirectory = Split-Path -Parent $SystemPwshPath
