@@ -98,7 +98,7 @@ $Config = @{
     IncludeDriverUpdates  = $false  # Opt in to Windows driver updates
     IncludeFirmwareUpdates = $false # Opt in to firmware updates
     SkipFeatureUpdates    = $false  # Set $true to leave Windows feature updates (new Windows versions) to Windows Update
-    FeatureUpdateTimeoutMin = 240   # Hard timeout for the Windows Update phase when a feature update is applicable
+    FeatureUpdateTimeoutMin = 240   # Hard timeout for the Windows Update phase when a feature or cumulative update is applicable
     UpdateWsl             = $false  # Opt in to WSL kernel/distribution updates
     UpdateContainers      = $false  # Opt in to Docker/Podman image refresh
     AllowMetered          = $false  # Permit metered network use
@@ -764,8 +764,7 @@ function Start-PersistentHeaderLogTail {
 <# Helper: Register scheduled task for non-direct mode #>
 function Register-ScheduledTaskNow {
     <# The task runs the pwsh.exe in $PSHOME: an MSIX pwsh is on PATH only as a per-user alias
-       that SYSTEM does not have, and the process path of an alias-started pwsh is the alias.
-       See Get-BootUpdatePwshPath in Invoke-BootUpdateCycle.ps1. #>
+       that SYSTEM does not have. See Get-BootUpdatePwshPath in Invoke-BootUpdateCycle.ps1. #>
     $pwshPath = Join-Path $PSHOME 'pwsh.exe'
 
     $taskArgs = @(

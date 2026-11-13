@@ -292,6 +292,16 @@ $moduleProof = Invoke-Command -VMName $VMName -Credential $cred -ErrorAction Sto
        SYSTEM) or the older MSI install. #>
     $guestPwsh = @(@(Get-AppxPackage -AllUsers -Name Microsoft.PowerShell -ErrorAction SilentlyContinue | Where-Object PublisherId -eq '8wekyb3d8bbwe' | Sort-Object { [version]$_.Version } -Descending | ForEach-Object { Join-Path $_.InstallLocation 'pwsh.exe' }) + 'C:\Program Files\PowerShell\7\pwsh.exe' | Where-Object { Test-Path -LiteralPath $_ })[0]
     if (-not $guestPwsh) { throw 'PowerShell 7 is not installed in the guest' }
+    <# Windows starts a packaged pwsh.exe only for an account the package is registered for,
+       and a provisioned package registers at that account's next interactive sign-in.
+       PowerShell Direct is not one: on a headless guest that has not been signed in to since
+       the MSIX was provisioned, this probe got "Access is denied" (row B, 2026-11-12).
+       Registering the provisioned package here is what that sign-in would do. The cycle
+       itself never needs it: its user tasks run only in a signed-in session and the rest
+       runs as SYSTEM. #>
+    if ($guestPwsh -like '*\WindowsApps\*' -and -not (Get-AppxPackage -Name Microsoft.PowerShell -ErrorAction SilentlyContinue | Where-Object PublisherId -eq '8wekyb3d8bbwe')) {
+        Add-AppxPackage -RegisterByFamilyName -MainPackage Microsoft.PowerShell_8wekyb3d8bbwe -ErrorAction Stop
+    }
     & $guestPwsh -NoProfile -ExecutionPolicy Bypass -Command $probe
     if ($LASTEXITCODE -ne 0) { throw 'Module prerequisite probe failed under PowerShell 7' }
 }
@@ -605,8 +615,13 @@ $summary = [pscustomobject]@{
     RebootsObservedOS = $bootsDuringRun.Count
     RebootAccountingAgrees = if ($null -eq $claimed) { $null } else { $claimed -eq $bootsDuringRun.Count }
     CollectedAtUtc   = $evidence.CollectedAtUtc
-    CandidateSourceHash = $evidence.CandidateSourceHash
+    <# The candidate is the host's frozen source, not the guest copy read at collection: a
+       launcher that self-updates on the guest replaces both guest copies with the published
+       release, and comparing the two would then report a match for code that never ran
+       (2026-11-12, two "row A" runs of v2.5.93 executed v2.5.92). #>
+    CandidateSourceHash = $(if ($hostHash) { $hostHash } else { $evidence.CandidateSourceHash })
     InstalledOrchestratorHash = $evidence.InstalledOrchestratorHash
+    InstalledIsCandidate = $(if ($hostHash) { $evidence.InstalledOrchestratorHash -eq $hostHash } else { $null })
     StateFileRemains = $evidence.StateFileExists
     TasksRemaining   = $evidence.TasksRemaining
     WaitingForSavedUser = Test-LabSavedUserWaitEvidence @waitEvidence

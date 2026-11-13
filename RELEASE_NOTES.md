@@ -1,17 +1,18 @@
 # Boot Update Cycle — Release Notes
 
-**Latest published version:** v2.5.92
+**Latest published version:** v2.5.93
 **Status:** Released
 
 ---
 
-## Unreleased
+## v2.5.93 (2026-11-12)
 
 Windows feature updates now install. A machine on Windows 11 25H2 that Windows Update was offering 26H2 ran the updater daily and reported Windows Update converged every time, while Settings kept showing the new version as available. Two things hid it. The phase asked PSWindowsUpdate for three categories only (Security, Critical, Definition), and feature updates live in a fourth. Even with that category added nothing would have appeared: the Windows Update Agent treats every search as "updates marked for installation" unless told otherwise, and a feature update a machine may take but has not yet been pushed is marked optional. The prefetch, the install and the final convergence scan all shared that blind spot, so they agreed with each other.
 
 - **Scope is defined once and written in Windows Update's own terms.** The phase now asks for every software update Windows Update would install itself, in any category, plus optional feature updates. That one definition drives the background download, the install and the final scan. Drivers stay with the opt-in `--drivers` / `--firmware` phase, SQL Server stays excluded, and `--exclude` patterns still apply to titles.
 - **`--skip-feature-updates`** leaves new Windows versions to Windows Update's own schedule. The rest of the phase is unchanged.
-- **`--feature-timeout <minutes>`** (default 240) is the Windows Update budget when a feature update is in scope. A feature update is a new Windows version; the old 30-minute per-provider budget would have killed it mid-install, and the updater's idle clock cannot see work that happens inside TrustedInstaller.
+- **`--feature-timeout <minutes>`** (default 240) is the Windows Update budget when a feature update or a Windows cumulative update is in scope. Both rewrite the OS; the old 30-minute per-provider budget killed a cumulative update mid-install on a lab guest, and the updater's idle clock cannot see work that happens inside TrustedInstaller.
+- **Windows cumulative updates are installed.** The old category filter also left them out: on a lab guest v2.5.92 reported Windows Update converged with the 2026-09 cumulative security update still offered. With the new scope, the same guest installed the 2026-09 and then the 2026-11 cumulative updates in one cycle.
 - **The log names what it leaves alone.** Before installing, and again at the final scan, the phase lists what Windows Update offered: in-scope items with size and download state, and each out-of-scope item with the reason (driver, optional, excluded by pattern, installed earlier this run). An update Microsoft starts offering in a new shape is visible the first time, not after weeks of "converged".
 - **Nothing to install, nothing called.** When the pre-install scan finds nothing in scope the install call is skipped and the result counts as the same zero-work evidence a scan would have produced.
 
@@ -20,14 +21,19 @@ PowerShell 7.7 now installs. Microsoft released it on 2026-11-10 without an MSI;
 - **PowerShell 7 is installed one way: Microsoft's MSIX, machine-wide.** The bundle comes from the PowerShell release page, is checked against the release's SHA-256 list and its Microsoft signature, and is provisioned for every account on the machine. WinGet is no longer used to install PowerShell: for 7.7 it installs the MSIX for the current user only.
 - **The old MSI is replaced.** Once the MSIX is installed and starts, the MSI install and the Microsoft Update package that services it are removed. Open PowerShell windows keep running.
 - **PowerShell is upgraded after every finished cycle.** A completed cycle checks for a newer PowerShell 7 and installs it once the cycle has exited, logging to `PowerShellRuntimeUpgrade.log` in the install folder. It never changes PowerShell while a cycle is in progress. `upd bootstrap` still does the same on demand.
-- **Child processes and tasks run PowerShell by its real path.** An MSIX `pwsh` is on PATH only as a per-user alias, and SYSTEM, which runs the continuation tasks, has none. Every place boot-upd starts PowerShell now uses the running executable's full path, which works as SYSTEM.
+- **Child processes and tasks run PowerShell by its real path.** An MSIX `pwsh` is on PATH only as a per-user alias, and SYSTEM, which runs the continuation tasks, has none. Every place boot-upd starts PowerShell now uses `pwsh.exe` in `$PSHOME`, the folder the running PowerShell lives in, which works as SYSTEM.
 - **Windows Server 2016 and Server Core keep the MSI.** They cannot install the MSIX, so they get the signed PowerShell 7.6 LTS MSI, the last line Microsoft ships that way.
 
 ### Testing
 
-PowerShell 7.7: on lab guest lab-b, a SYSTEM scheduled task ran the new installer against a 7.6.5 MSI install while a PowerShell from that MSI was busy. The installer exited 0, the MSI and its PATH entry were gone, the busy process was still running, 7.7.0 was provisioned, and a SYSTEM task ran 7.7.0 by full path, including a ThreadJob. A second run reported nothing to do. Lab rows for full cycles on the MSIX runtime are reported in the PR. Building a brand-new lab guest with the changed `New-LabGuest.ps1` is **not run**, and so is the MSI fallback on Windows Server 2016.
+Full results: [docs/validation-2.5.93.md](docs/validation-2.5.93.md).
 
-Verified read-only on the machine that reported the problem: the new scope criteria return the 26H2 feature update through the Windows Update Agent (online and from the local catalog) and through PSWindowsUpdate, and the previous category filter returns nothing for it. No feature update has yet been installed by the updater itself; a lab row with a feature update in scope is **not run** and is tracked for the next release that ships this.
+- Lab row A (interactive user, `upd run`, 3 armed reboots) on the release candidate, on a guest migrated from the 7.6.5 MSI to the 7.7.0 MSIX: **PASS**. 9 passes, 7 reboots, two Windows cumulative updates installed under the long budget, every continuation task ran the MSIX `pwsh.exe` by full path, and the post-cycle PowerShell check found 7.7.0 current.
+- Lab row B (headless, SYSTEM fallback, 2 armed reboots) on a guest no one had signed in to since the MSIX was provisioned: **PARTIAL**, as a headless row with queued user work always is. Machine scope converged after 5 reboots and the same two cumulative updates; every task ran the MSIX `pwsh.exe` as SYSTEM; user-scope work waits for the saved user's next sign-in. That sign-in is **not run**.
+- The new PowerShell installer, run as SYSTEM on two lab guests, replaced the 7.6.5 MSI with the 7.7.0 MSIX. On one of them a PowerShell from the MSI was busy during the swap and kept running; a second run had nothing to do.
+- Gates: 744 Pester tests passed, 0 failed; the cross-context mutex, User/SYSTEM boundary and published-launcher upgrade gates passed.
+- Verified read-only on the machine that reported the problem: the new scope criteria return the 26H2 feature update through the Windows Update Agent and PSWindowsUpdate, and the previous category filter returns nothing for it.
+- **Not run:** a lab row with a feature update in scope (no feature update has yet been installed by the updater itself), a newly built lab guest, and the MSI fallback on Windows Server 2016 or Server Core.
 
 ## v2.5.92 (2026-11-05)
 

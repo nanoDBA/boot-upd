@@ -35,7 +35,8 @@
 
 .PARAMETER FeatureUpdateTimeoutMinutes
     Hard timeout for the Windows Update phase when a feature update (a new Windows
-    version) is applicable. Default 240. Never below PackageTimeoutMinutes.
+    version) or a Windows cumulative update is applicable. Default 240. Never below
+    PackageTimeoutMinutes.
 
 .PARAMETER SkipFeatureUpdates
     Leave feature updates to Windows Update's own schedule. By default a feature update
@@ -89,7 +90,7 @@ param(
     [switch]$IncludeFirmwareUpdates,      # Firmware updates via PSWindowsUpdate (default: opt-in, off)
     [switch]$SkipFeatureUpdates,          # Leave Windows feature updates (new Windows versions) to Windows Update's own schedule
     [ValidateRange(30,1440)]
-    [int]$FeatureUpdateTimeoutMinutes = 240,  # Hard timeout for the Windows Update phase when a feature update is in scope
+    [int]$FeatureUpdateTimeoutMinutes = 240,  # Hard timeout for the Windows Update phase when a feature or cumulative update is in scope
     [switch]$UpdateWsl,                   # WSL kernel + distro updates (default: opt-in, off)
     [switch]$UpdateContainers,            # Docker/Podman image refresh + prune (default: opt-in, off)
     [switch]$SkipRestorePoint,
@@ -413,7 +414,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:HooksConfig) -and (Test-Path $scri
 }
 
 Set-Variable -Name 'BootUpdateStateSchemaVersion' -Value 7 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
-Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.92' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
+Set-Variable -Name 'BootUpdateCycleVersion' -Value '2.5.93' -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 Set-Variable -Name 'RebootSignalSettleSeconds' -Value 20 -Option ReadOnly -Scope Script -ErrorAction SilentlyContinue
 $script:ExplicitRebootRequests = [System.Collections.Generic.List[object]]::new()
 $script:LastPendingFileRenameOperations = @()
@@ -3957,14 +3958,13 @@ function Wait-ProcessWithIdleTimeout {
 
 function Get-BootUpdatePwshPath {
     <# The PowerShell 7 runtime is the pwsh.exe in $PSHOME, the folder this PowerShell runs
-       from. Not `pwsh` by name: an MSIX install puts pwsh on PATH only as a per-user app
-       execution alias, and SYSTEM (the continuation tasks, the headless fallback) has no
-       alias at all. Not [Environment]::ProcessPath either: started through the alias, that is
-       the alias itself, inside the starting user's profile (lab row A, 2026-11-12: every task
-       was registered with C:\Users\<user>\AppData\Local\Microsoft\WindowsApps\...\pwsh.exe,
-       which the SYSTEM fallback cannot run). $PSHOME is the package folder for the MSIX,
-       Program Files\PowerShell\7 for the MSI, and the unpacked folder for a ZIP, and the
-       executable there runs as SYSTEM (lab-b, 2026-11-12, PowerShell 7.7.0). #>
+       from: the package folder for the MSIX, Program Files\PowerShell\7 for the MSI, the
+       unpacked folder for a ZIP. The executable there runs as SYSTEM (lab-b, 2026-11-12,
+       PowerShell 7.7.0). Not `pwsh` by name: an MSIX install puts pwsh on PATH only as a
+       per-user app execution alias, Get-Command pwsh resolves to that alias inside the
+       user's profile, and SYSTEM (the continuation tasks, the headless fallback) has none.
+       v2.5.92 on an MSIX guest registered every continuation task, the SYSTEM fallback
+       included, with C:\Users\<user>\AppData\Local\Microsoft\WindowsApps\...\pwsh.exe. #>
     $home7 = Join-Path $PSHOME 'pwsh.exe'
     if (Test-Path -LiteralPath $home7) { return $home7 }
     $command = Get-Command pwsh.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -4939,6 +4939,12 @@ function Select-WindowsUpdateOffer {
     foreach ($offer in @($Offers | Where-Object { $null -ne $_ })) {
         $categories = @($offer.Categories)
         $isFeatureUpdate = $categories -contains 'Upgrades'
+        <# A Windows cumulative update rewrites the OS like a small feature update: on lab-a
+           (2026-11-12) the 2026-09 cumulative update was still installing when the 30-minute
+           per-package budget killed it. Microsoft titles them with the resulting OS build,
+           "(26100.9457)", or, on older releases, "Cumulative Update for Windows ..." /
+           "... for Microsoft server operating system ...". #>
+        $isOsUpdate = $isFeatureUpdate -or ([string]$offer.Title -match '\(\d{5}\.\d+\)|Cumulative Update for (Windows|Microsoft server operating system)')
         $reason = $null
         if ($Scope.ExcludedTitle -and [string]$offer.Title -match $Scope.ExcludedTitle) {
             $reason = 'excluded by title pattern'
@@ -4955,7 +4961,7 @@ function Select-WindowsUpdateOffer {
             Title = [string]$offer.Title; KB = [string]$offer.KB
             Categories = $categories; DeploymentAction = [string]$offer.DeploymentAction
             IsDownloaded = [bool]$offer.IsDownloaded; SizeMB = [int]$offer.SizeMB
-            IsFeatureUpdate = $isFeatureUpdate; Reason = $reason
+            IsFeatureUpdate = $isFeatureUpdate; IsOsUpdate = $isOsUpdate; Reason = $reason
         }
         if ($reason) { $outOfScope.Add($record) } else { $applicable.Add($record) }
     }
@@ -4963,6 +4969,7 @@ function Select-WindowsUpdateOffer {
         Applicable       = @($applicable)
         OutOfScope       = @($outOfScope)
         HasFeatureUpdate = [bool](@($applicable | Where-Object { $_.IsFeatureUpdate }).Count)
+        HasOsUpdate      = [bool](@($applicable | Where-Object { $_.IsOsUpdate }).Count)
     }
 }
 
@@ -5608,19 +5615,20 @@ function Install-WindowsUpdates {
             }
             <# A read-only scan of the configured scope comes first. It decides three things
                the install call cannot: whether there is anything to install (no PSWindowsUpdate
-               call for nothing), how long the install may take (a feature update is a new
-               Windows version and gets -FeatureUpdateTimeoutMinutes, not the per-package
-               budget; the child process waits on COM while TrustedInstaller works, so its own
-               CPU clock cannot tell a long install from a hang), and what Windows Update
+               call for nothing), how long the install may take (a feature update or a Windows
+               cumulative update rewrites the OS and gets -FeatureUpdateTimeoutMinutes, not the
+               per-package budget; the child process waits on COM while TrustedInstaller works,
+               so its own CPU clock cannot tell a long install from a hang), and what Windows Update
                offered that this cycle leaves alone, logged by name. #>
             $scan = Invoke-WindowsUpdateOfferScan -Scope $verificationScope -Online -Name 'Scanning Windows Update offers' `
                 -Status 'Windows Update scan is running' -TimeoutMinutes $script:PackageTimeoutMinutes
             if (-not $scan.Verified) { throw "the pre-install scan did not complete ($($scan.Error))" }
             $selection = Select-WindowsUpdateOffer -Offers $scan.Offers -Scope $verificationScope -SkipKbArticleIds $successfulKbIds
             Write-WindowsUpdateOfferLog -Selection $selection
-            if ($selection.HasFeatureUpdate) {
+            if ($selection.HasOsUpdate) {
                 $installTimeoutMinutes = [math]::Max([int]$script:FeatureUpdateTimeoutMinutes, [int]$script:PackageTimeoutMinutes)
-                Write-Log "Windows Update: a feature update is in scope; the install budget is $installTimeoutMinutes min instead of $($script:PackageTimeoutMinutes)."
+                $osKind = if ($selection.HasFeatureUpdate) { 'a feature update' } else { 'a Windows cumulative update' }
+                Write-Log "Windows Update: $osKind is in scope; the install budget is $installTimeoutMinutes min instead of $($script:PackageTimeoutMinutes)."
             }
             if (@($selection.Applicable).Count -eq 0) {
                 Write-Log 'Windows Update: nothing applicable in the configured scope; the install call is not needed.'
