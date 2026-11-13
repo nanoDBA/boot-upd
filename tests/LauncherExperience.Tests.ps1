@@ -1283,6 +1283,17 @@ Describe 'PowerShell MSIX task references survive package version changes' {
         ($summary -join '|') | Should -Not -Match 'ordinary|cycle\.ps1'
     }
 
+    It 'accepts empty task arguments while building the runtime reference summary' {
+        $summaryAst | Should -Not -BeNullOrEmpty
+        if (-not $summaryAst) { return }
+        . ([scriptblock]::Create($summaryAst.Extent.Text))
+
+        $summary = Get-PowerShell7RuntimeReferenceSummary -Texts @('') `
+            -LegacyPwshPath 'C:\Program Files\PowerShell\7\pwsh.exe'
+
+        @($summary).Count | Should -Be 0
+    }
+
     It 'registers SYSTEM tasks from the running MSIX path before using the MSI-only fallback' {
         $root = Split-Path $PSScriptRoot -Parent
         $source = Get-Content -LiteralPath (Join-Path $root 'Register-BootUpdateTask.ps1') -Raw

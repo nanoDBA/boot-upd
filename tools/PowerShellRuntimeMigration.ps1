@@ -116,7 +116,7 @@ function Convert-PowerShell7RuntimeReference {
 }
 
 function Get-PowerShell7RuntimeReferenceSummary {
-    param([Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Texts, [Parameter(Mandatory)][string]$LegacyPwshPath)
+    param([Parameter(Mandatory)][AllowEmptyCollection()][AllowEmptyString()][string[]]$Texts, [Parameter(Mandatory)][string]$LegacyPwshPath)
     $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     $references = New-Object 'System.Collections.Generic.List[string]'
     $patterns = @(
