@@ -54,6 +54,7 @@ $deployPath = Join-Path $repoRoot 'Deploy-BootUpdateCycle.ps1'
 $invokePath = Join-Path $repoRoot 'Invoke-BootUpdateCycle.ps1'
 $demoPath = Join-Path $PSScriptRoot 'Show-BootUpdateProgressDemo.ps1'
 $ps7BootstrapPath = Join-Path $PSScriptRoot 'Install-PowerShell7.ps1'
+$ps7MigrationPath = Join-Path $PSScriptRoot 'PowerShellRuntimeMigration.ps1'
 $argumentBootstrapPath = Join-Path $PSScriptRoot 'Invoke-UpdBootstrap.ps1'
 $awsPath = Join-Path $repoRoot 'Repair-AwsTooling.ps1'
 $diagnosticsPath = Join-Path $repoRoot 'Export-BootUpdateDiagnostics.ps1'
@@ -304,6 +305,7 @@ function Update-UpdSourceBundle {
             [pscustomobject]@{ Name='Invoke-UpdBootstrap.ps1'; Target=$argumentBootstrapPath; PowerShell=$true; StageBatch=$false }
             [pscustomobject]@{ Name='Show-BootUpdateProgressDemo.ps1'; Target=$demoPath; PowerShell=$true; StageBatch=$false }
             [pscustomobject]@{ Name='Install-PowerShell7.ps1'; Target=$ps7BootstrapPath; PowerShell=$true; StageBatch=$false }
+            [pscustomobject]@{ Name='PowerShellRuntimeMigration.ps1'; Target=$ps7MigrationPath; PowerShell=$true; StageBatch=$false }
             [pscustomobject]@{ Name='Repair-AwsTooling.ps1'; Target=$awsPath; PowerShell=$true; StageBatch=$false }
             [pscustomobject]@{ Name='Export-BootUpdateDiagnostics.ps1'; Target=$diagnosticsPath; PowerShell=$true; StageBatch=$false }
             [pscustomobject]@{ Name='upd.cmd'; Target=(Join-Path $repoRoot 'upd.cmd'); PowerShell=$false; StageBatch=$true }

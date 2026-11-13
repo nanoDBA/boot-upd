@@ -53,6 +53,28 @@ for every install method, and on an MSI machine it is the same path as before.
   (exit 3) while `BootUpdateCycle` or `BootUpdateCycleFallback` exists. A cycle that completes
   starts it with `-WaitForProcessId`, so upgrades happen between cycles without the operator
   running `upd bootstrap`.
+- The launcher checks the current user's WindowsApps alias before `where pwsh.exe`, so a
+  machine-level MSI PATH entry cannot win over the MSIX. Once the MSIX starts, the migration
+  backs up and text-edits Windows Terminal settings in every existing profile, updates task
+  actions and system registry/PATH entries, and logs each before/after value. Terminal JSONC is
+  never parsed or reserialized. Open Terminal windows still need to be closed and reopened to
+  discard profiles they already loaded; `upd status` shows the notice.
+- SYSTEM has no stable alias, and the package directory includes its version. A permanent
+  launcher at the old MSI path would only hide that problem and is deliberately not created.
+  Instead, boot-upd writes SYSTEM task actions, OpenSSH's `DefaultShell`, and App Paths to the
+  current package executable after provisioning it. The same migration runs on every
+  boot-upd-managed MSIX upgrade, before removing the old MSI. This is the supported servicing
+  path for those system references; a package update performed outside boot-upd is refreshed
+  the next time `upd bootstrap` or the post-cycle runtime check runs.
+- User-context task and Terminal paths point to each profile's stable
+  `%LOCALAPPDATA%\Microsoft\WindowsApps\pwsh.exe` alias. A scheduled task that stores a
+  password is reported with its replacement path and left unchanged because changing its action
+  requires that password. The old MSI may no longer satisfy that task; the task owner must
+  update it with the saved credential.
+- The MSI uninstall leaves `Modules` and `Scripts` behind. Before uninstalling, boot-upd moves
+  their files into the shared `%ProgramFiles%\PowerShell\Modules` and `Scripts` folders that
+  the MSIX reads. If a destination file already differs, the old copy is preserved under
+  `LegacyMsiConflicts` and the event is logged rather than silently overwriting either copy.
 - An existing MSI install is uninstalled once the MSIX has been provisioned and its pwsh.exe
   has started and reported the expected version. The Microsoft Update package that services
   the MSI goes with it. Restart Manager stays off, so open PowerShell windows keep running and

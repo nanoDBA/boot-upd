@@ -219,6 +219,10 @@ function Get-PowerShell7LegacyEntry {
     return Select-PowerShell7LegacyEntry -Entries @(Get-ItemProperty -Path $keys -ErrorAction SilentlyContinue)
 }
 
+$migrationPath = Join-Path $PSScriptRoot 'PowerShellRuntimeMigration.ps1'
+if (-not (Test-Path -LiteralPath $migrationPath -PathType Leaf)) { throw 'PowerShell runtime migration helpers are missing.' }
+. $migrationPath
+
 function Remove-PowerShell7LegacyInstall {
     <# Restart Manager stays off (MSIRESTARTMANAGERCONTROL=Disable): the launcher that started
        this may still be running on the MSI's pwsh.exe, and on lab-b (2026-09-15) Restart
@@ -249,7 +253,7 @@ function Remove-PowerShell7LegacyInstall {
         }
     }
     if ($legacyRemoved) {
-        Write-Host 'TERMINAL_NOTICE: Close and reopen Windows Terminal to refresh PowerShell profiles that still point to the removed MSI.' -ForegroundColor Yellow
+        Write-Host 'TERMINAL_NOTICE: Close and reopen Windows Terminal; open windows keep profiles they loaded before the PowerShell switch.' -ForegroundColor Yellow
     }
     return $restartPending
 }
@@ -378,6 +382,7 @@ function Complete-PowerShell7Install {
         if ($exitCode -eq 3010) { Write-Host 'A restart is pending before the new version is fully in place.' -ForegroundColor Yellow }
     } else {
         $installed = Install-PowerShell7Msix -Release $Release
+        Update-PowerShell7References -Installed $installed
         $restartPending = Remove-PowerShell7LegacyInstall
         if ($restartPending) { Write-Host 'The old MSI install finishes removing itself at the next restart.' -ForegroundColor Yellow }
     }
@@ -431,9 +436,14 @@ if ($existing -and $Upgrade) {
     }
     if (-not $decision.NeedsUpgrade) {
         Write-Host $decision.Message -ForegroundColor Green
-        if ($legacy.Count -and -not (Test-BootUpdateCycleActive)) {
-            <# The MSIX is current but an earlier removal did not finish. #>
-            $null = Remove-PowerShell7LegacyInstall
+        if ($msix -and -not (Test-BootUpdateCycleActive)) {
+            <# Refresh system-level versioned paths on each updater run, including when the
+               package was updated by servicing since boot-upd last ran. #>
+            Update-PowerShell7References -Installed $msix
+            if ($legacy.Count) {
+                <# The MSIX is current but an earlier removal did not finish. #>
+                $null = Remove-PowerShell7LegacyInstall
+            }
         }
         exit 0
     }

@@ -332,6 +332,7 @@ if ([string]::IsNullOrEmpty($env:BOOT_UPDATE_NO_SELF_UPDATE) -and -not $Config.D
             [pscustomobject]@{ Name='Invoke-UpdBootstrap.ps1';       RelativeTarget='tools\Invoke-UpdBootstrap.ps1'; Required=$true; PowerShell=$true; Core=$false }
             [pscustomobject]@{ Name='Show-BootUpdateProgressDemo.ps1'; RelativeTarget='tools\Show-BootUpdateProgressDemo.ps1'; Required=$true; PowerShell=$true; Core=$false }
             [pscustomobject]@{ Name='Install-PowerShell7.ps1';         RelativeTarget='tools\Install-PowerShell7.ps1'; Required=$true; PowerShell=$true; Core=$false }
+            [pscustomobject]@{ Name='PowerShellRuntimeMigration.ps1';  RelativeTarget='tools\PowerShellRuntimeMigration.ps1'; Required=$true; PowerShell=$true; Core=$false }
             [pscustomobject]@{ Name='Repair-AwsTooling.ps1';         RelativeTarget='Repair-AwsTooling.ps1';      Required=$true; PowerShell=$true; Core=$false }
             [pscustomobject]@{ Name='Export-BootUpdateDiagnostics.ps1'; RelativeTarget='Export-BootUpdateDiagnostics.ps1'; Required=$true; PowerShell=$true; Core=$false }
             [pscustomobject]@{ Name='upd.cmd';                       RelativeTarget='upd.cmd';                    Required=$true; PowerShell=$false; Core=$false }
@@ -469,6 +470,11 @@ $ps7Installer = Join-Path $PSScriptRoot 'tools\Install-PowerShell7.ps1'
 if (Test-Path -LiteralPath $ps7Installer) {
     Copy-Item -LiteralPath $ps7Installer -Destination (Join-Path $installDir 'Install-PowerShell7.ps1') -Force
     Write-Host 'Deployed: Install-PowerShell7.ps1'
+}
+$ps7Migration = Join-Path $PSScriptRoot 'tools\PowerShellRuntimeMigration.ps1'
+if (Test-Path -LiteralPath $ps7Migration) {
+    Copy-Item -LiteralPath $ps7Migration -Destination (Join-Path $installDir 'PowerShellRuntimeMigration.ps1') -Force
+    Write-Host 'Deployed: PowerShellRuntimeMigration.ps1'
 }
 
 <# Deploy uninstall helper script #>
