@@ -147,10 +147,10 @@ exit /b 2
 
 :find_pwsh
 set "UPD_PWSH="
+if exist "%LocalAppData%\Microsoft\WindowsApps\pwsh.exe" set "UPD_PWSH=%LocalAppData%\Microsoft\WindowsApps\pwsh.exe"
 where pwsh.exe >nul 2>&1
-if not errorlevel 1 set "UPD_PWSH=pwsh.exe"
+if not defined UPD_PWSH if not errorlevel 1 set "UPD_PWSH=pwsh.exe"
 if not defined UPD_PWSH if exist "%ProgramFiles%\PowerShell\7\pwsh.exe" set "UPD_PWSH=%ProgramFiles%\PowerShell\7\pwsh.exe"
-if not defined UPD_PWSH if exist "%LocalAppData%\Microsoft\WindowsApps\pwsh.exe" set "UPD_PWSH=%LocalAppData%\Microsoft\WindowsApps\pwsh.exe"
 exit /b 0
 
 :classify_read_only

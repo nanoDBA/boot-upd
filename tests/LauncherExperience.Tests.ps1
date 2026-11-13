@@ -42,9 +42,12 @@ BeforeAll {
         return $function.Extent.Text
     }
 
-    foreach ($name in @('Get-PowerShell7LatestStableVersion','Get-PowerShell7UpgradeDecision','ConvertFrom-PowerShell7HashFile','Select-PowerShell7LegacyEntry')) {
+    foreach ($name in @('Test-Administrator','Get-PowerShell7TargetArchitecture','Get-PowerShell7MsixInstall','Test-PowerShell7MsixSupported','Get-PowerShell7LatestStableVersion','Get-PowerShell7UpgradeDecision','Get-PowerShell7CheckOnlyResult','Get-PowerShell7LegacyEntry','ConvertFrom-PowerShell7HashFile','Select-PowerShell7LegacyEntry')) {
         . ([scriptblock]::Create((Get-FunctionText -Ast $ps7BootstrapAst -Name $name)))
     }
+    $script:PackageName = 'Microsoft.PowerShell'
+    $script:PublisherId = '8wekyb3d8bbwe'
+    $script:LegacyPwshPath = Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'
 
     function Invoke-UpdCommand {
         param([Parameter(Mandatory)][string]$Arguments)
@@ -74,6 +77,58 @@ Describe 'Batch launcher file format' {
         $text = [Text.Encoding]::UTF8.GetString($bytes)
         $text | Should -Match "`r`n"
         $text.Replace("`r`n", '') | Should -Not -Match "`n"
+    }
+}
+
+Describe 'upd.cmd prefers the PowerShell MSIX alias' {
+    It 'uses the WindowsApps alias before a PATH result' {
+        $aliasRoot = Join-Path $TestDrive 'user'
+        $windowsApps = Join-Path $aliasRoot 'Microsoft\WindowsApps'
+        $pathRoot = Join-Path $TestDrive 'path-hit'
+        $programFilesRoot = Join-Path $TestDrive 'program-files'
+        $null = New-Item -ItemType Directory -Force -Path $windowsApps,$pathRoot,(Join-Path $programFilesRoot 'PowerShell\7')
+        Set-Content -LiteralPath (Join-Path $windowsApps 'pwsh.exe') -Value 'alias' -Encoding ascii
+        Set-Content -LiteralPath (Join-Path $pathRoot 'pwsh.exe') -Value 'path' -Encoding ascii
+        Set-Content -LiteralPath (Join-Path $programFilesRoot 'PowerShell\7\pwsh.exe') -Value 'msi' -Encoding ascii
+
+        $findStart = $cmdSource.LastIndexOf(':find_pwsh')
+        $findStart | Should -BeGreaterThan 0
+        $findEnd = $cmdSource.IndexOf("`r`n:",$findStart + 1)
+        $findEnd | Should -BeGreaterThan $findStart
+        $subroutine = $cmdSource.Substring($findStart,$findEnd - $findStart)
+        $simulated = "@echo off`r`nset `"LocalAppData=$aliasRoot`"`r`nset `"ProgramFiles=$programFilesRoot`"`r`nset `"PATH=$pathRoot;%SystemRoot%\System32`"`r`ncall :find_pwsh`r`necho UPD_PWSH=%UPD_PWSH%`r`nexit /b 0`r`n" + $subroutine + "`r`n"
+        $simulatedPath = Join-Path $TestDrive 'find-pwsh-alias.cmd'
+        [IO.File]::WriteAllText($simulatedPath,$simulated,[Text.Encoding]::ASCII)
+
+        $output = & cmd.exe /d /c "`"$simulatedPath`"" 2>&1
+        $LASTEXITCODE | Should -Be 0
+        ($output -join "`n") | Should -Match ([regex]::Escape("UPD_PWSH=$windowsApps\pwsh.exe"))
+    }
+
+    It 'falls back to PATH and then Program Files when the alias is absent' {
+        $aliasRoot = Join-Path $TestDrive 'user'
+        $pathRoot = Join-Path $TestDrive 'path-hit'
+        $programFilesRoot = Join-Path $TestDrive 'program-files'
+        $null = New-Item -ItemType Directory -Force -Path $pathRoot,(Join-Path $programFilesRoot 'PowerShell\7')
+        $aliasPath = Join-Path $aliasRoot 'Microsoft\WindowsApps\pwsh.exe'
+        if (Test-Path -LiteralPath $aliasPath) { Remove-Item -LiteralPath $aliasPath -Force }
+        Set-Content -LiteralPath (Join-Path $pathRoot 'pwsh.exe') -Value 'path' -Encoding ascii
+        Set-Content -LiteralPath (Join-Path $programFilesRoot 'PowerShell\7\pwsh.exe') -Value 'msi' -Encoding ascii
+        $findStart = $cmdSource.LastIndexOf(':find_pwsh')
+        $findEnd = $cmdSource.IndexOf("`r`n:",$findStart + 1)
+        $subroutine = $cmdSource.Substring($findStart,$findEnd - $findStart)
+        $simulated = "@echo off`r`nset `"LocalAppData=$aliasRoot`"`r`nset `"ProgramFiles=$programFilesRoot`"`r`nset `"PATH=$pathRoot;%SystemRoot%\System32`"`r`ncall :find_pwsh`r`necho UPD_PWSH=%UPD_PWSH%`r`nexit /b 0`r`n" + $subroutine + "`r`n"
+        $simulatedPath = Join-Path $TestDrive 'find-pwsh-fallback.cmd'
+        [IO.File]::WriteAllText($simulatedPath,$simulated,[Text.Encoding]::ASCII)
+
+        $output = & cmd.exe /d /c "`"$simulatedPath`"" 2>&1
+        $LASTEXITCODE | Should -Be 0
+        ($output -join "`n") | Should -Match 'UPD_PWSH=pwsh\.exe'
+
+        Remove-Item -LiteralPath (Join-Path $pathRoot 'pwsh.exe') -Force
+        $output = & cmd.exe /d /c "`"$simulatedPath`"" 2>&1
+        $LASTEXITCODE | Should -Be 0
+        ($output -join "`n") | Should -Match ([regex]::Escape("UPD_PWSH=$programFilesRoot\PowerShell\7\pwsh.exe"))
     }
 }
 
@@ -720,6 +775,81 @@ exit 0
 }
 
 Describe 'upd bootstrap upgrades an installed PowerShell 7' {
+    BeforeEach {
+        $script:LegacyEntriesForCheckOnly = @()
+        Mock Test-Administrator { $true }
+        Mock Test-Path { $true }
+        Mock Get-ChildItem { @() }
+        Mock Get-AppxPackage {
+            [pscustomobject]@{
+                PublisherId='8wekyb3d8bbwe'; Architecture='x64'; Version='7.7.0.0'
+                InstallLocation='C:\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe'
+            }
+        }
+        Mock Get-ItemProperty { $script:LegacyEntriesForCheckOnly }
+        Mock Invoke-RestMethod {
+            $hashes = [pscustomobject]@{ name='hashes.sha256'; browser_download_url='https://example.invalid/hashes' }
+            @(
+                [pscustomobject]@{ draft=$false; prerelease=$false; tag_name='v7.7.0'; assets=@(
+                    [pscustomobject]@{ name='PowerShell-7.7.0.msixbundle'; browser_download_url='https://example.invalid/770.msixbundle' }; $hashes) }
+                [pscustomobject]@{ draft=$false; prerelease=$false; tag_name='v7.6.10'; assets=@(
+                    [pscustomobject]@{ name='PowerShell-7.6.10-win-x64.msi'; browser_download_url='https://example.invalid/7610.msi' }; $hashes) }
+            )
+        }
+    }
+
+    It 'returns 100 from -CheckOnly when the current MSIX has a legacy MSI to remove' {
+        $package = if (Test-PowerShell7MsixSupported) { 'Msix' } else { 'Msi' }
+        $script:LegacyEntriesForCheckOnly = @([pscustomobject]@{
+            PSChildName='{5417B253-1A6D-4638-BC94-743A6EC2E6F4}'; DisplayName='PowerShell 7-x64'
+            DisplayVersion='7.6.10.0'; WindowsInstaller=1; UninstallString='MsiExec.exe /X{5417B253-1A6D-4638-BC94-743A6EC2E6F4}'
+        })
+        $msix = Get-PowerShell7MsixInstall
+        $legacy = @(Get-PowerShell7LegacyEntry)
+        $latest = Get-PowerShell7LatestStableVersion -Package $package -Architecture 'x64'
+        $result = Get-PowerShell7CheckOnlyResult -Package $package -InstalledVersion $msix.Version `
+            -LatestVersion $latest.Version -LegacyEntries $legacy
+
+        $package | Should -Be 'Msix'
+        $result.ExitCode | Should -Be 100
+        $result.Message | Should -Be "PowerShell $($msix.Version) is current, but a deprecated MSI install is still present and will be removed."
+        $result.Message | Should -Not -Match '[\r\n]'
+        Should -Invoke Get-AppxPackage -Times 1 -Exactly
+        Should -Invoke Get-ItemProperty -Times 2 -Exactly
+        Should -Invoke Invoke-RestMethod -Times 1 -Exactly
+    }
+
+    It 'returns 0 from -CheckOnly when the current MSIX has no legacy MSI' {
+        $package = if (Test-PowerShell7MsixSupported) { 'Msix' } else { 'Msi' }
+        $msix = Get-PowerShell7MsixInstall
+        $legacy = @(Get-PowerShell7LegacyEntry)
+        $latest = Get-PowerShell7LatestStableVersion -Package $package -Architecture 'x64'
+        $result = Get-PowerShell7CheckOnlyResult -Package $package -InstalledVersion $msix.Version `
+            -LatestVersion $latest.Version -LegacyEntries $legacy
+
+        $legacy.Count | Should -Be 0
+        $result.ExitCode | Should -Be 0
+        $result.Message | Should -Be "PowerShell $($msix.Version) is already the latest stable release."
+        Should -Invoke Get-AppxPackage -Times 1 -Exactly
+        Should -Invoke Get-ItemProperty -Times 2 -Exactly
+        Should -Invoke Invoke-RestMethod -Times 1 -Exactly
+    }
+
+    It 'returns 0 from -CheckOnly on an MSI-only machine' {
+        Mock Test-PowerShell7MsixSupported { $false }
+        $package = if (Test-PowerShell7MsixSupported) { 'Msix' } else { 'Msi' }
+        $latest = Get-PowerShell7LatestStableVersion -Package $package -Architecture 'x64'
+        $result = Get-PowerShell7CheckOnlyResult -Package $package -InstalledVersion '7.6.10' `
+            -LatestVersion $latest.Version -LegacyEntries @()
+
+        $package | Should -Be 'Msi'
+        $result.ExitCode | Should -Be 0
+        $result.Message | Should -Be 'PowerShell 7.6.10 is already the latest stable release.'
+        Should -Invoke Test-PowerShell7MsixSupported -Times 1 -Exactly
+        Should -Invoke Invoke-RestMethod -Times 1 -Exactly
+        Should -Not -Invoke Get-AppxPackage
+    }
+
     It 'never downgrades and only reports an upgrade when installed is behind latest' {
         (Get-PowerShell7UpgradeDecision -InstalledVersion '7.4.5' -LatestVersion '7.4.6').NeedsUpgrade | Should -BeTrue
         (Get-PowerShell7UpgradeDecision -InstalledVersion '7.4.6' -LatestVersion '7.4.6').NeedsUpgrade | Should -BeFalse
@@ -863,13 +993,19 @@ Describe 'upd bootstrap upgrades an installed PowerShell 7' {
         $ps7BootstrapSource | Should -Match "'/x', \`$entry\.ProductCode, '/qn', '/norestart'"
     }
 
+    It 'records the Terminal refresh instruction only after an MSI uninstall succeeds' {
+        $removal = Get-FunctionText -Ast $ps7BootstrapAst -Name 'Remove-PowerShell7LegacyInstall'
+        $removal | Should -Match '(?s)if \(\$code -in @\(0,3010\)\).*?\$legacyRemoved = \$true.*?TERMINAL_NOTICE:'
+        $removal | Should -Match 'Close and reopen Windows Terminal'
+    }
+
     It 'never changes the runtime under a running cycle and reports a check with exit 100' {
         $ps7BootstrapSource | Should -Match "Get-ScheduledTask -TaskName 'BootUpdateCycle','BootUpdateCycleFallback'"
         $ps7BootstrapSource | Should -Match '(?s)if \(Test-BootUpdateCycleActive\) \{.*?exit 3'
         $ps7BootstrapSource.IndexOf('if (Test-BootUpdateCycleActive) {') |
             Should -BeLessThan $ps7BootstrapSource.IndexOf('$installed = Complete-PowerShell7Install -Release $latest')
         $ps7BootstrapSource | Should -Match 'if \(\$CheckOnly\) \{'
-        $ps7BootstrapSource | Should -Match 'exit 100'
+        $ps7BootstrapSource | Should -Match '(?s)if \(\$CheckOnly\) \{\s*\$check = Get-PowerShell7CheckOnlyResult.*?exit \$check\.ExitCode'
         $ps7BootstrapSource | Should -Match "PowerShell \`$installedVersion -> \`$\(\`$installed\.Version\) installed\."
     }
 
@@ -893,6 +1029,22 @@ Describe 'upd bootstrap upgrades an installed PowerShell 7' {
         $bootstrapCommand.Value | Should -Match '-RedirectStandardOutput \$upgradeLog -RedirectStandardError \$upgradeErrorLog'
         $bootstrapCommand.Value | Should -Not -Match '&\s*\$ps7BootstrapPath'
         $bootstrapCommand.Value | Should -Not -Match '-Wait[^\r\n]*-Upgrade''\)\s*$'
+    }
+
+    It 'shows the persisted Terminal refresh instruction in upd status' {
+        $status = Get-FunctionText -Ast $launcherAst -Name 'Show-UpdStatus'
+        $status | Should -Match 'Show-UpdRuntimeTerminalNotice'
+        $notice = $launcherAst.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Show-UpdRuntimeTerminalNotice' },$true)
+        $notice | Should -Not -BeNullOrEmpty
+        if ($notice) {
+            . ([scriptblock]::Create($notice.Extent.Text))
+            $programDataLog = Join-Path $TestDrive 'PowerShellRuntimeUpgrade.log'
+            $tempLog = Join-Path $TestDrive 'boot-upd-pwsh-upgrade.log'
+            Set-Content -LiteralPath $programDataLog -Value 'PowerShell 7 is already current.'
+            Set-Content -LiteralPath $tempLog -Value 'TERMINAL_NOTICE: Close and reopen Windows Terminal to refresh PowerShell profiles that still point to the removed MSI.'
+            $output = Show-UpdRuntimeTerminalNotice -LogPaths @($programDataLog,$tempLog) 6>&1
+            ($output -join "`n") | Should -Match 'Close and reopen Windows Terminal'
+        }
     }
 }
 

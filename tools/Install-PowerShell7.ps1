@@ -151,6 +151,27 @@ function Get-PowerShell7UpgradeDecision {
     return [pscustomobject]@{ NeedsUpgrade = $true; Message = $null }
 }
 
+function Get-PowerShell7CheckOnlyResult {
+    param(
+        [Parameter(Mandatory)][ValidateSet('Msix','Msi')][string]$Package,
+        [Parameter(Mandatory)][version]$InstalledVersion,
+        [Parameter(Mandatory)][version]$LatestVersion,
+        [AllowEmptyCollection()][object[]]$LegacyEntries = @()
+    )
+    $decision = Get-PowerShell7UpgradeDecision -InstalledVersion $InstalledVersion -LatestVersion $LatestVersion
+    if ($decision.NeedsUpgrade) {
+        $message = if ($decision.Message) { $decision.Message } else { "PowerShell $InstalledVersion is behind the latest stable release $LatestVersion." }
+        return [pscustomobject]@{ ExitCode = 100; Message = $message }
+    }
+    if ($Package -eq 'Msix' -and @($LegacyEntries).Count -gt 0) {
+        return [pscustomobject]@{
+            ExitCode = 100
+            Message = "PowerShell $InstalledVersion is current, but a deprecated MSI install is still present and will be removed."
+        }
+    }
+    return [pscustomobject]@{ ExitCode = 0; Message = $decision.Message }
+}
+
 function Get-PowerShell7InstalledVersion {
     param([Parameter(Mandatory)][string]$PwshPath)
     try {
@@ -205,6 +226,7 @@ function Remove-PowerShell7LegacyInstall {
        use are removed at the next restart instead (3010). The runtime no longer lives in that
        folder, so nothing depends on them. #>
     $restartPending = $false
+    $legacyRemoved = $false
     foreach ($entry in @(Get-PowerShell7LegacyEntry)) {
         Write-Host "Removing the deprecated PowerShell MSI install: $($entry.Name) $($entry.Version)..." -ForegroundColor Cyan
         if ($entry.Kind -eq 'Bundle') {
@@ -219,8 +241,15 @@ function Remove-PowerShell7LegacyInstall {
         }
         $code = $process.ExitCode
         $process.Dispose()
-        if ($code -eq 3010) { $restartPending = $true }
-        elseif ($code -notin @(0, 1605, 1614)) { Write-Warning "Removing $($entry.Name) returned $code; it may need to be removed from Settings > Apps." }
+        if ($code -in @(0,3010)) {
+            $legacyRemoved = $true
+            if ($code -eq 3010) { $restartPending = $true }
+        } elseif ($code -notin @(1605, 1614)) {
+            Write-Warning "Removing $($entry.Name) returned $code; it may need to be removed from Settings > Apps."
+        }
+    }
+    if ($legacyRemoved) {
+        Write-Host 'TERMINAL_NOTICE: Close and reopen Windows Terminal to refresh PowerShell profiles that still point to the removed MSI.' -ForegroundColor Yellow
     }
     return $restartPending
 }
@@ -393,20 +422,20 @@ if ($existing -and $Upgrade) {
         if (-not $installedVersion) { $installedVersion = [version]'0.0' }
         $decision = Get-PowerShell7UpgradeDecision -InstalledVersion $installedVersion -LatestVersion $latest.Version -Legacy:($package -eq 'Msix')
     }
+    if ($CheckOnly) {
+        $check = Get-PowerShell7CheckOnlyResult -Package $package -InstalledVersion $installedVersion `
+            -LatestVersion $latest.Version -LegacyEntries $legacy
+        $color = if ($check.ExitCode -eq 100) { 'Yellow' } else { 'Green' }
+        Write-Host $check.Message -ForegroundColor $color
+        exit $check.ExitCode
+    }
     if (-not $decision.NeedsUpgrade) {
         Write-Host $decision.Message -ForegroundColor Green
-        if ($legacy.Count -and -not $CheckOnly -and -not (Test-BootUpdateCycleActive)) {
+        if ($legacy.Count -and -not (Test-BootUpdateCycleActive)) {
             <# The MSIX is current but an earlier removal did not finish. #>
             $null = Remove-PowerShell7LegacyInstall
         }
         exit 0
-    }
-    if ($CheckOnly) {
-        <# Exit 100: an upgrade is available. The launcher hands the real upgrade to a detached
-           Windows PowerShell host so that removing the old MSI never runs inside its pwsh. #>
-        if ($decision.Message) { Write-Host $decision.Message -ForegroundColor Yellow }
-        else { Write-Host "PowerShell $installedVersion is behind the latest stable release $($latest.Version)." -ForegroundColor Yellow }
-        exit 100
     }
     if (Test-BootUpdateCycleActive) {
         Write-Warning "An update cycle is in progress; PowerShell $($latest.Version) will be installed when it finishes."

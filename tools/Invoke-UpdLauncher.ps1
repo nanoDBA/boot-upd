@@ -478,6 +478,25 @@ function Get-UpdCanonicalAwsArguments {
     return $arguments.ToArray()
 }
 
+function Show-UpdRuntimeTerminalNotice {
+    param([Parameter(Mandatory)][string[]]$LogPaths)
+    $candidates = foreach ($path in $LogPaths) {
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            $item = Get-Item -LiteralPath $path -ErrorAction SilentlyContinue
+            if ($item) { [pscustomobject]@{ Path=$path; LastWriteTime=$item.LastWriteTime } }
+        }
+    }
+    foreach ($candidate in @($candidates | Sort-Object LastWriteTime -Descending)) {
+        $notice = Get-Content -LiteralPath $candidate.Path -Tail 100 -ErrorAction SilentlyContinue |
+            Where-Object { $_ -match '^TERMINAL_NOTICE:' } | Select-Object -Last 1
+        if ($notice) {
+            $message = $notice -replace '^TERMINAL_NOTICE:\s*',''
+            Write-Host "  terminal $message" -ForegroundColor Yellow
+            return
+        }
+    }
+}
+
 function Show-UpdStatus {
     $statePath = Join-Path $env:ProgramData 'BootUpdateCycle\BootUpdateCycle.state.json'
     $quarantinePath = Join-Path $env:ProgramData 'BootUpdateCycle\BootUpdateCycle-winget-quarantine.json'
@@ -498,6 +517,9 @@ function Show-UpdStatus {
             foreach ($record in $quarantines) { Write-Host "    $($record.PackageId)  undo: $($record.UnpinCommand)" -ForegroundColor Yellow }
         } catch { Write-Warning "Winget quarantine record is unreadable: $quarantinePath" }
     }
+    Show-UpdRuntimeTerminalNotice -LogPaths @(
+        (Join-Path $env:ProgramData 'BootUpdateCycle\PowerShellRuntimeUpgrade.log'),
+        (Join-Path ([IO.Path]::GetTempPath()) 'boot-upd-pwsh-upgrade.log'))
 }
 
 function Remove-UpdWingetQuarantine {
