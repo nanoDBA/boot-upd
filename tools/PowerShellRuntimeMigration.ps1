@@ -86,15 +86,22 @@ function Get-PowerShell7TaskActionMigration {
         $newExecute = Convert-PowerShell7RuntimeReference -Text $execute -LegacyPwshPath $LegacyPwshPath -SystemPwshPath $SystemPwshPath
         $newArguments = Convert-PowerShell7RuntimeReference -Text $arguments -LegacyPwshPath $LegacyPwshPath -SystemPwshPath $SystemPwshPath
         if ($newExecute -cne $execute -or $newArguments -cne $arguments) { $hasMatch = $true }
-        $execute = if ($isSystem) { $newExecute } else { Convert-PowerShell7RuntimeReference -Text $execute -LegacyPwshPath $LegacyPwshPath -SystemPwshPath $UserPwshAlias }
-        $arguments = if ($isSystem) { $newArguments } else { Convert-PowerShell7RuntimeReference -Text $arguments -LegacyPwshPath $LegacyPwshPath -SystemPwshPath $UserPwshAlias }
+        if ($isSystem) {
+            $execute = $newExecute
+            $arguments = $newArguments
+        } elseif ($hasMatch -and $UserPwshAlias) {
+            $execute = Convert-PowerShell7RuntimeReference -Text $execute -LegacyPwshPath $LegacyPwshPath -SystemPwshPath $UserPwshAlias
+            $arguments = Convert-PowerShell7RuntimeReference -Text $arguments -LegacyPwshPath $LegacyPwshPath -SystemPwshPath $UserPwshAlias
+        }
         $definitions += [pscustomobject]@{ Execute=$execute; Argument=$arguments; WorkingDirectory=[string]$action.WorkingDirectory }
     }
     $requiresCredential = $hasMatch -and ([string]$principal.LogonType -eq 'Password')
-    $changed = $hasMatch -and -not $requiresCredential
+    $requiresUserAlias = $hasMatch -and -not $isSystem -and [string]::IsNullOrWhiteSpace($UserPwshAlias)
+    $changed = $hasMatch -and -not $requiresCredential -and -not $requiresUserAlias
     return [pscustomobject]@{
         Changed = $changed
         RequiresCredential = $requiresCredential
+        RequiresUserAlias = $requiresUserAlias
         ReplacementPath = if ($hasMatch) { $newPath } else { $null }
         Actions = if ($changed) { $definitions } else { @($Task.Actions) }
     }
@@ -196,6 +203,10 @@ function Update-PowerShell7ScheduledTaskReferences {
         if ($plan.RequiresCredential) {
             Write-PowerShell7RuntimeLog -LogPath $LogPath -Message "TASK MANUAL UPDATE REQUIRED: $($task.TaskPath)$($task.TaskName); before=$($beforeReferences -join ';'); replacement=$($plan.ReplacementPath)"
             continue
+        }
+        if ($plan.RequiresUserAlias) {
+            Write-PowerShell7RuntimeLog -LogPath $LogPath -Message "TASK MIGRATION BLOCKED: $($task.TaskPath)$($task.TaskName); before=$($beforeReferences -join ';'); reason=user profile alias could not be resolved"
+            throw "Cannot map scheduled task $($task.TaskPath)$($task.TaskName) to a user profile alias; its PowerShell action cannot be safely changed."
         }
         if (-not $plan.Changed) { continue }
         if (-not $alias) { throw "Cannot map scheduled task $($task.TaskPath)$($task.TaskName) to a user profile; its PowerShell action cannot be safely changed." }

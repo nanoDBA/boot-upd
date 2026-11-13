@@ -1271,6 +1271,43 @@ Describe 'PowerShell MSIX task references survive package version changes' {
         $plan.Actions[0].Argument | Should -Be ''
     }
 
+    It 'does not require a user PowerShell alias for unrelated scheduled tasks' {
+        $migrationAst | Should -Not -BeNullOrEmpty
+        if (-not $migrationAst) { return }
+        . ([scriptblock]::Create($migrationAst.Extent.Text))
+        $task = [pscustomobject]@{
+            Principal = [pscustomobject]@{ UserId='S-1-5-21-1-2-3-1001'; LogonType='InteractiveToken' }
+            Actions = @([pscustomobject]@{ Execute='C:\Windows\System32\cmd.exe'; Argument='/c exit 0'; WorkingDirectory='' })
+        }
+
+        $plan = Get-PowerShell7TaskActionMigration -Task $task `
+            -LegacyPwshPath 'C:\Program Files\PowerShell\7\pwsh.exe' `
+            -SystemPwshPath 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.1.0_x64__8wekyb3d8bbwe\pwsh.exe' `
+            -UserPwshAlias ''
+
+        $plan.Changed | Should -BeFalse
+        $plan.Actions[0].Execute | Should -Be 'C:\Windows\System32\cmd.exe'
+    }
+
+    It 'marks a user task for attention when its runtime reference has no profile alias' {
+        $migrationAst | Should -Not -BeNullOrEmpty
+        if (-not $migrationAst) { return }
+        . ([scriptblock]::Create($migrationAst.Extent.Text))
+        $task = [pscustomobject]@{
+            Principal = [pscustomobject]@{ UserId='S-1-5-21-1-2-3-1001'; LogonType='InteractiveToken' }
+            Actions = @([pscustomobject]@{ Execute='C:\Program Files\PowerShell\7\pwsh.exe'; Argument='-File job.ps1'; WorkingDirectory='C:\Jobs' })
+        }
+
+        $plan = Get-PowerShell7TaskActionMigration -Task $task `
+            -LegacyPwshPath 'C:\Program Files\PowerShell\7\pwsh.exe' `
+            -SystemPwshPath 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.1.0_x64__8wekyb3d8bbwe\pwsh.exe' `
+            -UserPwshAlias ''
+
+        $plan.Changed | Should -BeFalse
+        $plan.RequiresUserAlias | Should -BeTrue
+        $plan.Actions[0].Execute | Should -Be 'C:\Program Files\PowerShell\7\pwsh.exe'
+    }
+
     It 'logs only the runtime path from task arguments, not unrelated argument text' {
         $summaryAst | Should -Not -BeNullOrEmpty
         if (-not $summaryAst) { return }
