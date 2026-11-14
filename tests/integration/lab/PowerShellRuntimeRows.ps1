@@ -57,11 +57,23 @@ function Get-PowerShellRuntimeLabRow {
         Add-AppxPackage -Path $bundle -ErrorAction Stop
         $terminal = Get-Command wt.exe -ErrorAction SilentlyContinue
         if (-not $terminal) {
-            $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
-            if (-not $winget) { throw 'Windows Terminal is absent and winget is unavailable on this checkpoint.' }
-            & $winget.Source install --id Microsoft.WindowsTerminal --exact --source winget --silent --accept-source-agreements --accept-package-agreements
-            if ($LASTEXITCODE -ne 0) { throw "Windows Terminal install exited $LASTEXITCODE." }
-            $terminal = Get-Command wt.exe -ErrorAction SilentlyContinue
+            $terminalRoot = 'C:\Lab\PowerShellRuntimeAssets\WindowsTerminal'
+            New-Item -ItemType Directory -Path $terminalRoot -Force | Out-Null
+            $zip = Join-Path $terminalRoot 'WindowsTerminal-1.25.3131.0-preinstall.zip'
+            $sha = '7958c974571f795a42f387c59fb6bb0178e9d29e95d8398abeb496a3fbf6cd0c'
+            if (-not (Test-Path -LiteralPath $zip) -or (Get-FileHash -LiteralPath $zip).Hash -ine $sha) {
+                Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/microsoft/terminal/releases/download/v1.25.3131.0/Microsoft.WindowsTerminal_1.25.3131.0_8wekyb3d8bbwe.msixbundle_Windows10_PreinstallKit.zip' -OutFile $zip
+            }
+            if ((Get-FileHash -LiteralPath $zip).Hash -ine $sha) { throw 'Windows Terminal preinstall package hash mismatch.' }
+            $expanded = Join-Path $terminalRoot 'expanded'
+            Expand-Archive -LiteralPath $zip -DestinationPath $expanded -Force
+            $xaml = Get-ChildItem -LiteralPath $expanded -Filter 'Microsoft.UI.Xaml.2.8_*_x64__8wekyb3d8bbwe.appx' -File | Select-Object -First 1
+            if (-not $xaml) { throw 'Windows Terminal preinstall package lacks the x64 XAML dependency.' }
+            Add-AppxPackage -Path $xaml.FullName -ErrorAction Stop
+            $terminalBundle = Get-ChildItem -LiteralPath $expanded -Filter '*.msixbundle' -File | Select-Object -First 1
+            if (-not $terminalBundle) { throw 'Windows Terminal bundle was not found after extraction.' }
+            Add-AppxPackage -Path $terminalBundle.FullName -ErrorAction Stop
+            $terminal = Get-Command (Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\wt.exe') -ErrorAction SilentlyContinue
         }
         if (-not $terminal) { throw 'Windows Terminal was installed but wt.exe did not register for the row user.' }
         $before = Start-Process -FilePath $terminal.Source -PassThru
