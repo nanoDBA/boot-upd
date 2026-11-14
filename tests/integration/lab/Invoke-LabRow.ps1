@@ -39,6 +39,9 @@ param(
        letting it run clean, and the moment they care about is announced in the log. #>
     [string]$InjectWhen = '',
     [scriptblock]$InjectAction = $null,
+    <# Stable row-specific guest setup. This runs after sync and baseline checks but before
+       reboot arming or the cycle task, so setup is part of the committed row definition. #>
+    [scriptblock]$PrepareAction = $null,
     <# Extra arguments for Deploy-BootUpdateCycle.ps1. Row C needs -RebootDelaySec above
        zero: the default is 0, documented as "immediate, /f = force-close apps, no abort",
        so with the shipped default there is no countdown for a cancel to act on at all. #>
@@ -136,6 +139,7 @@ $manifest = [ordered]@{
     SystemContext=[bool]$SystemContext; TimeoutMinutes=$TimeoutMinutes; SkipSync=[bool]$SkipSync
     StopAtSavedUserWait=[bool]$StopAtSavedUserWait
     ModuleCacheSha256=$ModuleCacheSha256; InjectWhen=$InjectWhen; InjectionConfigured=[bool]$InjectAction
+    PreparationConfigured=[bool]$PrepareAction; PreparationAction=if ($PrepareAction) { $PrepareAction.ToString() } else { $null }
     SourceFiles=$sourceHashes
     InjectionAction=if ($InjectAction) { $InjectAction.ToString() } else { $null }
 }
@@ -325,6 +329,15 @@ Invoke-Command -VMName $VMName -Credential $cred -ErrorAction Stop -ScriptBlock 
         }
     }
 } | Out-Null
+$prepareProof = @()
+if ($PrepareAction) {
+    Say 'running committed row preparation action'
+    $prepareProof = @(Invoke-Command -VMName $VMName -Credential $cred -ArgumentList $GuestUser,$GuestPassword -ScriptBlock $PrepareAction -ErrorAction Stop)
+    if ($prepareProof.Count) {
+        $prepareProof | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $evidenceDir 'preparation-proof.json')
+    }
+    Say 'row preparation action completed'
+}
 if ($ArmReboots -gt 0) {
     Say "arming $ArmReboots real pending reboot(s)"
     Invoke-Command -VMName $VMName -Credential $cred -ArgumentList $ArmReboots -ScriptBlock {
@@ -488,7 +501,10 @@ while ((Get-Date) -lt $deadline) {
            reader going by the summary would have recorded a pass for a scenario that never
            happened. #>
             try {
-                Invoke-Command -VMName $VMName -Credential $cred -ScriptBlock $InjectAction -ErrorAction Stop | Out-Null
+                $injectionProof = @(Invoke-Command -VMName $VMName -Credential $cred -ScriptBlock $InjectAction -ErrorAction Stop)
+                if ($injectionProof.Count) {
+                    $injectionProof | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $evidenceDir 'injection-proof.json')
+                }
                 $injected = $true
             } catch {
                 $injectionError = $_.Exception.Message

@@ -2,10 +2,12 @@
 
 boot-upd installs PowerShell 7 one way: Microsoft's MSIX bundle from the PowerShell release
 page, checked against the release's `hashes.sha256` and its Microsoft signature, and
-provisioned for the whole machine with `Add-AppxProvisionedPackage -Online`. Everything in
-boot-upd that starts PowerShell 7 (continuation tasks, the Deploy task, child processes, the
-self-update relaunch, the launcher's elevation) uses `pwsh.exe` in `$PSHOME`, the folder the
-running PowerShell lives in (`Get-BootUpdatePwshPath`). It never asks for `pwsh` by name.
+provisioned for the whole machine with `Add-AppxProvisionedPackage -Online`. Continuation tasks
+for a user run through that user's WindowsApps alias. SYSTEM tasks and SYSTEM child processes
+use `pwsh.exe` in `$PSHOME`, the installed MSIX package folder. `upd.cmd` checks the current
+user's alias before PATH, so an old machine PATH entry cannot select the MSI. SYSTEM has no
+per-user alias, so its tasks use the full package path instead of asking SYSTEM to resolve
+`pwsh` by name.
 `Get-Command pwsh` is exactly what must not be used: for an MSIX install it resolves to the
 per-user alias inside the user's profile. A lab row that accidentally ran v2.5.92 on an MSIX
 guest registered every continuation task, the SYSTEM fallback included, with that alias.
@@ -53,6 +55,35 @@ for every install method, and on an MSI machine it is the same path as before.
   (exit 3) while `BootUpdateCycle` or `BootUpdateCycleFallback` exists. A cycle that completes
   starts it with `-WaitForProcessId`, so upgrades happen between cycles without the operator
   running `upd bootstrap`.
+- The launcher checks the current user's WindowsApps alias before `where pwsh.exe`, so a
+  machine-level MSI PATH entry cannot win over the MSIX. Once the MSIX starts, the migration
+  backs up and text-edits Windows Terminal settings in every existing profile, updates task
+  actions and system registry/PATH entries, and logs each before/after value. Terminal JSONC is
+  never parsed or reserialized. Open Terminal windows still need to be closed and reopened to
+  discard profiles they already loaded; `upd status` shows the notice from
+  `PowerShellRuntimeUpgrade.log`.
+- SYSTEM has no stable alias, and the package directory includes its version. Nothing is
+  installed at the retired MSI path. SYSTEM task actions, OpenSSH's `DefaultShell`, App Paths,
+  and machine PATH point at the installed MSIX version. User task actions, Terminal profiles,
+  and user PATH entries point at that user's WindowsApps alias. Each `upd run` checks those
+  references before starting the cycle and repairs stale package paths; `upd status` reports
+  stale paths and any saved-password task it cannot change. `upd bootstrap` also refreshes the
+  references after an upgrade. No shim or dispatcher is installed. If Windows or another tool
+  upgrades the MSIX on its own, versioned SYSTEM paths can be stale until the next `upd` run.
+  Microsoft's MSIX docs place app execution aliases under a user's
+  `%LOCALAPPDATA%\Microsoft\WindowsApps` and package folders under names based on the full
+  package name ([alias details](https://learn.microsoft.com/en-us/sysinternals/downloads/microsoft-store),
+  [package volumes](https://learn.microsoft.com/en-us/windows/msix/package/package-volumes)).
+- User-context task and Terminal paths point to each profile's stable
+  `%LOCALAPPDATA%\Microsoft\WindowsApps\pwsh.exe` alias. A scheduled task that stores a
+  password is reported with its replacement path and left unchanged because changing its action
+  requires that password. The old MSI may no longer satisfy that task; the task owner must
+  update it with the saved credential.
+- The MSI uninstall leaves `Modules` and `Scripts` behind. boot-upd moves their contents only
+  after the uninstall is confirmed. User-installed modules and scripts go into the shared
+  `%ProgramFiles%\PowerShell\Modules` and `Scripts` folders that the MSIX reads. Files already
+  supplied by the MSIX, or different content at an existing destination, are kept under
+  `LegacyMsiConflicts`; they do not shadow the MSIX's bundled modules.
 - An existing MSI install is uninstalled once the MSIX has been provisioned and its pwsh.exe
   has started and reported the expected version. The Microsoft Update package that services
   the MSI goes with it. Restart Manager stays off, so open PowerShell windows keep running and
@@ -64,5 +95,6 @@ for every install method, and on an MSI machine it is the same path as before.
   `$PSHOME` is read-only, so no all-users profile in `$PSHOME`, no WSMan endpoint
   registration and no `Set-ExecutionPolicy -Scope LocalMachine`. boot-upd uses none of these.
   An operator who relies on WinRM remoting into PowerShell 7 should know before upgrading.
-- When Microsoft ships SYSTEM support for the packaged pwsh (#27562), nothing here has to
-  change: the full path keeps working, and the alias becomes an extra.
+- If Microsoft adds a stable SYSTEM launch alias for packaged pwsh (#27562), verify how it
+  behaves across MSIX servicing before changing this decision. The current full path is
+  versioned and can go stale when Windows updates the package.

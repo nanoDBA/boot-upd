@@ -332,6 +332,7 @@ if ([string]::IsNullOrEmpty($env:BOOT_UPDATE_NO_SELF_UPDATE) -and -not $Config.D
             [pscustomobject]@{ Name='Invoke-UpdBootstrap.ps1';       RelativeTarget='tools\Invoke-UpdBootstrap.ps1'; Required=$true; PowerShell=$true; Core=$false }
             [pscustomobject]@{ Name='Show-BootUpdateProgressDemo.ps1'; RelativeTarget='tools\Show-BootUpdateProgressDemo.ps1'; Required=$true; PowerShell=$true; Core=$false }
             [pscustomobject]@{ Name='Install-PowerShell7.ps1';         RelativeTarget='tools\Install-PowerShell7.ps1'; Required=$true; PowerShell=$true; Core=$false }
+            [pscustomobject]@{ Name='PowerShellRuntimeMigration.ps1';  RelativeTarget='tools\PowerShellRuntimeMigration.ps1'; Required=$true; PowerShell=$true; Core=$false }
             [pscustomobject]@{ Name='Repair-AwsTooling.ps1';         RelativeTarget='Repair-AwsTooling.ps1';      Required=$true; PowerShell=$true; Core=$false }
             [pscustomobject]@{ Name='Export-BootUpdateDiagnostics.ps1'; RelativeTarget='Export-BootUpdateDiagnostics.ps1'; Required=$true; PowerShell=$true; Core=$false }
             [pscustomobject]@{ Name='upd.cmd';                       RelativeTarget='upd.cmd';                    Required=$true; PowerShell=$false; Core=$false }
@@ -469,6 +470,11 @@ $ps7Installer = Join-Path $PSScriptRoot 'tools\Install-PowerShell7.ps1'
 if (Test-Path -LiteralPath $ps7Installer) {
     Copy-Item -LiteralPath $ps7Installer -Destination (Join-Path $installDir 'Install-PowerShell7.ps1') -Force
     Write-Host 'Deployed: Install-PowerShell7.ps1'
+}
+$ps7Migration = Join-Path $PSScriptRoot 'tools\PowerShellRuntimeMigration.ps1'
+if (Test-Path -LiteralPath $ps7Migration) {
+    Copy-Item -LiteralPath $ps7Migration -Destination (Join-Path $installDir 'PowerShellRuntimeMigration.ps1') -Force
+    Write-Host 'Deployed: PowerShellRuntimeMigration.ps1'
 }
 
 <# Deploy uninstall helper script #>
@@ -766,6 +772,11 @@ function Register-ScheduledTaskNow {
     <# The task runs the pwsh.exe in $PSHOME: an MSIX pwsh is on PATH only as a per-user alias
        that SYSTEM does not have. See Get-BootUpdatePwshPath in Invoke-BootUpdateCycle.ps1. #>
     $pwshPath = Join-Path $PSHOME 'pwsh.exe'
+    $userPwshPath = $pwshPath
+    if ($pwshPath -match '(?i)\\WindowsApps\\Microsoft\.PowerShell_') {
+        $alias = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\pwsh.exe'
+        if (Test-Path -LiteralPath $alias -PathType Leaf) { $userPwshPath = $alias }
+    }
 
     $taskArgs = @(
         '-NoProfile', '-ExecutionPolicy Bypass'
@@ -816,17 +827,20 @@ function Register-ScheduledTaskNow {
     }
 
     $argString = $taskArgs -join ' '
-    $action   = New-ScheduledTaskAction -Execute $pwshPath -Argument $argString -WorkingDirectory $installDir
+    $userAction = New-ScheduledTaskAction -Execute $userPwshPath -Argument $argString -WorkingDirectory $installDir
+    $systemAction = New-ScheduledTaskAction -Execute $pwshPath -Argument $argString -WorkingDirectory $installDir
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
         -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 4) `
         -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 2) -MultipleInstances IgnoreNew
 
     if ($Config.RunAsUser) {
+        $action = $userAction
         $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
         $trigger   = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
         $principal = New-ScheduledTaskPrincipal -UserId $currentUser -LogonType Interactive -RunLevel Highest
         $runAsDesc = "$currentUser at logon"
     } else {
+        $action = $systemAction
         $trigger   = New-ScheduledTaskTrigger -AtStartup
         $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
         $runAsDesc = "SYSTEM at startup"

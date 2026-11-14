@@ -9,6 +9,16 @@ $tools = Join-Path $root 'tools'
 $null = New-Item -ItemType Directory -Path $tools
 $succeeded = $false
 
+function Read-SharedTextFile {
+    param([Parameter(Mandatory)][string]$Path)
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+    try {
+        $reader = [IO.StreamReader]::new($stream)
+        try { return $reader.ReadToEnd() }
+        finally { $reader.Dispose() }
+    } finally { $stream.Dispose() }
+}
+
 try {
     $oldUrl = "https://github.com/nanoDBA/boot-upd/releases/download/$FromTag/upd.cmd"
     Invoke-WebRequest -Uri $oldUrl -OutFile (Join-Path $root 'upd.cmd')
@@ -45,12 +55,12 @@ try {
     while ([datetime]::UtcNow -lt $logDeadline) {
         try {
             if ((Test-Path -LiteralPath $adoptionLog) -and
-                ((Get-Content -LiteralPath $adoptionLog -Raw -ErrorAction Stop) -match 'completed')) { break }
+                ((Read-SharedTextFile -Path $adoptionLog) -match 'completed')) { break }
         } catch { }
         Start-Sleep -Milliseconds 100
     }
     if (-not (Test-Path -LiteralPath $adoptionLog) -or
-        (Get-Content -LiteralPath $adoptionLog -Raw) -notmatch 'completed') {
+        (Read-SharedTextFile -Path $adoptionLog) -notmatch 'completed') {
         throw 'Compatibility adoption did not publish its terminal completion record.'
     }
     foreach ($sidecar in "$next.sha256","$next.baseline") {

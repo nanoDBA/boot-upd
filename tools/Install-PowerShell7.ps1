@@ -151,6 +151,89 @@ function Get-PowerShell7UpgradeDecision {
     return [pscustomobject]@{ NeedsUpgrade = $true; Message = $null }
 }
 
+function Get-PowerShell7CheckOnlyResult {
+    param(
+        [Parameter(Mandatory)][ValidateSet('Msix','Msi')][string]$Package,
+        [Parameter(Mandatory)][version]$InstalledVersion,
+        [Parameter(Mandatory)][version]$LatestVersion,
+        [AllowEmptyCollection()][object[]]$LegacyEntries = @(),
+        [switch]$StaleRuntimeReferences
+    )
+    $decision = Get-PowerShell7UpgradeDecision -InstalledVersion $InstalledVersion -LatestVersion $LatestVersion
+    if ($decision.NeedsUpgrade) {
+        $message = if ($decision.Message) { $decision.Message } else { "PowerShell $InstalledVersion is behind the latest stable release $LatestVersion." }
+        return [pscustomobject]@{ ExitCode = 100; Message = $message }
+    }
+    if ($Package -eq 'Msix' -and @($LegacyEntries).Count -gt 0) {
+        return [pscustomobject]@{
+            ExitCode = 100
+            Message = "PowerShell $InstalledVersion is current, but a deprecated MSI install is still present and will be removed."
+        }
+    }
+    if ($Package -eq 'Msix' -and $StaleRuntimeReferences) {
+        return [pscustomobject]@{
+            ExitCode = 100
+            Message = "PowerShell $InstalledVersion is current, but a saved task or system setting still points to an older PowerShell path and will be refreshed."
+        }
+    }
+    return [pscustomobject]@{ ExitCode = 0; Message = $decision.Message }
+}
+
+function Test-PowerShell7TextHasStaleRuntimeReference {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text, [Parameter(Mandatory)][string]$InstalledPwshPath)
+    $normalized = $Text.Replace('\\','\')
+    if ($normalized -match '(?i)(?:%ProgramFiles%|\$env:ProgramFiles)\\PowerShell\\7(?:\\pwsh\.exe)?') { return $true }
+    if ($normalized -match '(?i)[A-Z]:\\Program Files\\PowerShell\\7(?:\\pwsh\.exe)?') { return $true }
+    $packagePathPattern = '(?i)[A-Z]:\\(?:Program Files\\)?WindowsApps\\Microsoft\.PowerShell_[^\\;"\s]+\\pwsh\.exe'
+    foreach ($match in [regex]::Matches($normalized,$packagePathPattern)) {
+        if ($match.Value -ine $InstalledPwshPath) { return $true }
+    }
+    $packageFolderPattern = '(?i)[A-Z]:\\(?:Program Files\\)?WindowsApps\\Microsoft\.PowerShell_[^\\;"\s]+'
+    $installedFolder = (Split-Path -Parent $InstalledPwshPath).TrimEnd('\')
+    foreach ($match in [regex]::Matches($normalized,$packageFolderPattern)) {
+        if ($match.Value.TrimEnd('\') -ine $installedFolder) { return $true }
+    }
+    return $false
+}
+
+function Test-PowerShell7RuntimeReferencesStale {
+    param([Parameter(Mandatory)]$Installed)
+    $texts = [Collections.Generic.List[string]]::new()
+    $tasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue)
+    foreach ($task in $tasks) {
+        foreach ($action in @($task.Actions)) {
+            $argumentText = if ($action.PSObject.Properties['Arguments']) { [string]$action.Arguments } else { [string]$action.Argument }
+            $texts.Add([string]$action.Execute); $texts.Add($argumentText); $texts.Add([string]$action.WorkingDirectory)
+        }
+    }
+    $machinePath = [Environment]::GetEnvironmentVariable('Path','Machine')
+    if ($machinePath) { $texts.Add($machinePath) }
+    foreach ($profile in @(Get-PowerShell7UserProfiles)) {
+        foreach ($settings in @(
+            (Join-Path $profile.LocalAppData 'Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\settings.json'),
+            (Join-Path $profile.LocalAppData 'Packages\Microsoft.WindowsTerminalPreview_8wekyb3d8bbwe\LocalState\settings.json'),
+            (Join-Path $profile.LocalAppData 'Microsoft\Windows Terminal\settings.json')
+        )) {
+            if (Test-Path -LiteralPath $settings -PathType Leaf) { $texts.Add([IO.File]::ReadAllText($settings)) }
+        }
+    }
+    foreach ($keyPath in @('SOFTWARE\OpenSSH','SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\pwsh.exe')) {
+        foreach ($view in @([Microsoft.Win32.RegistryView]::Registry64,[Microsoft.Win32.RegistryView]::Registry32)) {
+            try {
+                $base=[Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine,$view)
+                try {
+                    $key=$base.OpenSubKey($keyPath)
+                    if ($key) { try { foreach ($name in $key.GetValueNames()) { $texts.Add([string]$key.GetValue($name,$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)) } } finally { $key.Dispose() } }
+                } finally { $base.Dispose() }
+            } catch { }
+        }
+    }
+    foreach ($text in $texts) {
+        if (Test-PowerShell7TextHasStaleRuntimeReference -Text $text -InstalledPwshPath ([string]$Installed.PwshPath)) { return $true }
+    }
+    return $false
+}
+
 function Get-PowerShell7InstalledVersion {
     param([Parameter(Mandatory)][string]$PwshPath)
     try {
@@ -198,6 +281,10 @@ function Get-PowerShell7LegacyEntry {
     return Select-PowerShell7LegacyEntry -Entries @(Get-ItemProperty -Path $keys -ErrorAction SilentlyContinue)
 }
 
+$migrationPath = Join-Path $PSScriptRoot 'PowerShellRuntimeMigration.ps1'
+if (-not (Test-Path -LiteralPath $migrationPath -PathType Leaf)) { throw 'PowerShell runtime migration helpers are missing.' }
+. $migrationPath
+
 function Remove-PowerShell7LegacyInstall {
     <# Restart Manager stays off (MSIRESTARTMANAGERCONTROL=Disable): the launcher that started
        this may still be running on the MSI's pwsh.exe, and on lab-b (2026-09-15) Restart
@@ -205,6 +292,7 @@ function Remove-PowerShell7LegacyInstall {
        use are removed at the next restart instead (3010). The runtime no longer lives in that
        folder, so nothing depends on them. #>
     $restartPending = $false
+    $legacyRemoved = $false
     foreach ($entry in @(Get-PowerShell7LegacyEntry)) {
         Write-Host "Removing the deprecated PowerShell MSI install: $($entry.Name) $($entry.Version)..." -ForegroundColor Cyan
         if ($entry.Kind -eq 'Bundle') {
@@ -219,8 +307,17 @@ function Remove-PowerShell7LegacyInstall {
         }
         $code = $process.ExitCode
         $process.Dispose()
-        if ($code -eq 3010) { $restartPending = $true }
-        elseif ($code -notin @(0, 1605, 1614)) { Write-Warning "Removing $($entry.Name) returned $code; it may need to be removed from Settings > Apps." }
+        if ($code -in @(0,3010)) {
+            $legacyRemoved = $true
+            if ($code -eq 3010) { $restartPending = $true }
+        } elseif ($code -notin @(1605, 1614)) {
+            Write-Warning "Removing $($entry.Name) returned $code; it may need to be removed from Settings > Apps."
+        }
+    }
+    if ($legacyRemoved) {
+        $notice = 'Close and reopen Windows Terminal; open windows keep profiles loaded before the PowerShell switch.'
+        Write-PowerShell7RuntimeLog -LogPath (Join-Path $env:ProgramData 'BootUpdateCycle\PowerShellRuntimeUpgrade.log') -Message "TERMINAL_NOTICE: $notice"
+        Write-Host "TERMINAL_NOTICE: $notice" -ForegroundColor Yellow
     }
     return $restartPending
 }
@@ -349,7 +446,14 @@ function Complete-PowerShell7Install {
         if ($exitCode -eq 3010) { Write-Host 'A restart is pending before the new version is fully in place.' -ForegroundColor Yellow }
     } else {
         $installed = Install-PowerShell7Msix -Release $Release
+        Update-PowerShell7References -Installed $installed
         $restartPending = Remove-PowerShell7LegacyInstall
+        if (@(Get-PowerShell7LegacyEntry).Count -eq 0) {
+            Move-PowerShell7LegacyContent -LogPath (Join-Path $env:ProgramData 'BootUpdateCycle\PowerShellRuntimeUpgrade.log') `
+                -BundledModulesRoot (Join-Path (Split-Path -Parent $installed.PwshPath) 'Modules')
+        } else {
+            Write-PowerShell7RuntimeLog -LogPath (Join-Path $env:ProgramData 'BootUpdateCycle\PowerShellRuntimeUpgrade.log') -Message 'LEGACY CONTENT CLEANUP DEFERRED: MSI uninstall is not confirmed; modules and scripts remain untouched.'
+        }
         if ($restartPending) { Write-Host 'The old MSI install finishes removing itself at the next restart.' -ForegroundColor Yellow }
     }
     Write-Host "PowerShell $($installed.Version) ready: $($installed.PwshPath)" -ForegroundColor Green
@@ -393,20 +497,30 @@ if ($existing -and $Upgrade) {
         if (-not $installedVersion) { $installedVersion = [version]'0.0' }
         $decision = Get-PowerShell7UpgradeDecision -InstalledVersion $installedVersion -LatestVersion $latest.Version -Legacy:($package -eq 'Msix')
     }
+    if ($CheckOnly) {
+        $check = Get-PowerShell7CheckOnlyResult -Package $package -InstalledVersion $installedVersion `
+            -LatestVersion $latest.Version -LegacyEntries $legacy `
+            -StaleRuntimeReferences:($msix -and (Test-PowerShell7RuntimeReferencesStale -Installed $msix))
+        $color = if ($check.ExitCode -eq 100) { 'Yellow' } else { 'Green' }
+        Write-Host $check.Message -ForegroundColor $color
+        exit $check.ExitCode
+    }
     if (-not $decision.NeedsUpgrade) {
         Write-Host $decision.Message -ForegroundColor Green
-        if ($legacy.Count -and -not $CheckOnly -and -not (Test-BootUpdateCycleActive)) {
-            <# The MSIX is current but an earlier removal did not finish. #>
-            $null = Remove-PowerShell7LegacyInstall
+        if ($msix -and -not (Test-BootUpdateCycleActive)) {
+            <# Refresh system-level versioned paths on each updater run, including when the
+               package was updated by servicing since boot-upd last ran. #>
+            Update-PowerShell7References -Installed $msix
+            if ($legacy.Count) {
+                <# The MSIX is current but an earlier removal did not finish. #>
+                $null = Remove-PowerShell7LegacyInstall
+            }
+            if (@(Get-PowerShell7LegacyEntry).Count -eq 0) {
+                Move-PowerShell7LegacyContent -LogPath (Join-Path $env:ProgramData 'BootUpdateCycle\PowerShellRuntimeUpgrade.log') `
+                    -BundledModulesRoot (Join-Path (Split-Path -Parent $msix.PwshPath) 'Modules')
+            }
         }
         exit 0
-    }
-    if ($CheckOnly) {
-        <# Exit 100: an upgrade is available. The launcher hands the real upgrade to a detached
-           Windows PowerShell host so that removing the old MSI never runs inside its pwsh. #>
-        if ($decision.Message) { Write-Host $decision.Message -ForegroundColor Yellow }
-        else { Write-Host "PowerShell $installedVersion is behind the latest stable release $($latest.Version)." -ForegroundColor Yellow }
-        exit 100
     }
     if (Test-BootUpdateCycleActive) {
         Write-Warning "An update cycle is in progress; PowerShell $($latest.Version) will be installed when it finishes."
@@ -426,6 +540,10 @@ if ($existing -and $Upgrade) {
 
 Write-Host 'PowerShell 7 is required for parallel update execution.' -ForegroundColor Cyan
 Write-Host 'Installing it machine-wide, side-by-side with Windows PowerShell 5.1...' -ForegroundColor Cyan
+if (Test-BootUpdateCycleActive) {
+    Write-Warning 'A boot-upd cycle is in progress; PowerShell will be installed after the cycle finishes.'
+    exit 3
+}
 $latest = Get-PowerShell7LatestStableVersion -Package $package -Architecture (Get-PowerShell7TargetArchitecture)
 $installed = Complete-PowerShell7Install -Release $latest
 Write-Output $installed.PwshPath

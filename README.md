@@ -263,9 +263,20 @@ per-user alias and SYSTEM, which runs the continuation tasks, has none.
   is in `PowerShellRuntimeUpgrade.log` beside the installed updater. `upd bootstrap` does
   the same on demand and writes `%TEMP%\boot-upd-pwsh-upgrade.log`. The runtime never
   changes while a cycle is in progress.
-- **An existing MSI install is replaced.** After the MSIX is installed and starts, the old
-  MSI (and the Microsoft Update package that services it) is uninstalled. PowerShell
-  windows that are already open keep running; files still in use go at the next restart.
+- **An existing MSI install is removed.** If `upd bootstrap` finds the current MSIX already
+  installed, it removes the old MSI (and its Microsoft Update package). When it installs a
+  new MSIX, it removes the MSI after the new `pwsh` starts. Open PowerShell windows keep
+  running; files still in use are removed at the next restart. Close and reopen Windows
+  Terminal after the switch; an already-running Terminal can keep its old generated profile.
+- **Saved PowerShell paths get updated.** The switch updates explicit Windows Terminal
+  profiles for every existing user, scheduled task actions, OpenSSH's default shell, App Paths,
+  and the machine PATH. Terminal settings are edited as text, with a timestamped backup beside
+  each changed file; comments and formatting stay put. SYSTEM task actions point at the installed
+  MSIX version. An independently serviced package upgrade can make those saved paths stale; run
+  `upd bootstrap` afterward to refresh them. A task saved with a password
+  is left alone and reported with the path it needs; boot-upd can't change its saved credentials.
+  MSI `Modules` and `Scripts` are moved only after uninstall succeeds. Modules already bundled
+  with the MSIX stay out of the shared module path; other conflicts are kept for inspection.
 - **Older Windows keeps the MSI.** Windows older than build 17763 (Windows Server 2016)
   and Server Core cannot install the MSIX. They get the signed PowerShell 7.6 LTS MSI,
   the last line Microsoft ships that way.

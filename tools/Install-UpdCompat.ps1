@@ -206,6 +206,7 @@ $specs = @(
     [pscustomobject]@{ Name='Invoke-UpdBootstrap.ps1'; Relative='tools\Invoke-UpdBootstrap.ps1'; PowerShell=$true; RequiredMajor=5; Batch=$false }
     [pscustomobject]@{ Name='Show-BootUpdateProgressDemo.ps1'; Relative='tools\Show-BootUpdateProgressDemo.ps1'; PowerShell=$true; RequiredMajor=7; Batch=$false }
     [pscustomobject]@{ Name='Install-PowerShell7.ps1'; Relative='tools\Install-PowerShell7.ps1'; PowerShell=$true; RequiredMajor=5; Batch=$false }
+    [pscustomobject]@{ Name='PowerShellRuntimeMigration.ps1'; Relative='tools\PowerShellRuntimeMigration.ps1'; PowerShell=$true; RequiredMajor=5; Batch=$false }
     [pscustomobject]@{ Name='Repair-AwsTooling.ps1'; Relative='Repair-AwsTooling.ps1'; PowerShell=$true; RequiredMajor=5; Batch=$false }
     [pscustomobject]@{ Name='Export-BootUpdateDiagnostics.ps1'; Relative='Export-BootUpdateDiagnostics.ps1'; PowerShell=$true; RequiredMajor=5; Batch=$false }
     [pscustomobject]@{ Name='upd.cmd'; Relative='upd.cmd'; PowerShell=$false; RequiredMajor=0; Batch=$true }

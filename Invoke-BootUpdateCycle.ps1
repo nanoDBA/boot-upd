@@ -3957,19 +3957,15 @@ function Wait-ProcessWithIdleTimeout {
 }
 
 function Get-BootUpdatePwshPath {
-    <# The PowerShell 7 runtime is the pwsh.exe in $PSHOME, the folder this PowerShell runs
-       from: the package folder for the MSIX, Program Files\PowerShell\7 for the MSI, the
-       unpacked folder for a ZIP. The executable there runs as SYSTEM (lab-b, 2026-11-12,
-       PowerShell 7.7.0). Not `pwsh` by name: an MSIX install puts pwsh on PATH only as a
-       per-user app execution alias, Get-Command pwsh resolves to that alias inside the
-       user's profile, and SYSTEM (the continuation tasks, the headless fallback) has none.
-       v2.5.92 on an MSIX guest registered every continuation task, the SYSTEM fallback
-       included, with C:\Users\<user>\AppData\Local\Microsoft\WindowsApps\...\pwsh.exe. #>
+    <# Use the executable beside the running PowerShell process. For MSIX this is its
+       versioned package path, which SYSTEM can run. Do not resolve `pwsh` by name: PATH
+       can select the wrong runtime or a per-user alias. The Program Files MSI path is a
+       last-resort compatibility fallback for older installs; it is not a persistent shim. #>
     $home7 = Join-Path $PSHOME 'pwsh.exe'
     if (Test-Path -LiteralPath $home7) { return $home7 }
-    $command = Get-Command pwsh.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($command) { return $command.Source }
-    return (Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe')
+    $legacyPath = Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'
+    if (Test-Path -LiteralPath $legacyPath) { return $legacyPath }
+    throw 'PowerShell 7 executable could not be resolved from the current runtime or MSI fallback path.'
 }
 
 function Invoke-PackageManagerWithTimeout {
@@ -7247,13 +7243,13 @@ function Start-PowerShellRuntimeUpgrade {
         return
     }
     $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $log = Join-Path $script:InstallDir 'PowerShellRuntimeUpgrade.log'
+    $log = Join-Path $script:InstallDir 'PowerShellRuntimeUpgrade-output.log'
     try {
         $null = Start-Process -FilePath $windowsPowerShell -WindowStyle Hidden `
             -RedirectStandardOutput $log -RedirectStandardError "$log.err" -ArgumentList @(
                 '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $installer),
                 '-Upgrade', '-WaitForProcessId', $PID)
-        Write-Log "PowerShell runtime: checking for a newer PowerShell 7 after this cycle exits (log: $log)."
+        Write-Log "PowerShell runtime: checking for a newer PowerShell 7 after this cycle exits (output: $log)."
     } catch {
         Write-Log "PowerShell runtime: could not start the upgrade check: $($_.Exception.Message)" -Level Warn
     }
@@ -7534,6 +7530,16 @@ function Register-BootUpdateTaskForReboot {
     )
     $taskName = 'BootUpdateCycle'
     $pwshPath = Get-BootUpdatePwshPath
+    $userPwshPath = $pwshPath
+    if ($pwshPath -match '(?i)\\WindowsApps\\Microsoft\.PowerShell_') {
+        $alias = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\pwsh.exe'
+        if (-not (Test-Path -LiteralPath $alias -PathType Leaf) -and $script:ResumeUserSid) {
+            $profile = Get-CimInstance -ClassName Win32_UserProfile -ErrorAction SilentlyContinue |
+                Where-Object { [string]$_.SID -eq [string]$script:ResumeUserSid -and $_.LocalPath } | Select-Object -First 1
+            if ($profile) { $alias = Join-Path $profile.LocalPath 'AppData\Local\Microsoft\WindowsApps\pwsh.exe' }
+        }
+        if (Test-Path -LiteralPath $alias -PathType Leaf) { $userPwshPath = $alias }
+    }
     $scriptPath = Join-Path $PSScriptRoot 'Invoke-BootUpdateCycle.ps1'
     $taskArgs = @(
         '-NoProfile', '-ExecutionPolicy Bypass'
@@ -7589,13 +7595,15 @@ function Register-BootUpdateTaskForReboot {
     }
     if ($script:NotificationLevel -ne 'Full') { $taskArgs += "-NotificationLevel $($script:NotificationLevel)" }
     $argString = $taskArgs -join ' '
-    $action   = New-ScheduledTaskAction -Execute $pwshPath -Argument $argString -WorkingDirectory $PSScriptRoot
+    $userAction = New-ScheduledTaskAction -Execute $userPwshPath -Argument $argString -WorkingDirectory $PSScriptRoot
+    $systemAction = New-ScheduledTaskAction -Execute $pwshPath -Argument $argString -WorkingDirectory $PSScriptRoot
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
         -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 4) `
         -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 2) -MultipleInstances IgnoreNew
     $registeredTaskNames = [System.Collections.Generic.List[string]]::new()
     $expectedPrincipal = @{}
     $expectedTriggerTypes = @{}
+    $expectedActions = @{}
     $retryTime = if ($LogonOnly) { $null } else {
         Get-BootUpdateRetryTriggerTime -RetryAt $RetryAt -RetrySoon ([bool]$RetrySoon)
     }
@@ -7660,10 +7668,11 @@ function Register-BootUpdateTaskForReboot {
         } else {
             'Boot update loop: patches everything, reboots until clean. (user context via ARSO)'
         }
-        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $userTriggers -Principal $userPrincipal -Settings $settings `
+        Register-ScheduledTask -TaskName $taskName -Action $userAction -Trigger $userTriggers -Principal $userPrincipal -Settings $settings `
             -Description $userTaskDescription -Force -ErrorAction Stop | Out-Null
         $registeredTaskNames.Add($taskName)
         $expectedPrincipal[$taskName] = $currentUser
+        $expectedActions[$taskName] = $userAction
         $expectedTriggerTypes[$taskName] = @('MSFT_TaskLogonTrigger') + $(if ($retryTrigger -or $watchdogTrigger) { 'MSFT_TaskTimeTrigger' } else { @() })
         $arsoText = if ($LogonOnly) { 'next interactive logon' } elseif (Test-ArsoAvailable) { 'ARSO or interactive logon' } else { 'next interactive logon' }
         Write-Log "Scheduled task registered: $taskName ($currentUser at logon — $arsoText)"
@@ -7674,10 +7683,11 @@ function Register-BootUpdateTaskForReboot {
             $fallbackTriggers = if ($fallbackRetryTrigger) { @($fbTrigger, $fallbackRetryTrigger) } else { @($fbTrigger) }
             if ($fallbackWatchdogTrigger) { $fallbackTriggers = @($fallbackTriggers) + $fallbackWatchdogTrigger }
             $fbPrincipal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-            Register-ScheduledTask -TaskName 'BootUpdateCycleFallback' -Action $action -Trigger $fallbackTriggers -Principal $fbPrincipal -Settings $settings `
+            Register-ScheduledTask -TaskName 'BootUpdateCycleFallback' -Action $systemAction -Trigger $fallbackTriggers -Principal $fbPrincipal -Settings $settings `
                 -Description 'Boot update loop fallback: runs as SYSTEM if ARSO sign-on does not occur.' -Force -ErrorAction Stop | Out-Null
             $registeredTaskNames.Add('BootUpdateCycleFallback')
             $expectedPrincipal['BootUpdateCycleFallback'] = 'SYSTEM'
+            $expectedActions['BootUpdateCycleFallback'] = $systemAction
             $expectedTriggerTypes['BootUpdateCycleFallback'] = @('MSFT_TaskBootTrigger') + $(if ($retryTrigger -or $watchdogTrigger) { 'MSFT_TaskTimeTrigger' } else { @() })
             Write-Log 'Scheduled task registered: BootUpdateCycleFallback (SYSTEM at startup +3min, mutex-arbitrated)'
         }
@@ -7686,10 +7696,11 @@ function Register-BootUpdateTaskForReboot {
         $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
         $systemTriggers = if ($retryTrigger) { @($trigger, $retryTrigger) } else { @($trigger) }
         if ($watchdogTrigger) { $systemTriggers = @($systemTriggers) + $watchdogTrigger }
-        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $systemTriggers -Principal $principal -Settings $settings `
+        Register-ScheduledTask -TaskName $taskName -Action $systemAction -Trigger $systemTriggers -Principal $principal -Settings $settings `
             -Description 'Boot update loop: patches everything, reboots until clean.' -Force -ErrorAction Stop | Out-Null
         $registeredTaskNames.Add($taskName)
         $expectedPrincipal[$taskName] = 'SYSTEM'
+        $expectedActions[$taskName] = $systemAction
         $expectedTriggerTypes[$taskName] = @('MSFT_TaskBootTrigger') + $(if ($retryTrigger -or $watchdogTrigger) { 'MSFT_TaskTimeTrigger' } else { @() })
         Write-Log "Scheduled task registered: $taskName (SYSTEM at startup — ARSO unavailable)"
     }
@@ -7719,8 +7730,9 @@ function Register-BootUpdateTaskForReboot {
             if (-not $principalMatches) { throw "Resume task '$registeredName' has the wrong principal (expected '$expectedUser', found '$actualPrincipal')." }
         }
         if ([int]$task.Settings.RestartCount -ne 3) { throw "Resume task '$registeredName' is missing its retry policy." }
+        $expectedAction = $expectedActions[$registeredName]
         $matchingAction = @($task.Actions | Where-Object {
-            $_.Execute -eq $pwshPath -and $_.Arguments -eq $argString -and $_.WorkingDirectory -eq $PSScriptRoot
+            $_.Execute -eq $expectedAction.Execute -and $_.Arguments -eq $expectedAction.Arguments -and $_.WorkingDirectory -eq $expectedAction.WorkingDirectory
         })
         if ($matchingAction.Count -eq 0) { throw "Resume task '$registeredName' does not contain the exact expected orchestrator action and arguments." }
         $actualTriggerTypes = @($task.Triggers | ForEach-Object { $_.CimClass.CimClassName })

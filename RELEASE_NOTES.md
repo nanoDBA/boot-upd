@@ -5,6 +5,21 @@
 
 ---
 
+## Unreleased
+
+The PowerShell 7.7 MSIX handoff now removes the old 7.6 MSI without leaving boot-upd's launch
+paths behind.
+
+- `upd` checks the user's MSIX alias before PATH, and `upd bootstrap` now removes a leftover MSI
+  even when the MSIX is already current.
+- Windows Terminal profiles, SYSTEM and user scheduled tasks, OpenSSH, App Paths, and the
+  machine PATH are updated during the switch. Terminal settings get timestamped backups and
+  are edited without stripping their comments. Open Terminal windows still need a restart.
+- SYSTEM paths are refreshed after boot-upd-managed MSIX upgrades. No fixed-path shim is added.
+- MSI `Modules` and `Scripts` content moves to the shared PowerShell folders; conflicting files
+  are preserved and logged. Password-backed scheduled tasks are reported for their owner to
+  update because boot-upd cannot change their saved credentials.
+
 ## v2.5.93 (2026-11-12)
 
 Windows feature updates now install. A machine on Windows 11 25H2 that Windows Update was offering 26H2 ran the updater daily and reported Windows Update converged every time, while Settings kept showing the new version as available. Two things hid it. The phase asked PSWindowsUpdate for three categories only (Security, Critical, Definition), and feature updates live in a fourth. Even with that category added nothing would have appeared: the Windows Update Agent treats every search as "updates marked for installation" unless told otherwise, and a feature update a machine may take but has not yet been pushed is marked optional. The prefetch, the install and the final convergence scan all shared that blind spot, so they agreed with each other.

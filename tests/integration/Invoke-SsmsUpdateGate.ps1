@@ -100,7 +100,7 @@ Invoke-Command -VMName $VMName -Credential $credential -ArgumentList $TimeoutMin
     foreach($path in @('C:\Lab\ssms-gate\result.json','C:\Lab\ssms-gate\provider.log')){
         if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Force -ErrorAction Stop}
     }
-    $action=New-ScheduledTaskAction -Execute 'C:\Program Files\PowerShell\7\pwsh.exe' -Argument '-NoProfile -ExecutionPolicy Bypass -File C:\Lab\ssms-gate\Run-SsmsProvider.ps1' -WorkingDirectory 'C:\Lab\ssms-gate'
+    $action=New-ScheduledTaskAction -Execute (Join-Path $PSHOME 'pwsh.exe') -Argument '-NoProfile -ExecutionPolicy Bypass -File C:\Lab\ssms-gate\Run-SsmsProvider.ps1' -WorkingDirectory 'C:\Lab\ssms-gate'
     $principal=New-ScheduledTaskPrincipal -UserId SYSTEM -LogonType ServiceAccount -RunLevel Highest
     $settings=New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([timespan]::FromMinutes($Minutes+35))
     Register-ScheduledTask -TaskName 'Lab-RunSsmsProvider' -Action $action -Principal $principal -Settings $settings -Force|Out-Null
