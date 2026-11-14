@@ -3957,19 +3957,15 @@ function Wait-ProcessWithIdleTimeout {
 }
 
 function Get-BootUpdatePwshPath {
-    <# The PowerShell 7 runtime is the pwsh.exe in $PSHOME, the folder this PowerShell runs
-       from: the package folder for the MSIX, Program Files\PowerShell\7 for the MSI, the
-       unpacked folder for a ZIP. The executable there runs as SYSTEM (lab-b, 2026-11-12,
-       PowerShell 7.7.0). Not `pwsh` by name: an MSIX install puts pwsh on PATH only as a
-       per-user app execution alias, Get-Command pwsh resolves to that alias inside the
-       user's profile, and SYSTEM (the continuation tasks, the headless fallback) has none.
-       v2.5.92 on an MSIX guest registered every continuation task, the SYSTEM fallback
-       included, with C:\Users\<user>\AppData\Local\Microsoft\WindowsApps\...\pwsh.exe. #>
+    <# Use the executable beside the running PowerShell process. For MSIX this is its
+       versioned package path, which SYSTEM can run. Do not resolve `pwsh` by name: PATH
+       can select the wrong runtime or a per-user alias. The Program Files MSI path is a
+       last-resort compatibility fallback for older installs; it is not a persistent shim. #>
     $home7 = Join-Path $PSHOME 'pwsh.exe'
     if (Test-Path -LiteralPath $home7) { return $home7 }
-    $command = Get-Command pwsh.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($command) { return $command.Source }
-    return (Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe')
+    $legacyPath = Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'
+    if (Test-Path -LiteralPath $legacyPath) { return $legacyPath }
+    throw 'PowerShell 7 executable could not be resolved from the current runtime or MSI fallback path.'
 }
 
 function Invoke-PackageManagerWithTimeout {

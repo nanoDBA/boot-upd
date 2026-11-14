@@ -1150,6 +1150,14 @@ Describe 'PowerShell 7 is started from $PSHOME, never from the process path or b
         Get-BootUpdatePwshPath | Should -Be (Join-Path $PSHOME 'pwsh.exe')
     }
 
+    It 'does not guess a PowerShell executable from PATH when the current runtime is missing' {
+        Mock Test-Path { $false }
+        Mock Get-Command { throw 'A PATH lookup is not a valid runtime fallback.' }
+
+        { Get-BootUpdatePwshPath } | Should -Throw '*PowerShell 7 executable could not be resolved*'
+        Should -Invoke Get-Command -Times 0 -Exactly
+    }
+
     It 'never launches the process path in any script' {
         foreach ($rel in $sources.Keys) {
             $sources[$rel] | Should -Not -Match '\(\[Environment\]::ProcessPath\)|=\s*\[Environment\]::ProcessPath|\{\s*\[Environment\]::ProcessPath' -Because $rel
