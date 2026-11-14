@@ -88,5 +88,6 @@ for every install method, and on an MSI machine it is the same path as before.
   `$PSHOME` is read-only, so no all-users profile in `$PSHOME`, no WSMan endpoint
   registration and no `Set-ExecutionPolicy -Scope LocalMachine`. boot-upd uses none of these.
   An operator who relies on WinRM remoting into PowerShell 7 should know before upgrading.
-- When Microsoft ships SYSTEM support for the packaged pwsh (#27562), nothing here has to
-  change: the full path keeps working, and the alias becomes an extra.
+- If Microsoft adds a stable SYSTEM launch alias for packaged pwsh (#27562), verify how it
+  behaves across MSIX servicing before changing this decision. The current full path is
+  versioned and can go stale when Windows updates the package.
