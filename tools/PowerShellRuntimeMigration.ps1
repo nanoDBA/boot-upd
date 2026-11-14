@@ -373,7 +373,8 @@ function Get-PowerShell7UserPathUpdate {
         $value = $entry.Trim().Trim('"')
         $expanded = [Environment]::ExpandEnvironmentVariables($value).TrimEnd('\')
         $isRuntime = $false
-        if ($expanded -ieq $legacyDirectory -or $expanded -ieq $aliasDirectory -or
+        if ($value -match '(?i)^%(?:LOCALAPPDATA%\\Microsoft\\WindowsApps|USERPROFILE%\\AppData\\Local\\Microsoft\\WindowsApps)(?:\\pwsh\.exe)?$' -or
+            $expanded -ieq $legacyDirectory -or $expanded -ieq $aliasDirectory -or
             $expanded -match '(?i)\\WindowsApps\\Microsoft\.PowerShell_[^\\]+(?:\\pwsh\.exe)?$') {
             $isRuntime = $true
             if (-not $addedAlias) { $null = $seen.Add($aliasDirectory); $entries.Add($aliasDirectory); $addedAlias = $true }
@@ -534,14 +535,15 @@ function Move-PowerShell7LegacyContent {
 }
 
 function Update-PowerShell7References {
-    param([Parameter(Mandatory)]$Installed)
+    param([Parameter(Mandatory)]$Installed,
+          [string]$LegacyPwshPath = (Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'))
     $logPath = Join-Path $env:ProgramData 'BootUpdateCycle\PowerShellRuntimeUpgrade.log'
     $profiles = @(Get-PowerShell7UserProfiles)
     $systemPath = [string]$Installed.PwshPath
-    $terminalCount = Update-PowerShell7TerminalProfiles -Profiles $profiles -LegacyPwshPath $script:LegacyPwshPath -LogPath $logPath
+    $terminalCount = Update-PowerShell7TerminalProfiles -Profiles $profiles -LegacyPwshPath $LegacyPwshPath -LogPath $logPath
     Write-PowerShell7RuntimeLog -LogPath $logPath -Message "TERMINAL MIGRATION COMPLETE: $terminalCount settings file(s) changed; user profiles=$($profiles.Count); package=$systemPath"
-    Update-PowerShell7ScheduledTaskReferences -Profiles $profiles -SystemPwshPath $systemPath -LegacyPwshPath $script:LegacyPwshPath -LogPath $logPath
-    Update-PowerShell7SystemRegistryReferences -LegacyPwshPath $script:LegacyPwshPath -SystemPwshPath $systemPath -LogPath $logPath
-    Update-PowerShell7MachinePath -LegacyPwshPath $script:LegacyPwshPath -SystemPwshPath $systemPath -LogPath $logPath
-    Update-PowerShell7UserPaths -Profiles $profiles -LegacyPwshPath $script:LegacyPwshPath -LogPath $logPath
+    Update-PowerShell7ScheduledTaskReferences -Profiles $profiles -SystemPwshPath $systemPath -LegacyPwshPath $LegacyPwshPath -LogPath $logPath
+    Update-PowerShell7SystemRegistryReferences -LegacyPwshPath $LegacyPwshPath -SystemPwshPath $systemPath -LogPath $logPath
+    Update-PowerShell7MachinePath -LegacyPwshPath $LegacyPwshPath -SystemPwshPath $systemPath -LogPath $logPath
+    Update-PowerShell7UserPaths -Profiles $profiles -LegacyPwshPath $LegacyPwshPath -LogPath $logPath
 }

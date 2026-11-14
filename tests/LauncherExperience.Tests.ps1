@@ -1265,6 +1265,14 @@ Describe 'PowerShell MSIX references are repaired at updater startup' {
         $summary.Manual[0].ReplacementPath | Should -Be 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.1.0_x64__8wekyb3d8bbwe\pwsh.exe'
     }
 
+    It 'keeps user PATH entries on the alias and preserves unrelated entries' {
+        $result = Get-PowerShell7UserPathUpdate `
+            -CurrentPath '%LOCALAPPDATA%\Microsoft\WindowsApps;C:\Program Files\PowerShell\7;C:\Tools' `
+            -LegacyPwshPath 'C:\Program Files\PowerShell\7\pwsh.exe' `
+            -UserPwshAlias 'C:\Users\Sample\AppData\Local\Microsoft\WindowsApps\pwsh.exe'
+        $result | Should -Be 'C:\Users\Sample\AppData\Local\Microsoft\WindowsApps;C:\Tools'
+    }
+
     It 'repairs before starting a run and shows the last stale-reference result in status' {
         $launcherAst = Get-ParsedScript (Join-Path (Split-Path $PSScriptRoot -Parent) 'tools\Invoke-UpdLauncher.ps1')
         $launcherText = Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'tools\Invoke-UpdLauncher.ps1') -Raw
@@ -1272,6 +1280,8 @@ Describe 'PowerShell MSIX references are repaired at updater startup' {
         $runBlock = $launcherText.Substring($runStart, $launcherText.IndexOf("`n    }",$runStart) - $runStart)
         $runBlock | Should -Match 'Invoke-UpdPowerShellReferenceRepair'
         $runBlock.IndexOf('Invoke-UpdPowerShellReferenceRepair') | Should -BeLessThan $runBlock.IndexOf('& $deployPath')
+        $repair = Get-FunctionText -Ast $launcherAst -Name 'Invoke-UpdPowerShellReferenceRepair'
+        $repair | Should -Match 'Update-PowerShell7References -Installed \$installed -LegacyPwshPath'
         $status = Get-FunctionText -Ast $launcherAst -Name 'Show-UpdStatus'
         $status | Should -Match 'Show-UpdPowerShellReferenceStatus'
     }

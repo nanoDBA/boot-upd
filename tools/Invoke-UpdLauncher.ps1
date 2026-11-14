@@ -79,7 +79,7 @@ function Invoke-UpdPowerShellReferenceRepair {
     $summary = Get-PowerShell7RuntimeRepairSummary -Findings $findings
     if ($summary.RepairableCount -or $summary.ManualCount) {
         Write-PowerShell7RuntimeLog -LogPath (Join-Path $env:ProgramData 'BootUpdateCycle\PowerShellRuntimeUpgrade.log') -Message "STARTUP REFERENCE SCAN: repairable=$($summary.RepairableCount); manual=$($summary.ManualCount); installed=$($installed.PwshPath)"
-        Update-PowerShell7References -Installed $installed
+        Update-PowerShell7References -Installed $installed -LegacyPwshPath (Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe')
     }
 }
 
