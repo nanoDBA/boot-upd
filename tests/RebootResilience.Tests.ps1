@@ -36,6 +36,9 @@ BeforeAll {
         'Get-BootUpdateBootReading',
         'Update-BootUpdateStateForBootSession',
         'Get-BootUpdateLaunchContract',
+        'Get-BootUpdateRuntimeLogLine',
+        'Get-BootUpdatePowerShellInstallInventory',
+        'Write-BootUpdatePowerShellInventory',
         'Wait-BootUpdateDelayedServiceStart',
         'Test-PostUpdateHealth',
         'Get-BootUpdateBootSessionId',
@@ -963,6 +966,56 @@ Describe 'Concise provider diagnostics' {
         $winget = Get-FunctionText $invokeAst 'Update-WingetPackages'
         $winget | Should -Match 'StartFailed = \$startFailed'
         $winget | Should -Match 'if \(\$jr\.StartFailed\)[\s\S]*?\$anyTimeout = \$true[\s\S]*?continue'
+    }
+}
+
+Describe 'PowerShell runtime diagnostics' {
+    It 'reports the executing PowerShell version, install folder, account, and launch source' {
+        $line = Get-BootUpdateRuntimeLogLine -LaunchOrigin 'continuation'
+
+        $line | Should -Match ([regex]::Escape([string]$PSVersionTable.PSVersion))
+        $line | Should -Match ([regex]::Escape($PSHOME))
+        $line | Should -Match '(?i)Account: .+'
+        $line | Should -Match 'Launched by: continuation'
+    }
+}
+
+Describe 'PowerShell installation inventory' {
+    It 'reports installed MSI and MSIX packages separately with their versions' {
+        Mock Get-AppxPackage {
+            [pscustomobject]@{
+                Name='Microsoft.PowerShell'; PublisherId='8wekyb3d8bbwe'
+                Version=[version]'7.7.0.0'; InstallLocation='C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe'
+            }
+        }
+        Mock Get-ItemProperty {
+            @(
+                [pscustomobject]@{ DisplayName='PowerShell 7-x64'; DisplayVersion='7.6.10.0'; WindowsInstaller=1; UninstallString='MsiExec.exe /X{11111111-2222-3333-4444-555555555555}' }
+                [pscustomobject]@{ DisplayName='Example App'; DisplayVersion='1.0'; WindowsInstaller=1; UninstallString='MsiExec.exe /X{AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE}' }
+            )
+        }
+
+        $inventory = Get-BootUpdatePowerShellInstallInventory
+
+        (@($inventory.Msi | ForEach-Object Version) -join ',') | Should -Be '7.6.10.0'
+        (@($inventory.Msix | ForEach-Object Version) -join ',') | Should -Be '7.7.0.0'
+    }
+
+    It 'logs each inventory snapshot with its cycle stage and MSI/MSIX versions' {
+        $script:InventoryLog = [Collections.Generic.List[string]]::new()
+        Mock Write-Log { $script:InventoryLog.Add($Message) }
+        Mock Get-AppxPackage {
+            [pscustomobject]@{ Name='Microsoft.PowerShell'; PublisherId='8wekyb3d8bbwe'; Version=[version]'7.7.0.0'; InstallLocation='C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe' }
+        }
+        Mock Get-ItemProperty {
+            [pscustomobject]@{ DisplayName='PowerShell 7-x64'; DisplayVersion='7.6.10.0'; WindowsInstaller=1; UninstallString='MsiExec.exe /X{11111111-2222-3333-4444-555555555555}' }
+        }
+
+        Write-BootUpdatePowerShellInventory -Stage 'cycle-start'
+        Write-BootUpdatePowerShellInventory -Stage 'cycle-end'
+
+        ($script:InventoryLog -join "`n") | Should -Match 'Stage: cycle-start.*MSI: 7\.6\.10\.0.*MSIX: 7\.7\.0\.0'
+        ($script:InventoryLog -join "`n") | Should -Match 'Stage: cycle-end.*MSI: 7\.6\.10\.0.*MSIX: 7\.7\.0\.0'
     }
 }
 
@@ -1904,7 +1957,9 @@ Describe 'In-flight watchdog scheduling' {
 
     BeforeEach {
         $script:CapturedTasks = @{}
-        Mock Write-Log { }
+        $script:CapturedLog = [Collections.Generic.List[string]]::new()
+        Mock Write-Log { $script:CapturedLog.Add($Message) }
+        Mock Get-BootUpdatePwshPath { 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\pwsh.exe' }
         Mock Resolve-BootUpdateResumeAccount { 'CONTOSO\updtest' }
         Mock Register-ScheduledTask {
             $script:CapturedTasks[$TaskName] = [pscustomobject]@{
@@ -1981,6 +2036,20 @@ Describe 'In-flight watchdog scheduling' {
 
         $script:CapturedTasks['BootUpdateCycle'].Action.Arguments | Should -Match '-WatchdogIntervalMinutes 15'
         $script:CapturedTasks['BootUpdateCycleFallback'].Action.Arguments | Should -Match '-WatchdogIntervalMinutes 15'
+    }
+
+    It 'logs the exact task program and labels primary and fallback launch origins' {
+        Register-BootUpdateTaskForReboot
+
+        $expectedProgram = 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\pwsh.exe'
+        $primary = $script:CapturedTasks['BootUpdateCycle']
+        $fallback = $script:CapturedTasks['BootUpdateCycleFallback']
+        $primary.Action.Execute | Should -Be $expectedProgram
+        $fallback.Action.Execute | Should -Be $expectedProgram
+        $primary.Action.Arguments | Should -Match '-LaunchOrigin continuation'
+        $fallback.Action.Arguments | Should -Match '-LaunchOrigin fallback'
+        ($script:CapturedLog -join "`n") | Should -Match ([regex]::Escape("Task action | Name: BootUpdateCycle | Program: $expectedProgram"))
+        ($script:CapturedLog -join "`n") | Should -Match ([regex]::Escape("Task action | Name: BootUpdateCycleFallback | Program: $expectedProgram"))
     }
 
     It 'forwards an SSMS skip on resume and omits it by default' {

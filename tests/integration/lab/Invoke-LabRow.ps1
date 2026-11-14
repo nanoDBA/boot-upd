@@ -56,7 +56,9 @@ param(
     [string]$ScreenCaptureScript = '',
     <# Collect a deliberate saved-user wait as PARTIAL instead of idling until timeout.
        Resume-LabSavedUser.ps1 can then test the real sign-in continuation. #>
-    [switch]$StopAtSavedUserWait
+    [switch]$StopAtSavedUserWait,
+    <# Stop after the narrow runtime-handoff claim is recorded, without waiting for Windows Update. #>
+    [switch]$StopAfterContinuationRuntime
 )
 
 function Test-LabCompletionEvidence {
@@ -80,6 +82,42 @@ function Test-LabSavedUserWaitEvidence {
     return ($Phase -eq 'UserContextPending' -and -not [string]::IsNullOrWhiteSpace($ResumeUser) -and
         $LogonOnlyVerified -and @($TaskNames).Count -eq 1 -and $TaskNames[0] -eq 'BootUpdateCycle' -and
         @($PrimaryTriggerTypes).Count -eq 1 -and $PrimaryTriggerTypes[0] -eq 'MSFT_TaskLogonTrigger')
+}
+
+function New-LabStageEvidence {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][datetime]$StartedAtUtc,
+        [Parameter(Mandatory)][datetime]$ObservedAtUtc,
+        [Parameter(Mandatory)]$Facts
+    )
+    [pscustomobject][ordered]@{
+        Name = $Name
+        ObservedAtUtc = $ObservedAtUtc.ToUniversalTime().ToString('o')
+        DurationSeconds = [math]::Round(($ObservedAtUtc.ToUniversalTime() - $StartedAtUtc.ToUniversalTime()).TotalSeconds, 3)
+        Facts = $Facts
+    }
+}
+
+function Get-LabPowerShellRuntimeHandoffEvidence {
+    param([string[]]$RuntimeLines, [string[]]$MsiVersions, [string[]]$MsixVersions, [bool]$RebootSeen = $false)
+
+    $upd = @($RuntimeLines | Where-Object { $_ -match '^PowerShell runtime \| Version: 7\.7(?:\.\d+)?\b.*\| Install folder: .*\\WindowsApps\\Microsoft\.PowerShell_7\.7\..*\| Account: SYSTEM \| Launched by: upd$' } | Select-Object -First 1)
+    $continuation = @($RuntimeLines | Where-Object { $_ -match '^PowerShell runtime \| Version: 7\.7(?:\.\d+)?\b.*\| Install folder: .*\\WindowsApps\\Microsoft\.PowerShell_7\.7\..*\| Account: SYSTEM \| Launched by: continuation$' } | Select-Object -Last 1)
+    $msiPresent = @($MsiVersions | Where-Object { $_ -match '^7\.6\.' }).Count -gt 0
+    $msixPresent = @($MsixVersions | Where-Object { $_ -match '^7\.7\.' }).Count -gt 0
+    [pscustomobject]@{
+        Passed = ($RebootSeen -and $upd.Count -gt 0 -and $continuation.Count -gt 0 -and $msiPresent -and $msixPresent)
+        UpdRuntimeLine = if ($upd.Count) { [string]$upd[0] } else { $null }
+        ContinuationRuntimeLine = if ($continuation.Count) { [string]$continuation[0] } else { $null }
+        MsiVersions = @($MsiVersions)
+        MsixVersions = @($MsixVersions)
+    }
+}
+
+function Test-LabShouldStopAfterContinuationRuntime {
+    param([bool]$Enabled, $Evidence)
+    return ($Enabled -and $null -ne $Evidence -and [bool]$Evidence.Passed)
 }
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'LabCredential.ps1')
@@ -134,7 +172,7 @@ $manifest = [ordered]@{
     HarnessSha256=(Get-FileHash $PSCommandPath).Hash
     Launcher=$Launcher; DeployArgs=$DeployArgs; ArmReboots=$ArmReboots
     SystemContext=[bool]$SystemContext; TimeoutMinutes=$TimeoutMinutes; SkipSync=[bool]$SkipSync
-    StopAtSavedUserWait=[bool]$StopAtSavedUserWait
+    StopAtSavedUserWait=[bool]$StopAtSavedUserWait; StopAfterContinuationRuntime=[bool]$StopAfterContinuationRuntime
     ModuleCacheSha256=$ModuleCacheSha256; InjectWhen=$InjectWhen; InjectionConfigured=[bool]$InjectAction
     SourceFiles=$sourceHashes
     InjectionAction=if ($InjectAction) { $InjectAction.ToString() } else { $null }
@@ -356,6 +394,7 @@ if ($n -lt $limit -and $n -lt $features.Count) {
    updater's own BootUpdateCycleFallback task runs in, which is what such a row exercises. #>
 if ($SystemContext) { Say 'launching the cycle as SYSTEM (no interactive user)' }
 else { Say 'launching the cycle in the interactive session' }
+$runStartedAtUtc = [datetime]::UtcNow
 Invoke-Command -VMName $VMName -Credential $cred -ArgumentList $GuestUser, ([bool]$SystemContext), $DeployArgs, $Launcher -ScriptBlock {
     param($User, $AsSystem, $Extra, $Entry)
     <# Capture Deploy's own stdout and stderr. Without this a failing deploy leaves nothing
@@ -414,6 +453,20 @@ $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
    on one or several guests' host-timeline.txt is a live view that costs no agent at all. #>
 $timelinePath = Join-Path $evidenceDir 'host-timeline.txt'
 function Add-Timeline { param([string]$Line) Add-Content -LiteralPath $timelinePath -Value $Line }
+$stageEvidencePath = Join-Path $evidenceDir 'stage-evidence.json'
+$stageEvidence = [Collections.Generic.List[object]]::new()
+$script:phaseStartedAtUtc = $runStartedAtUtc
+$bootstrapObservedAtUtc = $null
+$rebootObservedAtUtc = $null
+$stoppedAfterContinuationRuntime = $false
+function Add-LabStage {
+    param([string]$Name, [datetime]$ObservedAtUtc, $Facts)
+    $stage = New-LabStageEvidence -Name $Name -StartedAtUtc $script:phaseStartedAtUtc -ObservedAtUtc $ObservedAtUtc -Facts $Facts
+    $stageEvidence.Add($stage)
+    $stageEvidence.ToArray() | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $stageEvidencePath
+    Add-Timeline ("{0} stage={1} duration={2}s facts={3}" -f $ObservedAtUtc.ToString('o'), $stage.Name, $stage.DurationSeconds, (($Facts | ConvertTo-Json -Compress -Depth 4) -replace '[\r\n]', ' '))
+    $script:phaseStartedAtUtc = $ObservedAtUtc
+}
 <# The guest's updater log, appended poll by poll as it grows. BootUpdateCycle.log in the
    evidence directory is still the authoritative copy, taken whole at collection time; this
    one exists for the rows that never get there. A guest that dies, hangs, or loses its
@@ -464,6 +517,13 @@ while ((Get-Date) -lt $deadline) {
                 ResumeUser = [string]$state.ResumeUser
                 LogonOnlyVerified = @($lines | Where-Object { $_ -match 'Resume chain verified: BootUpdateCycle \(saved-user logon only\)' }).Count -gt 0
                 StateFileExists = Test-Path 'C:\ProgramData\BootUpdateCycle\BootUpdateCycle.state.json'
+                LatestBootTime = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+                RuntimeLines = @($lines | Where-Object { $_ -match '^PowerShell runtime \|' })
+                MsiVersions = @(Get-ItemProperty @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*') -ErrorAction SilentlyContinue |
+                    Where-Object { $_.DisplayName -match '^PowerShell 7(?:\b|[- ])' -and [int]($_.WindowsInstaller -as [int]) -eq 1 -and $_.DisplayVersion } |
+                    ForEach-Object { [string]$_.DisplayVersion } | Sort-Object -Unique)
+                MsixVersions = @(Get-AppxPackage -AllUsers -Name Microsoft.PowerShell -ErrorAction SilentlyContinue |
+                    Where-Object PublisherId -eq '8wekyb3d8bbwe' | ForEach-Object { [string]$_.Version } | Sort-Object -Unique)
                 <# consent.exe is the UAC consent dialog itself, so counting it counts real prompts rather than inferring them from a log. #>
                 Consent  = @(Get-Process consent -ErrorAction SilentlyContinue).Count
                 Pwsh     = [bool](@(@(Get-AppxPackage -AllUsers -Name Microsoft.PowerShell -ErrorAction SilentlyContinue | Where-Object PublisherId -eq '8wekyb3d8bbwe' | Sort-Object { [version]$_.Version } -Descending | ForEach-Object { Join-Path $_.InstallLocation 'pwsh.exe' }) + 'C:\Program Files\PowerShell\7\pwsh.exe' | Where-Object { Test-Path -LiteralPath $_ })[0])
@@ -478,6 +538,34 @@ while ((Get-Date) -lt $deadline) {
         if ($r.Pwsh) { $pwshSeen = $true }
         Add-Timeline (("{0} passes={1} lines={2} tasks={3} :: {4}" -f (Get-Date -Format 'HH:mm:ss'), $r.Passes, $r.Lines, $r.Tasks, $r.Last))
         $knownLogLines = Add-BootUpdLabLiveLog -Path $liveLogPath -KnownCount $knownLogLines -GuestCount $r.Lines -NewLines @($r.NewLines)
+        $observedAtUtc = [datetime]::UtcNow
+        $updRuntime = @($r.RuntimeLines | Where-Object { $_ -match '\| Launched by: upd$' } | Select-Object -First 1)
+        if ($updRuntime.Count -and $null -eq $bootstrapObservedAtUtc) {
+            $bootstrapObservedAtUtc = $observedAtUtc
+            Add-LabStage -Name 'bootstrap-done' -ObservedAtUtc $observedAtUtc -Facts ([pscustomobject]@{
+                RuntimeLine=[string]$updRuntime[0]; MsiVersions=@($r.MsiVersions); MsixVersions=@($r.MsixVersions)
+            })
+        }
+        if ($null -ne $bootstrapObservedAtUtc -and $null -eq $rebootObservedAtUtc -and [datetime]$r.LatestBootTime -gt $bootstrapObservedAtUtc) {
+            $rebootObservedAtUtc = $observedAtUtc
+            Add-LabStage -Name 'reboot-seen' -ObservedAtUtc $observedAtUtc -Facts ([pscustomobject]@{
+                LatestBootTime=([datetime]$r.LatestBootTime).ToUniversalTime().ToString('o'); MsiVersions=@($r.MsiVersions); MsixVersions=@($r.MsixVersions)
+            })
+        }
+        $handoffEvidence = Get-LabPowerShellRuntimeHandoffEvidence -RuntimeLines @($r.RuntimeLines) `
+            -MsiVersions @($r.MsiVersions) -MsixVersions @($r.MsixVersions) -RebootSeen ($null -ne $rebootObservedAtUtc)
+        if ($null -ne $rebootObservedAtUtc -and $handoffEvidence.ContinuationRuntimeLine -and -not @($stageEvidence | Where-Object Name -eq 'continuation-relaunched').Count) {
+            Add-LabStage -Name 'continuation-relaunched' -ObservedAtUtc $observedAtUtc -Facts ([pscustomobject]@{
+                RuntimeLine=$handoffEvidence.ContinuationRuntimeLine; HandoffPassed=[bool]$handoffEvidence.Passed
+                MsiVersions=@($r.MsiVersions); MsixVersions=@($r.MsixVersions)
+            })
+        }
+        if (Test-LabShouldStopAfterContinuationRuntime -Enabled ([bool]$StopAfterContinuationRuntime) -Evidence $handoffEvidence) {
+            $stoppedAfterContinuationRuntime = $true
+            Add-Timeline ("{0} stopping-after-continuation-runtime cycle-not-completed-by-design=true" -f $observedAtUtc.ToString('o'))
+            Say 'continuation runtime verified; stopping row without waiting for Windows Update'
+            break
+        }
         if ($injectArmed -and -not $injectAttempted -and $r.Matched) {
             Say "injecting on match at $(Get-Date -Format 'HH:mm:ss')"
             Add-Timeline (("{0} INJECTED on /{1}/" -f (Get-Date -Format 'HH:mm:ss'), $InjectWhen))
@@ -543,6 +631,12 @@ $evidence = Invoke-Command -VMName $VMName -Credential $cred -ScriptBlock {
             [pscustomobject]@{ Name=$_.TaskName; TriggerTypes=@($_.Triggers | ForEach-Object { $_.CimClass.CimClassName }); Xml=(Export-ScheduledTask -TaskName $_.TaskName) }
         })
         CbsPending      = Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
+        RuntimeLines    = @($lines | Where-Object { $_ -match '^PowerShell runtime \|' })
+        MsiVersions     = @(Get-ItemProperty @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*') -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -match '^PowerShell 7(?:\b|[- ])' -and [int]($_.WindowsInstaller -as [int]) -eq 1 -and $_.DisplayVersion } |
+            ForEach-Object { [string]$_.DisplayVersion } | Sort-Object -Unique)
+        MsixVersions    = @(Get-AppxPackage -AllUsers -Name Microsoft.PowerShell -ErrorAction SilentlyContinue |
+            Where-Object PublisherId -eq '8wekyb3d8bbwe' | ForEach-Object { [string]$_.Version } | Sort-Object -Unique)
         <# For a no-user row, proof that no interactive session ever appeared is part of the
            result: a SYSTEM-fallback claim means nothing if somebody was quietly logged in. #>
         ConsoleUser     = (Get-CimInstance Win32_ComputerSystem).UserName
@@ -558,6 +652,17 @@ ConvertTo-Json -InputObject @($evidence.ContinuationTasks) -Depth 5 | Set-Conten
 $schedulerEvents = @($evidence.SchedulerEvents | ConvertFrom-BootUpdLabTaskEvent | Where-Object { $_.TaskName -in @('\BootUpdateCycle','\BootUpdateCycleFallback') })
 ConvertTo-Json -InputObject @($schedulerEvents.Xml) | Set-Content (Join-Path $evidenceDir 'task-events.json')
 $evidence.Log | Set-Content (Join-Path $evidenceDir 'BootUpdateCycle.log')
+$runtimeHandoffEvidence = Get-LabPowerShellRuntimeHandoffEvidence -RuntimeLines @($evidence.RuntimeLines) `
+    -MsiVersions @($evidence.MsiVersions) -MsixVersions @($evidence.MsixVersions) `
+    -RebootSeen (@($stageEvidence | Where-Object Name -eq 'reboot-seen').Count -gt 0)
+if ($StopAfterContinuationRuntime -and $runtimeHandoffEvidence.Passed) { $stoppedAfterContinuationRuntime = $true }
+if ($StopAfterContinuationRuntime -and $runtimeHandoffEvidence.Passed -and -not @($stageEvidence | Where-Object Name -eq 'continuation-relaunched').Count) {
+    $nowUtc = [datetime]::UtcNow
+    Add-LabStage -Name 'continuation-relaunched' -ObservedAtUtc $nowUtc -Facts ([pscustomobject]@{
+        RuntimeLine=$runtimeHandoffEvidence.ContinuationRuntimeLine; HandoffPassed=$true
+        MsiVersions=@($evidence.MsiVersions); MsixVersions=@($evidence.MsixVersions)
+    })
+}
 if ($evidence.DeployOutput.Count) { $evidence.DeployOutput | Set-Content (Join-Path $evidenceDir 'deploy-output.txt') }
 ConvertTo-Json -InputObject @($evidence.OsBootTimes) | Set-Content (Join-Path $evidenceDir 'os-boot-times.json')
 if ($ScreenCaptureScript) {
@@ -610,6 +715,12 @@ $summary = [pscustomobject]@{
     VM               = $VMName
     Checkpoint       = $Checkpoint
     Completed        = $complete
+    PowerShellRuntimeHandoffPassed = [bool]$runtimeHandoffEvidence.Passed
+    StoppedAfterContinuationRuntime = [bool]$stoppedAfterContinuationRuntime
+    CycleNotCompletedByDesign = [bool]($StopAfterContinuationRuntime -and $runtimeHandoffEvidence.Passed -and -not $complete)
+    PowerShellRuntimeLines = @($evidence.RuntimeLines)
+    MsiVersions       = @($evidence.MsiVersions)
+    MsixVersions      = @($evidence.MsixVersions)
     Passes           = @($evidence.Log | Where-Object { $_ -match 'BOOT UPDATE CYCLE (STARTED|RESUMED)' }).Count
     RebootsClaimed   = $claimed
     RebootsObservedOS = $bootsDuringRun.Count

@@ -81,6 +81,10 @@ Describe 'Batch launcher file format' {
 }
 
 Describe 'upd.cmd prefers the PowerShell MSIX alias' {
+    It 'marks runs started through upd for pass diagnostics' {
+        $cmdSource | Should -Match '(?im)^set "BOOTUPDATE_LAUNCH_ORIGIN=upd"\r?$'
+    }
+
     It 'uses the WindowsApps alias before a PATH result' {
         $aliasRoot = Join-Path $TestDrive 'user'
         $windowsApps = Join-Path $aliasRoot 'Microsoft\WindowsApps'

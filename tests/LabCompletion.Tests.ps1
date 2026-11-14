@@ -13,6 +13,12 @@ BeforeAll {
         $node.Name -eq 'Test-LabSavedUserWaitEvidence'
     }, $true)
     . ([scriptblock]::Create($waitFn.Extent.Text))
+    foreach ($name in @('New-LabStageEvidence','Get-LabPowerShellRuntimeHandoffEvidence','Test-LabShouldStopAfterContinuationRuntime')) {
+        $helper = $ast.Find({ param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
+        }, $true)
+        if ($helper) { . ([scriptblock]::Create($helper.Extent.Text)) }
+    }
 }
 
 Describe 'A parked saved-user cycle needs checkpoint and scheduler evidence' {
@@ -72,5 +78,62 @@ Describe 'Lab completion requires observed cleanup' {
         $completed | Should -BeTrue
         $completed = Test-LabCompletionEvidence -Passes 2 -CompletionRecords 1 -TasksRemaining 0 -StateFileExists $true
         $completed | Should -BeFalse
+    }
+}
+
+Describe 'Lab runtime handoff stage evidence' {
+    It 'records the elapsed phase time with the observed facts' {
+        $start = [datetime]'2026-11-14T12:00:00Z'
+        $observed = [datetime]'2026-11-14T12:00:03.500Z'
+        $facts = [pscustomobject]@{ Runtime='PowerShell 7.7'; MSI=@('7.6.10.0'); MSIX=@('7.7.0.0') }
+
+        $stage = New-LabStageEvidence -Name 'bootstrap-done' -StartedAtUtc $start -ObservedAtUtc $observed -Facts $facts
+
+        $stage.Name | Should -Be 'bootstrap-done'
+        $stage.DurationSeconds | Should -Be 3.5
+        $stage.Facts.Runtime | Should -Be 'PowerShell 7.7'
+    }
+
+    It 'passes only when upd and the SYSTEM continuation use 7.7 while both installs remain' {
+        $runtimeLines = @(
+            'PowerShell runtime | Version: 7.7.0 | Install folder: C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\pwsh.exe | Account: SYSTEM | Launched by: upd',
+            'PowerShell runtime | Version: 7.7.0 | Install folder: C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\pwsh.exe | Account: SYSTEM | Launched by: continuation'
+        )
+
+        $evidence = Get-LabPowerShellRuntimeHandoffEvidence -RuntimeLines $runtimeLines `
+            -MsiVersions @('7.6.10.0') -MsixVersions @('7.7.0.0') -RebootSeen $true
+
+        $evidence.Passed | Should -BeTrue
+        $evidence.ContinuationRuntimeLine | Should -Be $runtimeLines[1]
+    }
+
+    It 'rejects a fallback launch or a missing MSI instead of overstating the row' {
+        $runtimeLines = @(
+            'PowerShell runtime | Version: 7.7.0 | Install folder: C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\pwsh.exe | Account: SYSTEM | Launched by: upd',
+            'PowerShell runtime | Version: 7.7.0 | Install folder: C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\pwsh.exe | Account: SYSTEM | Launched by: fallback'
+        )
+
+        $evidence = Get-LabPowerShellRuntimeHandoffEvidence -RuntimeLines $runtimeLines `
+            -MsiVersions @() -MsixVersions @('7.7.0.0') -RebootSeen $true
+
+        $evidence.Passed | Should -BeFalse
+    }
+
+    It 'does not call a continuation handoff a pass without a reboot between launches' {
+        $runtimeLines = @(
+            'PowerShell runtime | Version: 7.7.0 | Install folder: C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\pwsh.exe | Account: SYSTEM | Launched by: upd',
+            'PowerShell runtime | Version: 7.7.0 | Install folder: C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\pwsh.exe | Account: SYSTEM | Launched by: continuation'
+        )
+
+        $evidence = Get-LabPowerShellRuntimeHandoffEvidence -RuntimeLines $runtimeLines `
+            -MsiVersions @('7.6.10.0') -MsixVersions @('7.7.0.0') -RebootSeen $false
+
+        $evidence.Passed | Should -BeFalse
+    }
+
+    It 'stops only after the qualifying continuation runtime has been observed' {
+        Test-LabShouldStopAfterContinuationRuntime -Enabled $true -Evidence ([pscustomobject]@{ Passed=$false }) | Should -BeFalse
+        Test-LabShouldStopAfterContinuationRuntime -Enabled $true -Evidence ([pscustomobject]@{ Passed=$true }) | Should -BeTrue
+        Test-LabShouldStopAfterContinuationRuntime -Enabled $false -Evidence ([pscustomobject]@{ Passed=$true }) | Should -BeFalse
     }
 }

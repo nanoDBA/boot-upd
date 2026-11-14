@@ -124,6 +124,7 @@ param(
     [string]$IncludePatternsBase64 = '', # Internal scheduled-resume transport (UTF-8 JSON array).
     [ValidateSet('Quiet','Normal','Verbose','Debug')]
     [string]$OutputMode      = 'Normal', # Console detail; press v during an interactive run to cycle modes.
+    [Parameter(DontShow)][string]$LaunchOrigin = '', # Internal provenance for upd and scheduled resume tasks.
     [switch]$PreviewSplash               # Render all splash themes and exit (no updates). Also via `upd splash`.
 )
 
@@ -374,6 +375,7 @@ $script:PhaseHooks             = @{}
 $script:DisableSelfUpdate      = $DisableSelfUpdate
 $script:ConfigUrl              = $ConfigUrl
 $script:OutputMode             = $OutputMode
+$script:LaunchOrigin           = $LaunchOrigin
 
 if ($PSBoundParameters.ContainsKey('WebhookUrl')) {
     if ([string]::IsNullOrWhiteSpace($WebhookUrl)) {
@@ -7588,8 +7590,10 @@ function Register-BootUpdateTaskForReboot {
         $taskArgs += "-IncludePatternsBase64 $encodedPatterns"
     }
     if ($script:NotificationLevel -ne 'Full') { $taskArgs += "-NotificationLevel $($script:NotificationLevel)" }
-    $argString = $taskArgs -join ' '
-    $action   = New-ScheduledTaskAction -Execute $pwshPath -Argument $argString -WorkingDirectory $PSScriptRoot
+    $continuationArgString = (@($taskArgs) + '-LaunchOrigin continuation') -join ' '
+    $fallbackArgString = (@($taskArgs) + '-LaunchOrigin fallback') -join ' '
+    $action = New-ScheduledTaskAction -Execute $pwshPath -Argument $continuationArgString -WorkingDirectory $PSScriptRoot
+    $fallbackAction = New-ScheduledTaskAction -Execute $pwshPath -Argument $fallbackArgString -WorkingDirectory $PSScriptRoot
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
         -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 4) `
         -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 2) -MultipleInstances IgnoreNew
@@ -7660,6 +7664,7 @@ function Register-BootUpdateTaskForReboot {
         } else {
             'Boot update loop: patches everything, reboots until clean. (user context via ARSO)'
         }
+        Write-Log "Task action | Name: $taskName | Program: $pwshPath | Launched by: continuation" -Level Info
         Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $userTriggers -Principal $userPrincipal -Settings $settings `
             -Description $userTaskDescription -Force -ErrorAction Stop | Out-Null
         $registeredTaskNames.Add($taskName)
@@ -7674,7 +7679,8 @@ function Register-BootUpdateTaskForReboot {
             $fallbackTriggers = if ($fallbackRetryTrigger) { @($fbTrigger, $fallbackRetryTrigger) } else { @($fbTrigger) }
             if ($fallbackWatchdogTrigger) { $fallbackTriggers = @($fallbackTriggers) + $fallbackWatchdogTrigger }
             $fbPrincipal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-            Register-ScheduledTask -TaskName 'BootUpdateCycleFallback' -Action $action -Trigger $fallbackTriggers -Principal $fbPrincipal -Settings $settings `
+            Write-Log "Task action | Name: BootUpdateCycleFallback | Program: $pwshPath | Launched by: fallback" -Level Info
+            Register-ScheduledTask -TaskName 'BootUpdateCycleFallback' -Action $fallbackAction -Trigger $fallbackTriggers -Principal $fbPrincipal -Settings $settings `
                 -Description 'Boot update loop fallback: runs as SYSTEM if ARSO sign-on does not occur.' -Force -ErrorAction Stop | Out-Null
             $registeredTaskNames.Add('BootUpdateCycleFallback')
             $expectedPrincipal['BootUpdateCycleFallback'] = 'SYSTEM'
@@ -7686,6 +7692,7 @@ function Register-BootUpdateTaskForReboot {
         $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
         $systemTriggers = if ($retryTrigger) { @($trigger, $retryTrigger) } else { @($trigger) }
         if ($watchdogTrigger) { $systemTriggers = @($systemTriggers) + $watchdogTrigger }
+        Write-Log "Task action | Name: $taskName | Program: $pwshPath | Launched by: continuation" -Level Info
         Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $systemTriggers -Principal $principal -Settings $settings `
             -Description 'Boot update loop: patches everything, reboots until clean.' -Force -ErrorAction Stop | Out-Null
         $registeredTaskNames.Add($taskName)
@@ -7719,8 +7726,9 @@ function Register-BootUpdateTaskForReboot {
             if (-not $principalMatches) { throw "Resume task '$registeredName' has the wrong principal (expected '$expectedUser', found '$actualPrincipal')." }
         }
         if ([int]$task.Settings.RestartCount -ne 3) { throw "Resume task '$registeredName' is missing its retry policy." }
+        $expectedArgs = if ($registeredName -eq 'BootUpdateCycleFallback') { $fallbackArgString } else { $continuationArgString }
         $matchingAction = @($task.Actions | Where-Object {
-            $_.Execute -eq $pwshPath -and $_.Arguments -eq $argString -and $_.WorkingDirectory -eq $PSScriptRoot
+            $_.Execute -eq $pwshPath -and $_.Arguments -eq $expectedArgs -and $_.WorkingDirectory -eq $PSScriptRoot
         })
         if ($matchingAction.Count -eq 0) { throw "Resume task '$registeredName' does not contain the exact expected orchestrator action and arguments." }
         $actualTriggerTypes = @($task.Triggers | ForEach-Object { $_.CimClass.CimClassName })
@@ -8885,6 +8893,47 @@ function Apply-RemoteConfig {
 #endregion
 
 #region Main Orchestration
+function Get-BootUpdatePowerShellInstallInventory {
+    $uninstallPaths = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    )
+    $msi = @(Get-ItemProperty -Path $uninstallPaths -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.DisplayName -match '^PowerShell 7(?:\b|[- ])' -and
+            [int]($_.WindowsInstaller -as [int]) -eq 1 -and
+            -not [string]::IsNullOrWhiteSpace([string]$_.DisplayVersion)
+        } | ForEach-Object {
+            [pscustomobject]@{ Version=[string]$_.DisplayVersion }
+        } | Sort-Object Version -Unique)
+    $msix = @(Get-AppxPackage -AllUsers -Name Microsoft.PowerShell -ErrorAction SilentlyContinue |
+        Where-Object { $_.PublisherId -eq '8wekyb3d8bbwe' } | ForEach-Object {
+            [pscustomobject]@{ Version=[string]$_.Version }
+        } | Sort-Object Version -Unique)
+    return [pscustomobject]@{ Msi=$msi; Msix=$msix }
+}
+
+function Write-BootUpdatePowerShellInventory {
+    param([Parameter(Mandatory)][ValidateSet('cycle-start','cycle-end')][string]$Stage)
+
+    $inventory = Get-BootUpdatePowerShellInstallInventory
+    $msiVersions = if (@($inventory.Msi).Count) { (@($inventory.Msi | ForEach-Object Version) -join ',') } else { 'none' }
+    $msixVersions = if (@($inventory.Msix).Count) { (@($inventory.Msix | ForEach-Object Version) -join ',') } else { 'none' }
+    Write-Log "PowerShell installs | Stage: $Stage | MSI: $msiVersions | MSIX: $msixVersions" -Level Info
+}
+
+function Get-BootUpdateRuntimeLogLine {
+    param([string]$LaunchOrigin = '')
+
+    $allowedOrigins = @('upd','continuation','fallback','direct')
+    if ($LaunchOrigin -notin $allowedOrigins) { $LaunchOrigin = [string]$env:BOOTUPDATE_LAUNCH_ORIGIN }
+    if ($LaunchOrigin -notin $allowedOrigins) { $LaunchOrigin = 'direct' }
+
+    $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    $account = if ($identity.User.Value -eq 'S-1-5-18') { 'SYSTEM' } else { $identity.Name }
+    return "PowerShell runtime | Version: $($PSVersionTable.PSVersion) | Install folder: $PSHOME | Account: $account | Launched by: $LaunchOrigin"
+}
+
 function Get-BootUpdateLaunchContract {
     param(
         [Parameter(Mandatory)][bool]$IsFirstIteration,
@@ -9107,7 +9156,9 @@ function Invoke-BootUpdateCycle {
     }
     <# Log file: clean greppable entry #>
     $whatIfTag = if ($WhatIfPreference) { ' [WHATIF]' } else { '' }
+    if ($isFirstIteration) { Write-BootUpdatePowerShellInventory -Stage 'cycle-start' }
     Write-Log "BOOT UPDATE CYCLE$whatIfTag $cycleVerb | Session: $sessionId | Pass: $pendingIteration | Reboots: $($state.RebootCount) | Consecutive stalled reboots: $($state.NoProgressRebootCount)/$MaxIterations | Context: $context"
+    Write-Log (Get-BootUpdateRuntimeLogLine -LaunchOrigin $script:LaunchOrigin) -Level Info
     $isSystemContext = $currentIdentity.User.Value -eq 'S-1-5-18'
     Write-Log (Get-BootUpdateLaunchContract -IsFirstIteration $isFirstIteration -IsSystem $isSystemContext)
     if ($script:MaintenanceWindowStart -ge 0) { Write-Log "Maintenance window: $($script:MaintenanceWindowStart):00 - $($script:MaintenanceWindowEnd):00" -Level Info }
@@ -10281,6 +10332,7 @@ function Invoke-BootUpdateCycle {
             Send-CompletionNotification -Kind $completionToast.Kind -Title $completionToast.Title `
                 -Message $completionToast.Message -Data $summaryData
         }
+        Write-BootUpdatePowerShellInventory -Stage 'cycle-end'
         <# The congratulatory banner is the terminal commit point: hooks, notifications,
            task retirement, state removal, and cleanup verification have all finished. #>
         Write-BootUpdateProgress -Completed

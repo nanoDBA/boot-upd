@@ -5,6 +5,7 @@ goto trampoline_wrapper
 
 :trampoline_active
 setlocal
+set "BOOTUPDATE_LAUNCH_ORIGIN=upd"
 :: BootUpdateCycleVersion=2.5.93
 :: Friendly entry point. Argument parsing, safe demo modes, and elevation live in
 :: tools\Invoke-UpdLauncher.ps1 so quoting and validation remain testable.
