@@ -76,25 +76,34 @@ function Get-PowerShellRuntimeLabRow {
             $terminal = Get-Command (Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\wt.exe') -ErrorAction SilentlyContinue
         }
         if (-not $terminal) { throw 'Windows Terminal was installed but wt.exe did not register for the row user.' }
-        $before = Start-Process -FilePath $terminal.Source -PassThru
-        Start-Sleep -Seconds 5
+        $terminalPath = $terminal.Source
+        $principal = New-ScheduledTaskPrincipal -UserId "$env:COMPUTERNAME\$User" -LogonType Interactive -RunLevel Highest
+        $terminalAction = New-ScheduledTaskAction -Execute $terminalPath
+        Register-ScheduledTask -TaskName 'Lab-Terminal-Launch' -Action $terminalAction -Principal $principal -Force | Out-Null
+        Start-ScheduledTask -TaskName 'Lab-Terminal-Launch'
+        $beforeDeadline = (Get-Date).AddSeconds(45)
+        $before = $null
+        do { $before = Get-Process -Name WindowsTerminal -ErrorAction SilentlyContinue | Select-Object -First 1; if (-not $before) { Start-Sleep -Seconds 2 } } while (-not $before -and (Get-Date) -lt $beforeDeadline)
+        if (-not $before) { throw 'Windows Terminal did not open in the signed-in guest session before MSI removal.' }
         $command = '""C:\Lab\boot-upd\upd.cmd" bootstrap > "C:\Lab\row-b-bootstrap.txt" 2>&1"'
         $bootstrap = Start-Process -FilePath 'cmd.exe' -ArgumentList @('/d','/c',$command) -WorkingDirectory 'C:\Lab\boot-upd' -Wait -PassThru
         if ($bootstrap.ExitCode -ne 0) { throw "upd bootstrap failed with exit $($bootstrap.ExitCode)." }
+        $openAcrossRemoval = [bool](Get-Process -Id $before.Id -ErrorAction SilentlyContinue)
+        if (-not $openAcrossRemoval) { throw 'The original Windows Terminal process did not remain open across MSI removal.' }
         Stop-Process -Name WindowsTerminal -Force -ErrorAction SilentlyContinue
         Start-Sleep -Seconds 2
-        $restarted = Start-Process -FilePath $terminal.Source -PassThru
+        Start-ScheduledTask -TaskName 'Lab-Terminal-Launch'
         $deadline = (Get-Date).AddSeconds(45)
         $child = $null
+        $restarted = $null
         do {
-            $root = Get-CimInstance Win32_Process -Filter "ProcessId = $($restarted.Id)" -ErrorAction SilentlyContinue
-            $ids = @($restarted.Id)
-            if ($root) { $ids += @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object ParentProcessId -eq $root.ProcessId | Select-Object -ExpandProperty ProcessId) }
-            $child = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $ids -contains $_.ParentProcessId -and $_.Name -eq 'pwsh.exe' } | Select-Object -First 1
+            $restarted = Get-Process -Name WindowsTerminal -ErrorAction SilentlyContinue | Select-Object -First 1
+            $child = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'pwsh.exe' -and $_.ExecutablePath -match '(?i)\\WindowsApps\\Microsoft\.PowerShell_7\.7' } | Sort-Object CreationDate -Descending | Select-Object -First 1
             if (-not $child) { Start-Sleep -Seconds 2 }
         } while (-not $child -and (Get-Date) -lt $deadline)
         if (-not $child) { throw 'Restarted Windows Terminal did not start a PowerShell profile.' }
-        [pscustomobject]@{ Row='B'; TerminalBeforeRemoval=$before.Id; TerminalRestarted=$restarted.Id; ChildImage=$child.Name; ChildPath=$child.ExecutablePath; MsiEntriesRemaining=@(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match '^PowerShell 7' }).Count; Result='PASS' }
+        Unregister-ScheduledTask -TaskName 'Lab-Terminal-Launch' -Confirm:$false
+        [pscustomobject]@{ Row='B'; TerminalBeforeRemoval=$before.Id; TerminalStayedOpenAcrossRemoval=$openAcrossRemoval; TerminalRestarted=$restarted.Id; ChildImage=$child.Name; ChildPath=$child.ExecutablePath; MsiEntriesRemaining=@(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match '^PowerShell 7' }).Count; Result='PASS' }
     }
 
     $prepareC = {
