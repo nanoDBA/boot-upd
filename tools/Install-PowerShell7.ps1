@@ -7,13 +7,13 @@ param([switch]$Elevated, [switch]$Upgrade, [switch]$CheckOnly, [int]$WaitForProc
    the last line with one), and WinGet installs only the MSIX for 7.7. Provisioning makes it
    available to every account on the machine; SYSTEM has no app execution alias but runs the
    provisioned pwsh.exe by its full path, which is how boot-upd starts it (Get-BootUpdatePwshPath).
-   An existing MSI install is removed once the MSIX is verified, so one PowerShell 7 remains.
+   An existing 7.6 LTS MSI stays installed beside the newer MSIX. Do not remove it automatically.
    Windows that cannot install the MSIX (older than build 17763, or Server Core) keeps the
    deprecated route, the signed 7.6 LTS MSI, because that is what Microsoft supports there.
    See docs/adr/0008-powershell-7-is-the-machine-wide-msix.md.
 
    Exit codes: 0 done or nothing to do; 1 failed; 3 deferred because an update cycle is in
-   progress; 100 (-CheckOnly) an upgrade is available. #>
+   progress; 100 (-CheckOnly) a newer version is available. #>
 
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -159,14 +159,20 @@ function Get-PowerShell7CheckOnlyResult {
         [AllowEmptyCollection()][object[]]$LegacyEntries = @()
     )
     $decision = Get-PowerShell7UpgradeDecision -InstalledVersion $InstalledVersion -LatestVersion $LatestVersion
+    $coexistence = ''
+    if ($Package -eq 'Msix' -and @($LegacyEntries).Count -gt 0) {
+        $targetVersion = if ($decision.NeedsUpgrade) { $LatestVersion } else { $InstalledVersion }
+        $runtimeVerb = if ($decision.NeedsUpgrade) { 'will use' } else { 'use' }
+        $coexistence = " The PowerShell 7.6 MSI is kept on purpose. upd and a newly opened Windows Terminal $runtimeVerb PowerShell $targetVersion; pwsh typed by name may still start PowerShell 7.6."
+    }
     if ($decision.NeedsUpgrade) {
         $message = if ($decision.Message) { $decision.Message } else { "PowerShell $InstalledVersion is behind the latest stable release $LatestVersion." }
-        return [pscustomobject]@{ ExitCode = 100; Message = $message }
+        return [pscustomobject]@{ ExitCode = 100; Message = ($message + $coexistence) }
     }
     if ($Package -eq 'Msix' -and @($LegacyEntries).Count -gt 0) {
         return [pscustomobject]@{
-            ExitCode = 100
-            Message = "PowerShell $InstalledVersion is current, but a deprecated MSI install is still present and will be removed."
+            ExitCode = 0
+            Message = "PowerShell $InstalledVersion MSIX is current.$coexistence"
         }
     }
     return [pscustomobject]@{ ExitCode = 0; Message = $decision.Message }
@@ -220,6 +226,8 @@ function Get-PowerShell7LegacyEntry {
 }
 
 function Remove-PowerShell7LegacyInstall {
+    <# Deliberately uncalled. The owner chose to keep an installed 7.6 MSI beside the MSIX;
+       see bd on_boot_update_reboot_loop_while_pending_restarts_exist-14qf before changing this. #>
     <# Restart Manager stays off (MSIRESTARTMANAGERCONTROL=Disable): the launcher that started
        this may still be running on the MSI's pwsh.exe, and on lab-b (2026-09-15) Restart
        Manager closing pwsh mid-transaction left a machine with no PowerShell at all. Files in
@@ -378,8 +386,6 @@ function Complete-PowerShell7Install {
         if ($exitCode -eq 3010) { Write-Host 'A restart is pending before the new version is fully in place.' -ForegroundColor Yellow }
     } else {
         $installed = Install-PowerShell7Msix -Release $Release
-        $restartPending = Remove-PowerShell7LegacyInstall
-        if ($restartPending) { Write-Host 'The old MSI install finishes removing itself at the next restart.' -ForegroundColor Yellow }
     }
     Write-Host "PowerShell $($installed.Version) ready: $($installed.PwshPath)" -ForegroundColor Green
     return $installed
@@ -431,10 +437,6 @@ if ($existing -and $Upgrade) {
     }
     if (-not $decision.NeedsUpgrade) {
         Write-Host $decision.Message -ForegroundColor Green
-        if ($legacy.Count -and -not (Test-BootUpdateCycleActive)) {
-            <# The MSIX is current but an earlier removal did not finish. #>
-            $null = Remove-PowerShell7LegacyInstall
-        }
         exit 0
     }
     if (Test-BootUpdateCycleActive) {

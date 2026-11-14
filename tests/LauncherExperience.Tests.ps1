@@ -819,7 +819,7 @@ Describe 'upd bootstrap upgrades an installed PowerShell 7' {
         }
     }
 
-    It 'returns 100 from -CheckOnly when the current MSIX has a legacy MSI to remove' {
+    It 'returns 0 from -CheckOnly when the current MSIX and legacy MSI are kept side by side' {
         $package = if (Test-PowerShell7MsixSupported) { 'Msix' } else { 'Msi' }
         $script:LegacyEntriesForCheckOnly = @([pscustomobject]@{
             PSChildName='{5417B253-1A6D-4638-BC94-743A6EC2E6F4}'; DisplayName='PowerShell 7-x64'
@@ -832,12 +832,29 @@ Describe 'upd bootstrap upgrades an installed PowerShell 7' {
             -LatestVersion $latest.Version -LegacyEntries $legacy
 
         $package | Should -Be 'Msix'
-        $result.ExitCode | Should -Be 100
-        $result.Message | Should -Be "PowerShell $($msix.Version) is current, but a deprecated MSI install is still present and will be removed."
+        $result.ExitCode | Should -Be 0
+        $result.Message | Should -Match 'PowerShell 7\.7.*MSIX.*7\.6.*MSI.*kept on purpose'
+        $result.Message | Should -Match 'newly opened Windows Terminal.*7\.7'
+        $result.Message | Should -Match 'pwsh.*by name.*7\.6'
+        $script:LegacyEntriesForCheckOnly.Count | Should -Be 1
         $result.Message | Should -Not -Match '[\r\n]'
         Should -Invoke Get-AppxPackage -Times 1 -Exactly
         Should -Invoke Get-ItemProperty -Times 2 -Exactly
         Should -Invoke Invoke-RestMethod -Times 1 -Exactly
+    }
+
+    It 'reports that an MSIX upgrade will keep the existing MSI and run the new version' {
+        $legacy = @([pscustomobject]@{
+            PSChildName='{5417B253-1A6D-4638-BC94-743A6EC2E6F4}'; DisplayName='PowerShell 7-x64'
+            DisplayVersion='7.6.10.0'; WindowsInstaller=1; UninstallString='MsiExec.exe /X{5417B253-1A6D-4638-BC94-743A6EC2E6F4}'
+        })
+        $result = Get-PowerShell7CheckOnlyResult -Package Msix -InstalledVersion '7.6.10' `
+            -LatestVersion '7.7.0' -LegacyEntries $legacy
+
+        $result.ExitCode | Should -Be 100
+        $result.Message | Should -Match '7\.6 MSI is kept on purpose'
+        $result.Message | Should -Match 'newly opened Windows Terminal will use PowerShell 7\.7\.0'
+        $result.Message | Should -Match 'pwsh typed by name may still start PowerShell 7\.6'
     }
 
     It 'returns 0 from -CheckOnly when the current MSIX has no legacy MSI' {
@@ -1007,17 +1024,70 @@ Describe 'upd bootstrap upgrades an installed PowerShell 7' {
         $ps7BootstrapSource | Should -Match 'Get-FileHash -LiteralPath \$bundlePath -Algorithm SHA256'
     }
 
-    It 'removes the old MSI only after the MSIX starts, with Restart Manager off' {
-        $ps7BootstrapSource | Should -Match '(?s)function Complete-PowerShell7Install.*?Install-PowerShell7Msix -Release.*?Remove-PowerShell7LegacyInstall'
+    It 'keeps the legacy removal function defined but never calls it from bootstrap paths' {
+        $ps7BootstrapSource | Should -Match '(?s)function Remove-PowerShell7LegacyInstall\b'
+        $removal = Get-FunctionText -Ast $ps7BootstrapAst -Name 'Remove-PowerShell7LegacyInstall'
+        $removal | Should -Match 'on_boot_update_reboot_loop_while_pending_restarts_exist-14qf'
+        $removeCalls = @($ps7BootstrapAst.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.CommandAst] -and
+                $node.GetCommandName() -eq 'Remove-PowerShell7LegacyInstall'
+        },$true))
+        $removeCalls.Count | Should -Be 0
         $ps7BootstrapSource | Should -Match '(?s)function Install-PowerShell7Msix.*?Get-PowerShell7InstalledVersion -PwshPath \$installed\.PwshPath'
-        $ps7BootstrapSource | Should -Match 'MSIRESTARTMANAGERCONTROL=Disable'
-        $ps7BootstrapSource | Should -Match "'/x', \`$entry\.ProductCode, '/qn', '/norestart'"
     }
 
-    It 'records the Terminal refresh instruction only after an MSI uninstall succeeds' {
-        $removal = Get-FunctionText -Ast $ps7BootstrapAst -Name 'Remove-PowerShell7LegacyInstall'
-        $removal | Should -Match '(?s)if \(\$code -in @\(0,3010\)\).*?\$legacyRemoved = \$true.*?TERMINAL_NOTICE:'
-        $removal | Should -Match 'Close and reopen Windows Terminal'
+    It 'leaves the MSI installed after a fresh MSIX install and after an MSIX upgrade' {
+        $completion = Get-FunctionText -Ast $ps7BootstrapAst -Name 'Complete-PowerShell7Install'
+        $completion | Should -Match 'Install-PowerShell7Msix -Release \$Release'
+        $completion | Should -Not -Match 'Remove-PowerShell7LegacyInstall'
+        $bootstrap = [regex]::Match($ps7BootstrapSource, '(?s)if \(\$existing -and \$Upgrade\) \{.*?\n\}\s*\nWrite-Host').Value
+        $bootstrap | Should -Not -Match 'Remove-PowerShell7LegacyInstall'
+        $bootstrap | Should -Match 'Complete-PowerShell7Install -Release \$latest'
+    }
+
+    It 'keeps the MSI registered after a fresh MSIX install' {
+        . ([scriptblock]::Create((Get-FunctionText -Ast $ps7BootstrapAst -Name 'Complete-PowerShell7Install')))
+        $script:LegacyMsis = @('7.6.10.0')
+        function Install-PowerShell7Msix { return [pscustomobject]@{ Version=[version]'7.7.0'; PwshPath='msix-pwsh.exe' } }
+        function Remove-PowerShell7LegacyInstall { $script:LegacyMsis = @() }
+
+        $installed = Complete-PowerShell7Install -Release ([pscustomobject]@{ Package='Msix'; Version=[version]'7.7.0' })
+
+        $installed.Version | Should -Be ([version]'7.7.0')
+        $script:LegacyMsis | Should -Be @('7.6.10.0')
+    }
+
+    It 'keeps the MSI registered after an MSIX upgrade' {
+        . ([scriptblock]::Create((Get-FunctionText -Ast $ps7BootstrapAst -Name 'Complete-PowerShell7Install')))
+        $script:LegacyMsis = @('7.6.10.0')
+        function Install-PowerShell7Msix { return [pscustomobject]@{ Version=[version]'7.7.1'; PwshPath='msix-pwsh.exe' } }
+        function Remove-PowerShell7LegacyInstall { $script:LegacyMsis = @() }
+
+        $installed = Complete-PowerShell7Install -Release ([pscustomobject]@{ Package='Msix'; Version=[version]'7.7.1' })
+
+        $installed.Version | Should -Be ([version]'7.7.1')
+        $script:LegacyMsis | Should -Be @('7.6.10.0')
+    }
+
+    It 'leaves the MSI installed when bootstrap finds the MSIX already current' {
+        $checkResult = Get-FunctionText -Ast $ps7BootstrapAst -Name 'Get-PowerShell7CheckOnlyResult'
+        $checkResult | Should -Not -Match 'LegacyEntries.*ExitCode\s*=\s*100|will be removed'
+        $checkResult | Should -Match 'kept on purpose'
+        $currentPath = [regex]::Match($ps7BootstrapSource, '(?s)if \(-not \$decision\.NeedsUpgrade\) \{.*?\n    \}').Value
+        $currentPath | Should -Not -Match 'Remove-PowerShell7LegacyInstall'
+    }
+
+    It 'reports the side-by-side runtime decision from status' {
+        $bootstrap = [regex]::Match($launcherSource, "(?s)'bootstrap'\s*\{.*?\n    \}").Value
+        $bootstrap | Should -Match "'-Upgrade', '-CheckOnly'"
+        $bootstrap | Should -Match 'if \(\$check\.ExitCode -ne 100\) \{ exit \$check\.ExitCode \}'
+        $status = Get-FunctionText -Ast $launcherAst -Name 'Show-UpdStatus'
+        $status | Should -Match 'Get-UpdPowerShellCoexistenceMessage'
+        $notice = Get-FunctionText -Ast $launcherAst -Name 'Get-UpdPowerShellCoexistenceMessage'
+        $notice | Should -Match 'kept on purpose'
+        $notice | Should -Match 'newly opened Windows Terminal uses PowerShell'
+        $notice | Should -Match 'pwsh typed by name may still start \$msiVersion'
     }
 
     It 'never changes the runtime under a running cycle and reports a check with exit 100' {
@@ -1052,20 +1122,17 @@ Describe 'upd bootstrap upgrades an installed PowerShell 7' {
         $bootstrapCommand.Value | Should -Not -Match '-Wait[^\r\n]*-Upgrade''\)\s*$'
     }
 
-    It 'shows the persisted Terminal refresh instruction in upd status' {
-        $status = Get-FunctionText -Ast $launcherAst -Name 'Show-UpdStatus'
-        $status | Should -Match 'Show-UpdRuntimeTerminalNotice'
-        $notice = $launcherAst.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Show-UpdRuntimeTerminalNotice' },$true)
-        $notice | Should -Not -BeNullOrEmpty
-        if ($notice) {
-            . ([scriptblock]::Create($notice.Extent.Text))
-            $programDataLog = Join-Path $TestDrive 'PowerShellRuntimeUpgrade.log'
-            $tempLog = Join-Path $TestDrive 'boot-upd-pwsh-upgrade.log'
-            Set-Content -LiteralPath $programDataLog -Value 'PowerShell 7 is already current.'
-            Set-Content -LiteralPath $tempLog -Value 'TERMINAL_NOTICE: Close and reopen Windows Terminal to refresh PowerShell profiles that still point to the removed MSI.'
-            $output = Show-UpdRuntimeTerminalNotice -LogPaths @($programDataLog,$tempLog) 6>&1
-            ($output -join "`n") | Should -Match 'Close and reopen Windows Terminal'
+    It 'shows which runtime upd and Windows Terminal use when the MSI and MSIX coexist' {
+        $notice = Get-FunctionText -Ast $launcherAst -Name 'Get-UpdPowerShellCoexistenceMessage'
+        . ([scriptblock]::Create($notice))
+        Mock Get-ItemProperty {
+            @([pscustomobject]@{ DisplayName='PowerShell 7-x64'; DisplayVersion='7.6.10.0'; WindowsInstaller=1; PSChildName='{5417B253-1A6D-4638-BC94-743A6EC2E6F4}'; UninstallString='MsiExec.exe /X{5417B253-1A6D-4638-BC94-743A6EC2E6F4}' })
         }
+        $message = Get-UpdPowerShellCoexistenceMessage -RuntimePath 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe'
+        $message | Should -Match 'PowerShell 7\.7\.0\.0 MSIX is used by upd'
+        $message | Should -Match 'newly opened Windows Terminal uses PowerShell 7\.7\.0\.0'
+        $message | Should -Match 'PowerShell 7\.6\.10\.0 MSI is kept on purpose'
+        $message | Should -Match 'pwsh typed by name may still start 7\.6\.10\.0'
     }
 }
 

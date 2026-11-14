@@ -478,23 +478,26 @@ function Get-UpdCanonicalAwsArguments {
     return $arguments.ToArray()
 }
 
-function Show-UpdRuntimeTerminalNotice {
-    param([Parameter(Mandatory)][string[]]$LogPaths)
-    $candidates = foreach ($path in $LogPaths) {
-        if (Test-Path -LiteralPath $path -PathType Leaf) {
-            $item = Get-Item -LiteralPath $path -ErrorAction SilentlyContinue
-            if ($item) { [pscustomobject]@{ Path=$path; LastWriteTime=$item.LastWriteTime } }
-        }
+function Get-UpdPowerShellCoexistenceMessage {
+    param([string]$RuntimePath = $PSHOME)
+    $msix = [regex]::Match($RuntimePath, '(?i)Microsoft\.PowerShell_(?<version>[\d.]+)_')
+    if (-not $msix.Success) { return }
+
+    $keys = @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+              'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*')
+    $legacy = @(Get-ItemProperty -Path $keys -ErrorAction SilentlyContinue | Where-Object {
+        [string]$_.DisplayName -match '^PowerShell 7(\.[\d.]+)?-(x64|x86|arm64)$' -and
+        (([int]($_.WindowsInstaller -as [int]) -eq 1) -or [string]$_.UninstallString -match '(?i)\.exe"?\s+/uninstall')
+    })
+    if ($legacy.Count -eq 0) { return }
+
+    $versions = foreach ($entry in $legacy) {
+        $parsed = [version]'0.0'
+        if ([version]::TryParse([string]$entry.DisplayVersion, [ref]$parsed)) { $parsed }
     }
-    foreach ($candidate in @($candidates | Sort-Object LastWriteTime -Descending)) {
-        $notice = Get-Content -LiteralPath $candidate.Path -Tail 100 -ErrorAction SilentlyContinue |
-            Where-Object { $_ -match '^TERMINAL_NOTICE:' } | Select-Object -Last 1
-        if ($notice) {
-            $message = $notice -replace '^TERMINAL_NOTICE:\s*',''
-            Write-Host "  terminal $message" -ForegroundColor Yellow
-            return
-        }
-    }
+    $msiVersion = if ($versions) { ($versions | Sort-Object -Descending | Select-Object -First 1).ToString() } else { '7.6' }
+    $msixVersion = $msix.Groups['version'].Value
+    return "PowerShell $msixVersion MSIX is used by upd. A newly opened Windows Terminal uses PowerShell $msixVersion too. The PowerShell $msiVersion MSI is kept on purpose; pwsh typed by name may still start $msiVersion."
 }
 
 function Show-UpdStatus {
@@ -517,9 +520,8 @@ function Show-UpdStatus {
             foreach ($record in $quarantines) { Write-Host "    $($record.PackageId)  undo: $($record.UnpinCommand)" -ForegroundColor Yellow }
         } catch { Write-Warning "Winget quarantine record is unreadable: $quarantinePath" }
     }
-    Show-UpdRuntimeTerminalNotice -LogPaths @(
-        (Join-Path $env:ProgramData 'BootUpdateCycle\PowerShellRuntimeUpgrade.log'),
-        (Join-Path ([IO.Path]::GetTempPath()) 'boot-upd-pwsh-upgrade.log'))
+    $runtimeNotice = Get-UpdPowerShellCoexistenceMessage
+    if ($runtimeNotice) { Write-Host "  runtime $runtimeNotice" -ForegroundColor Yellow }
 }
 
 function Remove-UpdWingetQuarantine {
@@ -625,11 +627,9 @@ switch ($Command.ToLowerInvariant()) {
     'version' { Write-Host "Boot Update Cycle v$(Get-UpdVersion)"; exit 0 }
     'bootstrap' {
         Write-Host "PowerShell $($PSVersionTable.PSVersion) runtime ready: $((Get-Process -Id $PID).Path)" -ForegroundColor Green
-        <# Two steps, both under Windows PowerShell 5.1 rather than in this process: moving
-           off the old MSI uninstalls the pwsh.exe this launcher may be running on. Step 1 is
-           a fast check that runs synchronously and reports. Step 2, only when the check
-           returns 100, hands the real upgrade to a detached, hidden host whose output goes to
-           a log file, and this launcher exits. #>
+        <# The check runs synchronously under Windows PowerShell 5.1. Step 2, only when a newer
+           version is available, hands the upgrade to a detached, hidden host whose output goes
+           to a log file, and this launcher exits. #>
         $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
         $check = Start-Process -FilePath $windowsPowerShell -Wait -PassThru -NoNewWindow `
             -ArgumentList @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $ps7BootstrapPath), '-Upgrade', '-CheckOnly')
@@ -640,7 +640,7 @@ switch ($Command.ToLowerInvariant()) {
         $null = Start-Process -FilePath $windowsPowerShell -WindowStyle Hidden -PassThru `
             -RedirectStandardOutput $upgradeLog -RedirectStandardError $upgradeErrorLog `
             -ArgumentList @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $ps7BootstrapPath), '-Upgrade')
-        Write-Host 'Upgrading PowerShell 7 in the background. Open PowerShell 7 windows keep running; new ones start the new version.' -ForegroundColor Yellow
+        Write-Host 'Upgrading PowerShell 7 in the background. Progress and the result will be in the log below.' -ForegroundColor Yellow
         Write-Host "Progress and the result are written to $upgradeLog (errors to $upgradeErrorLog). Run 'upd version' afterwards." -ForegroundColor Yellow
         exit 0
     }
