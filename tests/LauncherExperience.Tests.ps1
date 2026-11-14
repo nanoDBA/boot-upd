@@ -1781,6 +1781,38 @@ Describe 'PowerShell MSIX task references update to the installed version' {
         $script:UpdatedRuntimeActions[0].Execute | Should -Be $alias
     }
 
+    It 'updates a SYSTEM task through the supported task-name parameter set' {
+        $migrationAst | Should -Not -BeNullOrEmpty
+        if (-not $migrationAst -or -not $updateTasksAst) { return }
+        . ([scriptblock]::Create($migrationAst.Extent.Text))
+        . ([scriptblock]::Create($updateTasksAst.Extent.Text))
+        $systemPath = 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.1.0_x64__8wekyb3d8bbwe\pwsh.exe'
+        $script:RuntimeTasksForRepair = @([pscustomobject]@{
+            Principal = [pscustomobject]@{ UserId='SYSTEM'; LogonType='ServiceAccount' }
+            TaskPath='\Test\'; TaskName='SystemCycle'
+            Actions=@([pscustomobject]@{ Execute='C:\Program Files\PowerShell\7\pwsh.exe'; Argument='-File cycle.ps1'; WorkingDirectory='C:\Lab' })
+        })
+        function Get-ScheduledTask { }
+        function Write-PowerShell7RuntimeLog { param($LogPath, $Message) }
+        function New-ScheduledTaskAction { param($Execute, $Argument, $WorkingDirectory, $Id) }
+        function Set-ScheduledTask { param($TaskName, $TaskPath, $Action) }
+        Mock Get-ScheduledTask { $script:RuntimeTasksForRepair }
+        Mock Get-PowerShell7RuntimeReferenceSummary { @('C:\Program Files\PowerShell\7\pwsh.exe') }
+        Mock Write-PowerShell7RuntimeLog { }
+        Mock New-ScheduledTaskAction { [pscustomobject]@{ Execute=$Execute; Argument=$Argument; WorkingDirectory=$WorkingDirectory } }
+        Mock Set-ScheduledTask { $script:UpdatedSystemTask = @{ TaskName=$TaskName; TaskPath=$TaskPath; Action=@($Action) } }
+
+        Update-PowerShell7ScheduledTaskReferences -Profiles @([pscustomobject]@{ Sid='S-1-5-21-1-2-3-1001'; Alias='C:\Test\pwsh.exe' }) -SystemPwshPath $systemPath `
+            -LegacyPwshPath 'C:\Program Files\PowerShell\7\pwsh.exe' -LogPath (Join-Path $TestDrive 'repair.log')
+
+        Should -Invoke Set-ScheduledTask -Times 1 -Exactly -ParameterFilter {
+            $TaskName -eq 'SystemCycle' -and $TaskPath -eq '\Test\' -and $Action[0].Execute -eq $systemPath
+        }
+        $script:UpdatedSystemTask.TaskName | Should -Be 'SystemCycle'
+        $script:UpdatedSystemTask.TaskPath | Should -Be '\Test\'
+        $script:UpdatedSystemTask.Action[0].Execute | Should -Be $systemPath
+    }
+
     It 'logs only the runtime path from task arguments, not unrelated argument text' {
         $summaryAst | Should -Not -BeNullOrEmpty
         if (-not $summaryAst) { return }

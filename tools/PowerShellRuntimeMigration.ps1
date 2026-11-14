@@ -304,7 +304,7 @@ function Update-PowerShell7ScheduledTaskReferences {
         }
         $target = "$($task.TaskPath)$($task.TaskName)"
         if ($PSCmdlet.ShouldProcess($target, 'Update the scheduled task PowerShell action')) {
-            Set-ScheduledTask -InputObject $task -Action @($actions) -ErrorAction Stop | Out-Null
+            Set-ScheduledTask -TaskName $task.TaskName -TaskPath $task.TaskPath -Action @($actions) -ErrorAction Stop | Out-Null
             Write-PowerShell7RuntimeLog -LogPath $LogPath -Message "TASK ACTION UPDATED: $target; before=$($beforeReferences -join ';'); after=$($plan.ReplacementPath)"
         }
     }
