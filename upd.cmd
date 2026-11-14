@@ -146,7 +146,7 @@ echo Run: upd bootstrap
 exit /b 2
 
 :find_pwsh
-:: SYSTEM has no per-user alias; prefer the machine-wide MSIX before PATH.
+rem SYSTEM has no per-user alias; prefer the machine-wide MSIX before PATH.
 set "UPD_PWSH="
 if exist "%LocalAppData%\Microsoft\WindowsApps\pwsh.exe" set "UPD_PWSH=%LocalAppData%\Microsoft\WindowsApps\pwsh.exe"
 if not defined UPD_PWSH if defined ProgramFiles for /d %%P in ("%ProgramFiles%\WindowsApps\Microsoft.PowerShell_*__8wekyb3d8bbwe") do if not defined UPD_PWSH if exist "%%~fP\pwsh.exe" set "UPD_PWSH=%%~fP\pwsh.exe"
