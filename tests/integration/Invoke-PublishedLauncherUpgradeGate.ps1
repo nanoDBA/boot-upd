@@ -13,6 +13,7 @@ try {
     $oldUrl = "https://github.com/nanoDBA/boot-upd/releases/download/$FromTag/upd.cmd"
     Invoke-WebRequest -Uri $oldUrl -OutFile (Join-Path $root 'upd.cmd')
     Copy-Item (Join-Path $repoRoot 'Invoke-BootUpdateCycle.ps1') $root
+    Copy-Item (Join-Path $repoRoot 'PowerShell7Runtime.ps1') $root
     Copy-Item (Join-Path $repoRoot 'upd.cmd') (Join-Path $root 'upd.cmd.next')
     Copy-Item (Join-Path $repoRoot 'tools\Invoke-UpdLauncher.ps1') $tools
 

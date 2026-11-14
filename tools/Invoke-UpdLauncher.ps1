@@ -44,12 +44,16 @@ param(
     [Parameter(DontShow)][switch]$St,
     [Parameter(DontShow)][switch]$BundlePreflighted,
     [Parameter(DontShow)][switch]$LegacyAdoptionWorker,
+    [Parameter(DontShow)][ValidateSet('upd','continuation','fallback','direct')][string]$LaunchOrigin = 'direct',
     [Parameter(DontShow)][string]$EncodedArguments = '',
     [Parameter(ValueFromRemainingArguments)][string[]]$RemainingArguments = @()
 )
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path $PSScriptRoot -Parent
+. (Join-Path $repoRoot 'PowerShell7Runtime.ps1')
+$script:LaunchOrigin = if ($LaunchOrigin -ne 'direct') { $LaunchOrigin } elseif ($env:BOOTUPDATE_LAUNCH_ORIGIN -in @('upd','continuation','fallback')) { $env:BOOTUPDATE_LAUNCH_ORIGIN } else { 'direct' }
+$env:BOOTUPDATE_LAUNCH_ORIGIN = $script:LaunchOrigin
 $deployPath = Join-Path $repoRoot 'Deploy-BootUpdateCycle.ps1'
 $invokePath = Join-Path $repoRoot 'Invoke-BootUpdateCycle.ps1'
 $demoPath = Join-Path $PSScriptRoot 'Show-BootUpdateProgressDemo.ps1'
@@ -299,6 +303,7 @@ function Update-UpdSourceBundle {
 
         $specs = @(
             [pscustomobject]@{ Name='Invoke-BootUpdateCycle.ps1'; Target=(Join-Path $repoRoot 'Invoke-BootUpdateCycle.ps1'); PowerShell=$true; StageBatch=$false }
+            [pscustomobject]@{ Name='PowerShell7Runtime.ps1'; Target=(Join-Path $repoRoot 'PowerShell7Runtime.ps1'); PowerShell=$true; StageBatch=$false }
             [pscustomobject]@{ Name='Deploy-BootUpdateCycle.ps1'; Target=(Join-Path $repoRoot 'Deploy-BootUpdateCycle.ps1'); PowerShell=$true; StageBatch=$false }
             [pscustomobject]@{ Name='Invoke-UpdLauncher.ps1'; Target=$PSCommandPath; PowerShell=$true; StageBatch=$false }
             [pscustomobject]@{ Name='Invoke-UpdBootstrap.ps1'; Target=$argumentBootstrapPath; PowerShell=$true; StageBatch=$false }
@@ -435,13 +440,16 @@ function Update-UpdSourceBundle {
 
 function Invoke-UpdElevated {
     param([Parameter(Mandatory)][string[]]$CanonicalArguments)
-    $json = ConvertTo-Json -InputObject @($CanonicalArguments) -Compress
+    $json = ConvertTo-Json -InputObject @{ Arguments=@($CanonicalArguments); LaunchOrigin=$script:LaunchOrigin } -Compress
     $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
-    $quotedScript = '"{0}"' -f $PSCommandPath
-    <# $PSHOME, not `pwsh` by name: an alias in this user's profile is not the elevated account's. #>
-    $process = Start-Process -FilePath (Join-Path $PSHOME 'pwsh.exe') -Verb RunAs -Wait -PassThru -ArgumentList @(
+    $bootstrapPath = Join-Path $PSScriptRoot 'Invoke-UpdBootstrap.ps1'
+    $quotedScript = '"{0}"' -f $bootstrapPath
+    <# Windows PowerShell is present for every account. The elevated bootstrap resolves the
+       machine MSIX package after UAC, so an alternate admin need not have a per-user alias. #>
+    $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $process = Start-Process -FilePath $windowsPowerShell -Verb RunAs -Wait -PassThru -ArgumentList @(
         '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $quotedScript,
-        '-EncodedArguments', $encoded
+        '--stage0-encoded', $encoded
     )
     return $process.ExitCode
 }
@@ -485,15 +493,12 @@ function Get-UpdPowerShellCoexistenceMessage {
 
     $keys = @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
               'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*')
-    $legacy = @(Get-ItemProperty -Path $keys -ErrorAction SilentlyContinue | Where-Object {
-        [string]$_.DisplayName -match '^PowerShell 7(\.[\d.]+)?-(x64|x86|arm64)$' -and
-        (([int]($_.WindowsInstaller -as [int]) -eq 1) -or [string]$_.UninstallString -match '(?i)\.exe"?\s+/uninstall')
-    })
+    $legacy = @(Select-PowerShell7LegacyEntry -Entries @(Get-ItemProperty -Path $keys -ErrorAction SilentlyContinue))
     if ($legacy.Count -eq 0) { return }
 
     $versions = foreach ($entry in $legacy) {
         $parsed = [version]'0.0'
-        if ([version]::TryParse([string]$entry.DisplayVersion, [ref]$parsed)) { $parsed }
+        if ([version]::TryParse([string]$entry.Version, [ref]$parsed)) { $parsed }
     }
     $msiVersion = if ($versions) { ($versions | Sort-Object -Descending | Select-Object -First 1).ToString() } else { '7.6' }
     $msixVersion = $msix.Groups['version'].Value
@@ -706,6 +711,7 @@ switch ($Command.ToLowerInvariant()) {
     }
     'run' {
         $deployParameters = Get-UpdDeployParameters
+        $deployParameters.LaunchOrigin = $script:LaunchOrigin
         if (-not (Test-UpdAdministrator)) {
             Write-Host 'Requesting administrator access for the update cycle...' -ForegroundColor Yellow
             exit (Invoke-UpdElevated -CanonicalArguments (Get-UpdCanonicalRunArguments -DeployParameters $deployParameters))

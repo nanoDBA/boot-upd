@@ -100,19 +100,46 @@ function New-LabStageEvidence {
 }
 
 function Get-LabPowerShellRuntimeHandoffEvidence {
-    param([string[]]$RuntimeLines, [string[]]$MsiVersions, [string[]]$MsixVersions, [bool]$RebootSeen = $false)
-
-    $upd = @($RuntimeLines | Where-Object { $_ -match '^.*PowerShell runtime \| Version: 7\.7(?:\.\d+)?\b.*\| Install folder: .*\\WindowsApps\\Microsoft\.PowerShell_7\.7\..*\| Account: SYSTEM \| Launched by: upd$' } | Select-Object -First 1)
-    $continuation = @($RuntimeLines | Where-Object { $_ -match '^.*PowerShell runtime \| Version: 7\.7(?:\.\d+)?\b.*\| Install folder: .*\\WindowsApps\\Microsoft\.PowerShell_7\.7\..*\| Account: SYSTEM \| Launched by: (?:continuation|fallback)$' } | Select-Object -Last 1)
-    $msiPresent = @($MsiVersions | Where-Object { $_ -match '^7\.6\.' }).Count -gt 0
-    $msixPresent = @($MsixVersions | Where-Object { $_ -match '^7\.7\.' }).Count -gt 0
-    [pscustomobject]@{
-        Passed = ($RebootSeen -and $upd.Count -gt 0 -and $continuation.Count -gt 0 -and $msiPresent -and $msixPresent)
-        UpdRuntimeLine = if ($upd.Count) { [string]$upd[0] } else { $null }
-        ContinuationRuntimeLine = if ($continuation.Count) { [string]$continuation[0] } else { $null }
-        MsiVersions = @($MsiVersions)
-        MsixVersions = @($MsixVersions)
+    param([string[]]$RuntimeLines, [object[]]$RuntimeEvents = @(), [string[]]$MsiVersions, [string[]]$MsixVersions,
+          [Nullable[datetime]]$RebootObservedAtUtc = $null)
+    $runtimePattern = 'PowerShell runtime \| Version: (?<version>[\d.]+) \| Install folder: .*\\WindowsApps\\Microsoft\.PowerShell_[^ ]+ \| Account: .+ \| Launched by: '
+    $updLine = $null
+    foreach ($line in $RuntimeLines) {
+        $match = [regex]::Match([string]$line, $runtimePattern + 'upd$')
+        if (-not $match.Success) { continue }
+        $runtimeVersion = ([version]$match.Groups['version'].Value).ToString(3)
+        if (@($MsixVersions | Where-Object { ([version]$_).ToString(3) -eq $runtimeVersion }).Count) { $updLine=[string]$line; break }
     }
+    $continuationLine = $null
+    if ($null -ne $RebootObservedAtUtc) {
+        foreach ($event in $RuntimeEvents) {
+            $match = [regex]::Match([string]$event.Line, $runtimePattern + '(?:continuation|fallback)$')
+            if (-not $match.Success) { continue }
+            $runtimeVersion = ([version]$match.Groups['version'].Value).ToString(3)
+            if (@($MsixVersions | Where-Object { ([version]$_).ToString(3) -eq $runtimeVersion }).Count -eq 0) { continue }
+            $eventTime = Get-LabRuntimeEventTimestampUtc -RuntimeEvent $event
+            if ($null -ne $eventTime -and $eventTime -gt ([datetime]$RebootObservedAtUtc).ToUniversalTime()) {
+                $continuationLine=[string]$event.Line; break
+            }
+        }
+        if (-not $RuntimeEvents.Count) {
+            foreach ($line in $RuntimeLines) {
+                $match=[regex]::Match([string]$line, '^\[(?<stamp>[^]]+)\].*' + $runtimePattern + '(?:continuation|fallback)$')
+                if (-not $match.Success) { continue }
+                $runtimeVersion=([version]$match.Groups['version'].Value).ToString(3)
+                if (@($MsixVersions | Where-Object { ([version]$_).ToString(3) -eq $runtimeVersion }).Count -eq 0) { continue }
+                $eventTime=[datetime]::Parse($match.Groups['stamp'].Value,[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::AssumeUniversal).ToUniversalTime()
+                if ($eventTime -gt ([datetime]$RebootObservedAtUtc).ToUniversalTime()) { $continuationLine=[string]$line; break }
+            }
+        }
+    }
+    $msiPresent = @($MsiVersions | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count -gt 0
+    [pscustomobject]@{ Passed=($null -ne $updLine -and $null -ne $continuationLine -and $msiPresent -and @($MsixVersions).Count -gt 0); UpdRuntimeLine=$updLine; ContinuationRuntimeLine=$continuationLine; MsiVersions=@($MsiVersions); MsixVersions=@($MsixVersions) }
+}
+
+function Test-LabShouldMarkStoppedAfterContinuationRuntime {
+    param([bool]$StoppedAtRuntime,[bool]$CycleCompleted)
+    return ($StoppedAtRuntime -and -not $CycleCompleted)
 }
 
 function Test-LabShouldStopAfterContinuationRuntime {
@@ -502,6 +529,7 @@ while ((Get-Date) -lt $deadline) {
     try {
         $r = Invoke-Command -VMName $VMName -Credential $cred -ErrorAction Stop -ArgumentList $InjectWhen, $knownLogLines -ScriptBlock {
             param($Pattern, $KnownLines)
+            . 'C:\Lab\boot-upd\PowerShell7Runtime.ps1'
             $log = 'C:\ProgramData\BootUpdateCycle\BootUpdateCycle.log'
             <# @() OUTSIDE the if, not inside it. `$x = if (...) { @('one') }` assigns the
                STRING, because the statement's output is enumerated on the way out, and a
@@ -544,11 +572,8 @@ while ((Get-Date) -lt $deadline) {
                     [pscustomobject]@{ Line=[string]$line; TimestampUtc=$runtimeTimeUtc }
                 })
                 RuntimeLines = @($lines | Where-Object { $_ -match 'PowerShell runtime \|' })
-                MsiVersions = @(Get-ItemProperty @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*') -ErrorAction SilentlyContinue |
-                    Where-Object { $_.DisplayName -match '^PowerShell 7(?:\b|[- ])' -and [int]($_.WindowsInstaller -as [int]) -eq 1 -and $_.DisplayVersion } |
-                    ForEach-Object { [string]$_.DisplayVersion } | Sort-Object -Unique)
-                MsixVersions = @(Get-AppxPackage -AllUsers -Name Microsoft.PowerShell -ErrorAction SilentlyContinue |
-                    Where-Object PublisherId -eq '8wekyb3d8bbwe' | ForEach-Object { [string]$_.Version } | Sort-Object -Unique)
+                MsiVersions = @(Select-PowerShell7LegacyEntry -Entries @(Get-ItemProperty @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*') -ErrorAction SilentlyContinue) | ForEach-Object { [string]$_.Version } | Sort-Object -Unique)
+                MsixVersions = @(Get-PowerShell7MachineMsixPackages | ForEach-Object { $_.Version.ToString() } | Sort-Object -Unique)
                 <# consent.exe is the UAC consent dialog itself, so counting it counts real prompts rather than inferring them from a log. #>
                 Consent  = @(Get-Process consent -ErrorAction SilentlyContinue).Count
                 Pwsh     = [bool](@(@(Get-AppxPackage -AllUsers -Name Microsoft.PowerShell -ErrorAction SilentlyContinue | Where-Object PublisherId -eq '8wekyb3d8bbwe' | Sort-Object { [version]$_.Version } -Descending | ForEach-Object { Join-Path $_.InstallLocation 'pwsh.exe' }) + 'C:\Program Files\PowerShell\7\pwsh.exe' | Where-Object { Test-Path -LiteralPath $_ })[0])
@@ -581,9 +606,9 @@ while ((Get-Date) -lt $deadline) {
             })
         }
         $handoffEvidence = Get-LabPowerShellRuntimeHandoffEvidence -RuntimeLines @($r.RuntimeLines) `
-            -MsiVersions @($r.MsiVersions) -MsixVersions @($r.MsixVersions) -RebootSeen ($null -ne $rebootObservedAtUtc)
+            -MsiVersions @($r.MsiVersions) -MsixVersions @($r.MsixVersions) -RuntimeEvents @($r.RuntimeEvents) -RebootObservedAtUtc $rebootObservedAtUtc
         if ($null -ne $rebootObservedAtUtc -and $handoffEvidence.ContinuationRuntimeLine -and -not @($stageEvidence | Where-Object Name -eq 'continuation-relaunched').Count) {
-            $continuationRuntimeEvent = @($r.RuntimeEvents | Where-Object { $_.Line -eq $handoffEvidence.ContinuationRuntimeLine } | Select-Object -Last 1)
+            $continuationRuntimeEvent = @($r.RuntimeEvents | Where-Object { $_.Line -eq $handoffEvidence.ContinuationRuntimeLine -and (Get-LabRuntimeEventTimestampUtc -RuntimeEvent $_) -gt $rebootObservedAtUtc } | Select-Object -First 1)
             $continuationAtUtc = if ($continuationRuntimeEvent.Count) { Get-LabRuntimeEventTimestampUtc -RuntimeEvent $continuationRuntimeEvent[0] } else { $null }
             if ($null -eq $continuationAtUtc) { $continuationAtUtc = $observedAtUtc }
             Add-LabStage -Name 'continuation-relaunched' -ObservedAtUtc $continuationAtUtc -Facts ([pscustomobject]@{
@@ -634,6 +659,7 @@ while ((Get-Date) -lt $deadline) {
 # The completion-intent log precedes task/state retirement. Require both cleanup facts.
 Say 'collecting evidence'
 $evidence = Invoke-Command -VMName $VMName -Credential $cred -ScriptBlock {
+    . 'C:\Lab\boot-upd\PowerShell7Runtime.ps1'
     $log = 'C:\ProgramData\BootUpdateCycle\BootUpdateCycle.log'
     $lines = @(if (Test-Path $log) { Get-Content $log -ErrorAction SilentlyContinue })
     # Event 6005 is the OS's own boot record, written by the event log service. It is the
@@ -663,11 +689,18 @@ $evidence = Invoke-Command -VMName $VMName -Credential $cred -ScriptBlock {
         })
         CbsPending      = Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
         RuntimeLines    = @($lines | Where-Object { $_ -match 'PowerShell runtime \|' })
-        MsiVersions     = @(Get-ItemProperty @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*') -ErrorAction SilentlyContinue |
-            Where-Object { $_.DisplayName -match '^PowerShell 7(?:\b|[- ])' -and [int]($_.WindowsInstaller -as [int]) -eq 1 -and $_.DisplayVersion } |
-            ForEach-Object { [string]$_.DisplayVersion } | Sort-Object -Unique)
-        MsixVersions    = @(Get-AppxPackage -AllUsers -Name Microsoft.PowerShell -ErrorAction SilentlyContinue |
-            Where-Object PublisherId -eq '8wekyb3d8bbwe' | ForEach-Object { [string]$_.Version } | Sort-Object -Unique)
+        RuntimeEvents   = @(foreach ($line in @($lines | Where-Object { $_ -match 'PowerShell runtime \|' })) {
+            $runtimeStamp = [regex]::Match([string]$line, '^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]')
+            $runtimeTimeUtc = $null
+            if ($runtimeStamp.Success) {
+                $guestLocalTime = [datetime]::ParseExact($runtimeStamp.Groups[1].Value, 'yyyy-MM-dd HH:mm:ss',
+                    [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeLocal)
+                $runtimeTimeUtc = $guestLocalTime.ToUniversalTime().ToString('o')
+            }
+            [pscustomobject]@{ Line=[string]$line; TimestampUtc=$runtimeTimeUtc }
+        })
+        MsiVersions     = @(Select-PowerShell7LegacyEntry -Entries @(Get-ItemProperty @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*') -ErrorAction SilentlyContinue) | ForEach-Object { [string]$_.Version } | Sort-Object -Unique)
+        MsixVersions    = @(Get-PowerShell7MachineMsixPackages | ForEach-Object { $_.Version.ToString() } | Sort-Object -Unique)
         <# For a no-user row, proof that no interactive session ever appeared is part of the
            result: a SYSTEM-fallback claim means nothing if somebody was quietly logged in. #>
         ConsoleUser     = (Get-CimInstance Win32_ComputerSystem).UserName
@@ -685,11 +718,12 @@ ConvertTo-Json -InputObject @($schedulerEvents.Xml) | Set-Content (Join-Path $ev
 $evidence.Log | Set-Content (Join-Path $evidenceDir 'BootUpdateCycle.log')
 $runtimeHandoffEvidence = Get-LabPowerShellRuntimeHandoffEvidence -RuntimeLines @($evidence.RuntimeLines) `
     -MsiVersions @($evidence.MsiVersions) -MsixVersions @($evidence.MsixVersions) `
-    -RebootSeen (@($stageEvidence | Where-Object Name -eq 'reboot-seen').Count -gt 0)
-if ($StopAfterContinuationRuntime -and $runtimeHandoffEvidence.Passed) { $stoppedAfterContinuationRuntime = $true }
+    -RuntimeEvents @($evidence.RuntimeEvents) -RebootObservedAtUtc $rebootObservedAtUtc
+
 if ($StopAfterContinuationRuntime -and $runtimeHandoffEvidence.Passed -and -not @($stageEvidence | Where-Object Name -eq 'continuation-relaunched').Count) {
-    $nowUtc = [datetime]::UtcNow
-    Add-LabStage -Name 'continuation-relaunched' -ObservedAtUtc $nowUtc -Facts ([pscustomobject]@{
+    $continuationRuntimeEvent = @($evidence.RuntimeEvents | Where-Object { $_.Line -eq $runtimeHandoffEvidence.ContinuationRuntimeLine -and (Get-LabRuntimeEventTimestampUtc -RuntimeEvent $_) -gt $rebootObservedAtUtc } | Select-Object -First 1)
+    $continuationAtUtc = if ($continuationRuntimeEvent.Count) { Get-LabRuntimeEventTimestampUtc -RuntimeEvent $continuationRuntimeEvent[0] } else { [datetime]::Parse([string]$evidence.CollectedAtUtc).ToUniversalTime() }
+    Add-LabStage -Name 'continuation-relaunched' -ObservedAtUtc $continuationAtUtc -Facts ([pscustomobject]@{
         RuntimeLine=$runtimeHandoffEvidence.ContinuationRuntimeLine; HandoffPassed=$true
         MsiVersions=@($evidence.MsiVersions); MsixVersions=@($evidence.MsixVersions)
     })
@@ -747,8 +781,8 @@ $summary = [pscustomobject]@{
     Checkpoint       = $Checkpoint
     Completed        = $complete
     PowerShellRuntimeHandoffPassed = [bool]$runtimeHandoffEvidence.Passed
-    StoppedAfterContinuationRuntime = [bool]$stoppedAfterContinuationRuntime
-    CycleNotCompletedByDesign = [bool]($StopAfterContinuationRuntime -and $runtimeHandoffEvidence.Passed -and -not $complete)
+    StoppedAfterContinuationRuntime = [bool](Test-LabShouldMarkStoppedAfterContinuationRuntime -StoppedAtRuntime $stoppedAfterContinuationRuntime -CycleCompleted $complete)
+    CycleNotCompletedByDesign = [bool](Test-LabShouldMarkStoppedAfterContinuationRuntime -StoppedAtRuntime $stoppedAfterContinuationRuntime -CycleCompleted $complete)
     PowerShellRuntimeLines = @($evidence.RuntimeLines)
     MsiVersions       = @($evidence.MsiVersions)
     MsixVersions      = @($evidence.MsixVersions)

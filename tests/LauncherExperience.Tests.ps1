@@ -23,6 +23,8 @@ BeforeAll {
     $argumentBootstrapAst = Get-ParsedScript $argumentBootstrapPath
     $compatInstallerAst = Get-ParsedScript $compatInstallerPath
     $ps7BootstrapAst = Get-ParsedScript $ps7BootstrapPath
+    $runtimeHelperPath = Join-Path $repoRoot 'PowerShell7Runtime.ps1'
+    $runtimeHelperAst = Get-ParsedScript $runtimeHelperPath
     $launcherSource = Get-Content -LiteralPath $launcherPath -Raw
     $deploySource = Get-Content -LiteralPath $deployPath -Raw
     $invokeSource = Get-Content -LiteralPath $invokePath -Raw
@@ -42,8 +44,13 @@ BeforeAll {
         return $function.Extent.Text
     }
 
-    foreach ($name in @('Test-Administrator','Get-PowerShell7TargetArchitecture','Get-PowerShell7MsixInstall','Test-PowerShell7MsixSupported','Get-PowerShell7LatestStableVersion','Get-PowerShell7UpgradeDecision','Get-PowerShell7CheckOnlyResult','Get-PowerShell7LegacyEntry','ConvertFrom-PowerShell7HashFile','Select-PowerShell7LegacyEntry')) {
+    foreach ($name in @('Test-Administrator','Get-PowerShell7TargetArchitecture','Get-PowerShell7MsixInstall','Test-PowerShell7MsixSupported','Get-PowerShell7LatestStableVersion','Get-PowerShell7UpgradeDecision','Get-PowerShell7CheckOnlyResult','Get-PowerShell7LegacyEntry','ConvertFrom-PowerShell7HashFile')) {
         . ([scriptblock]::Create((Get-FunctionText -Ast $ps7BootstrapAst -Name $name)))
+    }
+    $runtimeHelperAst = Get-ParsedScript $runtimeHelperPath
+    foreach ($name in @('Get-PowerShell7TargetArchitecture','Get-PowerShell7MachineMsixPackages','Get-PowerShell7MachineMsixPath','Select-PowerShell7LegacyEntry')) {
+        $helperFn = $runtimeHelperAst.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name },$true)
+        if ($helperFn) { . ([scriptblock]::Create($helperFn.Extent.Text)) }
     }
     $script:PackageName = 'Microsoft.PowerShell'
     $script:PublisherId = '8wekyb3d8bbwe'
@@ -100,7 +107,7 @@ Describe 'upd.cmd prefers the PowerShell MSIX alias' {
         $findEnd = $cmdSource.IndexOf("`r`n:",$findStart + 1)
         $findEnd | Should -BeGreaterThan $findStart
         $subroutine = $cmdSource.Substring($findStart,$findEnd - $findStart)
-        $simulated = "@echo off`r`nset `"LocalAppData=$aliasRoot`"`r`nset `"ProgramFiles=$programFilesRoot`"`r`nset `"PATH=$pathRoot;%SystemRoot%\System32`"`r`ncall :find_pwsh`r`necho UPD_PWSH=%UPD_PWSH%`r`nexit /b 0`r`n" + $subroutine + "`r`n"
+        $simulated = "@echo off`r`nset `"LocalAppData=$aliasRoot`"`r`nset `"ProgramFiles=$programFilesRoot`"`r`nset `"UPD_ROOT=$repoRoot`"`r`nset `"PATH=$pathRoot;%SystemRoot%\System32`"`r`ncall :find_pwsh`r`necho UPD_PWSH=%UPD_PWSH%`r`nexit /b 0`r`n" + $subroutine + "`r`n"
         $simulatedPath = Join-Path $TestDrive 'find-pwsh-alias.cmd'
         [IO.File]::WriteAllText($simulatedPath,$simulated,[Text.Encoding]::ASCII)
 
@@ -121,7 +128,7 @@ Describe 'upd.cmd prefers the PowerShell MSIX alias' {
         $findStart = $cmdSource.LastIndexOf(':find_pwsh')
         $findEnd = $cmdSource.IndexOf("`r`n:",$findStart + 1)
         $subroutine = $cmdSource.Substring($findStart,$findEnd - $findStart)
-        $simulated = "@echo off`r`nset `"LocalAppData=$aliasRoot`"`r`nset `"ProgramFiles=$programFilesRoot`"`r`nset `"PATH=$pathRoot;%SystemRoot%\System32`"`r`ncall :find_pwsh`r`necho UPD_PWSH=%UPD_PWSH%`r`nexit /b 0`r`n" + $subroutine + "`r`n"
+        $simulated = "@echo off`r`nset `"LocalAppData=$aliasRoot`"`r`nset `"ProgramFiles=$programFilesRoot`"`r`nset `"UPD_ROOT=$repoRoot`"`r`nset `"PATH=$pathRoot;%SystemRoot%\System32`"`r`ncall :find_pwsh`r`necho UPD_PWSH=%UPD_PWSH%`r`nexit /b 0`r`n" + $subroutine + "`r`n"
         $simulatedPath = Join-Path $TestDrive 'find-pwsh-fallback.cmd'
         [IO.File]::WriteAllText($simulatedPath,$simulated,[Text.Encoding]::ASCII)
 
@@ -148,7 +155,7 @@ Describe 'upd.cmd finds a machine-wide PowerShell MSIX for SYSTEM' {
         $findStart = $cmdSource.LastIndexOf(':find_pwsh')
         $findEnd = $cmdSource.IndexOf("`r`n:",$findStart + 1)
         $subroutine = $cmdSource.Substring($findStart,$findEnd - $findStart)
-        $simulated = "@echo off`r`nset `"LocalAppData=$TestDrive\system-profile`"`r`nset `"ProgramFiles=$programFilesRoot`"`r`nset `"PATH=$msiRoot;%SystemRoot%\System32`"`r`ncall :find_pwsh`r`necho UPD_PWSH=%UPD_PWSH%`r`nexit /b 0`r`n" + $subroutine + "`r`n"
+        $simulated = "@echo off`r`nset `"LocalAppData=$TestDrive\system-profile`"`r`nset `"ProgramFiles=$programFilesRoot`"`r`nset `"UPD_ROOT=$repoRoot`"`r`nset `"PATH=$msiRoot;%SystemRoot%\System32`"`r`ncall :find_pwsh`r`necho UPD_PWSH=%UPD_PWSH%`r`nexit /b 0`r`n" + $subroutine + "`r`n"
         $simulatedPath = Join-Path $TestDrive 'find-pwsh-system-msix.cmd'
         [IO.File]::WriteAllText($simulatedPath,$simulated,[Text.Encoding]::ASCII)
 
@@ -242,7 +249,7 @@ Describe 'Safe fun and planning commands' {
 
 Describe 'Checksummed launcher self-update handoff' {
     It 'requires checksum sidecars for every executable bundle asset' {
-        foreach ($asset in @('Invoke-BootUpdateCycle.ps1','Deploy-BootUpdateCycle.ps1','Invoke-UpdLauncher.ps1','Invoke-UpdBootstrap.ps1','Show-BootUpdateProgressDemo.ps1','Install-PowerShell7.ps1','Repair-AwsTooling.ps1','Export-BootUpdateDiagnostics.ps1','upd.cmd')) {
+        foreach ($asset in @('Invoke-BootUpdateCycle.ps1','Deploy-BootUpdateCycle.ps1','Invoke-UpdLauncher.ps1','Invoke-UpdBootstrap.ps1','Show-BootUpdateProgressDemo.ps1','Install-PowerShell7.ps1','PowerShell7Runtime.ps1','Repair-AwsTooling.ps1','Export-BootUpdateDiagnostics.ps1','upd.cmd')) {
             $launcherSource | Should -Match ([regex]::Escape("Name='$asset'"))
         }
         $launcherSource | Should -Match '\$\(\$spec\.Name\)\.sha256'
@@ -371,6 +378,16 @@ exit 29
             Should -BeGreaterThan $compatInstallerSource.IndexOf('Committed bundle verification failed')
     }
 
+    It 'documents the PowerShell bootstrap, MSI compatibility, Terminal recovery and runtime logs' {
+        $readme = Get-Content -LiteralPath (Join-Path $repoRoot 'README.md') -Raw
+        $readme | Should -Match 'Windows includes PowerShell 5\.1'
+        $readme | Should -Match 'another administrator does not depend on your account'
+        $readme | Should -Match 'WinRM remoting into PowerShell 7'
+        $readme | Should -Match 'error 0x80070002'
+        $readme | Should -Match 'PowerShell runtime \| Version: 7\.7\.0 \| Install folder: <install folder> \| Account: SYSTEM \| Launched by: continuation'
+        $readme | Should -Match 'PowerShell installs \| Stage: cycle-start \| MSI: 7\.6\.10 \| MSIX: 7\.7\.0'
+    }
+
     It 'coheres release versions and detects cloud races around every bundle commit' {
         $launcherSource | Should -Match 'core version does not match its tag'
         $launcherSource | Should -Match 'batch version does not match its tag'
@@ -442,6 +459,7 @@ exit 29
         $tools = Join-Path $root 'tools'
         $null = New-Item -ItemType Directory -Path $tools
         Copy-Item $launcherPath (Join-Path $tools 'Invoke-UpdLauncher.ps1')
+        Copy-Item (Join-Path $repoRoot 'PowerShell7Runtime.ps1') (Join-Path $root 'PowerShell7Runtime.ps1') -ErrorAction SilentlyContinue
         Copy-Item $invokePath (Join-Path $root 'Invoke-BootUpdateCycle.ps1')
         Copy-Item $cmdPath (Join-Path $root 'upd.cmd')
         Copy-Item $cmdPath (Join-Path $root 'upd.cmd.next')
@@ -470,6 +488,7 @@ exit 29
         $tools = Join-Path $root 'tools'
         $null = New-Item -ItemType Directory -Path $tools
         Copy-Item $launcherPath (Join-Path $tools 'Invoke-UpdLauncher.ps1')
+        Copy-Item (Join-Path $repoRoot 'PowerShell7Runtime.ps1') (Join-Path $root 'PowerShell7Runtime.ps1') -ErrorAction SilentlyContinue
         Copy-Item $invokePath (Join-Path $root 'Invoke-BootUpdateCycle.ps1')
         $target = Join-Path $root 'upd.cmd'
         Copy-Item $cmdPath $target
@@ -519,6 +538,7 @@ param([Parameter(ValueFromRemainingArguments)][string[]]$Arguments)
         $tools = Join-Path $root 'tools'
         $null = New-Item -ItemType Directory -Path $tools
         Copy-Item $launcherPath (Join-Path $tools 'Invoke-UpdLauncher.ps1')
+        Copy-Item (Join-Path $repoRoot 'PowerShell7Runtime.ps1') (Join-Path $root 'PowerShell7Runtime.ps1') -ErrorAction SilentlyContinue
         Copy-Item $invokePath (Join-Path $root 'Invoke-BootUpdateCycle.ps1')
         $target = Join-Path $root 'upd.cmd'
         @"
@@ -553,6 +573,7 @@ exit /b 0
         $tools = Join-Path $root 'tools'
         $null = New-Item -ItemType Directory -Path $tools
         Copy-Item $launcherPath (Join-Path $tools 'Invoke-UpdLauncher.ps1')
+        Copy-Item (Join-Path $repoRoot 'PowerShell7Runtime.ps1') (Join-Path $root 'PowerShell7Runtime.ps1') -ErrorAction SilentlyContinue
         Copy-Item $invokePath (Join-Path $root 'Invoke-BootUpdateCycle.ps1')
         Copy-Item $cmdPath (Join-Path $root 'upd.cmd')
         $stale = (Get-Content $cmdPath -Raw) -replace 'BootUpdateCycleVersion=\d+(?:\.\d+){2}','BootUpdateCycleVersion=1.0.0'
@@ -856,7 +877,7 @@ Describe 'upd bootstrap upgrades an installed PowerShell 7' {
             -LatestVersion '7.7.0' -LegacyEntries $legacy
 
         $result.ExitCode | Should -Be 100
-        $result.Message | Should -Match '7\.6 MSI is kept on purpose'
+        $result.Message | Should -Match 'PowerShell 7\.6\.10\.0 MSI is kept on purpose'
         $result.Message | Should -Match 'newly opened Windows Terminal will use PowerShell 7\.7\.0'
         $result.Message | Should -Match 'pwsh typed by name may still start PowerShell 7\.6'
     }
@@ -892,6 +913,21 @@ Describe 'upd bootstrap upgrades an installed PowerShell 7' {
         Should -Not -Invoke Get-AppxPackage
     }
 
+    It 'does not keep requesting an update when the MSIX is not registered for this non-admin account' {
+        $legacy = @([pscustomobject]@{
+            PSChildName='{5417B253-1A6D-4638-BC94-743A6EC2E6F4}'; DisplayName='PowerShell 7-x64'
+            DisplayVersion='7.6.10.0'; WindowsInstaller=1; UninstallString='MsiExec.exe /X{5417B253-1A6D-4638-BC94-743A6EC2E6F4}'
+        })
+        $result = Get-PowerShell7CheckOnlyResult -Package Msix -InstalledVersion '7.6.10' `
+            -LatestVersion '7.7.0' -LegacyEntries $legacy -MsixRegistered:$false -IsAdministrator:$false
+
+        $result.ExitCode | Should -Be 0
+        $result.Message | Should -Match 'PowerShell 7\.6\.10\.0 MSI is installed and kept'
+        $result.Message | Should -Match 'MSIX is not registered for this account'
+        $result.Message | Should -Not -Match 'upd.*will use.*7\.7'
+        $result.Message | Should -Not -Match '7\.7.*MSI'
+    }
+
     It 'never downgrades and only reports an upgrade when installed is behind latest' {
         (Get-PowerShell7UpgradeDecision -InstalledVersion '7.4.5' -LatestVersion '7.4.6').NeedsUpgrade | Should -BeTrue
         (Get-PowerShell7UpgradeDecision -InstalledVersion '7.4.6' -LatestVersion '7.4.6').NeedsUpgrade | Should -BeFalse
@@ -900,11 +936,17 @@ Describe 'upd bootstrap upgrades an installed PowerShell 7' {
         (Get-PowerShell7UpgradeDecision -InstalledVersion '7.5.0' -LatestVersion '7.4.6').NeedsUpgrade | Should -BeFalse
     }
 
-    It 'treats any non-MSIX PowerShell 7 as needing the move to MSIX, whatever its version' {
+    It 'upgrades an MSI install without saying that the MSI will be replaced' {
         $decision = Get-PowerShell7UpgradeDecision -InstalledVersion '7.6.10' -LatestVersion '7.7.0' -Legacy
         $decision.NeedsUpgrade | Should -BeTrue
-        $decision.Message | Should -Match 'MSI install, which Microsoft no longer ships'
+        $decision.Message | Should -Match 'MSI is installed.*installing.*MSIX beside it'
+        $decision.Message | Should -Not -Match '(?i)replac(e|ing)'
         (Get-PowerShell7UpgradeDecision -InstalledVersion '7.8.0' -LatestVersion '7.7.0' -Legacy).NeedsUpgrade | Should -BeTrue
+    }
+
+    It 'has no callable legacy MSI uninstaller' {
+        $ps7BootstrapSource | Should -Not -Match 'function Remove-PowerShell7LegacyInstall'
+        $ps7BootstrapSource | Should -Not -Match 'Start-Process.*msiexec.*(/x|/uninstall)'
     }
 
     It 'picks the highest stable version that has an MSIX bundle and checksums, not the first listed' {
@@ -1028,17 +1070,9 @@ Describe 'upd bootstrap upgrades an installed PowerShell 7' {
         $ps7BootstrapSource | Should -Match 'Get-FileHash -LiteralPath \$bundlePath -Algorithm SHA256'
     }
 
-    It 'keeps the legacy removal function defined but never calls it from bootstrap paths' {
-        $ps7BootstrapSource | Should -Match '(?s)function Remove-PowerShell7LegacyInstall\b'
-        $removal = Get-FunctionText -Ast $ps7BootstrapAst -Name 'Remove-PowerShell7LegacyInstall'
-        $removal | Should -Match 'on_boot_update_reboot_loop_while_pending_restarts_exist-14qf'
-        $removeCalls = @($ps7BootstrapAst.FindAll({
-            param($node)
-            $node -is [Management.Automation.Language.CommandAst] -and
-                $node.GetCommandName() -eq 'Remove-PowerShell7LegacyInstall'
-        },$true))
-        $removeCalls.Count | Should -Be 0
-        $ps7BootstrapSource | Should -Match '(?s)function Install-PowerShell7Msix.*?Get-PowerShell7InstalledVersion -PwshPath \$installed\.PwshPath'
+    It 'does not ship a PowerShell MSI uninstaller' {
+        $ps7BootstrapSource | Should -Not -Match 'Remove-PowerShell7LegacyInstall|msiexec\.exe.*?/x'
+        @($ps7BootstrapAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Remove-PowerShell7LegacyInstall' },$true)).Count | Should -Be 0
     }
 
     It 'leaves the MSI installed after a fresh MSIX install and after an MSIX upgrade' {
@@ -1054,7 +1088,6 @@ Describe 'upd bootstrap upgrades an installed PowerShell 7' {
         . ([scriptblock]::Create((Get-FunctionText -Ast $ps7BootstrapAst -Name 'Complete-PowerShell7Install')))
         $script:LegacyMsis = @('7.6.10.0')
         function Install-PowerShell7Msix { return [pscustomobject]@{ Version=[version]'7.7.0'; PwshPath='msix-pwsh.exe' } }
-        function Remove-PowerShell7LegacyInstall { $script:LegacyMsis = @() }
 
         $installed = Complete-PowerShell7Install -Release ([pscustomobject]@{ Package='Msix'; Version=[version]'7.7.0' })
 
@@ -1066,7 +1099,6 @@ Describe 'upd bootstrap upgrades an installed PowerShell 7' {
         . ([scriptblock]::Create((Get-FunctionText -Ast $ps7BootstrapAst -Name 'Complete-PowerShell7Install')))
         $script:LegacyMsis = @('7.6.10.0')
         function Install-PowerShell7Msix { return [pscustomobject]@{ Version=[version]'7.7.1'; PwshPath='msix-pwsh.exe' } }
-        function Remove-PowerShell7LegacyInstall { $script:LegacyMsis = @() }
 
         $installed = Complete-PowerShell7Install -Release ([pscustomobject]@{ Package='Msix'; Version=[version]'7.7.1' })
 
@@ -1172,6 +1204,97 @@ Describe 'Typed run option forwarding' {
         $deploySource | Should -Not -Match 'foreach \(\$name in @\([^)]*''SkipSsms'''
         (Get-FunctionText -Ast $launcherAst -Name 'Get-UpdDeployParameters') | Should -Match "SkipSsms='SkipSsms'"
         (Get-FunctionText -Ast $launcherAst -Name 'Get-UpdDeployParameters') | Should -Match 'ResumeAfterAttention=''ResumeAfterAttention'''
+    }
+}
+
+Describe 'PowerShell runtime selection and launch provenance handoff' {
+    It 'selects the highest machine MSIX for this architecture rather than the first folder' {
+        $runtimeHelper = Join-Path $repoRoot 'PowerShell7Runtime.ps1'
+        $runtimeHelper | Should -Exist
+        $helperTokens = $null; $helperErrors = $null
+        $helperAst = [Management.Automation.Language.Parser]::ParseFile($runtimeHelper,[ref]$helperTokens,[ref]$helperErrors)
+        $helperErrors | Should -BeNullOrEmpty
+        $selector = $helperAst.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-PowerShell7MachineMsixPath'
+        },$true)
+        $selector | Should -Not -BeNullOrEmpty
+        . ([scriptblock]::Create($selector.Extent.Text))
+
+        $root = Join-Path $TestDrive 'WindowsApps'
+        $folders = @(
+            'Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe',
+            'Microsoft.PowerShell_7.10.0.0_x86__8wekyb3d8bbwe',
+            'Microsoft.PowerShell_7.9.0.0_x64__8wekyb3d8bbwe'
+        )
+        foreach ($folder in $folders) {
+            $path = Join-Path $root "$folder\pwsh.exe"
+            $null = New-Item -ItemType Directory -Force -Path (Split-Path $path)
+            Set-Content -LiteralPath $path -Value 'fixture' -Encoding ascii
+        }
+
+        Get-PowerShell7MachineMsixPath -WindowsAppsRoot $root -Architecture x64 |
+            Should -Be (Join-Path $root 'Microsoft.PowerShell_7.9.0.0_x64__8wekyb3d8bbwe\pwsh.exe')
+    }
+
+    It 'uses the inbox Windows PowerShell bootstrap host for UAC and carries upd origin in the payload' {
+        $elevated = Get-FunctionText -Ast $launcherAst -Name 'Invoke-UpdElevated'
+        $elevated | Should -Match 'System32\\WindowsPowerShell\\v1\.0\\powershell\.exe'
+        $elevated | Should -Match 'stage0-encoded'
+        $elevated | Should -Match 'LaunchOrigin=\$script:LaunchOrigin'
+        $argumentBootstrapSource | Should -Match 'ConvertFrom-UpdBootstrapHandoff'
+        $argumentBootstrapSource | Should -Match 'BOOTUPDATE_LAUNCH_ORIGIN'
+    }
+
+    It 'resolves the machine MSIX from the Windows PowerShell 5.1 elevation broker' {
+        $root = Join-Path $TestDrive 'broker-fixture'
+        $package = Join-Path $root 'WindowsApps\Microsoft.PowerShell_7.9.0.0_x64__8wekyb3d8bbwe'
+        $null = New-Item -ItemType Directory -Path $package -Force
+        Set-Content -LiteralPath (Join-Path $package 'pwsh.exe') -Value 'fixture'
+        $bootstrapFn = $argumentBootstrapAst.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-UpdBootstrapPowerShellPath' },$true)
+        $bootstrapFn | Should -Not -BeNullOrEmpty
+        $scriptText = '$env:ProgramFiles=' + (ConvertTo-Json -Compress $root) + '; $runtimeHelper=' + (ConvertTo-Json -Compress $runtimeHelperPath) + '; . $runtimeHelper; ' + $bootstrapFn.Extent.Text + '; Get-UpdBootstrapPowerShellPath'
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($scriptText))
+        $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $output = @(& $windowsPowerShell -NoLogo -NoProfile -EncodedCommand $encoded 2>&1)
+        $LASTEXITCODE | Should -Be 0
+        ($output -join [Environment]::NewLine) | Should -Match ([regex]::Escape((Join-Path $package 'pwsh.exe')))
+    }
+
+    It 'decodes the launch origin and original arguments from the elevated handoff' {
+        $handoff = $argumentBootstrapAst.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'ConvertFrom-UpdBootstrapHandoff'
+        },$true)
+        $handoff | Should -Not -BeNullOrEmpty
+        . ([scriptblock]::Create($handoff.Extent.Text))
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(
+            (ConvertTo-Json -InputObject @{ Arguments=@('run','-NoUpdate'); LaunchOrigin='upd' } -Compress)))
+
+        $decoded = ConvertFrom-UpdBootstrapHandoff -Encoded $encoded
+
+        $decoded.Arguments | Should -Be @('run','-NoUpdate')
+        $decoded.LaunchOrigin | Should -Be 'upd'
+    }
+
+    It 'passes upd origin into a Deploy-registered first-run task' {
+        $registration = Get-FunctionText -Ast (Get-ParsedScript $deployPath) -Name 'Register-ScheduledTaskNow'
+        $registration | Should -Match '-LaunchOrigin'
+        $launcherSource | Should -Match 'LaunchOrigin.*BOOTUPDATE_LAUNCH_ORIGIN'
+    }
+
+    It 'uses the shared installer MSI rule and excludes preview packages' {
+        $runtimeHelper = Join-Path $repoRoot 'PowerShell7Runtime.ps1'
+        $runtimeHelper | Should -Exist
+        . $runtimeHelper
+        $entries = @(
+            [pscustomobject]@{ PSChildName='{11111111-2222-3333-4444-555555555555}'; DisplayName='PowerShell 7-x64'; DisplayVersion='7.6.10.0'; WindowsInstaller=1; UninstallString='MsiExec.exe /X{11111111-2222-3333-4444-555555555555}' },
+            [pscustomobject]@{ PSChildName='Example'; DisplayName='PowerShell 7-preview-x64'; DisplayVersion='7.7.0.5'; WindowsInstaller=1; UninstallString='MsiExec.exe /X{x}' },
+            [pscustomobject]@{ PSChildName='{22222222-2222-3333-4444-555555555555}'; DisplayName='PowerShell 7.6.10.0-x64'; DisplayVersion='7.6.10.0'; WindowsInstaller=$null; UninstallString='"C:\ProgramData\Package Cache\pwsh.exe" /uninstall' }
+        )
+
+        $matched = @(Select-PowerShell7LegacyEntry -Entries $entries)
+
+        $matched.Count | Should -Be 2
+        @($matched.DisplayName) | Should -Not -Contain 'PowerShell 7-preview-x64'
     }
 }
 

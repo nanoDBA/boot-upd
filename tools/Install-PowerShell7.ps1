@@ -28,6 +28,14 @@ if ($PSVersionTable.PSEdition -eq 'Desktop') {
 $script:PackageName = 'Microsoft.PowerShell'
 $script:PublisherId = '8wekyb3d8bbwe'
 $script:LegacyPwshPath = Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'
+$runtimeHelper = Join-Path $PSScriptRoot 'PowerShell7Runtime.ps1'
+if (-not (Test-Path -LiteralPath $runtimeHelper)) { $runtimeHelper = Join-Path (Split-Path $PSScriptRoot -Parent) 'PowerShell7Runtime.ps1' }
+. $runtimeHelper
+
+function Test-PowerShell7MsixRegistered {
+    try { return @((Get-AppxPackage -Name $script:PackageName -ErrorAction Stop | Where-Object PublisherId -eq $script:PublisherId)).Count -gt 0 }
+    catch { return $false }
+}
 
 function Test-Administrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -62,11 +70,8 @@ function Get-PowerShell7MsixInstall {
             if (Test-Path -LiteralPath $path) { $found += [pscustomobject]@{ Version = [version]$package.Version; PwshPath = $path } }
         }
     } catch { }
-    $pattern = '^{0}_(?<ver>[\d.]+)_{1}__{2}$' -f [regex]::Escape($script:PackageName), $architecture, $script:PublisherId
-    foreach ($folder in @(Get-ChildItem -LiteralPath (Join-Path $env:ProgramFiles 'WindowsApps') -Directory -ErrorAction SilentlyContinue)) {
-        if ($folder.Name -notmatch $pattern) { continue }
-        $path = Join-Path $folder.FullName 'pwsh.exe'
-        if (Test-Path -LiteralPath $path) { $found += [pscustomobject]@{ Version = [version]$Matches.ver; PwshPath = $path } }
+    foreach ($package in @(Get-PowerShell7MachineMsixPackages -Architecture $architecture)) {
+        $found += [pscustomobject]@{ Version = $package.Version; PwshPath = $package.PwshPath }
     }
     return ($found | Sort-Object Version -Descending | Select-Object -First 1)
 }
@@ -139,7 +144,7 @@ function Get-PowerShell7UpgradeDecision {
     if ($Legacy) {
         return [pscustomobject]@{
             NeedsUpgrade = $true
-            Message      = "PowerShell $InstalledVersion is an MSI install, which Microsoft no longer ships; replacing it with the $LatestVersion MSIX."
+            Message      = "PowerShell $InstalledVersion MSI is installed; installing the PowerShell $LatestVersion MSIX beside it."
         }
     }
     if ($InstalledVersion -ge $LatestVersion) {
@@ -156,14 +161,31 @@ function Get-PowerShell7CheckOnlyResult {
         [Parameter(Mandatory)][ValidateSet('Msix','Msi')][string]$Package,
         [Parameter(Mandatory)][version]$InstalledVersion,
         [Parameter(Mandatory)][version]$LatestVersion,
-        [AllowEmptyCollection()][object[]]$LegacyEntries = @()
+        [AllowEmptyCollection()][object[]]$LegacyEntries = @(),
+        [bool]$MsixRegistered = $true,
+        [bool]$IsAdministrator = $true
     )
+    $legacyVersion = $null
+    foreach ($entry in @($LegacyEntries)) {
+        $versionText = [string]$entry.Version
+        if ([string]::IsNullOrWhiteSpace($versionText)) { $versionText = [string]$entry.DisplayVersion }
+        $parsed = [version]'0.0'
+        if ([version]::TryParse($versionText, [ref]$parsed) -and ($null -eq $legacyVersion -or $parsed -gt $legacyVersion)) { $legacyVersion = $parsed }
+    }
+    if ($Package -eq 'Msix' -and @($LegacyEntries).Count -gt 0 -and -not $MsixRegistered -and -not $IsAdministrator) {
+        $legacyLabel = if ($legacyVersion) { "PowerShell $legacyVersion MSI" } else { 'A PowerShell MSI installation' }
+        return [pscustomobject]@{
+            ExitCode = 0
+            Message = "$legacyLabel is installed and kept. The MSIX is not registered for this account; this check makes no claim about which PowerShell upd will use."
+        }
+    }
     $decision = Get-PowerShell7UpgradeDecision -InstalledVersion $InstalledVersion -LatestVersion $LatestVersion
     $coexistence = ''
     if ($Package -eq 'Msix' -and @($LegacyEntries).Count -gt 0) {
         $targetVersion = if ($decision.NeedsUpgrade) { $LatestVersion } else { $InstalledVersion }
         $runtimeVerb = if ($decision.NeedsUpgrade) { 'will use' } else { 'use' }
-        $coexistence = " The PowerShell 7.6 MSI is kept on purpose. upd and a newly opened Windows Terminal $runtimeVerb PowerShell $targetVersion; pwsh typed by name may still start PowerShell 7.6."
+        $legacyLabel = if ($legacyVersion) { "PowerShell $legacyVersion MSI" } else { 'The PowerShell MSI' }
+        $coexistence = " $legacyLabel is kept on purpose. upd and a newly opened Windows Terminal $runtimeVerb PowerShell $targetVersion; pwsh typed by name may still start PowerShell $legacyVersion."
     }
     if ($decision.NeedsUpgrade) {
         $message = if ($decision.Message) { $decision.Message } else { "PowerShell $InstalledVersion is behind the latest stable release $LatestVersion." }
@@ -200,66 +222,10 @@ function Get-PowerShell7InstalledVersion {
     try { return [version](Get-Item -LiteralPath $PwshPath).VersionInfo.ProductVersion.Split(' ')[0] } catch { return $null }
 }
 
-function Select-PowerShell7LegacyEntry {
-    <# Uninstall entries of the deprecated PowerShell 7 MSI: the MSI product ("PowerShell 7-x64")
-       and the Microsoft Update bundle that wraps it ("PowerShell 7.6.9.0-x64"). Previews and
-       the MSIX are not matched. Bundles first: removing one removes its MSI too. #>
-    param([object[]]$Entries)
-    $matched = foreach ($entry in @($Entries)) {
-        if (-not $entry -or [string]$entry.DisplayName -notmatch '^PowerShell 7(\.[\d.]+)?-(x64|x86|arm64)$') { continue }
-        $isBundle = [string]$entry.UninstallString -match '(?i)\.exe"?\s+/uninstall'
-        $isMsi = -not $isBundle -and ([int]($entry.WindowsInstaller -as [int]) -eq 1) -and [string]$entry.PSChildName -match '^\{[0-9A-Fa-f-]{36}\}$'
-        if (-not $isBundle -and -not $isMsi) { continue }
-        [pscustomobject]@{
-            Name = [string]$entry.DisplayName; Version = [string]$entry.DisplayVersion
-            Kind = $(if ($isBundle) { 'Bundle' } else { 'Msi' })
-            ProductCode = [string]$entry.PSChildName; UninstallString = [string]$entry.UninstallString
-        }
-    }
-    return @($matched | Sort-Object @{ Expression = { if ($_.Kind -eq 'Bundle') { 0 } else { 1 } } })
-}
-
 function Get-PowerShell7LegacyEntry {
     $keys = @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
               'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*')
     return Select-PowerShell7LegacyEntry -Entries @(Get-ItemProperty -Path $keys -ErrorAction SilentlyContinue)
-}
-
-function Remove-PowerShell7LegacyInstall {
-    <# Deliberately uncalled. The owner chose to keep an installed 7.6 MSI beside the MSIX;
-       see bd on_boot_update_reboot_loop_while_pending_restarts_exist-14qf before changing this. #>
-    <# Restart Manager stays off (MSIRESTARTMANAGERCONTROL=Disable): the launcher that started
-       this may still be running on the MSI's pwsh.exe, and on lab-b (2026-09-15) Restart
-       Manager closing pwsh mid-transaction left a machine with no PowerShell at all. Files in
-       use are removed at the next restart instead (3010). The runtime no longer lives in that
-       folder, so nothing depends on them. #>
-    $restartPending = $false
-    $legacyRemoved = $false
-    foreach ($entry in @(Get-PowerShell7LegacyEntry)) {
-        Write-Host "Removing the deprecated PowerShell MSI install: $($entry.Name) $($entry.Version)..." -ForegroundColor Cyan
-        if ($entry.Kind -eq 'Bundle') {
-            if ($entry.UninstallString -notmatch '^\s*"(?<exe>[^"]+\.exe)"') { Write-Warning "Unrecognised uninstall command for $($entry.Name); left in place."; continue }
-            $exe = $Matches.exe
-            if (-not (Test-Path -LiteralPath $exe)) { continue }
-            $process = Start-Process -FilePath $exe -ArgumentList @('/uninstall','/quiet','/norestart') -Wait -PassThru
-        } else {
-            $msiLog = Join-Path ([IO.Path]::GetTempPath()) 'boot-upd-PowerShell-msi-uninstall.log'
-            $process = Start-Process -FilePath msiexec.exe -Wait -PassThru -ArgumentList @(
-                '/x', $entry.ProductCode, '/qn', '/norestart', '/l*v', ('"{0}"' -f $msiLog), 'MSIRESTARTMANAGERCONTROL=Disable')
-        }
-        $code = $process.ExitCode
-        $process.Dispose()
-        if ($code -in @(0,3010)) {
-            $legacyRemoved = $true
-            if ($code -eq 3010) { $restartPending = $true }
-        } elseif ($code -notin @(1605, 1614)) {
-            Write-Warning "Removing $($entry.Name) returned $code; it may need to be removed from Settings > Apps."
-        }
-    }
-    if ($legacyRemoved) {
-        Write-Host 'TERMINAL_NOTICE: Close and reopen Windows Terminal to refresh PowerShell profiles that still point to the removed MSI.' -ForegroundColor Yellow
-    }
-    return $restartPending
 }
 
 function Test-BootUpdateCycleActive {
@@ -430,7 +396,8 @@ if ($existing -and $Upgrade) {
     }
     if ($CheckOnly) {
         $check = Get-PowerShell7CheckOnlyResult -Package $package -InstalledVersion $installedVersion `
-            -LatestVersion $latest.Version -LegacyEntries $legacy
+            -LatestVersion $latest.Version -LegacyEntries $legacy -MsixRegistered:(Test-PowerShell7MsixRegistered) `
+            -IsAdministrator:(Test-Administrator)
         $color = if ($check.ExitCode -eq 100) { 'Yellow' } else { 'Green' }
         Write-Host $check.Message -ForegroundColor $color
         exit $check.ExitCode

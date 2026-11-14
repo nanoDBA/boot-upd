@@ -42,6 +42,7 @@ param(
     [switch]$SkipHealthCheck,
     [switch]$SkipBitLocker,
     [switch]$DisableSelfUpdate,
+    [Parameter(DontShow)][ValidateSet('upd','direct')][string]$LaunchOrigin = 'direct',
     [string[]]$ExcludePatterns = @(),
     [string[]]$IncludePatterns = @(),
     [switch]$NonInteractive
@@ -327,6 +328,7 @@ if ([string]::IsNullOrEmpty($env:BOOT_UPDATE_NO_SELF_UPDATE) -and -not $Config.D
            on the run after an older Deploy script updates itself. #>
         $sourceAssets = @(
             [pscustomobject]@{ Name='Invoke-BootUpdateCycle.ps1';   RelativeTarget='Invoke-BootUpdateCycle.ps1'; Required=$true;  PowerShell=$true;  Core=$true }
+            [pscustomobject]@{ Name='PowerShell7Runtime.ps1';        RelativeTarget='PowerShell7Runtime.ps1'; Required=$true; PowerShell=$true; Core=$false }
             [pscustomobject]@{ Name='Deploy-BootUpdateCycle.ps1';   RelativeTarget='Deploy-BootUpdateCycle.ps1'; Required=$true; PowerShell=$true;  Core=$true }
             [pscustomobject]@{ Name='Invoke-UpdLauncher.ps1';        RelativeTarget='tools\Invoke-UpdLauncher.ps1'; Required=$true; PowerShell=$true; Core=$false }
             [pscustomobject]@{ Name='Invoke-UpdBootstrap.ps1';       RelativeTarget='tools\Invoke-UpdBootstrap.ps1'; Required=$true; PowerShell=$true; Core=$false }
@@ -470,6 +472,11 @@ if (Test-Path -LiteralPath $ps7Installer) {
     Copy-Item -LiteralPath $ps7Installer -Destination (Join-Path $installDir 'Install-PowerShell7.ps1') -Force
     Write-Host 'Deployed: Install-PowerShell7.ps1'
 }
+$runtimeHelper = Join-Path $PSScriptRoot 'PowerShell7Runtime.ps1'
+if (Test-Path -LiteralPath $runtimeHelper) {
+    Copy-Item -LiteralPath $runtimeHelper -Destination (Join-Path $installDir 'PowerShell7Runtime.ps1') -Force
+    Write-Host 'Deployed: PowerShell7Runtime.ps1'
+}
 
 <# Deploy uninstall helper script #>
 $uninstallScript = @'
@@ -590,6 +597,7 @@ $invokeArgs = @{
     MaintenanceWindowEnd    = $Config.MaintenanceWindowEnd
     ExcludePatterns         = $Config.ExcludePatterns
     IncludePatterns         = $Config.IncludePatterns
+    LaunchOrigin            = $LaunchOrigin
 }
 
 function Invoke-DeployedCycle {
@@ -770,6 +778,7 @@ function Register-ScheduledTaskNow {
     $taskArgs = @(
         '-NoProfile', '-ExecutionPolicy Bypass'
         "-File `"$scriptPath`"", '-Force'
+        "-LaunchOrigin $LaunchOrigin"
         "-MaxIterations $($Config.MaxIterations)"
         "-MaxRetryPasses $($Config.MaxRetryPasses)"
         "-MaxUserIdentityWaits $($Config.MaxUserIdentityWaits)"

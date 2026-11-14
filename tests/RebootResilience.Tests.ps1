@@ -22,6 +22,12 @@ BeforeAll {
         return $function.Extent.Text
     }
 
+    $runtimeHelperPath = Join-Path $repoRoot 'PowerShell7Runtime.ps1'
+    $runtimeHelperAst = Get-ScriptAst $runtimeHelperPath
+    foreach ($helperName in @('Get-PowerShell7TargetArchitecture','Get-PowerShell7MachineMsixPackages','Select-PowerShell7LegacyEntry')) {
+        $helperFn = $runtimeHelperAst.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $helperName },$true)
+        if ($helperFn) { . ([scriptblock]::Create($helperFn.Extent.Text)) }
+    }
     $invokeAst = Get-ScriptAst $invokePath
     $deployAst = Get-ScriptAst $deployPath
     $invokeSource = Get-Content $invokePath -Raw
@@ -982,6 +988,10 @@ Describe 'PowerShell runtime diagnostics' {
 
 Describe 'PowerShell installation inventory' {
     It 'reports installed MSI and MSIX packages separately with their versions' {
+        $windowsApps = Join-Path $TestDrive 'WindowsApps'
+        $fakePwsh = Join-Path $windowsApps 'Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\pwsh.exe'
+        $null = New-Item -ItemType Directory -Path (Split-Path $fakePwsh) -Force
+        Set-Content -LiteralPath $fakePwsh -Value 'fixture'
         Mock Get-AppxPackage {
             [pscustomobject]@{
                 Name='Microsoft.PowerShell'; PublisherId='8wekyb3d8bbwe'
@@ -990,32 +1000,46 @@ Describe 'PowerShell installation inventory' {
         }
         Mock Get-ItemProperty {
             @(
-                [pscustomobject]@{ DisplayName='PowerShell 7-x64'; DisplayVersion='7.6.10.0'; WindowsInstaller=1; UninstallString='MsiExec.exe /X{11111111-2222-3333-4444-555555555555}' }
+                [pscustomobject]@{ PSChildName='{11111111-2222-3333-4444-555555555555}'; DisplayName='PowerShell 7-x64'; DisplayVersion='7.6.10.0'; WindowsInstaller=1; UninstallString='MsiExec.exe /X{11111111-2222-3333-4444-555555555555}' }
                 [pscustomobject]@{ DisplayName='Example App'; DisplayVersion='1.0'; WindowsInstaller=1; UninstallString='MsiExec.exe /X{AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE}' }
             )
         }
 
-        $inventory = Get-BootUpdatePowerShellInstallInventory
+        $inventory = Get-BootUpdatePowerShellInstallInventory -WindowsAppsRoot $windowsApps
 
         (@($inventory.Msi | ForEach-Object Version) -join ',') | Should -Be '7.6.10.0'
         (@($inventory.Msix | ForEach-Object Version) -join ',') | Should -Be '7.7.0.0'
     }
 
     It 'logs each inventory snapshot with its cycle stage and MSI/MSIX versions' {
+        $windowsApps = Join-Path $TestDrive 'WindowsApps'
+        $fakePwsh = Join-Path $windowsApps 'Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\pwsh.exe'
+        $null = New-Item -ItemType Directory -Path (Split-Path $fakePwsh) -Force
+        Set-Content -LiteralPath $fakePwsh -Value 'fixture'
         $script:InventoryLog = [Collections.Generic.List[string]]::new()
         Mock Write-Log { $script:InventoryLog.Add($Message) }
         Mock Get-AppxPackage {
             [pscustomobject]@{ Name='Microsoft.PowerShell'; PublisherId='8wekyb3d8bbwe'; Version=[version]'7.7.0.0'; InstallLocation='C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe' }
         }
         Mock Get-ItemProperty {
-            [pscustomobject]@{ DisplayName='PowerShell 7-x64'; DisplayVersion='7.6.10.0'; WindowsInstaller=1; UninstallString='MsiExec.exe /X{11111111-2222-3333-4444-555555555555}' }
+            [pscustomobject]@{ PSChildName='{11111111-2222-3333-4444-555555555555}'; DisplayName='PowerShell 7-x64'; DisplayVersion='7.6.10.0'; WindowsInstaller=1; UninstallString='MsiExec.exe /X{11111111-2222-3333-4444-555555555555}' }
         }
 
-        Write-BootUpdatePowerShellInventory -Stage 'cycle-start'
-        Write-BootUpdatePowerShellInventory -Stage 'cycle-end'
+        Write-BootUpdatePowerShellInventory -Stage 'cycle-start' -WindowsAppsRoot $windowsApps
+        Write-BootUpdatePowerShellInventory -Stage 'cycle-end' -WindowsAppsRoot $windowsApps
 
         ($script:InventoryLog -join "`n") | Should -Match 'Stage: cycle-start.*MSI: 7\.6\.10\.0.*MSIX: 7\.7\.0\.0'
         ($script:InventoryLog -join "`n") | Should -Match 'Stage: cycle-end.*MSI: 7\.6\.10\.0.*MSIX: 7\.7\.0\.0'
+    }
+
+    It 'keeps the cycle moving and logs unknown inventory when an inventory read fails' {
+        $script:InventoryLog = [Collections.Generic.List[string]]::new()
+        Mock Write-Log { $script:InventoryLog.Add($Message) }
+        Mock Get-PowerShell7MachineMsixPackages { throw 'Package inventory unavailable' }
+
+        { Write-BootUpdatePowerShellInventory -Stage 'cycle-start' } | Should -Not -Throw
+
+        ($script:InventoryLog -join "`n") | Should -Match 'Stage: cycle-start.*MSI: unknown.*MSIX: unknown'
     }
 }
 

@@ -14,16 +14,41 @@ $ErrorActionPreference = 'Stop'
 
 $repoRoot = if ($env:UPD_ROOT) { [IO.Path]::GetFullPath($env:UPD_ROOT) } else { Split-Path $PSScriptRoot -Parent }
 $launcherPath = Join-Path $repoRoot 'tools\Invoke-UpdLauncher.ps1'
+$runtimeHelper = Join-Path $repoRoot 'PowerShell7Runtime.ps1'
+$script:LaunchOrigin = if ($env:BOOTUPDATE_LAUNCH_ORIGIN -in @('upd','continuation','fallback')) { $env:BOOTUPDATE_LAUNCH_ORIGIN } else { 'direct' }
 $rawArguments = @($args)
+
+function ConvertFrom-UpdBootstrapHandoff {
+    param([Parameter(Mandatory)][string]$Encoded)
+    $json = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Encoded))
+    $decoded = ConvertFrom-Json -InputObject $json
+    if ($null -ne $decoded.Arguments) {
+        $origin = [string]$decoded.LaunchOrigin
+        if ($origin -notin @('upd','continuation','fallback','direct')) { $origin = 'direct' }
+        return [pscustomobject]@{ Arguments=@($decoded.Arguments | ForEach-Object { [string]$_ }); LaunchOrigin=$origin }
+    }
+    return [pscustomobject]@{ Arguments=@($decoded | ForEach-Object { [string]$_ }); LaunchOrigin='direct' }
+}
 
 if ($rawArguments.Count -eq 2 -and $rawArguments[0] -eq '--stage0-encoded') {
     try {
-        $json = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($rawArguments[1]))
-        $decoded = ConvertFrom-Json -InputObject $json
-        $rawArguments = @($decoded | ForEach-Object { [string]$_ })
-    } catch {
-        throw 'The elevated launcher handoff arguments are malformed.'
+        $handoff = ConvertFrom-UpdBootstrapHandoff -Encoded $rawArguments[1]
+        $rawArguments = @($handoff.Arguments)
+        $script:LaunchOrigin = $handoff.LaunchOrigin
+        $env:BOOTUPDATE_LAUNCH_ORIGIN = $script:LaunchOrigin
+    } catch { throw 'The elevated launcher handoff arguments are malformed.' }
+}
+
+function Get-UpdBootstrapPowerShellPath {
+    if ($PSVersionTable.PSEdition -eq 'Core') { return (Get-Process -Id $PID).Path }
+    if (Test-Path -LiteralPath $runtimeHelper) {
+        . $runtimeHelper
+        $path = Get-PowerShell7MachineMsixPath
+        if ($path) { return $path }
     }
+    $legacy = Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'
+    if (Test-Path -LiteralPath $legacy) { return $legacy }
+    throw 'No machine-accessible PowerShell 7 install was found for the elevated account.'
 }
 
 function Test-UpdBootstrapAdministrator {
@@ -37,7 +62,7 @@ function Invoke-UpdBootstrapLauncher {
     if (-not (Test-Path -LiteralPath $launcherPath)) {
         throw "The typed UPD launcher is missing: $launcherPath"
     }
-    $pwshPath = (Get-Process -Id $PID).Path
+    $pwshPath = Get-UpdBootstrapPowerShellPath
     & $pwshPath -NoLogo -NoProfile -ExecutionPolicy Bypass -File $launcherPath @Arguments
     $script:UpdBootstrapLauncherExitCode = $LASTEXITCODE
 }
@@ -80,10 +105,11 @@ if (Test-UpdBootstrapUpdateDisabled -Arguments $rawArguments) {
    elevated copy updates first and then dispatches the untouched argv to the
    newly installed typed launcher, so there is no second elevation prompt. #>
 if (-not (Test-UpdBootstrapAdministrator)) {
-    $json = ConvertTo-Json -InputObject @($rawArguments) -Compress
+    $json = ConvertTo-Json -InputObject @{ Arguments=@($rawArguments); LaunchOrigin=$script:LaunchOrigin } -Compress
     $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
     $quotedScript = '"{0}"' -f $PSCommandPath
-    $process = Start-Process -FilePath (Get-Process -Id $PID).Path -Verb RunAs -Wait -PassThru -ArgumentList @(
+    $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $process = Start-Process -FilePath $windowsPowerShell -Verb RunAs -Wait -PassThru -ArgumentList @(
         '-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-File',$quotedScript,
         '--stage0-encoded',$encoded
     )

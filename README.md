@@ -249,7 +249,10 @@ Windows PowerShell 5.1 is supported as a bootstrap host. On an operational comma
 version remain read-only; preview/plan/status commands ask the user to run
 `upd bootstrap` rather than silently installing anything. The updater itself remains
 PowerShell 7-only so `Start-ThreadJob` and `ForEach-Object -Parallel` execution are
-preserved.
+preserved. Windows includes PowerShell 5.1, so the bootstrap can install PowerShell 7 on a
+machine that does not have it yet. It also runs the installer outside PowerShell 7, which
+cannot replace its own files while it is running. The elevation handoff starts in 5.1 too,
+so entering credentials for another administrator does not depend on your account's PowerShell 7 alias.
 
 Where Windows supports it, boot-upd installs PowerShell 7 from Microsoft's MSIX bundle,
 checks the release's SHA-256 list and Microsoft signature, and provisions it machine-wide.
@@ -268,6 +271,8 @@ per-user alias and SYSTEM, which runs the continuation tasks, has none.
   prefers the MSIX alias when it is registered for your account. With the MSIX registered,
   a newly opened Windows Terminal uses 7.7 for its default PowerShell profile; the 7.6 MSI
   remains a second profile.
+  The MSI stays for software and services that need WinRM remoting into PowerShell 7, an
+  all-users profile, a machine-wide execution policy, or a stable PowerShell path for SYSTEM.
   Since the MSI directory can come first on PATH, `pwsh` typed by name may still start 7.6.
   A machine where an earlier boot-upd release already removed the MSI is left as it is.
 - **Older Windows keeps the MSI.** Windows older than build 17763 (Windows Server 2016)
@@ -449,6 +454,14 @@ the troubleshooter addresses the stale Windows inventory.
 
 ### More monitoring
 
+Each pass logs the PowerShell version, install folder, account, and launcher. The cycle also
+logs the installed MSI and MSIX versions at startup and shutdown. For example:
+
+```text
+PowerShell runtime | Version: 7.7.0 | Install folder: <install folder> | Account: SYSTEM | Launched by: continuation
+PowerShell installs | Stage: cycle-start | MSI: 7.6.10 | MSIX: 7.7.0
+```
+
 ```powershell
 # Live log tail
 Get-Content "$env:ProgramData\BootUpdateCycle\BootUpdateCycle.log" -Tail 50 -Wait
@@ -485,6 +498,13 @@ its resume tasks; use the task-removal command above to stop automatic continuat
 
 <a id="common-questions"></a>
 ## 🙋 Common questions
+
+### Why does Windows Terminal say it cannot find `pwsh.exe` (error 0x80070002)?
+
+Terminal builds its PowerShell profile list when it starts. If it was already open when
+PowerShell 7 was installed, upgraded, or removed, it can keep the old path. Close every
+Terminal window and open Terminal again. This can happen on machines where an earlier
+boot-upd release removed the 7.6 MSI.
 
 ### Is `ChocolateyPrototypeCleanup` a problem?
 

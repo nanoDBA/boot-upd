@@ -150,7 +150,7 @@ exit /b 2
 rem SYSTEM has no per-user alias; prefer the machine-wide MSIX before PATH.
 set "UPD_PWSH="
 if exist "%LocalAppData%\Microsoft\WindowsApps\pwsh.exe" set "UPD_PWSH=%LocalAppData%\Microsoft\WindowsApps\pwsh.exe"
-if not defined UPD_PWSH if defined ProgramFiles for /d %%P in ("%ProgramFiles%\WindowsApps\Microsoft.PowerShell_*__8wekyb3d8bbwe") do if not defined UPD_PWSH if exist "%%~fP\pwsh.exe" set "UPD_PWSH=%%~fP\pwsh.exe"
+if not defined UPD_PWSH for /f "delims=" %%P in ('""%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%UPD_ROOT%\PowerShell7Runtime.ps1" -ResolveMachineMsixPath -WindowsAppsRoot "%ProgramFiles%\WindowsApps"" 2^>nul') do if not defined UPD_PWSH set "UPD_PWSH=%%P"
 where pwsh.exe >nul 2>&1
 if not defined UPD_PWSH if not errorlevel 1 set "UPD_PWSH=pwsh.exe"
 if not defined UPD_PWSH if exist "%ProgramFiles%\PowerShell\7\pwsh.exe" set "UPD_PWSH=%ProgramFiles%\PowerShell\7\pwsh.exe"

@@ -34,6 +34,7 @@ $root = Split-Path $PSScriptRoot -Parent
 $assetSpecs = @(
     [pscustomobject]@{ Source='Deploy-BootUpdateCycle.ps1';       Name='Deploy-BootUpdateCycle.ps1'; Kind='PowerShell' }
     [pscustomobject]@{ Source='Invoke-BootUpdateCycle.ps1';       Name='Invoke-BootUpdateCycle.ps1'; Kind='PowerShell' }
+    [pscustomobject]@{ Source='PowerShell7Runtime.ps1';            Name='PowerShell7Runtime.ps1';      Kind='PowerShell' }
     [pscustomobject]@{ Source='upd.cmd';                           Name='upd.cmd';                    Kind='Batch' }
     [pscustomobject]@{ Source='tools/Invoke-UpdLauncher.ps1';      Name='Invoke-UpdLauncher.ps1';     Kind='PowerShell' }
     [pscustomobject]@{ Source='tools/Invoke-UpdBootstrap.ps1';     Name='Invoke-UpdBootstrap.ps1';    Kind='PowerShell' }

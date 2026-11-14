@@ -13,7 +13,7 @@ BeforeAll {
         $node.Name -eq 'Test-LabSavedUserWaitEvidence'
     }, $true)
     . ([scriptblock]::Create($waitFn.Extent.Text))
-    foreach ($name in @('New-LabStageEvidence','Get-LabPowerShellRuntimeHandoffEvidence','Test-LabShouldStopAfterContinuationRuntime','Test-LabRebootAfterBootstrap','Get-LabRuntimeEventTimestampUtc')) {
+    foreach ($name in @('New-LabStageEvidence','Get-LabPowerShellRuntimeHandoffEvidence','Test-LabShouldStopAfterContinuationRuntime','Test-LabShouldMarkStoppedAfterContinuationRuntime','Test-LabRebootAfterBootstrap','Get-LabRuntimeEventTimestampUtc')) {
         $helper = $ast.Find({ param($node)
             $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
         }, $true)
@@ -108,14 +108,15 @@ Describe 'Lab runtime handoff stage evidence' {
         $stage.Facts.Runtime | Should -Be 'PowerShell 7.7'
     }
 
-    It 'passes only when upd and the SYSTEM continuation use 7.7 while both installs remain' {
+    It 'matches the installed MSIX version for upd and any-account continuation while both installs remain' {
         $runtimeLines = @(
-            '[2026-11-14 14:18:45] [Info] PowerShell runtime | Version: 7.7.0 | Install folder: C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\pwsh.exe | Account: SYSTEM | Launched by: upd',
-            '[2026-11-14 14:19:49] [Info] PowerShell runtime | Version: 7.7.0 | Install folder: C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\pwsh.exe | Account: SYSTEM | Launched by: continuation'
+            '[2026-11-14 14:18:45] [Info] PowerShell runtime | Version: 7.8.2 | Install folder: C:\Program Files\WindowsApps\Microsoft.PowerShell_7.8.2.0_x64__8wekyb3d8bbwe | Account: LAB\updtest | Launched by: upd',
+            '[2026-11-14 14:19:49] [Info] PowerShell runtime | Version: 7.8.2 | Install folder: C:\Program Files\WindowsApps\Microsoft.PowerShell_7.8.2.0_x64__8wekyb3d8bbwe | Account: NT AUTHORITY\SYSTEM | Launched by: fallback'
         )
 
         $evidence = Get-LabPowerShellRuntimeHandoffEvidence -RuntimeLines $runtimeLines `
-            -MsiVersions @('7.6.10.0') -MsixVersions @('7.7.0.0') -RebootSeen $true
+            -MsiVersions @('7.6.10.0') -MsixVersions @('7.8.2.0') `
+            -RebootObservedAtUtc ([datetime]'2026-11-14T14:19:00Z')
 
         $evidence.Passed | Should -BeTrue
         $evidence.ContinuationRuntimeLine | Should -Be $runtimeLines[1]
@@ -123,12 +124,12 @@ Describe 'Lab runtime handoff stage evidence' {
 
     It 'rejects a fallback launch or a missing MSI instead of overstating the row' {
         $runtimeLines = @(
-            'PowerShell runtime | Version: 7.7.0 | Install folder: C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\pwsh.exe | Account: SYSTEM | Launched by: upd',
-            'PowerShell runtime | Version: 7.7.0 | Install folder: C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\pwsh.exe | Account: SYSTEM | Launched by: fallback'
+            '[2026-11-14T14:18:45Z] PowerShell runtime | Version: 7.7.0 | Install folder: C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\pwsh.exe | Account: SYSTEM | Launched by: upd',
+            '[2026-11-14T14:19:49Z] PowerShell runtime | Version: 7.7.0 | Install folder: C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\pwsh.exe | Account: SYSTEM | Launched by: fallback'
         )
 
         $evidence = Get-LabPowerShellRuntimeHandoffEvidence -RuntimeLines $runtimeLines `
-            -MsiVersions @() -MsixVersions @('7.7.0.0') -RebootSeen $true
+            -MsiVersions @() -MsixVersions @('7.7.0.0') -RebootObservedAtUtc ([datetime]'2026-11-14T14:19:00Z')
 
         $evidence.Passed | Should -BeFalse
     }
@@ -140,7 +141,7 @@ Describe 'Lab runtime handoff stage evidence' {
         )
 
         $evidence = Get-LabPowerShellRuntimeHandoffEvidence -RuntimeLines $runtimeLines `
-            -MsiVersions @('7.6.10.0') -MsixVersions @('7.7.0.0') -RebootSeen $false
+            -MsiVersions @('7.6.10.0') -MsixVersions @('7.7.0.0')
 
         $evidence.Passed | Should -BeFalse
     }
@@ -152,10 +153,30 @@ Describe 'Lab runtime handoff stage evidence' {
         )
 
         $evidence = Get-LabPowerShellRuntimeHandoffEvidence -RuntimeLines $runtimeLines `
-            -MsiVersions @('7.6.10.0') -MsixVersions @('7.7.0.0') -RebootSeen $true
+            -MsiVersions @('7.6.10.0') -MsixVersions @('7.7.0.0') -RebootObservedAtUtc ([datetime]'2026-11-14T14:19:00Z')
 
         $evidence.Passed | Should -BeTrue
         $evidence.ContinuationRuntimeLine | Should -Be $runtimeLines[1]
+    }
+
+    It 'rejects a continuation runtime line that predates the observed reboot' {
+        $runtimeLines = @(
+            '[2026-11-14 14:18:45] [Info] PowerShell runtime | Version: 7.8.2 | Install folder: C:\Program Files\WindowsApps\Microsoft.PowerShell_7.8.2.0_x64__8wekyb3d8bbwe | Account: LAB\updtest | Launched by: upd',
+            '[2026-11-14 14:18:59] [Info] PowerShell runtime | Version: 7.8.2 | Install folder: C:\Program Files\WindowsApps\Microsoft.PowerShell_7.8.2.0_x64__8wekyb3d8bbwe | Account: LAB\updtest | Launched by: continuation'
+        )
+
+        $evidence = Get-LabPowerShellRuntimeHandoffEvidence -RuntimeLines $runtimeLines `
+            -MsiVersions @('7.6.10.0') -MsixVersions @('7.8.2.0') `
+            -RebootObservedAtUtc ([datetime]'2026-11-14T14:19:00Z')
+
+        $evidence.Passed | Should -BeFalse
+        $evidence.ContinuationRuntimeLine | Should -BeNullOrEmpty
+    }
+
+    It 'does not mark a cycle complete at the continuation stop boundary' {
+        Test-LabShouldMarkStoppedAfterContinuationRuntime -StoppedAtRuntime $true -CycleCompleted $false | Should -BeTrue
+        Test-LabShouldMarkStoppedAfterContinuationRuntime -StoppedAtRuntime $true -CycleCompleted $true | Should -BeFalse
+        Test-LabShouldMarkStoppedAfterContinuationRuntime -StoppedAtRuntime $false -CycleCompleted $false | Should -BeFalse
     }
 
     It 'stops only after the qualifying continuation runtime has been observed' {

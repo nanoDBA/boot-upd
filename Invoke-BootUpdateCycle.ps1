@@ -129,6 +129,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'PowerShell7Runtime.ps1')
 $script:ScriptBoundParams = @{} + $PSBoundParameters
 $decodePatternArray = {
     param([string]$Encoded, [string[]]$Fallback)
@@ -8894,32 +8895,35 @@ function Apply-RemoteConfig {
 
 #region Main Orchestration
 function Get-BootUpdatePowerShellInstallInventory {
-    $uninstallPaths = @(
-        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
-        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
-    )
-    $msi = @(Get-ItemProperty -Path $uninstallPaths -ErrorAction SilentlyContinue |
-        Where-Object {
-            $_.DisplayName -match '^PowerShell 7(?:\b|[- ])' -and
-            [int]($_.WindowsInstaller -as [int]) -eq 1 -and
-            -not [string]::IsNullOrWhiteSpace([string]$_.DisplayVersion)
-        } | ForEach-Object {
-            [pscustomobject]@{ Version=[string]$_.DisplayVersion }
-        } | Sort-Object Version -Unique)
-    $msix = @(Get-AppxPackage -AllUsers -Name Microsoft.PowerShell -ErrorAction SilentlyContinue |
-        Where-Object { $_.PublisherId -eq '8wekyb3d8bbwe' } | ForEach-Object {
-            [pscustomobject]@{ Version=[string]$_.Version }
-        } | Sort-Object Version -Unique)
-    return [pscustomobject]@{ Msi=$msi; Msix=$msix }
+    param([string]$WindowsAppsRoot = (Join-Path $env:ProgramFiles 'WindowsApps'))
+    try {
+        $uninstallPaths = @(
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+        )
+        $entries = @(Get-ItemProperty -Path $uninstallPaths -ErrorAction Stop)
+        $msi = @(Select-PowerShell7LegacyEntry -Entries $entries | Where-Object Version |
+            ForEach-Object { [pscustomobject]@{ Version=[string]$_.Version } } | Sort-Object Version -Unique)
+        $msix = @(Get-PowerShell7MachineMsixPackages -WindowsAppsRoot $WindowsAppsRoot -ErrorOnEnumerationFailure |
+            ForEach-Object { [pscustomobject]@{ Version=$_.Version.ToString() } } | Sort-Object Version -Unique)
+        return [pscustomobject]@{ Known=$true; Msi=$msi; Msix=$msix }
+    } catch {
+        return [pscustomobject]@{ Known=$false; Msi=@(); Msix=@() }
+    }
 }
 
 function Write-BootUpdatePowerShellInventory {
-    param([Parameter(Mandatory)][ValidateSet('cycle-start','cycle-end')][string]$Stage)
-
-    $inventory = Get-BootUpdatePowerShellInstallInventory
-    $msiVersions = if (@($inventory.Msi).Count) { (@($inventory.Msi | ForEach-Object Version) -join ',') } else { 'none' }
-    $msixVersions = if (@($inventory.Msix).Count) { (@($inventory.Msix | ForEach-Object Version) -join ',') } else { 'none' }
-    Write-Log "PowerShell installs | Stage: $Stage | MSI: $msiVersions | MSIX: $msixVersions" -Level Info
+    param([Parameter(Mandatory)][ValidateSet('cycle-start','cycle-end')][string]$Stage,
+          [string]$WindowsAppsRoot = (Join-Path $env:ProgramFiles 'WindowsApps'))
+    try {
+        $inventory = Get-BootUpdatePowerShellInstallInventory -WindowsAppsRoot $WindowsAppsRoot
+        if (-not $inventory.Known) { throw 'inventory read failed' }
+        $msiVersions = if (@($inventory.Msi).Count) { (@($inventory.Msi | ForEach-Object Version) -join ',') } else { 'none' }
+        $msixVersions = if (@($inventory.Msix).Count) { (@($inventory.Msix | ForEach-Object Version) -join ',') } else { 'none' }
+        Write-Log "PowerShell installs | Stage: $Stage | MSI: $msiVersions | MSIX: $msixVersions" -Level Info
+    } catch {
+        try { Write-Log "PowerShell installs | Stage: $Stage | MSI: unknown | MSIX: unknown" -Level Info } catch { }
+    }
 }
 
 function Get-BootUpdateRuntimeLogLine {
