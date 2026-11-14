@@ -490,9 +490,9 @@ function Show-UpdRuntimeTerminalNotice {
     }
     foreach ($candidate in @($candidates | Sort-Object LastWriteTime -Descending)) {
         $notice = Get-Content -LiteralPath $candidate.Path -Tail 100 -ErrorAction SilentlyContinue |
-            Where-Object { $_ -match '^TERMINAL_NOTICE:' } | Select-Object -Last 1
+            Where-Object { $_ -match 'TERMINAL_NOTICE:' } | Select-Object -Last 1
         if ($notice) {
-            $message = $notice -replace '^TERMINAL_NOTICE:\s*',''
+            $message = $notice -replace '^.*?TERMINAL_NOTICE:\s*',''
             Write-Host "  terminal $message" -ForegroundColor Yellow
             return
         }

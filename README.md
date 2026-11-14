@@ -268,14 +268,15 @@ per-user alias and SYSTEM, which runs the continuation tasks, has none.
   new MSIX, it removes the MSI after the new `pwsh` starts. Open PowerShell windows keep
   running; files still in use are removed at the next restart. Close and reopen Windows
   Terminal after the switch; an already-running Terminal can keep its old generated profile.
-- **Old launch paths get moved out of the way.** The switch updates explicit Windows Terminal
+- **Saved PowerShell paths get updated.** The switch updates explicit Windows Terminal
   profiles for every existing user, scheduled task actions, OpenSSH's default shell, App Paths,
   and the machine PATH. Terminal settings are edited as text, with a timestamped backup beside
-  each changed file; comments and formatting stay put. SYSTEM tasks use the installed MSIX
-  executable and are repointed after boot-upd upgrades PowerShell. A task saved with a password
+  each changed file; comments and formatting stay put. SYSTEM task actions point at the installed
+  MSIX version. An independently serviced package upgrade can make those saved paths stale; run
+  `upd bootstrap` afterward to refresh them. A task saved with a password
   is left alone and reported with the path it needs; boot-upd can't change its saved credentials.
-  Leftover MSI `Modules` and `Scripts` are moved into the shared PowerShell folders, with
-  conflicting files kept for inspection.
+  MSI `Modules` and `Scripts` are moved only after uninstall succeeds. Modules already bundled
+  with the MSIX stay out of the shared module path; other conflicts are kept for inspection.
 - **Older Windows keeps the MSI.** Windows older than build 17763 (Windows Server 2016)
   and Server Core cannot install the MSIX. They get the signed PowerShell 7.6 LTS MSI,
   the last line Microsoft ships that way.

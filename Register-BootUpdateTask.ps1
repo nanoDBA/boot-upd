@@ -99,16 +99,10 @@ if ($SkipAwsTooling)  { $arguments += '-SkipAwsTooling' }
 
 $argString = $arguments -join ' '
 
-<# Prefer the running PowerShell 7 install. On MSIX this is the package executable that
-   SYSTEM can run; Get-Command pwsh would select the per-user alias. #>
+<# Prefer the running PowerShell 7 install. #>
 $pwshPath = Join-Path $PSHOME 'pwsh.exe'
 if (-not (Test-Path -LiteralPath $pwshPath)) { $pwshPath = $null }
-if (-not $pwshPath) {
-    $pwshPath = (Get-Command pwsh.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1).Source
-}
-if (-not $pwshPath) {
-    $pwshPath = Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'
-}
+if (-not $pwshPath) { $pwshPath = Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe' }
 if (-not (Test-Path $pwshPath)) {
     throw "PowerShell 7 (pwsh.exe) not found. Install PowerShell 7+ first."
 }

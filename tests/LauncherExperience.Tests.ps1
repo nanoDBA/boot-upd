@@ -42,7 +42,7 @@ BeforeAll {
         return $function.Extent.Text
     }
 
-    foreach ($name in @('Test-Administrator','Get-PowerShell7TargetArchitecture','Get-PowerShell7MsixInstall','Test-PowerShell7MsixSupported','Get-PowerShell7LatestStableVersion','Get-PowerShell7UpgradeDecision','Get-PowerShell7CheckOnlyResult','Get-PowerShell7LegacyEntry','ConvertFrom-PowerShell7HashFile','Select-PowerShell7LegacyEntry')) {
+    foreach ($name in @('Test-Administrator','Get-PowerShell7TargetArchitecture','Get-PowerShell7MsixInstall','Test-PowerShell7MsixSupported','Get-PowerShell7LatestStableVersion','Get-PowerShell7UpgradeDecision','Get-PowerShell7CheckOnlyResult','Test-PowerShell7TextHasStaleRuntimeReference','Get-PowerShell7LegacyEntry','ConvertFrom-PowerShell7HashFile','Select-PowerShell7LegacyEntry')) {
         . ([scriptblock]::Create((Get-FunctionText -Ast $ps7BootstrapAst -Name $name)))
     }
     $script:PackageName = 'Microsoft.PowerShell'
@@ -879,6 +879,22 @@ Describe 'upd bootstrap upgrades an installed PowerShell 7' {
         Should -Not -Invoke Get-AppxPackage
     }
 
+    It 'returns 100 when an external MSIX upgrade left an older package path saved in a task' {
+        $result = Get-PowerShell7CheckOnlyResult -Package Msix -InstalledVersion '7.7.1' `
+            -LatestVersion '7.7.1' -LegacyEntries @() -StaleRuntimeReferences
+        $result.ExitCode | Should -Be 100
+        $result.Message | Should -Match 'saved task or system setting'
+        $result.Message | Should -Not -Match '[\r\n]'
+    }
+
+    It 'detects literal and environment-variable MSI references but leaves the current MSIX alone' {
+        $current = 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.1.0_x64__8wekyb3d8bbwe\pwsh.exe'
+        (Test-PowerShell7TextHasStaleRuntimeReference -Text '%ProgramFiles%\PowerShell\7\pwsh.exe' -InstalledPwshPath $current) | Should -BeTrue
+        (Test-PowerShell7TextHasStaleRuntimeReference -Text 'C:\Program Files\PowerShell\7\pwsh.exe' -InstalledPwshPath $current) | Should -BeTrue
+        (Test-PowerShell7TextHasStaleRuntimeReference -Text 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\pwsh.exe' -InstalledPwshPath $current) | Should -BeTrue
+        (Test-PowerShell7TextHasStaleRuntimeReference -Text $current -InstalledPwshPath $current) | Should -BeFalse
+    }
+
     It 'never downgrades and only reports an upgrade when installed is behind latest' {
         (Get-PowerShell7UpgradeDecision -InstalledVersion '7.4.5' -LatestVersion '7.4.6').NeedsUpgrade | Should -BeTrue
         (Get-PowerShell7UpgradeDecision -InstalledVersion '7.4.6' -LatestVersion '7.4.6').NeedsUpgrade | Should -BeFalse
@@ -1026,6 +1042,7 @@ Describe 'upd bootstrap upgrades an installed PowerShell 7' {
         $removal = Get-FunctionText -Ast $ps7BootstrapAst -Name 'Remove-PowerShell7LegacyInstall'
         $removal | Should -Match '(?s)if \(\$code -in @\(0,3010\)\).*?\$legacyRemoved = \$true.*?TERMINAL_NOTICE:'
         $removal | Should -Match 'Close and reopen Windows Terminal'
+        $removal | Should -Match 'PowerShellRuntimeUpgrade\.log'
     }
 
     It 'never changes the runtime under a running cycle and reports a check with exit 100' {
@@ -1036,6 +1053,8 @@ Describe 'upd bootstrap upgrades an installed PowerShell 7' {
         $ps7BootstrapSource | Should -Match 'if \(\$CheckOnly\) \{'
         $ps7BootstrapSource | Should -Match '(?s)if \(\$CheckOnly\) \{\s*\$check = Get-PowerShell7CheckOnlyResult.*?exit \$check\.ExitCode'
         $ps7BootstrapSource | Should -Match "PowerShell \`$installedVersion -> \`$\(\`$installed\.Version\) installed\."
+        $freshInstall = [regex]::Match($ps7BootstrapSource,'(?s)Write-Host ''PowerShell 7 is required for parallel update execution\.''.*?\$latest = Get-PowerShell7LatestStableVersion').Value
+        $freshInstall | Should -Match '(?s)Test-BootUpdateCycleActive.*?exit 3'
     }
 
     It 'starts the upgrade after a verified completion, never during a preview or a pass' {
@@ -1069,8 +1088,8 @@ Describe 'upd bootstrap upgrades an installed PowerShell 7' {
             . ([scriptblock]::Create($notice.Extent.Text))
             $programDataLog = Join-Path $TestDrive 'PowerShellRuntimeUpgrade.log'
             $tempLog = Join-Path $TestDrive 'boot-upd-pwsh-upgrade.log'
-            Set-Content -LiteralPath $programDataLog -Value 'PowerShell 7 is already current.'
-            Set-Content -LiteralPath $tempLog -Value 'TERMINAL_NOTICE: Close and reopen Windows Terminal to refresh PowerShell profiles that still point to the removed MSI.'
+            Set-Content -LiteralPath $programDataLog -Value '2026-11-13 22:00:00Z TERMINAL_NOTICE: Close and reopen Windows Terminal to refresh PowerShell profiles after the switch.'
+            Set-Content -LiteralPath $tempLog -Value 'PowerShell 7 is already current.'
             $output = Show-UpdRuntimeTerminalNotice -LogPaths @($programDataLog,$tempLog) 6>&1
             ($output -join "`n") | Should -Match 'Close and reopen Windows Terminal'
         }
@@ -1204,7 +1223,7 @@ Describe 'PowerShell MSIX migrates explicit Windows Terminal paths without rewri
     }
 }
 
-Describe 'PowerShell MSIX task references survive package version changes' {
+Describe 'PowerShell MSIX task references update to the installed version' {
     BeforeAll {
         $root = Split-Path $PSScriptRoot -Parent
         $installer = Join-Path $root 'tools\PowerShellRuntimeMigration.ps1'
@@ -1232,6 +1251,75 @@ Describe 'PowerShell MSIX task references survive package version changes' {
         $plan.Actions[0].Execute | Should -Be 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.1.0_x64__8wekyb3d8bbwe\pwsh.exe'
         $plan.Actions[0].Argument | Should -Be '-File cycle.ps1'
         $plan.Actions[0].WorkingDirectory | Should -Be 'C:\Lab'
+    }
+
+    It 'preserves action IDs, non-executable actions, and neighboring arguments during migration' {
+        $migrationAst | Should -Not -BeNullOrEmpty
+        $referenceAst | Should -Not -BeNullOrEmpty
+        if (-not $migrationAst -or -not $referenceAst) { return }
+        . ([scriptblock]::Create($referenceAst.Extent.Text))
+        . ([scriptblock]::Create($migrationAst.Extent.Text))
+        $oldPackage = 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\pwsh.exe'
+        $newPackage = 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.1.0_x64__8wekyb3d8bbwe\pwsh.exe'
+        $task = [pscustomobject]@{
+            Principal = [pscustomobject]@{ UserId='SYSTEM'; LogonType='ServiceAccount' }
+            Actions = @(
+                [pscustomobject]@{ Id='Cycle'; Execute='C:\Program Files\PowerShell\7\pwsh.exe'; Argument="-File $oldPackage;C:\Tools\after.exe"; WorkingDirectory='C:\Program Files\PowerShell\7' },
+                [pscustomobject]@{ ClassId='{12345678-1234-1234-1234-123456789012}'; Data='handler-data' }
+            )
+        }
+
+        $plan = Get-PowerShell7TaskActionMigration -Task $task `
+            -LegacyPwshPath 'C:\Program Files\PowerShell\7\pwsh.exe' `
+            -SystemPwshPath $newPackage `
+            -UserPwshAlias 'C:\Users\Sample\AppData\Local\Microsoft\WindowsApps\pwsh.exe'
+        $argument = Convert-PowerShell7RuntimeReference -Text "-File C:\Jobs\first.ps1 -Engine $oldPackage;C:\Tools\after.exe" `
+            -LegacyPwshPath 'C:\Program Files\PowerShell\7\pwsh.exe' -SystemPwshPath $newPackage
+
+        $plan.Actions[0].Id | Should -Be 'Cycle'
+        $plan.Actions[0].Execute | Should -Be $newPackage
+        $plan.Actions[0].WorkingDirectory | Should -Be (Split-Path $newPackage)
+        $plan.Actions[1].ClassId | Should -Be '{12345678-1234-1234-1234-123456789012}'
+        $plan.Actions[1].Data | Should -Be 'handler-data'
+        $argument | Should -Be "-File C:\Jobs\first.ps1 -Engine $newPackage;C:\Tools\after.exe"
+    }
+
+    It 'updates SYSTEM task actions to the installed MSIX and forwards existing arguments' {
+        $migrationAst | Should -Not -BeNullOrEmpty
+        if (-not $migrationAst) { return }
+        . ([scriptblock]::Create($referenceAst.Extent.Text))
+        . ([scriptblock]::Create($migrationAst.Extent.Text))
+        $task = [pscustomobject]@{
+            Principal = [pscustomobject]@{ UserId='SYSTEM'; LogonType='ServiceAccount' }
+            Actions = @([pscustomobject]@{ Id='Cycle'; Execute='C:\Program Files\PowerShell\7\pwsh.exe'; Argument='-NoLogo -File C:\BootUpdateCycle\Invoke-BootUpdateCycle.ps1'; WorkingDirectory='' })
+        }
+        $plan = Get-PowerShell7TaskActionMigration -Task $task `
+            -LegacyPwshPath 'C:\Program Files\PowerShell\7\pwsh.exe' `
+            -SystemPwshPath 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.1.0_x64__8wekyb3d8bbwe\pwsh.exe' `
+            -UserPwshAlias ''
+
+        $plan.Actions[0].Execute | Should -Be 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.1.0_x64__8wekyb3d8bbwe\pwsh.exe'
+        $plan.Actions[0].Id | Should -Be 'Cycle'
+        $plan.Actions[0].Argument | Should -Be '-NoLogo -File C:\BootUpdateCycle\Invoke-BootUpdateCycle.ps1'
+        $plan.Actions[0].WorkingDirectory | Should -Be ''
+        $plan.Actions[0].Argument | Should -Not -Match 'Program Files\\PowerShell\\7\\pwsh'
+    }
+
+    It 'reads scheduler CIM Arguments and keeps unrelated working directories' {
+        $migrationAst | Should -Not -BeNullOrEmpty
+        if (-not $migrationAst) { return }
+        . ([scriptblock]::Create($referenceAst.Extent.Text))
+        . ([scriptblock]::Create($migrationAst.Extent.Text))
+        $oldPackage = 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\pwsh.exe'
+        $action = New-ScheduledTaskAction -Execute $oldPackage -Argument '-NoLogo -File C:\Jobs\cycle.ps1' -WorkingDirectory 'C:\Jobs'
+        $action.PSObject.Properties.Name | Should -Contain 'Arguments'
+        $task = [pscustomobject]@{ Principal=[pscustomobject]@{UserId='SYSTEM';LogonType='ServiceAccount'}; Actions=@($action) }
+        $plan = Get-PowerShell7TaskActionMigration -Task $task `
+            -LegacyPwshPath 'C:\Program Files\PowerShell\7\pwsh.exe' `
+            -SystemPwshPath 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.1.0_x64__8wekyb3d8bbwe\pwsh.exe' `
+            -UserPwshAlias ''
+        $plan.Actions[0].Argument | Should -Match '-File C:\\Jobs\\cycle\.ps1'
+        $plan.Actions[0].WorkingDirectory | Should -Be 'C:\Jobs'
     }
 
     It 'leaves a password task unchanged and returns its exact replacement path for the report' {
@@ -1335,8 +1423,10 @@ Describe 'PowerShell MSIX task references survive package version changes' {
         $root = Split-Path $PSScriptRoot -Parent
         $source = Get-Content -LiteralPath (Join-Path $root 'Register-BootUpdateTask.ps1') -Raw
         $source | Should -Match '\$pwshPath\s*=\s*Join-Path\s+\$PSHOME\s+''pwsh\.exe'''
+        $source | Should -Not -Match 'Get-Command\s+pwsh'
         $source | Should -Match '(?s)if\s*\(-not\s*\$pwshPath\).*?Join-Path\s+\$env:ProgramFiles\s+''PowerShell\\7\\pwsh\.exe'''
     }
+
 }
 
 Describe 'PowerShell MSIX machine PATH migration' {
@@ -1416,5 +1506,32 @@ Describe 'PowerShell MSI module and script leftovers move out of the old runtime
         Test-Path -LiteralPath $legacyRoot | Should -BeFalse
         (Get-Content -LiteralPath $conflictTarget -Raw) | Should -Match 'new content'
         (Get-Content -LiteralPath $log -Raw) | Should -Match 'LEGACY CONTENT CONFLICT PRESERVED'
+    }
+
+    It 'keeps old copies of MSIX-bundled modules out of the shared module path' {
+        $moveAst | Should -Not -BeNullOrEmpty
+        if (-not $moveAst) { return }
+        . ([scriptblock]::Create($moveAst.Extent.Text))
+        $targetRoot = Join-Path $TestDrive 'PowerShell'
+        $legacyRoot = Join-Path $targetRoot '7'
+        $bundleModules = Join-Path $TestDrive 'MSIX\Modules'
+        $log = Join-Path $TestDrive 'PowerShellRuntimeUpgrade.log'
+        $legacyBuiltin = Join-Path $legacyRoot 'Modules\PSReadLine\PSReadLine.psm1'
+        $bundleBuiltin = Join-Path $bundleModules 'PSReadLine\PSReadLine.psm1'
+        $legacyUserModule = Join-Path $legacyRoot 'Modules\LocalTools\LocalTools.psm1'
+        foreach ($path in @($legacyBuiltin,$bundleBuiltin,$legacyUserModule)) {
+            $null = New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force
+        }
+        Set-Content -LiteralPath $legacyBuiltin -Value 'old bundled module' -Encoding utf8
+        Set-Content -LiteralPath $bundleBuiltin -Value 'MSIX bundled module' -Encoding utf8
+        Set-Content -LiteralPath $legacyUserModule -Value 'function Get-LocalTool {}' -Encoding utf8
+
+        Move-PowerShell7LegacyContent -LegacyRoot $legacyRoot -TargetRoot $targetRoot `
+            -BundledModulesRoot $bundleModules -LogPath $log
+
+        Test-Path -LiteralPath (Join-Path $targetRoot 'Modules\PSReadLine\PSReadLine.psm1') | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $targetRoot 'LegacyMsiConflicts\Modules\PSReadLine\PSReadLine.psm1') | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $targetRoot 'Modules\LocalTools\LocalTools.psm1') | Should -BeTrue
+        Test-Path -LiteralPath $legacyRoot | Should -BeFalse
     }
 }

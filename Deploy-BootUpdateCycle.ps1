@@ -772,6 +772,11 @@ function Register-ScheduledTaskNow {
     <# The task runs the pwsh.exe in $PSHOME: an MSIX pwsh is on PATH only as a per-user alias
        that SYSTEM does not have. See Get-BootUpdatePwshPath in Invoke-BootUpdateCycle.ps1. #>
     $pwshPath = Join-Path $PSHOME 'pwsh.exe'
+    $userPwshPath = $pwshPath
+    if ($pwshPath -match '(?i)\\WindowsApps\\Microsoft\.PowerShell_') {
+        $alias = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\pwsh.exe'
+        if (Test-Path -LiteralPath $alias -PathType Leaf) { $userPwshPath = $alias }
+    }
 
     $taskArgs = @(
         '-NoProfile', '-ExecutionPolicy Bypass'
@@ -822,17 +827,20 @@ function Register-ScheduledTaskNow {
     }
 
     $argString = $taskArgs -join ' '
-    $action   = New-ScheduledTaskAction -Execute $pwshPath -Argument $argString -WorkingDirectory $installDir
+    $userAction = New-ScheduledTaskAction -Execute $userPwshPath -Argument $argString -WorkingDirectory $installDir
+    $systemAction = New-ScheduledTaskAction -Execute $pwshPath -Argument $argString -WorkingDirectory $installDir
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
         -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 4) `
         -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 2) -MultipleInstances IgnoreNew
 
     if ($Config.RunAsUser) {
+        $action = $userAction
         $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
         $trigger   = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
         $principal = New-ScheduledTaskPrincipal -UserId $currentUser -LogonType Interactive -RunLevel Highest
         $runAsDesc = "$currentUser at logon"
     } else {
+        $action = $systemAction
         $trigger   = New-ScheduledTaskTrigger -AtStartup
         $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
         $runAsDesc = "SYSTEM at startup"
