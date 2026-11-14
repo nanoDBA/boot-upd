@@ -55,7 +55,15 @@ function Get-PowerShellRuntimeLabRow {
         }
         if ((Get-FileHash -LiteralPath $bundle).Hash -ine $sha) { throw 'PowerShell 7.7.0 bundle hash mismatch.' }
         Add-AppxPackage -Path $bundle -ErrorAction Stop
-        $terminal = Get-Command wt.exe -ErrorAction Stop
+        $terminal = Get-Command wt.exe -ErrorAction SilentlyContinue
+        if (-not $terminal) {
+            $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
+            if (-not $winget) { throw 'Windows Terminal is absent and winget is unavailable on this checkpoint.' }
+            & $winget.Source install --id Microsoft.WindowsTerminal --exact --source winget --silent --accept-source-agreements --accept-package-agreements
+            if ($LASTEXITCODE -ne 0) { throw "Windows Terminal install exited $LASTEXITCODE." }
+            $terminal = Get-Command wt.exe -ErrorAction SilentlyContinue
+        }
+        if (-not $terminal) { throw 'Windows Terminal was installed but wt.exe did not register for the row user.' }
         $before = Start-Process -FilePath $terminal.Source -PassThru
         Start-Sleep -Seconds 5
         $command = '""C:\Lab\boot-upd\upd.cmd" bootstrap > "C:\Lab\row-b-bootstrap.txt" 2>&1"'

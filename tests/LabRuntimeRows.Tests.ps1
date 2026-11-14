@@ -19,6 +19,7 @@ Describe 'PowerShell runtime lab row definitions' {
         $row.PrepareAction.ToString() | Should -Match 'Start-Process -FilePath \$terminal.Source'
         $row.PrepareAction.ToString() | Should -Match 'Stop-Process -Name WindowsTerminal'
         $row.PrepareAction.ToString() | Should -Match 'ChildPath'
+        $row.PrepareAction.ToString() | Should -Match 'Microsoft\.WindowsTerminal'
     }
 
     It 'defines Row C to preserve a stored-password task and report its replacement path' {
