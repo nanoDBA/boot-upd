@@ -251,10 +251,10 @@ version remain read-only; preview/plan/status commands ask the user to run
 PowerShell 7-only so `Start-ThreadJob` and `ForEach-Object -Parallel` execution are
 preserved.
 
-PowerShell 7 is installed one way: Microsoft's MSIX bundle from the PowerShell release
-page, checked against the release's SHA-256 list and its Microsoft signature, and
-provisioned machine-wide so every account has it. Microsoft ships no MSI from 7.7 on, and
-WinGet installs the MSIX for the current user only. The updater runs PowerShell by the
+Where Windows supports it, boot-upd installs PowerShell 7 from Microsoft's MSIX bundle,
+checks the release's SHA-256 list and Microsoft signature, and provisions it machine-wide.
+Microsoft ships no MSI from 7.7 on, and WinGet installs the MSIX for the current user only.
+The updater runs PowerShell by the
 executable's full path rather than by `pwsh`, because an MSIX `pwsh` is on PATH only as a
 per-user alias and SYSTEM, which runs the continuation tasks, has none.
 
@@ -263,9 +263,13 @@ per-user alias and SYSTEM, which runs the continuation tasks, has none.
   is in `PowerShellRuntimeUpgrade.log` beside the installed updater. `upd bootstrap` does
   the same on demand and writes `%TEMP%\boot-upd-pwsh-upgrade.log`. The runtime never
   changes while a cycle is in progress.
-- **An existing MSI install is replaced.** After the MSIX is installed and starts, the old
-  MSI (and the Microsoft Update package that services it) is uninstalled. PowerShell
-  windows that are already open keep running; files still in use go at the next restart.
+- **An existing PowerShell 7.6 MSI stays installed.** On systems that can use MSIX, boot-upd
+  installs or upgrades the newer PowerShell MSIX beside it and leaves the MSI in place. `upd`
+  prefers the MSIX alias when it is registered for your account. With the MSIX registered,
+  a newly opened Windows Terminal uses 7.7 for its default PowerShell profile; the 7.6 MSI
+  remains a second profile.
+  Since the MSI directory can come first on PATH, `pwsh` typed by name may still start 7.6.
+  A machine where an earlier boot-upd release already removed the MSI is left as it is.
 - **Older Windows keeps the MSI.** Windows older than build 17763 (Windows Server 2016)
   and Server Core cannot install the MSIX. They get the signed PowerShell 7.6 LTS MSI,
   the last line Microsoft ships that way.
