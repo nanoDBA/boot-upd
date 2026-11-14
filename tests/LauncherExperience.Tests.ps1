@@ -1284,6 +1284,9 @@ Describe 'PowerShell MSIX references are repaired at updater startup' {
         $repair | Should -Match 'Update-PowerShell7References -Installed \$installed -LegacyPwshPath'
         $status = Get-FunctionText -Ast $launcherAst -Name 'Show-UpdStatus'
         $status | Should -Match 'Show-UpdPowerShellReferenceStatus'
+        $referenceStatus = Get-FunctionText -Ast $launcherAst -Name 'Show-UpdPowerShellReferenceStatus'
+        $referenceStatus | Should -Match 'summary\.Repairable'
+        $referenceStatus | Should -Match 'summary\.Manual'
     }
 }
 Describe 'PowerShell MSIX task references update to the installed version' {

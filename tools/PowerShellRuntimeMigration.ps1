@@ -417,6 +417,12 @@ function Get-PowerShell7RuntimeReferenceFindings {
     foreach ($profile in $Profiles) {
         $handle = $null
         try { $handle = Open-PowerShell7ProfileEnvironmentKey -Profile $profile } catch { }
+        if (-not $handle) {
+            if (Test-Path -LiteralPath (Join-Path $profile.Root 'NTUSER.DAT') -PathType Leaf) {
+                $findings.Add([pscustomobject]@{ Kind='User PATH'; Text='Profile environment hive could not be inspected'; Manual=$true; ReplacementPath=$profile.Alias; ProfileSid=$profile.Sid })
+            }
+            continue
+        }
         if ($handle) {
             try { $value = [string]$handle.Key.GetValue('Path',$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) }
             finally { Close-PowerShell7ProfileEnvironmentKey -Handle $handle }

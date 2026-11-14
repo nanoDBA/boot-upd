@@ -92,7 +92,8 @@ function Show-UpdPowerShellReferenceStatus {
         $summary = Get-PowerShell7RuntimeRepairSummary -Findings $findings
         if (-not $findings.Count) { Write-Host '  PowerShell refs current' -ForegroundColor Green; return }
         Write-Host "  PowerShell refs stale: $($summary.RepairableCount) repairable, $($summary.ManualCount) manual" -ForegroundColor Yellow
-        foreach ($finding in $summary.Manual) { Write-Host "    $($finding.Kind) $($finding.TaskName): $($finding.Text) -> $($finding.ReplacementPath)" -ForegroundColor Yellow }
+        foreach ($finding in $summary.Repairable) { Write-Host "    $($finding.Kind): $($finding.Text) -> $($finding.ReplacementPath)" -ForegroundColor Yellow }
+        foreach ($finding in $summary.Manual) { Write-Host "    manual $($finding.Kind) $($finding.TaskName): $($finding.Text) -> $($finding.ReplacementPath)" -ForegroundColor Yellow }
     } catch { Write-Warning "Could not scan PowerShell runtime references: $_" }
 }
 
