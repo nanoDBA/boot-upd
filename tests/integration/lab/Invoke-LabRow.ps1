@@ -102,8 +102,8 @@ function New-LabStageEvidence {
 function Get-LabPowerShellRuntimeHandoffEvidence {
     param([string[]]$RuntimeLines, [string[]]$MsiVersions, [string[]]$MsixVersions, [bool]$RebootSeen = $false)
 
-    $upd = @($RuntimeLines | Where-Object { $_ -match '^PowerShell runtime \| Version: 7\.7(?:\.\d+)?\b.*\| Install folder: .*\\WindowsApps\\Microsoft\.PowerShell_7\.7\..*\| Account: SYSTEM \| Launched by: upd$' } | Select-Object -First 1)
-    $continuation = @($RuntimeLines | Where-Object { $_ -match '^PowerShell runtime \| Version: 7\.7(?:\.\d+)?\b.*\| Install folder: .*\\WindowsApps\\Microsoft\.PowerShell_7\.7\..*\| Account: SYSTEM \| Launched by: continuation$' } | Select-Object -Last 1)
+    $upd = @($RuntimeLines | Where-Object { $_ -match '^.*PowerShell runtime \| Version: 7\.7(?:\.\d+)?\b.*\| Install folder: .*\\WindowsApps\\Microsoft\.PowerShell_7\.7\..*\| Account: SYSTEM \| Launched by: upd$' } | Select-Object -First 1)
+    $continuation = @($RuntimeLines | Where-Object { $_ -match '^.*PowerShell runtime \| Version: 7\.7(?:\.\d+)?\b.*\| Install folder: .*\\WindowsApps\\Microsoft\.PowerShell_7\.7\..*\| Account: SYSTEM \| Launched by: (?:continuation|fallback)$' } | Select-Object -Last 1)
     $msiPresent = @($MsiVersions | Where-Object { $_ -match '^7\.6\.' }).Count -gt 0
     $msixPresent = @($MsixVersions | Where-Object { $_ -match '^7\.7\.' }).Count -gt 0
     [pscustomobject]@{
@@ -518,7 +518,7 @@ while ((Get-Date) -lt $deadline) {
                 LogonOnlyVerified = @($lines | Where-Object { $_ -match 'Resume chain verified: BootUpdateCycle \(saved-user logon only\)' }).Count -gt 0
                 StateFileExists = Test-Path 'C:\ProgramData\BootUpdateCycle\BootUpdateCycle.state.json'
                 LatestBootTime = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
-                RuntimeLines = @($lines | Where-Object { $_ -match '^PowerShell runtime \|' })
+                RuntimeLines = @($lines | Where-Object { $_ -match 'PowerShell runtime \|' })
                 MsiVersions = @(Get-ItemProperty @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*') -ErrorAction SilentlyContinue |
                     Where-Object { $_.DisplayName -match '^PowerShell 7(?:\b|[- ])' -and [int]($_.WindowsInstaller -as [int]) -eq 1 -and $_.DisplayVersion } |
                     ForEach-Object { [string]$_.DisplayVersion } | Sort-Object -Unique)
@@ -631,7 +631,7 @@ $evidence = Invoke-Command -VMName $VMName -Credential $cred -ScriptBlock {
             [pscustomobject]@{ Name=$_.TaskName; TriggerTypes=@($_.Triggers | ForEach-Object { $_.CimClass.CimClassName }); Xml=(Export-ScheduledTask -TaskName $_.TaskName) }
         })
         CbsPending      = Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
-        RuntimeLines    = @($lines | Where-Object { $_ -match '^PowerShell runtime \|' })
+        RuntimeLines    = @($lines | Where-Object { $_ -match 'PowerShell runtime \|' })
         MsiVersions     = @(Get-ItemProperty @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*') -ErrorAction SilentlyContinue |
             Where-Object { $_.DisplayName -match '^PowerShell 7(?:\b|[- ])' -and [int]($_.WindowsInstaller -as [int]) -eq 1 -and $_.DisplayVersion } |
             ForEach-Object { [string]$_.DisplayVersion } | Sort-Object -Unique)

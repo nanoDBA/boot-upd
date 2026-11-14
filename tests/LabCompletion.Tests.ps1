@@ -96,8 +96,8 @@ Describe 'Lab runtime handoff stage evidence' {
 
     It 'passes only when upd and the SYSTEM continuation use 7.7 while both installs remain' {
         $runtimeLines = @(
-            'PowerShell runtime | Version: 7.7.0 | Install folder: C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\pwsh.exe | Account: SYSTEM | Launched by: upd',
-            'PowerShell runtime | Version: 7.7.0 | Install folder: C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\pwsh.exe | Account: SYSTEM | Launched by: continuation'
+            '[2026-11-14 14:18:45] [Info] PowerShell runtime | Version: 7.7.0 | Install folder: C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\pwsh.exe | Account: SYSTEM | Launched by: upd',
+            '[2026-11-14 14:19:49] [Info] PowerShell runtime | Version: 7.7.0 | Install folder: C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\pwsh.exe | Account: SYSTEM | Launched by: continuation'
         )
 
         $evidence = Get-LabPowerShellRuntimeHandoffEvidence -RuntimeLines $runtimeLines `
@@ -121,14 +121,27 @@ Describe 'Lab runtime handoff stage evidence' {
 
     It 'does not call a continuation handoff a pass without a reboot between launches' {
         $runtimeLines = @(
-            'PowerShell runtime | Version: 7.7.0 | Install folder: C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\pwsh.exe | Account: SYSTEM | Launched by: upd',
-            'PowerShell runtime | Version: 7.7.0 | Install folder: C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\pwsh.exe | Account: SYSTEM | Launched by: continuation'
+            '[2026-11-14 14:18:45] [Info] PowerShell runtime | Version: 7.7.0 | Install folder: C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\pwsh.exe | Account: SYSTEM | Launched by: upd',
+            '[2026-11-14 14:19:49] [Info] PowerShell runtime | Version: 7.7.0 | Install folder: C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\pwsh.exe | Account: SYSTEM | Launched by: continuation'
         )
 
         $evidence = Get-LabPowerShellRuntimeHandoffEvidence -RuntimeLines $runtimeLines `
             -MsiVersions @('7.6.10.0') -MsixVersions @('7.7.0.0') -RebootSeen $false
 
         $evidence.Passed | Should -BeFalse
+    }
+
+    It 'accepts the SYSTEM fallback task as the headless continuation path' {
+        $runtimeLines = @(
+            '[2026-11-14 14:18:45] [Info] PowerShell runtime | Version: 7.7.0 | Install folder: C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\pwsh.exe | Account: SYSTEM | Launched by: upd',
+            '[2026-11-14 14:19:49] [Info] PowerShell runtime | Version: 7.7.0 | Install folder: C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\pwsh.exe | Account: SYSTEM | Launched by: fallback'
+        )
+
+        $evidence = Get-LabPowerShellRuntimeHandoffEvidence -RuntimeLines $runtimeLines `
+            -MsiVersions @('7.6.10.0') -MsixVersions @('7.7.0.0') -RebootSeen $true
+
+        $evidence.Passed | Should -BeTrue
+        $evidence.ContinuationRuntimeLine | Should -Be $runtimeLines[1]
     }
 
     It 'stops only after the qualifying continuation runtime has been observed' {
