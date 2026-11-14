@@ -1138,7 +1138,7 @@ Describe 'PowerShell 7 is started from $PSHOME, never from the process path or b
     BeforeAll {
         $root = Split-Path $PSScriptRoot -Parent
         $sources = @{}
-        foreach ($rel in 'Invoke-BootUpdateCycle.ps1','Deploy-BootUpdateCycle.ps1','tools/Invoke-UpdLauncher.ps1','Repair-AwsTooling.ps1') {
+        foreach ($rel in 'Invoke-BootUpdateCycle.ps1','Deploy-BootUpdateCycle.ps1','tools/Invoke-UpdLauncher.ps1','Repair-AwsTooling.ps1','tests/integration/Invoke-CrossContextMutexGate.ps1') {
             $sources[$rel] = Get-Content -LiteralPath (Join-Path $root $rel) -Raw
         }
         $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $root 'Invoke-BootUpdateCycle.ps1'), [ref]$null, [ref]$null)
@@ -1168,6 +1168,11 @@ Describe 'PowerShell 7 is started from $PSHOME, never from the process path or b
     It 'registers the Deploy task with $PSHOME\pwsh.exe' {
         $sources['Deploy-BootUpdateCycle.ps1'] | Should -Match "\`$pwshPath = Join-Path \`$PSHOME 'pwsh\.exe'"
         $sources['Invoke-BootUpdateCycle.ps1'] | Should -Match '(?s)function Register-BootUpdateTaskForReboot.*?\$pwshPath = Get-BootUpdatePwshPath'
+    }
+
+    It 'uses the production runtime resolver for the SYSTEM mutex worker, not the user app alias' {
+        $sources['tests/integration/Invoke-CrossContextMutexGate.ps1'] | Should -Match 'Get-BootUpdatePwshPath'
+        $sources['tests/integration/Invoke-CrossContextMutexGate.ps1'] | Should -Not -Match '\(Get-Command pwsh\)\.Source'
     }
 }
 
