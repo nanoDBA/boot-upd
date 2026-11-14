@@ -88,7 +88,7 @@ function Get-PowerShell7TaskActionMigration {
         $newExecute = Convert-PowerShell7RuntimeReference -Text $execute -LegacyPwshPath $LegacyPwshPath -SystemPwshPath $SystemPwshPath
         $newArguments = Convert-PowerShell7RuntimeReference -Text $arguments -LegacyPwshPath $LegacyPwshPath -SystemPwshPath $SystemPwshPath
         $isRuntimeExecutable = $execute -match '(?i)pwsh\.exe$' -and
-            ($execute -match '(?i)Program Files\\PowerShell\\7\\pwsh\.exe$' -or $execute -match '(?i)WindowsApps\\Microsoft\.PowerShell_[^\\]+\\pwsh\.exe$')
+            ($newExecute -cne $execute -or $execute -match '(?i)WindowsApps\\Microsoft\.PowerShell_[^\\]+\\pwsh\.exe$')
         $userNeedsAlias = -not $isSystem -and $isRuntimeExecutable -and $UserPwshAlias -and $execute -cne $UserPwshAlias
         if ($newExecute -cne $execute -or $newArguments -cne $arguments -or ($isRuntimeExecutable -and -not $isSystem)) {
             $hasMatch = $true

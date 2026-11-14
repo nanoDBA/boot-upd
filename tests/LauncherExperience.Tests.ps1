@@ -1353,6 +1353,28 @@ Describe 'PowerShell MSIX task references update to the installed version' {
         $plan.Actions[0].Execute | Should -Be 'C:\Program Files\PowerShell\7\pwsh.exe'
     }
 
+    It 'rewrites an environment-variable MSI executable to the user MSIX alias' {
+        $migrationAst | Should -Not -BeNullOrEmpty
+        $referenceAst | Should -Not -BeNullOrEmpty
+        if (-not $migrationAst -or -not $referenceAst) { return }
+        . ([scriptblock]::Create($referenceAst.Extent.Text))
+        . ([scriptblock]::Create($migrationAst.Extent.Text))
+        $alias = 'C:\Users\Sample\AppData\Local\Microsoft\WindowsApps\pwsh.exe'
+        $task = [pscustomobject]@{
+            Principal = [pscustomobject]@{ UserId='S-1-5-21-1-2-3-1001'; LogonType='InteractiveToken' }
+            Actions = @([pscustomobject]@{ Execute='%ProgramFiles%\PowerShell\7\pwsh.exe'; Argument='-NoLogo -File C:\Jobs\run.ps1'; WorkingDirectory='C:\Jobs' })
+        }
+
+        $plan = Get-PowerShell7TaskActionMigration -Task $task `
+            -LegacyPwshPath 'C:\Program Files\PowerShell\7\pwsh.exe' `
+            -SystemPwshPath 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.1.0_x64__8wekyb3d8bbwe\pwsh.exe' `
+            -UserPwshAlias $alias
+
+        $plan.Changed | Should -BeTrue
+        $plan.Actions[0].Execute | Should -Be $alias
+        $plan.Actions[0].Argument | Should -Be '-NoLogo -File C:\Jobs\run.ps1'
+        $plan.Actions[0].Execute | Should -Not -Match '(?i)%ProgramFiles%|Program Files\\PowerShell\\7\\pwsh\.exe'
+    }
     It 'handles scheduled task actions with no argument string' {
         $migrationAst | Should -Not -BeNullOrEmpty
         if (-not $migrationAst) { return }
