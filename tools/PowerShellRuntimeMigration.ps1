@@ -274,16 +274,22 @@ function Update-PowerShell7ScheduledTaskReferences {
           [Parameter(Mandatory)][string]$LegacyPwshPath, [Parameter(Mandatory)][string]$LogPath)
     foreach ($task in @(Get-ScheduledTask -ErrorAction Stop)) {
         $isSystem = ([string]$task.Principal.LogonType -eq 'ServiceAccount') -or ([string]$task.Principal.UserId -match '^(?i)(SYSTEM|NT AUTHORITY\\SYSTEM|S-1-5-18|LOCAL SERVICE|NT AUTHORITY\\LOCAL SERVICE|NETWORK SERVICE|NT AUTHORITY\\NETWORK SERVICE)$')
-        $alias = if ($isSystem) { $SystemPwshPath } else { Resolve-PowerShell7TaskAlias -Task $task -Profiles $Profiles }
-        if (-not $alias) { $alias = '' }
+        $aliasPath = if ($isSystem) { $SystemPwshPath } else { Resolve-PowerShell7TaskAlias -Task $task -Profiles $Profiles }
+        $aliasAvailable = $isSystem
+        if (-not $isSystem -and $aliasPath) {
+            try { $aliasAvailable = Test-Path -LiteralPath $aliasPath -PathType Leaf -ErrorAction Stop }
+            catch { $aliasAvailable = $false }
+        }
+        $alias = if ($aliasAvailable) { $aliasPath } else { '' }
         $plan = Get-PowerShell7TaskActionMigration -Task $task -LegacyPwshPath $LegacyPwshPath -SystemPwshPath $SystemPwshPath -UserPwshAlias $alias
         $beforeReferences = @(Get-PowerShell7RuntimeReferenceSummary -Texts @($task.Actions | ForEach-Object { [string]$_.Execute; [string]$(if ($_.PSObject.Properties['Arguments']) { $_.Arguments } else { $_.Argument }); [string]$_.WorkingDirectory }) -LegacyPwshPath $LegacyPwshPath)
         if ($plan.RequiresCredential) {
-            Write-PowerShell7RuntimeLog -LogPath $LogPath -Message "TASK MANUAL UPDATE REQUIRED: $($task.TaskPath)$($task.TaskName); before=$($beforeReferences -join ';'); replacement=$($plan.ReplacementPath)"
+            $replacement = if ($plan.ReplacementPath) { $plan.ReplacementPath } else { $aliasPath }
+            Write-PowerShell7RuntimeLog -LogPath $LogPath -Message "TASK MANUAL UPDATE REQUIRED: $($task.TaskPath)$($task.TaskName); before=$($beforeReferences -join ';'); replacement=$replacement; reason=task stores a password"
             continue
         }
         if ($plan.RequiresUserAlias) {
-            Write-PowerShell7RuntimeLog -LogPath $LogPath -Message "TASK MANUAL UPDATE REQUIRED: $($task.TaskPath)$($task.TaskName); before=$($beforeReferences -join ';'); reason=user profile alias could not be resolved"
+            Write-PowerShell7RuntimeLog -LogPath $LogPath -Message "TASK MANUAL UPDATE REQUIRED: $($task.TaskPath)$($task.TaskName); before=$($beforeReferences -join ';'); replacement=$aliasPath; reason=user profile alias is not registered"
             continue
         }
         if (-not $plan.Changed) { continue }
@@ -436,6 +442,11 @@ function Get-PowerShell7RuntimeReferenceFindings {
     foreach ($task in @(Get-ScheduledTask -ErrorAction SilentlyContinue)) {
         $system = ([string]$task.Principal.LogonType -eq 'ServiceAccount') -or ([string]$task.Principal.UserId -match '^(?i)(SYSTEM|NT AUTHORITY\\SYSTEM|S-1-5-18|LOCAL SERVICE|NT AUTHORITY\\LOCAL SERVICE|NETWORK SERVICE|NT AUTHORITY\\NETWORK SERVICE)$')
         $alias = if ($system) { $InstalledPwshPath } else { Resolve-PowerShell7TaskAlias -Task $task -Profiles $Profiles }
+        $aliasAvailable = $system
+        if (-not $system -and $alias) {
+            try { $aliasAvailable = Test-Path -LiteralPath $alias -PathType Leaf -ErrorAction Stop }
+            catch { $aliasAvailable = $false }
+        }
         foreach ($action in @($task.Actions)) {
             $argument = if ($action.PSObject.Properties['Arguments']) { [string]$action.Arguments } else { [string]$action.Argument }
             foreach ($text in @([string]$action.Execute,$argument,[string]$action.WorkingDirectory)) {
@@ -445,7 +456,7 @@ function Get-PowerShell7RuntimeReferenceFindings {
                     $expectedPath = if ($system) { $InstalledPwshPath } else { $alias }
                     $expectedReference = if (-not $expectedPath) { $null } elseif ($match.Value -match '(?i)\\pwsh\.exe$') { $expectedPath } else { Split-Path -Parent $expectedPath }
                     if ($expectedReference -and $match.Value -ieq $expectedReference) { continue }
-                    $findings.Add([pscustomobject]@{ Kind='Task'; Text=$match.Value; Manual=(([string]$task.Principal.LogonType -eq 'Password') -or -not $expectedPath); ReplacementPath=$expectedReference; TaskName="$($task.TaskPath)$($task.TaskName)" })
+                    $findings.Add([pscustomobject]@{ Kind='Task'; Text=$match.Value; Manual=(([string]$task.Principal.LogonType -eq 'Password') -or -not $aliasAvailable); ReplacementPath=$expectedReference; TaskName="$($task.TaskPath)$($task.TaskName)" })
                 }
             }
         }

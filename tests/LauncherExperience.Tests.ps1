@@ -1305,7 +1305,8 @@ Describe 'PowerShell runtime reference discovery' {
     It 'reports a user task on the current versioned MSIX with its alias as the replacement' {
         $legacy = 'C:\Program Files\PowerShell\7\pwsh.exe'
         $current = 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\pwsh.exe'
-        $alias = 'C:\Users\Sample\AppData\Local\Microsoft\WindowsApps\pwsh.exe'
+        $alias = Join-Path $TestDrive 'profile\AppData\Local\Microsoft\WindowsApps\pwsh.exe'
+        $null = New-Item -ItemType File -Path $alias -Force
         $sid = 'S-1-5-21-10-20-30-1001'
         $script:RuntimeReferenceTask = [pscustomobject]@{
             Principal = [pscustomobject]@{ UserId=$sid; LogonType='InteractiveToken' }
@@ -1322,6 +1323,29 @@ Describe 'PowerShell runtime reference discovery' {
         $finding.Count | Should -Be 1
         $finding[0].ReplacementPath | Should -Be $alias
         $finding[0].Manual | Should -BeFalse
+    }
+
+    It 'reports a stale user task as manual when its per-user MSIX alias is not registered' {
+        $legacy = 'C:\Program Files\PowerShell\7\pwsh.exe'
+        $current = 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\pwsh.exe'
+        $alias = 'C:\Users\Sample\AppData\Local\Microsoft\WindowsApps\pwsh.exe'
+        $sid = 'S-1-5-21-10-20-30-1001'
+        $script:RuntimeReferenceTask = [pscustomobject]@{
+            Principal = [pscustomobject]@{ UserId=$sid; LogonType='InteractiveToken' }
+            TaskPath = '\Test\'
+            TaskName = 'AliasNotRegistered'
+            Actions = @([pscustomobject]@{ Execute=$legacy; Arguments='-File C:\Jobs\run.ps1'; WorkingDirectory='C:\Jobs' })
+        }
+        $profiles = @([pscustomobject]@{ Sid=$sid; Root=$TestDrive; Alias=$alias; LocalAppData=(Join-Path $TestDrive 'AppData\Local') })
+        Mock Get-ScheduledTask { @($script:RuntimeReferenceTask) }
+        Mock Test-Path { $false }
+
+        $findings = @(Get-PowerShell7RuntimeReferenceFindings -InstalledPwshPath $current -Profiles $profiles -LegacyPwshPath $legacy)
+        $finding = @($findings | Where-Object { $_.Kind -eq 'Task' -and $_.TaskName -eq '\Test\AliasNotRegistered' })
+
+        $finding.Count | Should -Be 1
+        $finding[0].Manual | Should -BeTrue
+        $finding[0].ReplacementPath | Should -Be $alias
     }
 
     It 'reports a stale SYSTEM task package directory in arguments or working directory' {
@@ -1689,6 +1713,72 @@ Describe 'PowerShell MSIX task references update to the installed version' {
         $plan.Changed | Should -BeFalse
         $plan.RequiresUserAlias | Should -BeTrue
         $plan.Actions[0].Execute | Should -Be 'C:\Program Files\PowerShell\7\pwsh.exe'
+    }
+
+    It 'leaves a user task unchanged when its profile alias is not registered yet' {
+        $migrationAst | Should -Not -BeNullOrEmpty
+        if (-not $migrationAst -or -not $updateTasksAst) { return }
+        . ([scriptblock]::Create($migrationAst.Extent.Text))
+        . ([scriptblock]::Create($updateTasksAst.Extent.Text))
+        $alias = 'C:\Users\Sample\AppData\Local\Microsoft\WindowsApps\pwsh.exe'
+        $script:RuntimeTasksForRepair = @([pscustomobject]@{
+            Principal = [pscustomobject]@{ UserId='S-1-5-21-1-2-3-1001'; LogonType='InteractiveToken' }
+            TaskPath='\Test\'; TaskName='NotRegistered'
+            Actions=@([pscustomobject]@{ Execute='C:\Program Files\PowerShell\7\pwsh.exe'; Argument='-File job.ps1'; WorkingDirectory='C:\Jobs' })
+        })
+        function Get-ScheduledTask { }
+        function Resolve-PowerShell7TaskAlias { param($Task, $Profiles); return $alias }
+        function Write-PowerShell7RuntimeLog { param($LogPath, $Message) }
+        function New-ScheduledTaskAction { param($Execute, $Argument, $WorkingDirectory, $Id) }
+        function Set-ScheduledTask { }
+        Mock Get-ScheduledTask { $script:RuntimeTasksForRepair }
+        Mock Test-Path { $false }
+        Mock Resolve-PowerShell7TaskAlias { $alias }
+        Mock Get-PowerShell7RuntimeReferenceSummary { @('C:\Program Files\PowerShell\7\pwsh.exe') }
+        Mock Write-PowerShell7RuntimeLog { }
+        Mock New-ScheduledTaskAction { [pscustomobject]@{ Execute=$Execute; Argument=$Argument; WorkingDirectory=$WorkingDirectory } }
+        Mock Set-ScheduledTask { }
+
+        Update-PowerShell7ScheduledTaskReferences -Profiles @([pscustomobject]@{ Sid='S-1-5-21-1-2-3-1001'; Alias=$alias }) `
+            -SystemPwshPath 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.1.0_x64__8wekyb3d8bbwe\pwsh.exe' `
+            -LegacyPwshPath 'C:\Program Files\PowerShell\7\pwsh.exe' -LogPath (Join-Path $TestDrive 'repair.log')
+
+        Should -Invoke Set-ScheduledTask -Times 0 -Exactly
+        Should -Invoke Write-PowerShell7RuntimeLog -Times 1 -Exactly -ParameterFilter {
+            $Message -match 'TASK MANUAL UPDATE REQUIRED: \\Test\\NotRegistered' -and $Message -match [regex]::Escape($alias)
+        }
+    }
+
+    It 'updates a user task to the alias after it is registered' {
+        $migrationAst | Should -Not -BeNullOrEmpty
+        if (-not $migrationAst -or -not $updateTasksAst) { return }
+        . ([scriptblock]::Create($migrationAst.Extent.Text))
+        . ([scriptblock]::Create($updateTasksAst.Extent.Text))
+        $alias = Join-Path $TestDrive 'registered\Microsoft\WindowsApps\pwsh.exe'
+        $null = New-Item -ItemType File -Path $alias -Force
+        $script:RuntimeTasksForRepair = @([pscustomobject]@{
+            Principal = [pscustomobject]@{ UserId='S-1-5-21-1-2-3-1001'; LogonType='InteractiveToken' }
+            TaskPath='\Test\'; TaskName='Registered'
+            Actions=@([pscustomobject]@{ Execute='C:\Program Files\PowerShell\7\pwsh.exe'; Argument='-File job.ps1'; WorkingDirectory='C:\Jobs' })
+        })
+        function Get-ScheduledTask { }
+        function Resolve-PowerShell7TaskAlias { param($Task, $Profiles); return $alias }
+        function Write-PowerShell7RuntimeLog { param($LogPath, $Message) }
+        function New-ScheduledTaskAction { param($Execute, $Argument, $WorkingDirectory, $Id) }
+        function Set-ScheduledTask { param($InputObject, $Action) }
+        Mock Get-ScheduledTask { $script:RuntimeTasksForRepair }
+        Mock Resolve-PowerShell7TaskAlias { $alias }
+        Mock Get-PowerShell7RuntimeReferenceSummary { @('C:\Program Files\PowerShell\7\pwsh.exe') }
+        Mock Write-PowerShell7RuntimeLog { }
+        Mock New-ScheduledTaskAction { [pscustomobject]@{ Execute=$Execute; Argument=$Argument; WorkingDirectory=$WorkingDirectory } }
+        Mock Set-ScheduledTask { $script:UpdatedRuntimeActions = @($Action) }
+
+        Update-PowerShell7ScheduledTaskReferences -Profiles @([pscustomobject]@{ Sid='S-1-5-21-1-2-3-1001'; Alias=$alias }) `
+            -SystemPwshPath 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.1.0_x64__8wekyb3d8bbwe\pwsh.exe' `
+            -LegacyPwshPath 'C:\Program Files\PowerShell\7\pwsh.exe' -LogPath (Join-Path $TestDrive 'repair.log')
+
+        Should -Invoke Set-ScheduledTask -Times 1 -Exactly
+        $script:UpdatedRuntimeActions[0].Execute | Should -Be $alias
     }
 
     It 'logs only the runtime path from task arguments, not unrelated argument text' {
