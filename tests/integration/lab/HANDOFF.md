@@ -114,6 +114,32 @@ For an injection row, `Start-Job` serializes the `InjectAction` scriptblock as
 text. The worker above reconstructs it before calling the harness. Use only the
 injection code you supplied for the row; never reconstruct code from guest logs.
 
+The PowerShell runtime migration rows are defined in the committed
+`PowerShellRuntimeRows.ps1`. It contains the guest setup and proof for rows A to E,
+including the SYSTEM post-upgrade launch check and the outside-upgrade startup repair.
+The package URLs and SHA256 digests are pinned in those definitions. Preparation and
+injection actions are recorded in the row manifest and evidence directory.
+
+From a detached checkout pinned to the commit under test, run a selected row through the
+same harness as every other lab row:
+
+```powershell
+. ./tests/integration/lab/PowerShellRuntimeRows.ps1
+$row = Get-PowerShellRuntimeLabRow -Row D
+$harness = (Resolve-Path ./tests/integration/lab/Invoke-LabRow.ps1).Path
+$job = Start-Job -ArgumentList $harness,$row -ScriptBlock {
+    param($script,$arguments)
+    foreach ($name in 'PrepareAction','InjectAction') {
+        if ($arguments[$name] -is [string]) { $arguments[$name] = [scriptblock]::Create($arguments[$name]) }
+    }
+    & $script @arguments
+}
+$job | Wait-Job | Receive-Job -Keep
+```
+
+Select `A`, `B`, `C`, `D`, or `E` for the row value. Keep one row per guest at a time.
+The harness writes preparation and injection proofs beside `summary.json`.
+
 The harness does not automatically shut down guests at completion, so failed
 state remains inspectable. When finished collecting evidence, use a guest-side
 normal shutdown (`shutdown.exe /s /t 0` through PowerShell Direct), wait for Off,
