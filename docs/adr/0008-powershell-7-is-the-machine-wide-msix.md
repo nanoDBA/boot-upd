@@ -66,7 +66,12 @@ for every install method, and on an MSI machine it is the same path as before.
   boot-upd, these saved paths can go stale; `upd bootstrap` detects and refreshes them when run.
   No shim or dispatcher is installed. A persistent entry point that survives independent MSIX
   servicing without one remains unresolved and must be proven before claiming unattended
-  continuation across that upgrade.
+  continuation across that upgrade. Microsoft's MSIX docs place app execution aliases under a
+  user's `%LOCALAPPDATA%\Microsoft\WindowsApps` and package folders under names based on the
+  full package name ([alias details](https://learn.microsoft.com/en-us/sysinternals/downloads/microsoft-store),
+  [package volumes](https://learn.microsoft.com/en-us/windows/msix/package/package-volumes)).
+  Those references explain why the current task path can go stale; they do not document a stable
+  SYSTEM target. That target remains an open design question, not a solved behavior.
 - User-context task and Terminal paths point to each profile's stable
   `%LOCALAPPDATA%\Microsoft\WindowsApps\pwsh.exe` alias. A scheduled task that stores a
   password is reported with its replacement path and left unchanged because changing its action
