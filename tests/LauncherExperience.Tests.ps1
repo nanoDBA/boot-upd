@@ -1294,7 +1294,7 @@ Describe 'PowerShell runtime reference discovery' {
     BeforeAll {
         $migrationPath = Join-Path (Split-Path $PSScriptRoot -Parent) 'tools\PowerShellRuntimeMigration.ps1'
         $migrationAst = Get-ParsedScript $migrationPath
-        foreach ($name in @('Get-PowerShell7RuntimeReferenceFindings','Resolve-PowerShell7TaskAlias','Get-PowerShell7UserPathUpdate','Get-PowerShell7MachinePathUpdate','Convert-PowerShell7RuntimeReference')) {
+        foreach ($name in @('Get-PowerShell7RuntimeReferenceFindings','Resolve-PowerShell7TaskAlias','Get-PowerShell7UserPathUpdate','Get-PowerShell7MachinePathUpdate','Convert-PowerShell7RuntimeReference','Update-PowerShell7References')) {
             $function = $migrationAst.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name },$true)
             if ($function) { . ([scriptblock]::Create($function.Extent.Text)) }
         }
@@ -1324,10 +1324,35 @@ Describe 'PowerShell runtime reference discovery' {
         $finding[0].Manual | Should -BeFalse
     }
 
+    It 'reports a stale SYSTEM task package directory in arguments or working directory' {
+        $legacy = 'C:\Program Files\PowerShell\7\pwsh.exe'
+        $current = 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.1.0_x64__8wekyb3d8bbwe\pwsh.exe'
+        $oldDirectory = 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe'
+        $sid = 'S-1-5-18'
+        $script:RuntimeReferenceTask = [pscustomobject]@{
+            Principal = [pscustomobject]@{ UserId='SYSTEM'; LogonType='ServiceAccount' }
+            TaskPath = '\Test\'
+            TaskName = 'SystemPowerShell'
+            Actions = @([pscustomobject]@{
+                Execute=$current
+                Arguments="-WorkingDirectory `"$oldDirectory`" -File cycle.ps1"
+                WorkingDirectory=$oldDirectory
+            })
+        }
+        $profiles = @([pscustomobject]@{ Sid=$sid; Root=$TestDrive; Alias='C:\TestAliases\pwsh.exe'; LocalAppData=(Join-Path $TestDrive 'AppData\Local') })
+        Mock Get-ScheduledTask { @($script:RuntimeReferenceTask) }
+
+        $findings = @(Get-PowerShell7RuntimeReferenceFindings -InstalledPwshPath $current -Profiles $profiles -LegacyPwshPath $legacy)
+        $finding = @($findings | Where-Object { $_.Kind -eq 'Task' -and $_.TaskName -eq '\Test\SystemPowerShell' })
+
+        $finding.Count | Should -Be 2
+        $finding.ReplacementPath | Should -Be @((Split-Path -Parent $current),(Split-Path -Parent $current))
+    }
+
     It 'reports a saved-password task that names the MSI through ProgramFiles' {
         $legacy = 'C:\Program Files\PowerShell\7\pwsh.exe'
         $current = 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\pwsh.exe'
-        $alias = 'C:\Users\Sample\AppData\Local\Microsoft\WindowsApps\pwsh.exe'
+        $alias = 'C:\TestAliases\pwsh.exe'
         $sid = 'S-1-5-21-10-20-30-1002'
         $script:RuntimeReferenceTask = [pscustomobject]@{
             Principal = [pscustomobject]@{ UserId=$sid; LogonType='Password' }
@@ -1344,6 +1369,70 @@ Describe 'PowerShell runtime reference discovery' {
         $finding.Count | Should -Be 1
         $finding[0].Manual | Should -BeTrue
         $finding[0].ReplacementPath | Should -Be $alias
+    }
+
+    It 'reports an MSI runtime directory in a task argument without requiring pwsh.exe' {
+        $legacy = 'C:\Program Files\PowerShell\7\pwsh.exe'
+        $current = 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\pwsh.exe'
+        $alias = 'C:\TestAliases\pwsh.exe'
+        $sid = 'S-1-5-21-10-20-30-1004'
+        $script:RuntimeReferenceTask = [pscustomobject]@{
+            Principal = [pscustomobject]@{ UserId=$sid; LogonType='InteractiveToken' }
+            TaskPath = '\Test\'
+            TaskName = 'LegacyDirectoryArgument'
+            Actions = @([pscustomobject]@{ Execute=$current; Arguments='-WorkingDirectory %ProgramFiles%\PowerShell\7'; WorkingDirectory='C:\Jobs' })
+        }
+        $profiles = @([pscustomobject]@{ Sid=$sid; Root=$TestDrive; Alias=$alias; LocalAppData=(Join-Path $TestDrive 'AppData\Local') })
+        Mock Get-ScheduledTask { @($script:RuntimeReferenceTask) }
+
+        $findings = @(Get-PowerShell7RuntimeReferenceFindings -InstalledPwshPath $current -Profiles $profiles -LegacyPwshPath $legacy)
+
+        $finding = @($findings | Where-Object { $_.Kind -eq 'Task' -and $_.TaskName -eq '\Test\LegacyDirectoryArgument' -and $_.Text -match '%ProgramFiles%\\PowerShell\\7' })
+        $finding.Count | Should -Be 1
+    }
+
+    It 'reports a stale task path when the task profile alias cannot be resolved' {
+        $legacy = 'C:\Program Files\PowerShell\7\pwsh.exe'
+        $current = 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\pwsh.exe'
+        $oldDirectory = 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe'
+        $script:RuntimeReferenceTask = [pscustomobject]@{
+            Principal = [pscustomobject]@{ UserId='S-1-5-21-99-98-97-1001'; LogonType='InteractiveToken' }
+            TaskPath = '\Test\'
+            TaskName = 'UnknownUserProfile'
+            Actions = @([pscustomobject]@{ Execute=$current; Arguments='-File cycle.ps1'; WorkingDirectory=$oldDirectory })
+        }
+        $profiles = @([pscustomobject]@{ Sid='S-1-5-21-10-20-30-1004'; Root=$TestDrive; Alias='C:\TestAliases\pwsh.exe'; LocalAppData=(Join-Path $TestDrive 'AppData\Local') })
+        Mock Get-ScheduledTask { @($script:RuntimeReferenceTask) }
+
+        $findings = @(Get-PowerShell7RuntimeReferenceFindings -InstalledPwshPath $current -Profiles $profiles -LegacyPwshPath $legacy)
+
+        $finding = @($findings | Where-Object { $_.Kind -eq 'Task' -and $_.TaskName -eq '\Test\UnknownUserProfile' })
+        $finding.Count | Should -Be 2
+        @($finding | Where-Object Manual).Count | Should -Be 2
+        @($finding | Where-Object { $_.Text -eq $oldDirectory }).Count | Should -Be 1
+    }
+
+    It 'reports the replacement directory for a saved-password task directory reference' {
+        $legacy = 'C:\Program Files\PowerShell\7\pwsh.exe'
+        $current = 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.1.0_x64__8wekyb3d8bbwe\pwsh.exe'
+        $oldDirectory = 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe'
+        $alias = 'C:\TestAliases\pwsh.exe'
+        $sid = 'S-1-5-21-10-20-30-1005'
+        $script:RuntimeReferenceTask = [pscustomobject]@{
+            Principal = [pscustomobject]@{ UserId=$sid; LogonType='Password' }
+            TaskPath = '\Test\'
+            TaskName = 'SavedPasswordDirectory'
+            Actions = @([pscustomobject]@{ Execute=$current; Arguments='-File cycle.ps1'; WorkingDirectory=$oldDirectory })
+        }
+        $profiles = @([pscustomobject]@{ Sid=$sid; Root=$TestDrive; Alias=$alias; LocalAppData=(Join-Path $TestDrive 'AppData\Local') })
+        Mock Get-ScheduledTask { @($script:RuntimeReferenceTask) }
+
+        $findings = @(Get-PowerShell7RuntimeReferenceFindings -InstalledPwshPath $current -Profiles $profiles -LegacyPwshPath $legacy)
+        $finding = @($findings | Where-Object { $_.Kind -eq 'Task' -and $_.TaskName -eq '\Test\SavedPasswordDirectory' -and $_.Text -eq $oldDirectory })
+
+        $finding.Count | Should -Be 1
+        $finding[0].Manual | Should -BeTrue
+        $finding[0].ReplacementPath | Should -Be (Split-Path -Parent $alias)
     }
 
     It 'finds JSON-escaped MSI paths in Windows Terminal settings' {
@@ -1365,6 +1454,21 @@ Describe 'PowerShell runtime reference discovery' {
         $finding[0].Text | Should -Be $legacy
         $finding[0].ReplacementPath | Should -Be $alias
     }
+
+    It 'does not inspect or change runtime references under WhatIf' {
+        $migrationPath = Join-Path (Split-Path $PSScriptRoot -Parent) 'tools\PowerShellRuntimeMigration.ps1'
+        $migrationAst = Get-ParsedScript $migrationPath
+        $function = $migrationAst.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Update-PowerShell7References' },$true)
+        $function | Should -Not -BeNullOrEmpty
+        if (-not $function) { return }
+        . ([scriptblock]::Create($function.Extent.Text))
+        function Get-PowerShell7UserProfiles { return @() }
+        Mock Get-PowerShell7UserProfiles { throw 'WhatIf should stop before profile discovery' }
+
+        Update-PowerShell7References -Installed ([pscustomobject]@{ PwshPath='C:\MSIX\pwsh.exe' }) -WhatIf
+
+        Should -Invoke Get-PowerShell7UserProfiles -Times 0 -Exactly
+    }
 }
 
 Describe 'PowerShell MSIX task references update to the installed version' {
@@ -1374,6 +1478,11 @@ Describe 'PowerShell MSIX task references update to the installed version' {
         $ast = [Management.Automation.Language.Parser]::ParseFile($installer, [ref]$null, [ref]$null)
         $migrationAst = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-PowerShell7TaskActionMigration' }, $true)
         $referenceAst = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Convert-PowerShell7RuntimeReference' }, $true)
+        $summaryAst = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-PowerShell7RuntimeReferenceSummary' }, $true)
+        $updateTasksAst = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Update-PowerShell7ScheduledTaskReferences' }, $true)
+        if ($referenceAst) { . ([scriptblock]::Create($referenceAst.Extent.Text)) }
+        if ($summaryAst) { . ([scriptblock]::Create($summaryAst.Extent.Text)) }
+        if ($updateTasksAst) { . ([scriptblock]::Create($updateTasksAst.Extent.Text)) }
         $summaryAst = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-PowerShell7RuntimeReferenceSummary' }, $true)
         if ($referenceAst) { . ([scriptblock]::Create($referenceAst.Extent.Text)) }
     }
@@ -1389,7 +1498,7 @@ Describe 'PowerShell MSIX task references update to the installed version' {
         $plan = Get-PowerShell7TaskActionMigration -Task $systemTask `
             -LegacyPwshPath 'C:\Program Files\PowerShell\7\pwsh.exe' `
             -SystemPwshPath 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.1.0_x64__8wekyb3d8bbwe\pwsh.exe' `
-            -UserPwshAlias 'C:\Users\Sample\AppData\Local\Microsoft\WindowsApps\pwsh.exe'
+            -UserPwshAlias 'C:\TestAliases\pwsh.exe'
         $plan.Changed | Should -BeTrue
         $plan.RequiresCredential | Should -BeFalse
         $plan.Actions[0].Execute | Should -Be 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.1.0_x64__8wekyb3d8bbwe\pwsh.exe'
@@ -1471,7 +1580,7 @@ Describe 'PowerShell MSIX task references update to the installed version' {
         if (-not $migrationAst) { return }
         . ([scriptblock]::Create($migrationAst.Extent.Text))
         $passwordTask = [pscustomobject]@{
-            Principal = [pscustomobject]@{ UserId='CONTOSO\svc-updater'; LogonType='Password' }
+            Principal = [pscustomobject]@{ UserId='S-1-5-21-10-20-30-1006'; LogonType='Password' }
             Actions = @([pscustomobject]@{ Execute='C:\Program Files\PowerShell\7\pwsh.exe'; Argument='-File job.ps1'; WorkingDirectory='C:\Jobs' })
         }
         $plan = Get-PowerShell7TaskActionMigration -Task $passwordTask `
@@ -1482,6 +1591,26 @@ Describe 'PowerShell MSIX task references update to the installed version' {
         $plan.RequiresCredential | Should -BeTrue
         $plan.ReplacementPath | Should -Be 'C:\Users\Sample\AppData\Local\Microsoft\WindowsApps\pwsh.exe'
         $plan.Actions[0].Execute | Should -Be 'C:\Program Files\PowerShell\7\pwsh.exe'
+    }
+
+    It 'reports a directory replacement for a saved-password working-directory reference' {
+        $migrationAst | Should -Not -BeNullOrEmpty
+        $referenceAst | Should -Not -BeNullOrEmpty
+        if (-not $migrationAst -or -not $referenceAst) { return }
+        . ([scriptblock]::Create($referenceAst.Extent.Text))
+        . ([scriptblock]::Create($migrationAst.Extent.Text))
+        $task = [pscustomobject]@{
+            Principal = [pscustomobject]@{ UserId='CONTOSO\svc-updater'; LogonType='Password' }
+            Actions = @([pscustomobject]@{ Execute='C:\Windows\System32\cmd.exe'; Argument='/c run.cmd'; WorkingDirectory='C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe' })
+        }
+
+        $plan = Get-PowerShell7TaskActionMigration -Task $task `
+            -LegacyPwshPath 'C:\Program Files\PowerShell\7\pwsh.exe' `
+            -SystemPwshPath 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.1.0_x64__8wekyb3d8bbwe\pwsh.exe' `
+            -UserPwshAlias 'C:\TestAliases\pwsh.exe'
+
+        $plan.RequiresCredential | Should -BeTrue
+        $plan.ReplacementPath | Should -Be 'C:\TestAliases'
     }
 
     It 'rewrites an environment-variable MSI executable to the user MSIX alias' {
@@ -1567,9 +1696,10 @@ Describe 'PowerShell MSIX task references update to the installed version' {
         if (-not $summaryAst) { return }
         . ([scriptblock]::Create($summaryAst.Extent.Text))
         $summary = Get-PowerShell7RuntimeReferenceSummary `
-            -Texts @('C:\Program Files\PowerShell\7\pwsh.exe', '-File C:\Jobs\cycle.ps1; note=ordinary', 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\pwsh.exe') `
+            -Texts @('C:\Program Files\PowerShell\7\pwsh.exe', 'C:\Program Files\PowerShell\7', '-File C:\Jobs\cycle.ps1; note=ordinary', 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\pwsh.exe') `
             -LegacyPwshPath 'C:\Program Files\PowerShell\7\pwsh.exe'
         $summary | Should -Contain 'C:\Program Files\PowerShell\7\pwsh.exe'
+        $summary | Should -Contain 'C:\Program Files\PowerShell\7'
         $summary | Should -Contain 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\pwsh.exe'
         ($summary -join '|') | Should -Not -Match 'ordinary|cycle\.ps1'
     }
@@ -1583,6 +1713,29 @@ Describe 'PowerShell MSIX task references update to the installed version' {
             -LegacyPwshPath 'C:\Program Files\PowerShell\7\pwsh.exe'
 
         @($summary).Count | Should -Be 0
+    }
+
+    It 'continues repairing SYSTEM tasks when a stale user task has no resolvable alias' {
+        $script:RuntimeTasksForRepair = @(
+            [pscustomobject]@{ Principal=[pscustomobject]@{ UserId='S-1-5-21-unknown'; LogonType='InteractiveToken' }; TaskPath='\Test\'; TaskName='Unresolved'; Actions=@([pscustomobject]@{ Execute='C:\Windows\System32\cmd.exe'; Argument='/c run.cmd'; WorkingDirectory='C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe' }) },
+            [pscustomobject]@{ Principal=[pscustomobject]@{ UserId='SYSTEM'; LogonType='ServiceAccount' }; TaskPath='\Test\'; TaskName='SystemCycle'; Actions=@([pscustomobject]@{ Execute='C:\Program Files\PowerShell\7\pwsh.exe'; Argument='-File b.ps1' }) }
+        )
+        . ([scriptblock]::Create($migrationAst.Extent.Text))
+        function Get-ScheduledTask { }
+        function Get-PowerShell7RuntimeReferenceSummary { }
+        function Resolve-PowerShell7TaskAlias { param($Task, $Profiles); return ($Profiles | Where-Object Sid -eq $Task.Principal.UserId | Select-Object -First 1).Alias }
+        function Write-PowerShell7RuntimeLog { param($LogPath, $Message) }
+        function New-ScheduledTaskAction { param($Execute, $Argument, $WorkingDirectory, $Id) }
+        function Set-ScheduledTask { }
+        Mock Get-ScheduledTask { $script:RuntimeTasksForRepair }
+        Mock Get-PowerShell7RuntimeReferenceSummary { @('C:\Program Files\PowerShell\7\pwsh.exe') }
+        Mock Write-PowerShell7RuntimeLog { }
+        Mock New-ScheduledTaskAction { [pscustomobject]@{ Execute=$Execute; Argument=$Argument; WorkingDirectory=$WorkingDirectory } }
+        Mock Set-ScheduledTask { }
+
+        { Update-PowerShell7ScheduledTaskReferences -Profiles @([pscustomobject]@{ Sid='S-1-5-21-other'; Alias='C:\TestAliases\other\pwsh.exe' }) -SystemPwshPath 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.1.0_x64__8wekyb3d8bbwe\pwsh.exe' -LegacyPwshPath 'C:\Program Files\PowerShell\7\pwsh.exe' -LogPath (Join-Path $TestDrive 'repair.log') } | Should -Not -Throw
+        Should -Invoke Set-ScheduledTask -Times 1 -Exactly
+        Should -Invoke Write-PowerShell7RuntimeLog -Times 1 -Exactly -ParameterFilter { $Message -match 'TASK MANUAL UPDATE REQUIRED: \\Test\\Unresolved' }
     }
 
     It 'registers SYSTEM tasks from the running MSIX path before using the MSI-only fallback' {
@@ -1699,5 +1852,21 @@ Describe 'PowerShell MSI module and script leftovers move out of the old runtime
         Test-Path -LiteralPath (Join-Path $targetRoot 'LegacyMsiConflicts\Modules\PSReadLine\PSReadLine.psm1') | Should -BeTrue
         Test-Path -LiteralPath (Join-Path $targetRoot 'Modules\LocalTools\LocalTools.psm1') | Should -BeTrue
         Test-Path -LiteralPath $legacyRoot | Should -BeFalse
+    }
+
+    It 'does not move or delete MSI leftovers under WhatIf' {
+        $moveAst | Should -Not -BeNullOrEmpty
+        if (-not $moveAst) { return }
+        . ([scriptblock]::Create($moveAst.Extent.Text))
+        $targetRoot = Join-Path $TestDrive 'WhatIfPowerShell'
+        $legacyRoot = Join-Path $targetRoot '7'
+        $source = Join-Path $legacyRoot 'Scripts\keep-me.ps1'
+        $null = New-Item -ItemType Directory -Path (Split-Path -Parent $source) -Force
+        Set-Content -LiteralPath $source -Value 'Write-Output safe' -Encoding utf8
+
+        Move-PowerShell7LegacyContent -LegacyRoot $legacyRoot -TargetRoot $targetRoot -LogPath (Join-Path $TestDrive 'whatif.log') -WhatIf
+
+        Test-Path -LiteralPath $source | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $targetRoot 'Scripts\keep-me.ps1') | Should -BeFalse
     }
 }

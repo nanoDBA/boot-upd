@@ -15,6 +15,7 @@ function Get-PowerShell7SettingsTextUpdate {
 }
 
 function Update-PowerShell7TerminalSettingsFile {
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)][string]$OldPath,
@@ -43,6 +44,9 @@ function Update-PowerShell7TerminalSettingsFile {
     $text = $encoding.GetString($bytes, $preambleLength, $bytes.Length - $preambleLength)
     $updated = Get-PowerShell7SettingsTextUpdate -Text $text -OldPath $OldPath -NewPath $NewPath
     if ($updated -ceq $text) { return [pscustomobject]@{ Changed = $false; BackupPath = $null } }
+    if (-not $PSCmdlet.ShouldProcess($Path, 'Replace the PowerShell path in Windows Terminal settings')) {
+        return [pscustomobject]@{ Changed = $false; BackupPath = $null }
+    }
 
     $stamp = [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmssfffZ')
     $backupPath = "$Path.$stamp.bak"
@@ -81,6 +85,7 @@ function Get-PowerShell7TaskActionMigration {
     $newPath = if ($isSystem) { $SystemPwshPath } else { $UserPwshAlias }
     $definitions = [System.Collections.Generic.List[object]]::new()
     $hasMatch = $false
+    $hasExecutableReference = $false
     foreach ($action in @($Task.Actions)) {
         $execute = [string]$action.Execute
         $arguments = if ($action.PSObject.Properties['Arguments']) { [string]$action.Arguments } else { [string]$action.Argument }
@@ -89,6 +94,7 @@ function Get-PowerShell7TaskActionMigration {
         $newArguments = Convert-PowerShell7RuntimeReference -Text $arguments -LegacyPwshPath $LegacyPwshPath -SystemPwshPath $SystemPwshPath
         $isRuntimeExecutable = $execute -match '(?i)pwsh\.exe$' -and
             ($newExecute -cne $execute -or $execute -match '(?i)WindowsApps\\Microsoft\.PowerShell_[^\\]+\\pwsh\.exe$')
+        if ($isRuntimeExecutable -or ($newArguments -cne $arguments -and $arguments -match '(?i)pwsh\.exe')) { $hasExecutableReference = $true }
         $userNeedsAlias = -not $isSystem -and $isRuntimeExecutable -and $UserPwshAlias -and $execute -cne $UserPwshAlias
         if ($newExecute -cne $execute -or $newArguments -cne $arguments -or ($isRuntimeExecutable -and -not $isSystem)) {
             $hasMatch = $true
@@ -110,8 +116,12 @@ function Get-PowerShell7TaskActionMigration {
         $workingDirectory = [string]$action.WorkingDirectory
         if ($workingDirectory) {
             $replacement = if ($isSystem) { $SystemPwshPath } else { $UserPwshAlias }
-            if ($replacement) {
-                $workingDirectory = Convert-PowerShell7RuntimeReference -Text $workingDirectory -LegacyPwshPath $LegacyPwshPath -SystemPwshPath $replacement
+            $conversionTarget = if ($replacement) { $replacement } else { $SystemPwshPath }
+            $updatedWorkingDirectory = Convert-PowerShell7RuntimeReference -Text $workingDirectory -LegacyPwshPath $LegacyPwshPath -SystemPwshPath $conversionTarget
+            if ($updatedWorkingDirectory -cne $workingDirectory) {
+                $hasMatch = $true
+                $actionChanged = $true
+                if ($replacement) { $workingDirectory = $updatedWorkingDirectory }
             }
         }
         if ($workingDirectory -cne [string]$action.WorkingDirectory) { $hasMatch = $true; $actionChanged = $true }
@@ -124,7 +134,7 @@ function Get-PowerShell7TaskActionMigration {
         Changed = $changed
         RequiresCredential = $requiresCredential
         RequiresUserAlias = $requiresUserAlias
-        ReplacementPath = if ($hasMatch) { $newPath } else { $null }
+        ReplacementPath = if (-not $hasMatch -or -not $newPath) { $null } elseif ($hasExecutableReference) { $newPath } else { Split-Path -Parent $newPath }
         Actions = if ($changed) { $definitions.ToArray() } else { @($Task.Actions) }
     }
 }
@@ -159,11 +169,16 @@ function Get-PowerShell7RuntimeReferenceSummary {
     param([Parameter(Mandatory)][AllowEmptyCollection()][AllowEmptyString()][string[]]$Texts, [Parameter(Mandatory)][string]$LegacyPwshPath)
     $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     $references = New-Object 'System.Collections.Generic.List[string]'
+    $legacyDirectory = Split-Path -Parent $LegacyPwshPath
     $patterns = @(
         [regex]::Escape($LegacyPwshPath),
         '(?i)%ProgramFiles%\\PowerShell\\7\\pwsh\.exe',
         '(?i)\$env:ProgramFiles\\PowerShell\\7\\pwsh\.exe',
-        '(?i)[A-Z]:\\(?:Program Files\\)?WindowsApps\\Microsoft\.PowerShell_[^\\;"\s]+\\pwsh\.exe'
+        '(?i)[A-Z]:\\(?:Program Files\\)?WindowsApps\\Microsoft\.PowerShell_[^\\;"\s]+\\pwsh\.exe',
+        [regex]::Escape($legacyDirectory),
+        '(?i)%ProgramFiles%\\PowerShell\\7',
+        '(?i)\$env:ProgramFiles\\PowerShell\\7',
+        '(?i)[A-Z]:\\(?:Program Files\\)?WindowsApps\\Microsoft\.PowerShell_[^\\;"\s]+'
     )
     foreach ($text in $Texts) {
         foreach ($pattern in $patterns) {
@@ -254,6 +269,7 @@ function Resolve-PowerShell7TaskAlias {
 }
 
 function Update-PowerShell7ScheduledTaskReferences {
+    [CmdletBinding(SupportsShouldProcess)]
     param([Parameter(Mandatory)][object[]]$Profiles, [Parameter(Mandatory)][string]$SystemPwshPath,
           [Parameter(Mandatory)][string]$LegacyPwshPath, [Parameter(Mandatory)][string]$LogPath)
     foreach ($task in @(Get-ScheduledTask -ErrorAction Stop)) {
@@ -267,8 +283,8 @@ function Update-PowerShell7ScheduledTaskReferences {
             continue
         }
         if ($plan.RequiresUserAlias) {
-            Write-PowerShell7RuntimeLog -LogPath $LogPath -Message "TASK MIGRATION BLOCKED: $($task.TaskPath)$($task.TaskName); before=$($beforeReferences -join ';'); reason=user profile alias could not be resolved"
-            throw "Cannot map scheduled task $($task.TaskPath)$($task.TaskName) to a user profile alias; its PowerShell action cannot be safely changed."
+            Write-PowerShell7RuntimeLog -LogPath $LogPath -Message "TASK MANUAL UPDATE REQUIRED: $($task.TaskPath)$($task.TaskName); before=$($beforeReferences -join ';'); reason=user profile alias could not be resolved"
+            continue
         }
         if (-not $plan.Changed) { continue }
         if (-not $alias) { throw "Cannot map scheduled task $($task.TaskPath)$($task.TaskName) to a user profile; its PowerShell action cannot be safely changed." }
@@ -280,12 +296,16 @@ function Update-PowerShell7ScheduledTaskReferences {
             if ($action.Id) { $actionParameters.Id = $action.Id }
             New-ScheduledTaskAction @actionParameters
         }
-        Set-ScheduledTask -InputObject $task -Action @($actions) -ErrorAction Stop | Out-Null
-        Write-PowerShell7RuntimeLog -LogPath $LogPath -Message "TASK ACTION UPDATED: $($task.TaskPath)$($task.TaskName); before=$($beforeReferences -join ';'); after=$($plan.ReplacementPath)"
+        $target = "$($task.TaskPath)$($task.TaskName)"
+        if ($PSCmdlet.ShouldProcess($target, 'Update the scheduled task PowerShell action')) {
+            Set-ScheduledTask -InputObject $task -Action @($actions) -ErrorAction Stop | Out-Null
+            Write-PowerShell7RuntimeLog -LogPath $LogPath -Message "TASK ACTION UPDATED: $target; before=$($beforeReferences -join ';'); after=$($plan.ReplacementPath)"
+        }
     }
 }
 
 function Update-PowerShell7SystemRegistryReferences {
+    [CmdletBinding(SupportsShouldProcess)]
     param([Parameter(Mandatory)][string]$LegacyPwshPath, [Parameter(Mandatory)][string]$SystemPwshPath,
           [Parameter(Mandatory)][string]$LogPath)
     $targets = @(
@@ -308,8 +328,11 @@ function Update-PowerShell7SystemRegistryReferences {
                         $after = Convert-PowerShell7RuntimeReference -Text $before -LegacyPwshPath $LegacyPwshPath -SystemPwshPath $SystemPwshPath
                         if ($after -ceq $before) { continue }
                         $kind = $key.GetValueKind($name)
-                        $key.SetValue($name, $after, $kind)
-                        Write-PowerShell7RuntimeLog -LogPath $LogPath -Message "REGISTRY UPDATED: HKLM\$($target.Key)\$name ($view); before=$before; after=$after"
+                        $targetName = "HKLM\$($target.Key)\$name ($view)"
+                        if ($PSCmdlet.ShouldProcess($targetName, 'Update the PowerShell runtime path')) {
+                            $key.SetValue($name, $after, $kind)
+                            Write-PowerShell7RuntimeLog -LogPath $LogPath -Message "REGISTRY UPDATED: $targetName; before=$before; after=$after"
+                        }
                     }
                 } finally { $key.Dispose() }
             }
@@ -318,14 +341,17 @@ function Update-PowerShell7SystemRegistryReferences {
 }
 
 function Update-PowerShell7MachinePath {
+    [CmdletBinding(SupportsShouldProcess)]
     param([Parameter(Mandatory)][string]$LegacyPwshPath, [Parameter(Mandatory)][string]$SystemPwshPath,
           [Parameter(Mandatory)][string]$LogPath)
     $before = [Environment]::GetEnvironmentVariable('Path', 'Machine')
     if (-not $before) { return }
     $after = Get-PowerShell7MachinePathUpdate -CurrentPath $before -LegacyPwshPath $LegacyPwshPath -SystemPwshPath $SystemPwshPath
     if ($after -cne $before) {
-        [Environment]::SetEnvironmentVariable('Path', $after, 'Machine')
-        Write-PowerShell7RuntimeLog -LogPath $LogPath -Message "MACHINE PATH UPDATED: before=$before; after=$after"
+        if ($PSCmdlet.ShouldProcess('Machine PATH', 'Replace the legacy PowerShell directory')) {
+            [Environment]::SetEnvironmentVariable('Path', $after, 'Machine')
+            Write-PowerShell7RuntimeLog -LogPath $LogPath -Message "MACHINE PATH UPDATED: before=$before; after=$after"
+        }
     }
 }
 
@@ -399,10 +425,14 @@ function Get-PowerShell7RuntimeReferenceFindings {
           [Parameter(Mandatory)][object[]]$Profiles,
           [Parameter(Mandatory)][string]$LegacyPwshPath)
     $findings = New-Object 'System.Collections.Generic.List[object]'
-    $packagePattern = '(?i)[A-Z]:\\(?:Program Files\\)?WindowsApps\\Microsoft\.PowerShell_[^\\;"\s]+\\pwsh\.exe'
+    $packagePattern = '(?i)[A-Z]:\\(?:Program Files\\)?WindowsApps\\Microsoft\.PowerShell_[^\\;"\s]+(?:\\pwsh\.exe)?'
+    $legacyDirectory = Split-Path -Parent $LegacyPwshPath
     $runtimeReferencePattern = '(?i)(?:' + [regex]::Escape($LegacyPwshPath) + '|' +
         [regex]::Escape('%ProgramFiles%\PowerShell\7\pwsh.exe') + '|' +
-        [regex]::Escape('$env:ProgramFiles\PowerShell\7\pwsh.exe') + '|' + $packagePattern + ')'
+        [regex]::Escape('$env:ProgramFiles\PowerShell\7\pwsh.exe') + '|' +
+        [regex]::Escape($legacyDirectory) + '|' +
+        [regex]::Escape('%ProgramFiles%\PowerShell\7') + '|' +
+        [regex]::Escape('$env:ProgramFiles\PowerShell\7') + '|' + $packagePattern + ')'
     foreach ($task in @(Get-ScheduledTask -ErrorAction SilentlyContinue)) {
         $system = ([string]$task.Principal.LogonType -eq 'ServiceAccount') -or ([string]$task.Principal.UserId -match '^(?i)(SYSTEM|NT AUTHORITY\\SYSTEM|S-1-5-18|LOCAL SERVICE|NT AUTHORITY\\LOCAL SERVICE|NETWORK SERVICE|NT AUTHORITY\\NETWORK SERVICE)$')
         $alias = if ($system) { $InstalledPwshPath } else { Resolve-PowerShell7TaskAlias -Task $task -Profiles $Profiles }
@@ -413,8 +443,9 @@ function Get-PowerShell7RuntimeReferenceFindings {
                 $matches = [regex]::Matches($scanText, $runtimeReferencePattern)
                 foreach ($match in $matches) {
                     $expectedPath = if ($system) { $InstalledPwshPath } else { $alias }
-                    if ($expectedPath -and $match.Value -ieq $expectedPath) { continue }
-                    $findings.Add([pscustomobject]@{ Kind='Task'; Text=$match.Value; Manual=([string]$task.Principal.LogonType -eq 'Password'); ReplacementPath=$alias; TaskName="$($task.TaskPath)$($task.TaskName)" })
+                    $expectedReference = if (-not $expectedPath) { $null } elseif ($match.Value -match '(?i)\\pwsh\.exe$') { $expectedPath } else { Split-Path -Parent $expectedPath }
+                    if ($expectedReference -and $match.Value -ieq $expectedReference) { continue }
+                    $findings.Add([pscustomobject]@{ Kind='Task'; Text=$match.Value; Manual=(([string]$task.Principal.LogonType -eq 'Password') -or -not $expectedPath); ReplacementPath=$expectedReference; TaskName="$($task.TaskPath)$($task.TaskName)" })
                 }
             }
         }
@@ -474,6 +505,7 @@ function Get-PowerShell7RuntimeReferenceFindings {
 }
 
 function Update-PowerShell7UserPaths {
+    [CmdletBinding(SupportsShouldProcess)]
     param([Parameter(Mandatory)][object[]]$Profiles,[Parameter(Mandatory)][string]$LegacyPwshPath,[Parameter(Mandatory)][string]$LogPath)
     foreach ($profile in $Profiles) {
         $handle = $null
@@ -486,17 +518,21 @@ function Update-PowerShell7UserPaths {
             $after = Get-PowerShell7UserPathUpdate -CurrentPath $before -LegacyPwshPath $LegacyPwshPath -UserPwshAlias $profile.Alias
             if ($after -ceq $before) { continue }
             $kind = $key.GetValueKind('Path')
-            $key.SetValue('Path',$after,$kind)
-            Write-PowerShell7RuntimeLog -LogPath $LogPath -Message "USER PATH UPDATED: profile=$($profile.Sid); before=$before; after=$after"
+            if ($PSCmdlet.ShouldProcess("User PATH for profile $($profile.Sid)", 'Replace the legacy PowerShell directory')) {
+                $key.SetValue('Path',$after,$kind)
+                Write-PowerShell7RuntimeLog -LogPath $LogPath -Message "USER PATH UPDATED: profile=$($profile.Sid); before=$before; after=$after"
+            }
         } finally { Close-PowerShell7ProfileEnvironmentKey -Handle $handle }
     }
 }
 
 function Move-PowerShell7LegacyContent {
+    [CmdletBinding(SupportsShouldProcess)]
     param([Parameter(Mandatory)][string]$LogPath,
           [string]$LegacyRoot = (Join-Path $env:ProgramFiles 'PowerShell\7'),
           [string]$TargetRoot = (Join-Path $env:ProgramFiles 'PowerShell'),
           [string]$BundledModulesRoot = '')
+    if (-not $PSCmdlet.ShouldProcess($LegacyRoot, 'Move or remove legacy PowerShell modules and scripts')) { return }
     foreach ($kind in @('Modules','Scripts')) {
         $source = Join-Path $legacyRoot $kind
         if (-not (Test-Path -LiteralPath $source -PathType Container)) { continue }
@@ -547,8 +583,10 @@ function Move-PowerShell7LegacyContent {
 }
 
 function Update-PowerShell7References {
+    [CmdletBinding(SupportsShouldProcess)]
     param([Parameter(Mandatory)]$Installed,
           [string]$LegacyPwshPath = (Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'))
+    if (-not $PSCmdlet.ShouldProcess('PowerShell runtime references', 'Update paths and settings for the installed MSIX')) { return }
     $logPath = Join-Path $env:ProgramData 'BootUpdateCycle\PowerShellRuntimeUpgrade.log'
     $profiles = @(Get-PowerShell7UserProfiles)
     $systemPath = [string]$Installed.PwshPath
