@@ -132,6 +132,27 @@ Describe 'upd.cmd prefers the PowerShell MSIX alias' {
     }
 }
 
+Describe 'upd.cmd finds a machine-wide PowerShell MSIX for SYSTEM' {
+    It 'uses the installed MSIX ahead of an MSI PATH entry when no user alias exists' {
+        $programFilesRoot = Join-Path $TestDrive 'program-files'
+        $packageRoot = Join-Path $programFilesRoot 'WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe'
+        $msiRoot = Join-Path $programFilesRoot 'PowerShell\7'
+        $null = New-Item -ItemType Directory -Force -Path $packageRoot,$msiRoot
+        Set-Content -LiteralPath (Join-Path $packageRoot 'pwsh.exe') -Value 'msix' -Encoding ascii
+        Set-Content -LiteralPath (Join-Path $msiRoot 'pwsh.exe') -Value 'msi' -Encoding ascii
+
+        $findStart = $cmdSource.LastIndexOf(':find_pwsh')
+        $findEnd = $cmdSource.IndexOf("`r`n:",$findStart + 1)
+        $subroutine = $cmdSource.Substring($findStart,$findEnd - $findStart)
+        $simulated = "@echo off`r`nset `"LocalAppData=$TestDrive\system-profile`"`r`nset `"ProgramFiles=$programFilesRoot`"`r`nset `"PATH=$msiRoot;%SystemRoot%\System32`"`r`ncall :find_pwsh`r`necho UPD_PWSH=%UPD_PWSH%`r`nexit /b 0`r`n" + $subroutine + "`r`n"
+        $simulatedPath = Join-Path $TestDrive 'find-pwsh-system-msix.cmd'
+        [IO.File]::WriteAllText($simulatedPath,$simulated,[Text.Encoding]::ASCII)
+
+        $output = & cmd.exe /d /c "`"$simulatedPath`"" 2>&1
+        $LASTEXITCODE | Should -Be 0
+        ($output -join "`n") | Should -Match ([regex]::Escape("UPD_PWSH=$packageRoot\pwsh.exe"))
+    }
+}
 Describe 'Friendly launcher help' {
     It 'accepts <alias> without elevation or side effects' -ForEach @(
         @{ Alias='/?' }, @{ Alias='?' }, @{ Alias='/help' }, @{ Alias='help' },
