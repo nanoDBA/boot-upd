@@ -127,6 +127,13 @@ function Test-LabRebootAfterBootstrap {
         [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
     return ($bootTime -gt $BootstrapObservedAtUtc.ToUniversalTime())
 }
+
+function Get-LabRuntimeEventTimestampUtc {
+    param($RuntimeEvent)
+    if ($null -eq $RuntimeEvent -or [string]::IsNullOrWhiteSpace([string]$RuntimeEvent.TimestampUtc)) { return $null }
+    return [datetime]::Parse([string]$RuntimeEvent.TimestampUtc, [Globalization.CultureInfo]::InvariantCulture,
+        [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
+}
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'LabCredential.ps1')
 . (Join-Path $PSScriptRoot 'LabEvidence.ps1')
@@ -526,6 +533,16 @@ while ((Get-Date) -lt $deadline) {
                 LogonOnlyVerified = @($lines | Where-Object { $_ -match 'Resume chain verified: BootUpdateCycle \(saved-user logon only\)' }).Count -gt 0
                 StateFileExists = Test-Path 'C:\ProgramData\BootUpdateCycle\BootUpdateCycle.state.json'
                 LatestBootTimeUtc = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o')
+                RuntimeEvents = @(foreach ($line in @($lines | Where-Object { $_ -match 'PowerShell runtime \|' })) {
+                    $runtimeStamp = [regex]::Match([string]$line, '^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]')
+                    $runtimeTimeUtc = $null
+                    if ($runtimeStamp.Success) {
+                        $guestLocalTime = [datetime]::ParseExact($runtimeStamp.Groups[1].Value, 'yyyy-MM-dd HH:mm:ss',
+                            [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeLocal)
+                        $runtimeTimeUtc = $guestLocalTime.ToUniversalTime().ToString('o')
+                    }
+                    [pscustomobject]@{ Line=[string]$line; TimestampUtc=$runtimeTimeUtc }
+                })
                 RuntimeLines = @($lines | Where-Object { $_ -match 'PowerShell runtime \|' })
                 MsiVersions = @(Get-ItemProperty @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*') -ErrorAction SilentlyContinue |
                     Where-Object { $_.DisplayName -match '^PowerShell 7(?:\b|[- ])' -and [int]($_.WindowsInstaller -as [int]) -eq 1 -and $_.DisplayVersion } |
@@ -547,24 +564,29 @@ while ((Get-Date) -lt $deadline) {
         Add-Timeline (("{0} passes={1} lines={2} tasks={3} :: {4}" -f (Get-Date -Format 'HH:mm:ss'), $r.Passes, $r.Lines, $r.Tasks, $r.Last))
         $knownLogLines = Add-BootUpdLabLiveLog -Path $liveLogPath -KnownCount $knownLogLines -GuestCount $r.Lines -NewLines @($r.NewLines)
         $observedAtUtc = [datetime]::UtcNow
-        $updRuntime = @($r.RuntimeLines | Where-Object { $_ -match '\| Launched by: upd$' } | Select-Object -First 1)
+        $updRuntime = @($r.RuntimeEvents | Where-Object { $_.Line -match '\| Launched by: upd$' } | Select-Object -First 1)
         if ($updRuntime.Count -and $null -eq $bootstrapObservedAtUtc) {
-            $bootstrapObservedAtUtc = $observedAtUtc
-            Add-LabStage -Name 'bootstrap-done' -ObservedAtUtc $observedAtUtc -Facts ([pscustomobject]@{
-                RuntimeLine=[string]$updRuntime[0]; MsiVersions=@($r.MsiVersions); MsixVersions=@($r.MsixVersions)
+            $bootstrapObservedAtUtc = Get-LabRuntimeEventTimestampUtc -RuntimeEvent $updRuntime[0]
+            if ($null -eq $bootstrapObservedAtUtc) { $bootstrapObservedAtUtc = $observedAtUtc }
+            Add-LabStage -Name 'bootstrap-done' -ObservedAtUtc $bootstrapObservedAtUtc -Facts ([pscustomobject]@{
+                RuntimeLine=[string]$updRuntime[0].Line; MsiVersions=@($r.MsiVersions); MsixVersions=@($r.MsixVersions)
             })
         }
         if ($null -ne $bootstrapObservedAtUtc -and $null -eq $rebootObservedAtUtc -and
             (Test-LabRebootAfterBootstrap -BootTimeUtc ([string]$r.LatestBootTimeUtc) -BootstrapObservedAtUtc $bootstrapObservedAtUtc)) {
-            $rebootObservedAtUtc = $observedAtUtc
-            Add-LabStage -Name 'reboot-seen' -ObservedAtUtc $observedAtUtc -Facts ([pscustomobject]@{
+            $rebootObservedAtUtc = [datetime]::Parse([string]$r.LatestBootTimeUtc, [Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
+            Add-LabStage -Name 'reboot-seen' -ObservedAtUtc $rebootObservedAtUtc -Facts ([pscustomobject]@{
                 LatestBootTimeUtc=[string]$r.LatestBootTimeUtc; MsiVersions=@($r.MsiVersions); MsixVersions=@($r.MsixVersions)
             })
         }
         $handoffEvidence = Get-LabPowerShellRuntimeHandoffEvidence -RuntimeLines @($r.RuntimeLines) `
             -MsiVersions @($r.MsiVersions) -MsixVersions @($r.MsixVersions) -RebootSeen ($null -ne $rebootObservedAtUtc)
         if ($null -ne $rebootObservedAtUtc -and $handoffEvidence.ContinuationRuntimeLine -and -not @($stageEvidence | Where-Object Name -eq 'continuation-relaunched').Count) {
-            Add-LabStage -Name 'continuation-relaunched' -ObservedAtUtc $observedAtUtc -Facts ([pscustomobject]@{
+            $continuationRuntimeEvent = @($r.RuntimeEvents | Where-Object { $_.Line -eq $handoffEvidence.ContinuationRuntimeLine } | Select-Object -Last 1)
+            $continuationAtUtc = if ($continuationRuntimeEvent.Count) { Get-LabRuntimeEventTimestampUtc -RuntimeEvent $continuationRuntimeEvent[0] } else { $null }
+            if ($null -eq $continuationAtUtc) { $continuationAtUtc = $observedAtUtc }
+            Add-LabStage -Name 'continuation-relaunched' -ObservedAtUtc $continuationAtUtc -Facts ([pscustomobject]@{
                 RuntimeLine=$handoffEvidence.ContinuationRuntimeLine; HandoffPassed=[bool]$handoffEvidence.Passed
                 MsiVersions=@($r.MsiVersions); MsixVersions=@($r.MsixVersions)
             })

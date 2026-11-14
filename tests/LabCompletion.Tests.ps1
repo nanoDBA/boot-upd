@@ -13,7 +13,7 @@ BeforeAll {
         $node.Name -eq 'Test-LabSavedUserWaitEvidence'
     }, $true)
     . ([scriptblock]::Create($waitFn.Extent.Text))
-    foreach ($name in @('New-LabStageEvidence','Get-LabPowerShellRuntimeHandoffEvidence','Test-LabShouldStopAfterContinuationRuntime','Test-LabRebootAfterBootstrap')) {
+    foreach ($name in @('New-LabStageEvidence','Get-LabPowerShellRuntimeHandoffEvidence','Test-LabShouldStopAfterContinuationRuntime','Test-LabRebootAfterBootstrap','Get-LabRuntimeEventTimestampUtc')) {
         $helper = $ast.Find({ param($node)
             $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
         }, $true)
@@ -87,6 +87,13 @@ Describe 'Lab runtime handoff stage evidence' {
 
         Test-LabRebootAfterBootstrap -BootTimeUtc '2026-11-14T19:19:40.0000000Z' -BootstrapObservedAtUtc $bootstrap | Should -BeTrue
         Test-LabRebootAfterBootstrap -BootTimeUtc '2026-11-14T19:18:44.0000000Z' -BootstrapObservedAtUtc $bootstrap | Should -BeFalse
+    }
+
+    It 'orders a delayed poll by the guest runtime event time, not the host observation time' {
+        $event = [pscustomobject]@{ TimestampUtc='2026-11-14T19:43:47.0000000Z' }
+        $runtimeTime = Get-LabRuntimeEventTimestampUtc -RuntimeEvent $event
+
+        Test-LabRebootAfterBootstrap -BootTimeUtc '2026-11-14T19:44:02.0000000Z' -BootstrapObservedAtUtc $runtimeTime | Should -BeTrue
     }
 
     It 'records the elapsed phase time with the observed facts' {
