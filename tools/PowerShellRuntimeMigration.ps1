@@ -400,15 +400,20 @@ function Get-PowerShell7RuntimeReferenceFindings {
           [Parameter(Mandatory)][string]$LegacyPwshPath)
     $findings = New-Object 'System.Collections.Generic.List[object]'
     $packagePattern = '(?i)[A-Z]:\\(?:Program Files\\)?WindowsApps\\Microsoft\.PowerShell_[^\\;"\s]+\\pwsh\.exe'
+    $runtimeReferencePattern = '(?i)(?:' + [regex]::Escape($LegacyPwshPath) + '|' +
+        [regex]::Escape('%ProgramFiles%\PowerShell\7\pwsh.exe') + '|' +
+        [regex]::Escape('$env:ProgramFiles\PowerShell\7\pwsh.exe') + '|' + $packagePattern + ')'
     foreach ($task in @(Get-ScheduledTask -ErrorAction SilentlyContinue)) {
         $system = ([string]$task.Principal.LogonType -eq 'ServiceAccount') -or ([string]$task.Principal.UserId -match '^(?i)(SYSTEM|NT AUTHORITY\\SYSTEM|S-1-5-18|LOCAL SERVICE|NT AUTHORITY\\LOCAL SERVICE|NETWORK SERVICE|NT AUTHORITY\\NETWORK SERVICE)$')
         $alias = if ($system) { $InstalledPwshPath } else { Resolve-PowerShell7TaskAlias -Task $task -Profiles $Profiles }
         foreach ($action in @($task.Actions)) {
             $argument = if ($action.PSObject.Properties['Arguments']) { [string]$action.Arguments } else { [string]$action.Argument }
             foreach ($text in @([string]$action.Execute,$argument,[string]$action.WorkingDirectory)) {
-                $matches = [regex]::Matches($text, [regex]::Escape($LegacyPwshPath) + '|' + $packagePattern)
+                $scanText = $text.Replace('\\','\')
+                $matches = [regex]::Matches($scanText, $runtimeReferencePattern)
                 foreach ($match in $matches) {
-                    if ($match.Value -ieq $InstalledPwshPath) { continue }
+                    $expectedPath = if ($system) { $InstalledPwshPath } else { $alias }
+                    if ($expectedPath -and $match.Value -ieq $expectedPath) { continue }
                     $findings.Add([pscustomobject]@{ Kind='Task'; Text=$match.Value; Manual=([string]$task.Principal.LogonType -eq 'Password'); ReplacementPath=$alias; TaskName="$($task.TaskPath)$($task.TaskName)" })
                 }
             }
@@ -458,8 +463,9 @@ function Get-PowerShell7RuntimeReferenceFindings {
         foreach ($settings in @((Join-Path $profile.LocalAppData 'Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\settings.json'),(Join-Path $profile.LocalAppData 'Packages\Microsoft.WindowsTerminalPreview_8wekyb3d8bbwe\LocalState\settings.json'),(Join-Path $profile.LocalAppData 'Microsoft\Windows Terminal\settings.json'))) {
             if (-not (Test-Path -LiteralPath $settings -PathType Leaf)) { continue }
             $text = [IO.File]::ReadAllText($settings)
-            foreach ($match in [regex]::Matches($text, '(?i)(?:[A-Z]:\\(?:Program Files\\)?WindowsApps\\Microsoft\.PowerShell_[^\\"\s]+\\pwsh\.exe|[A-Z]:\\Program Files\\PowerShell\\7\\pwsh\.exe)')) {
-                if ($match.Value -ieq $InstalledPwshPath) { continue }
+            $scanText = $text.Replace('\\','\')
+            foreach ($match in [regex]::Matches($scanText, $runtimeReferencePattern)) {
+                if ($match.Value -ieq $profile.Alias) { continue }
                 $findings.Add([pscustomobject]@{ Kind='Windows Terminal'; Text=$match.Value; Manual=$false; ReplacementPath=$profile.Alias; SettingsPath=$settings })
             }
         }

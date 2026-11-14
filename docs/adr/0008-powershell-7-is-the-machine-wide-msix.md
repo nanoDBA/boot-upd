@@ -2,10 +2,12 @@
 
 boot-upd installs PowerShell 7 one way: Microsoft's MSIX bundle from the PowerShell release
 page, checked against the release's `hashes.sha256` and its Microsoft signature, and
-provisioned for the whole machine with `Add-AppxProvisionedPackage -Online`. Everything in
-boot-upd that starts PowerShell 7 (continuation tasks, the Deploy task, child processes, the
-self-update relaunch, the launcher's elevation) uses `pwsh.exe` in `$PSHOME`, the folder the
-running PowerShell lives in (`Get-BootUpdatePwshPath`). It never asks for `pwsh` by name.
+provisioned for the whole machine with `Add-AppxProvisionedPackage -Online`. Continuation tasks
+for a user run through that user's WindowsApps alias. SYSTEM tasks and SYSTEM child processes
+use `pwsh.exe` in `$PSHOME`, the installed MSIX package folder. `upd.cmd` checks the current
+user's alias before PATH, so an old machine PATH entry cannot select the MSI. SYSTEM has no
+per-user alias, so its tasks use the full package path instead of asking SYSTEM to resolve
+`pwsh` by name.
 `Get-Command pwsh` is exactly what must not be used: for an MSIX install it resolves to the
 per-user alias inside the user's profile. A lab row that accidentally ran v2.5.92 on an MSIX
 guest registered every continuation task, the SYSTEM fallback included, with that alias.

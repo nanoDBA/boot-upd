@@ -1289,6 +1289,84 @@ Describe 'PowerShell MSIX references are repaired at updater startup' {
         $referenceStatus | Should -Match 'summary\.Manual'
     }
 }
+
+Describe 'PowerShell runtime reference discovery' {
+    BeforeAll {
+        $migrationPath = Join-Path (Split-Path $PSScriptRoot -Parent) 'tools\PowerShellRuntimeMigration.ps1'
+        $migrationAst = Get-ParsedScript $migrationPath
+        foreach ($name in @('Get-PowerShell7RuntimeReferenceFindings','Resolve-PowerShell7TaskAlias','Get-PowerShell7UserPathUpdate','Get-PowerShell7MachinePathUpdate','Convert-PowerShell7RuntimeReference')) {
+            $function = $migrationAst.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name },$true)
+            if ($function) { . ([scriptblock]::Create($function.Extent.Text)) }
+        }
+        function Open-PowerShell7ProfileEnvironmentKey { return $null }
+        function Close-PowerShell7ProfileEnvironmentKey { param($Handle) }
+    }
+
+    It 'reports a user task on the current versioned MSIX with its alias as the replacement' {
+        $legacy = 'C:\Program Files\PowerShell\7\pwsh.exe'
+        $current = 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\pwsh.exe'
+        $alias = 'C:\Users\Sample\AppData\Local\Microsoft\WindowsApps\pwsh.exe'
+        $sid = 'S-1-5-21-10-20-30-1001'
+        $script:RuntimeReferenceTask = [pscustomobject]@{
+            Principal = [pscustomobject]@{ UserId=$sid; LogonType='InteractiveToken' }
+            TaskPath = '\Test\'
+            TaskName = 'UserPowerShell'
+            Actions = @([pscustomobject]@{ Execute=$current; Arguments='-File C:\Jobs\run.ps1'; WorkingDirectory='C:\Jobs' })
+        }
+        $profiles = @([pscustomobject]@{ Sid=$sid; Root=$TestDrive; Alias=$alias; LocalAppData=(Join-Path $TestDrive 'AppData\Local') })
+        Mock Get-ScheduledTask { @($script:RuntimeReferenceTask) }
+
+        $findings = @(Get-PowerShell7RuntimeReferenceFindings -InstalledPwshPath $current -Profiles $profiles -LegacyPwshPath $legacy)
+        $finding = @($findings | Where-Object { $_.Kind -eq 'Task' -and $_.TaskName -eq '\Test\UserPowerShell' })
+
+        $finding.Count | Should -Be 1
+        $finding[0].ReplacementPath | Should -Be $alias
+        $finding[0].Manual | Should -BeFalse
+    }
+
+    It 'reports a saved-password task that names the MSI through ProgramFiles' {
+        $legacy = 'C:\Program Files\PowerShell\7\pwsh.exe'
+        $current = 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\pwsh.exe'
+        $alias = 'C:\Users\Sample\AppData\Local\Microsoft\WindowsApps\pwsh.exe'
+        $sid = 'S-1-5-21-10-20-30-1002'
+        $script:RuntimeReferenceTask = [pscustomobject]@{
+            Principal = [pscustomobject]@{ UserId=$sid; LogonType='Password' }
+            TaskPath = '\Test\'
+            TaskName = 'SavedPasswordPowerShell'
+            Actions = @([pscustomobject]@{ Execute='%ProgramFiles%\PowerShell\7\pwsh.exe'; Arguments='-File C:\Jobs\run.ps1'; WorkingDirectory='C:\Jobs' })
+        }
+        $profiles = @([pscustomobject]@{ Sid=$sid; Root=$TestDrive; Alias=$alias; LocalAppData=(Join-Path $TestDrive 'AppData\Local') })
+        Mock Get-ScheduledTask { @($script:RuntimeReferenceTask) }
+
+        $findings = @(Get-PowerShell7RuntimeReferenceFindings -InstalledPwshPath $current -Profiles $profiles -LegacyPwshPath $legacy)
+        $finding = @($findings | Where-Object { $_.Kind -eq 'Task' -and $_.TaskName -eq '\Test\SavedPasswordPowerShell' })
+
+        $finding.Count | Should -Be 1
+        $finding[0].Manual | Should -BeTrue
+        $finding[0].ReplacementPath | Should -Be $alias
+    }
+
+    It 'finds JSON-escaped MSI paths in Windows Terminal settings' {
+        $legacy = 'C:\Program Files\PowerShell\7\pwsh.exe'
+        $current = 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\pwsh.exe'
+        $alias = 'C:\Users\Sample\AppData\Local\Microsoft\WindowsApps\pwsh.exe'
+        $profileRoot = Join-Path $TestDrive 'terminal-profile'
+        $localAppData = Join-Path $profileRoot 'AppData\Local'
+        $settingsPath = Join-Path $localAppData 'Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\settings.json'
+        $null = New-Item -ItemType Directory -Path (Split-Path -Parent $settingsPath) -Force
+        [IO.File]::WriteAllText($settingsPath, '{"profiles":{"list":[{"commandline":"C:\\Program Files\\PowerShell\\7\\pwsh.exe"}]}}')
+        $profiles = @([pscustomobject]@{ Sid='S-1-5-21-10-20-30-1003'; Root=$profileRoot; Alias=$alias; LocalAppData=$localAppData })
+        Mock Get-ScheduledTask { @() }
+
+        $findings = @(Get-PowerShell7RuntimeReferenceFindings -InstalledPwshPath $current -Profiles $profiles -LegacyPwshPath $legacy)
+        $finding = @($findings | Where-Object { $_.Kind -eq 'Windows Terminal' -and $_.SettingsPath -eq $settingsPath })
+
+        $finding.Count | Should -Be 1
+        $finding[0].Text | Should -Be $legacy
+        $finding[0].ReplacementPath | Should -Be $alias
+    }
+}
+
 Describe 'PowerShell MSIX task references update to the installed version' {
     BeforeAll {
         $root = Split-Path $PSScriptRoot -Parent
