@@ -62,17 +62,34 @@ function Get-PowerShellRuntimeLabRow {
             $zip = Join-Path $terminalRoot 'WindowsTerminal-1.25.3131.0-preinstall.zip'
             $sha = '7958c974571f795a42f387c59fb6bb0178e9d29e95d8398abeb496a3fbf6cd0c'
             if (-not (Test-Path -LiteralPath $zip) -or (Get-FileHash -LiteralPath $zip).Hash -ine $sha) {
-                Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/microsoft/terminal/releases/download/v1.25.3131.0/Microsoft.WindowsTerminal_1.25.3131.0_8wekyb3d8bbwe.msixbundle_Windows10_PreinstallKit.zip' -OutFile $zip
+                Invoke-WebRequest -UseBasicParsing -TimeoutSec 120 -Uri 'https://github.com/microsoft/terminal/releases/download/v1.25.3131.0/Microsoft.WindowsTerminal_1.25.3131.0_8wekyb3d8bbwe.msixbundle_Windows10_PreinstallKit.zip' -OutFile $zip
             }
             if ((Get-FileHash -LiteralPath $zip).Hash -ine $sha) { throw 'Windows Terminal preinstall package hash mismatch.' }
             $expanded = Join-Path $terminalRoot 'expanded'
             Expand-Archive -LiteralPath $zip -DestinationPath $expanded -Force
             $xaml = Get-ChildItem -LiteralPath $expanded -Filter 'Microsoft.UI.Xaml.2.8_*_x64__8wekyb3d8bbwe.appx' -File | Select-Object -First 1
             if (-not $xaml) { throw 'Windows Terminal preinstall package lacks the x64 XAML dependency.' }
-            Add-AppxPackage -Path $xaml.FullName -ErrorAction Stop
             $terminalBundle = Get-ChildItem -LiteralPath $expanded -Filter '*.msixbundle' -File | Select-Object -First 1
             if (-not $terminalBundle) { throw 'Windows Terminal bundle was not found after extraction.' }
-            Add-AppxPackage -Path $terminalBundle.FullName -ErrorAction Stop
+            $installResult = 'C:\Lab\row-b-terminal-install.json'
+            Remove-Item -LiteralPath $installResult -Force -ErrorAction SilentlyContinue
+            $installHelper = 'C:\Lab\boot-upd\tests\integration\lab\Install-LabWindowsTerminal.ps1'
+            $installTaskAction = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -ExecutionPolicy Bypass -File "{0}" -BundlePath "{1}" -XamlDependencyPath "{2}" -BundleSha256 "{3}" -ResultPath "{4}"' -f $installHelper,$terminalBundle.FullName,$xaml.FullName,$sha,$installResult)
+            $installPrincipal = New-ScheduledTaskPrincipal -UserId "$env:COMPUTERNAME\$User" -LogonType Interactive -RunLevel Highest
+            Register-ScheduledTask -TaskName 'Lab-InstallWindowsTerminal' -Action $installTaskAction -Principal $installPrincipal -Force | Out-Null
+            Start-ScheduledTask -TaskName 'Lab-InstallWindowsTerminal'
+            $installDeadline = (Get-Date).AddMinutes(3)
+            do {
+                if (Test-Path -LiteralPath $installResult) { break }
+                $installState = Get-ScheduledTask -TaskName 'Lab-InstallWindowsTerminal' -ErrorAction Stop
+                if ($installState.State -ne 'Running') { break }
+                Start-Sleep -Seconds 3
+            } while ((Get-Date) -lt $installDeadline)
+            if (-not (Test-Path -LiteralPath $installResult)) {
+                $installError = Get-Content ($installResult + '.err') -Raw -ErrorAction SilentlyContinue
+                throw "Windows Terminal interactive install did not finish: $installError"
+            }
+            Unregister-ScheduledTask -TaskName 'Lab-InstallWindowsTerminal' -Confirm:$false
             $terminal = Get-Command (Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\wt.exe') -ErrorAction SilentlyContinue
         }
         if (-not $terminal) { throw 'Windows Terminal was installed but wt.exe did not register for the row user.' }
