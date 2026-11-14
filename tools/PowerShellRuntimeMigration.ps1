@@ -189,6 +189,33 @@ function Get-PowerShell7UserProfiles {
     return $profiles
 }
 
+function Open-PowerShell7ProfileEnvironmentKey {
+    param([Parameter(Mandatory)]$Profile,[switch]$Writable)
+    $mountName = $null
+    $path = "$($Profile.Sid)\Environment"
+    $key = if ($Writable) { [Microsoft.Win32.Registry]::Users.OpenSubKey($path,$true) } else { [Microsoft.Win32.Registry]::Users.OpenSubKey($path) }
+    if (-not $key) {
+        $hivePath = Join-Path $Profile.Root 'NTUSER.DAT'
+        if (-not (Test-Path -LiteralPath $hivePath -PathType Leaf)) { return $null }
+        $mountName = '_BootUpdateCycle_' + [guid]::NewGuid().ToString('N')
+        & reg.exe load "HKU\$mountName" $hivePath 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) { return $null }
+        $path = "$mountName\Environment"
+        $key = if ($Writable) { [Microsoft.Win32.Registry]::Users.OpenSubKey($path,$true) } else { [Microsoft.Win32.Registry]::Users.OpenSubKey($path) }
+    }
+    if (-not $key) {
+        if ($mountName) { & reg.exe unload "HKU\$mountName" 2>$null | Out-Null }
+        return $null
+    }
+    return [pscustomobject]@{ Key=$key; MountName=$mountName }
+}
+
+function Close-PowerShell7ProfileEnvironmentKey {
+    param([Parameter(Mandatory)]$Handle)
+    if ($Handle.Key) { $Handle.Key.Dispose() }
+    if ($Handle.MountName) { & reg.exe unload "HKU\$($Handle.MountName)" 2>$null | Out-Null }
+}
+
 function Write-PowerShell7RuntimeLog {
     param([Parameter(Mandatory)][string]$LogPath, [Parameter(Mandatory)][string]$Message)
     $directory = Split-Path -Parent $LogPath
@@ -333,6 +360,125 @@ function Get-PowerShell7MachinePathUpdate {
     return ($entries.ToArray() -join ';')
 }
 
+function Get-PowerShell7UserPathUpdate {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$CurrentPath,
+          [Parameter(Mandatory)][string]$LegacyPwshPath,
+          [Parameter(Mandatory)][string]$UserPwshAlias)
+    $legacyDirectory = (Split-Path -Parent $LegacyPwshPath).TrimEnd('\')
+    $aliasDirectory = (Split-Path -Parent $UserPwshAlias).TrimEnd('\')
+    $entries = New-Object 'System.Collections.Generic.List[string]'
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $addedAlias = $false
+    foreach ($entry in $CurrentPath.Split(';')) {
+        $value = $entry.Trim().Trim('"')
+        $expanded = [Environment]::ExpandEnvironmentVariables($value).TrimEnd('\')
+        $isRuntime = $false
+        if ($expanded -ieq $legacyDirectory -or $expanded -ieq $aliasDirectory -or
+            $expanded -match '(?i)\\WindowsApps\\Microsoft\.PowerShell_[^\\]+(?:\\pwsh\.exe)?$') {
+            $isRuntime = $true
+            if (-not $addedAlias) { $null = $seen.Add($aliasDirectory); $entries.Add($aliasDirectory); $addedAlias = $true }
+        } elseif ($expanded -ieq $LegacyPwshPath -or $expanded -match '(?i)\\WindowsApps\\Microsoft\.PowerShell_[^\\]+\\pwsh\.exe$') {
+            $isRuntime = $true
+            if (-not $addedAlias) { $null = $seen.Add($aliasDirectory); $entries.Add($aliasDirectory); $addedAlias = $true }
+        }
+        if (-not $isRuntime -and $entry -and $seen.Add($entry.Trim().Trim('"'))) { $entries.Add($entry) }
+    }
+    return ($entries.ToArray() -join ';')
+}
+
+function Get-PowerShell7RuntimeRepairSummary {
+    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Findings)
+    $manual = @($Findings | Where-Object { $_.Manual })
+    $repairable = @($Findings | Where-Object { -not $_.Manual })
+    return [pscustomobject]@{ RepairableCount=$repairable.Count; ManualCount=$manual.Count; Manual=$manual; Repairable=$repairable }
+}
+
+function Get-PowerShell7RuntimeReferenceFindings {
+    param([Parameter(Mandatory)][string]$InstalledPwshPath,
+          [Parameter(Mandatory)][object[]]$Profiles,
+          [Parameter(Mandatory)][string]$LegacyPwshPath)
+    $findings = New-Object 'System.Collections.Generic.List[object]'
+    $packagePattern = '(?i)[A-Z]:\\(?:Program Files\\)?WindowsApps\\Microsoft\.PowerShell_[^\\;"\s]+\\pwsh\.exe'
+    foreach ($task in @(Get-ScheduledTask -ErrorAction SilentlyContinue)) {
+        $system = ([string]$task.Principal.LogonType -eq 'ServiceAccount') -or ([string]$task.Principal.UserId -match '^(?i)(SYSTEM|NT AUTHORITY\\SYSTEM|S-1-5-18|LOCAL SERVICE|NT AUTHORITY\\LOCAL SERVICE|NETWORK SERVICE|NT AUTHORITY\\NETWORK SERVICE)$')
+        $alias = if ($system) { $InstalledPwshPath } else { Resolve-PowerShell7TaskAlias -Task $task -Profiles $Profiles }
+        foreach ($action in @($task.Actions)) {
+            $argument = if ($action.PSObject.Properties['Arguments']) { [string]$action.Arguments } else { [string]$action.Argument }
+            foreach ($text in @([string]$action.Execute,$argument,[string]$action.WorkingDirectory)) {
+                $matches = [regex]::Matches($text, [regex]::Escape($LegacyPwshPath) + '|' + $packagePattern)
+                foreach ($match in $matches) {
+                    if ($match.Value -ieq $InstalledPwshPath) { continue }
+                    $findings.Add([pscustomobject]@{ Kind='Task'; Text=$match.Value; Manual=([string]$task.Principal.LogonType -eq 'Password'); ReplacementPath=$alias; TaskName="$($task.TaskPath)$($task.TaskName)" })
+                }
+            }
+        }
+    }
+    foreach ($profile in $Profiles) {
+        $handle = $null
+        try { $handle = Open-PowerShell7ProfileEnvironmentKey -Profile $profile } catch { }
+        if ($handle) {
+            try { $value = [string]$handle.Key.GetValue('Path',$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) }
+            finally { Close-PowerShell7ProfileEnvironmentKey -Handle $handle }
+            if ($value) {
+                $replacement = Get-PowerShell7UserPathUpdate -CurrentPath $value -LegacyPwshPath $LegacyPwshPath -UserPwshAlias $profile.Alias
+                if ($replacement -cne $value) { $findings.Add([pscustomobject]@{ Kind='User PATH'; Text=$value; Manual=$false; ReplacementPath=$replacement; ProfileSid=$profile.Sid }) }
+            }
+        }
+    }
+    $machinePath = [Environment]::GetEnvironmentVariable('Path','Machine')
+    if ($machinePath) {
+        $replacement = Get-PowerShell7MachinePathUpdate -CurrentPath $machinePath -LegacyPwshPath $LegacyPwshPath -SystemPwshPath $InstalledPwshPath
+        if ($replacement -cne $machinePath) { $findings.Add([pscustomobject]@{ Kind='Machine PATH'; Text=$machinePath; Manual=$false; ReplacementPath=$replacement }) }
+    }
+    foreach ($keyPath in @('SOFTWARE\OpenSSH','SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\pwsh.exe')) {
+        foreach ($view in @([Microsoft.Win32.RegistryView]::Registry64,[Microsoft.Win32.RegistryView]::Registry32)) {
+            $base = $null; $key = $null
+            try {
+                $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine,$view)
+                $key = $base.OpenSubKey($keyPath)
+                if (-not $key) { continue }
+                foreach ($name in $key.GetValueNames()) {
+                    $value = [string]$key.GetValue($name,$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                    if (-not $value) { continue }
+                    $replacement = Convert-PowerShell7RuntimeReference -Text $value -LegacyPwshPath $LegacyPwshPath -SystemPwshPath $InstalledPwshPath
+                    if ($replacement -cne $value) { $findings.Add([pscustomobject]@{ Kind='HKLM registry'; Text=$value; Manual=$false; ReplacementPath=$replacement; RegistryPath="HKLM\$keyPath\$name ($view)" }) }
+                }
+            } catch { }
+            finally { if ($key) { $key.Dispose() }; if ($base) { $base.Dispose() } }
+        }
+    }
+    foreach ($profile in $Profiles) {
+        foreach ($settings in @((Join-Path $profile.LocalAppData 'Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\settings.json'),(Join-Path $profile.LocalAppData 'Packages\Microsoft.WindowsTerminalPreview_8wekyb3d8bbwe\LocalState\settings.json'),(Join-Path $profile.LocalAppData 'Microsoft\Windows Terminal\settings.json'))) {
+            if (-not (Test-Path -LiteralPath $settings -PathType Leaf)) { continue }
+            $text = [IO.File]::ReadAllText($settings)
+            foreach ($match in [regex]::Matches($text, '(?i)(?:[A-Z]:\\(?:Program Files\\)?WindowsApps\\Microsoft\.PowerShell_[^\\"\s]+\\pwsh\.exe|[A-Z]:\\Program Files\\PowerShell\\7\\pwsh\.exe)')) {
+                if ($match.Value -ieq $InstalledPwshPath) { continue }
+                $findings.Add([pscustomobject]@{ Kind='Windows Terminal'; Text=$match.Value; Manual=$false; ReplacementPath=$profile.Alias; SettingsPath=$settings })
+            }
+        }
+    }
+    return $findings.ToArray()
+}
+
+function Update-PowerShell7UserPaths {
+    param([Parameter(Mandatory)][object[]]$Profiles,[Parameter(Mandatory)][string]$LegacyPwshPath,[Parameter(Mandatory)][string]$LogPath)
+    foreach ($profile in $Profiles) {
+        $handle = $null
+        try { $handle = Open-PowerShell7ProfileEnvironmentKey -Profile $profile -Writable } catch { }
+        if (-not $handle) { continue }
+        try {
+            $key = $handle.Key
+            $before = [string]$key.GetValue('Path',$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            if (-not $before) { continue }
+            $after = Get-PowerShell7UserPathUpdate -CurrentPath $before -LegacyPwshPath $LegacyPwshPath -UserPwshAlias $profile.Alias
+            if ($after -ceq $before) { continue }
+            $kind = $key.GetValueKind('Path')
+            $key.SetValue('Path',$after,$kind)
+            Write-PowerShell7RuntimeLog -LogPath $LogPath -Message "USER PATH UPDATED: profile=$($profile.Sid); before=$before; after=$after"
+        } finally { Close-PowerShell7ProfileEnvironmentKey -Handle $handle }
+    }
+}
+
 function Move-PowerShell7LegacyContent {
     param([Parameter(Mandatory)][string]$LogPath,
           [string]$LegacyRoot = (Join-Path $env:ProgramFiles 'PowerShell\7'),
@@ -397,4 +543,5 @@ function Update-PowerShell7References {
     Update-PowerShell7ScheduledTaskReferences -Profiles $profiles -SystemPwshPath $systemPath -LegacyPwshPath $script:LegacyPwshPath -LogPath $logPath
     Update-PowerShell7SystemRegistryReferences -LegacyPwshPath $script:LegacyPwshPath -SystemPwshPath $systemPath -LogPath $logPath
     Update-PowerShell7MachinePath -LegacyPwshPath $script:LegacyPwshPath -SystemPwshPath $systemPath -LogPath $logPath
+    Update-PowerShell7UserPaths -Profiles $profiles -LegacyPwshPath $script:LegacyPwshPath -LogPath $logPath
 }

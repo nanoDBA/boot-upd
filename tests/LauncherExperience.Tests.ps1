@@ -1236,6 +1236,46 @@ Describe 'PowerShell MSIX migrates explicit Windows Terminal paths without rewri
     }
 }
 
+Describe 'PowerShell MSIX references are repaired at updater startup' {
+    BeforeAll {
+        $migrationPath = Join-Path (Split-Path $PSScriptRoot -Parent) 'tools\PowerShellRuntimeMigration.ps1'
+        $migrationAst = Get-ParsedScript $migrationPath
+        foreach ($name in @('Get-PowerShell7UserPathUpdate','Get-PowerShell7RuntimeReferenceFindings','Get-PowerShell7RuntimeRepairSummary')) {
+            $function = $migrationAst.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name },$true)
+            if ($function) { . ([scriptblock]::Create($function.Extent.Text)) }
+        }
+    }
+
+    It 'replaces old user PATH package directories with the per-user alias directory' {
+        $result = Get-PowerShell7UserPathUpdate `
+            -CurrentPath 'C:\Program Files\PowerShell\7;C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe;C:\Tools' `
+            -LegacyPwshPath 'C:\Program Files\PowerShell\7\pwsh.exe' `
+            -UserPwshAlias 'C:\Users\Sample\AppData\Local\Microsoft\WindowsApps\pwsh.exe'
+        $result | Should -Be 'C:\Users\Sample\AppData\Local\Microsoft\WindowsApps;C:\Tools'
+    }
+
+    It 'reports stale saved-password tasks without counting them as repairable' {
+        $findings = @(
+            [pscustomobject]@{ Kind='Task'; Text='C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\pwsh.exe'; Manual=$false; ReplacementPath='C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.1.0_x64__8wekyb3d8bbwe\pwsh.exe' },
+            [pscustomobject]@{ Kind='Task'; Text='C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\pwsh.exe'; Manual=$true; ReplacementPath='C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.1.0_x64__8wekyb3d8bbwe\pwsh.exe' }
+        )
+        $summary = Get-PowerShell7RuntimeRepairSummary -Findings $findings
+        $summary.RepairableCount | Should -Be 1
+        $summary.ManualCount | Should -Be 1
+        $summary.Manual[0].ReplacementPath | Should -Be 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.1.0_x64__8wekyb3d8bbwe\pwsh.exe'
+    }
+
+    It 'repairs before starting a run and shows the last stale-reference result in status' {
+        $launcherAst = Get-ParsedScript (Join-Path (Split-Path $PSScriptRoot -Parent) 'tools\Invoke-UpdLauncher.ps1')
+        $launcherText = Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'tools\Invoke-UpdLauncher.ps1') -Raw
+        $runStart = $launcherText.IndexOf("'run' {")
+        $runBlock = $launcherText.Substring($runStart, $launcherText.IndexOf("`n    }",$runStart) - $runStart)
+        $runBlock | Should -Match 'Invoke-UpdPowerShellReferenceRepair'
+        $runBlock.IndexOf('Invoke-UpdPowerShellReferenceRepair') | Should -BeLessThan $runBlock.IndexOf('& $deployPath')
+        $status = Get-FunctionText -Ast $launcherAst -Name 'Show-UpdStatus'
+        $status | Should -Match 'Show-UpdPowerShellReferenceStatus'
+    }
+}
 Describe 'PowerShell MSIX task references update to the installed version' {
     BeforeAll {
         $root = Split-Path $PSScriptRoot -Parent

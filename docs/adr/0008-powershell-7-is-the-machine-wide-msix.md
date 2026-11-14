@@ -62,16 +62,16 @@ for every install method, and on an MSI machine it is the same path as before.
   `PowerShellRuntimeUpgrade.log`.
 - SYSTEM has no stable alias, and the package directory includes its version. Nothing is
   installed at the retired MSI path. SYSTEM task actions, OpenSSH's `DefaultShell`, App Paths,
-  and machine PATH point at the installed MSIX version. If Windows services the package outside
-  boot-upd, these saved paths can go stale; `upd bootstrap` detects and refreshes them when run.
-  No shim or dispatcher is installed. A persistent entry point that survives independent MSIX
-  servicing without one remains unresolved and must be proven before claiming unattended
-  continuation across that upgrade. Microsoft's MSIX docs place app execution aliases under a
-  user's `%LOCALAPPDATA%\Microsoft\WindowsApps` and package folders under names based on the
-  full package name ([alias details](https://learn.microsoft.com/en-us/sysinternals/downloads/microsoft-store),
+  and machine PATH point at the installed MSIX version. User task actions, Terminal profiles,
+  and user PATH entries point at that user's WindowsApps alias. Each `upd run` checks those
+  references before starting the cycle and repairs stale package paths; `upd status` reports
+  stale paths and any saved-password task it cannot change. `upd bootstrap` also refreshes the
+  references after an upgrade. No shim or dispatcher is installed. If Windows or another tool
+  upgrades the MSIX on its own, versioned SYSTEM paths can be stale until the next `upd` run.
+  Microsoft's MSIX docs place app execution aliases under a user's
+  `%LOCALAPPDATA%\Microsoft\WindowsApps` and package folders under names based on the full
+  package name ([alias details](https://learn.microsoft.com/en-us/sysinternals/downloads/microsoft-store),
   [package volumes](https://learn.microsoft.com/en-us/windows/msix/package/package-volumes)).
-  Those references explain why the current task path can go stale; they do not document a stable
-  SYSTEM target. That target remains an open design question, not a solved behavior.
 - User-context task and Terminal paths point to each profile's stable
   `%LOCALAPPDATA%\Microsoft\WindowsApps\pwsh.exe` alias. A scheduled task that stores a
   password is reported with its replacement path and left unchanged because changing its action

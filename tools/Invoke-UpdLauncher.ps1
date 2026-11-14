@@ -58,6 +58,43 @@ $ps7MigrationPath = Join-Path $PSScriptRoot 'PowerShellRuntimeMigration.ps1'
 $argumentBootstrapPath = Join-Path $PSScriptRoot 'Invoke-UpdBootstrap.ps1'
 $awsPath = Join-Path $repoRoot 'Repair-AwsTooling.ps1'
 $diagnosticsPath = Join-Path $repoRoot 'Export-BootUpdateDiagnostics.ps1'
+if (Test-Path -LiteralPath $ps7MigrationPath -PathType Leaf) { . $ps7MigrationPath }
+
+function Get-UpdInstalledPowerShellMsix {
+    $architecture = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64' -or $env:PROCESSOR_ARCHITEW6432 -eq 'ARM64') { 'arm64' } elseif ([Environment]::Is64BitOperatingSystem) { 'x64' } else { 'x86' }
+    $pattern = '^Microsoft\.PowerShell_(?<version>[\d.]+)_' + [regex]::Escape($architecture) + '__8wekyb3d8bbwe$'
+    $root = Join-Path $env:ProgramFiles 'WindowsApps'
+    foreach ($folder in @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue | Where-Object Name -Match $pattern | Sort-Object { [version]($_.Name -replace '^Microsoft\.PowerShell_([\d.]+)_.*','$1') } -Descending)) {
+        $path = Join-Path $folder.FullName 'pwsh.exe'
+        if (Test-Path -LiteralPath $path -PathType Leaf) { return [pscustomobject]@{ Version=[version]($folder.Name -replace '^Microsoft\.PowerShell_([\d.]+)_.*','$1'); PwshPath=$path } }
+    }
+    return $null
+}
+
+function Invoke-UpdPowerShellReferenceRepair {
+    if (-not (Get-Command Update-PowerShell7References -ErrorAction SilentlyContinue)) { return }
+    $installed = Get-UpdInstalledPowerShellMsix
+    if (-not $installed) { return }
+    $findings = @(Get-PowerShell7RuntimeReferenceFindings -InstalledPwshPath $installed.PwshPath -Profiles @(Get-PowerShell7UserProfiles) -LegacyPwshPath (Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'))
+    $summary = Get-PowerShell7RuntimeRepairSummary -Findings $findings
+    if ($summary.RepairableCount -or $summary.ManualCount) {
+        Write-PowerShell7RuntimeLog -LogPath (Join-Path $env:ProgramData 'BootUpdateCycle\PowerShellRuntimeUpgrade.log') -Message "STARTUP REFERENCE SCAN: repairable=$($summary.RepairableCount); manual=$($summary.ManualCount); installed=$($installed.PwshPath)"
+        Update-PowerShell7References -Installed $installed
+    }
+}
+
+function Show-UpdPowerShellReferenceStatus {
+    if (-not (Get-Command Get-PowerShell7RuntimeReferenceFindings -ErrorAction SilentlyContinue)) { return }
+    $installed = Get-UpdInstalledPowerShellMsix
+    if (-not $installed) { return }
+    try {
+        $findings = @(Get-PowerShell7RuntimeReferenceFindings -InstalledPwshPath $installed.PwshPath -Profiles @(Get-PowerShell7UserProfiles) -LegacyPwshPath (Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'))
+        $summary = Get-PowerShell7RuntimeRepairSummary -Findings $findings
+        if (-not $findings.Count) { Write-Host '  PowerShell refs current' -ForegroundColor Green; return }
+        Write-Host "  PowerShell refs stale: $($summary.RepairableCount) repairable, $($summary.ManualCount) manual" -ForegroundColor Yellow
+        foreach ($finding in $summary.Manual) { Write-Host "    $($finding.Kind) $($finding.TaskName): $($finding.Text) -> $($finding.ReplacementPath)" -ForegroundColor Yellow }
+    } catch { Write-Warning "Could not scan PowerShell runtime references: $_" }
+}
 
 function Enable-UpdNtfsCompression {
     param([Parameter(Mandatory)][string]$Path)
@@ -504,6 +541,7 @@ function Show-UpdStatus {
     $quarantinePath = Join-Path $env:ProgramData 'BootUpdateCycle\BootUpdateCycle-winget-quarantine.json'
     $taskNames = @('BootUpdateCycle','BootUpdateCycleFallback')
     Write-Host "Boot Update Cycle v$(Get-UpdVersion)" -ForegroundColor Cyan
+    Show-UpdPowerShellReferenceStatus
     foreach ($name in $taskNames) {
         $task = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
         if ($task) { Write-Host ("  task  {0,-24} {1}" -f $name,$task.State) }
@@ -712,6 +750,7 @@ switch ($Command.ToLowerInvariant()) {
             Write-Host 'Requesting administrator access for the update cycle...' -ForegroundColor Yellow
             exit (Invoke-UpdElevated -CanonicalArguments (Get-UpdCanonicalRunArguments -DeployParameters $deployParameters))
         }
+        Invoke-UpdPowerShellReferenceRepair
         Add-UpdToMachinePath
         if (-not $DisableSelfUpdate -and -not $BundlePreflighted) { $null = Update-UpdSourceBundle }
         & $deployPath @deployParameters
