@@ -13,7 +13,7 @@ BeforeAll {
         $node.Name -eq 'Test-LabSavedUserWaitEvidence'
     }, $true)
     . ([scriptblock]::Create($waitFn.Extent.Text))
-    foreach ($name in @('New-LabStageEvidence','Get-LabPowerShellRuntimeHandoffEvidence','Test-LabShouldStopAfterContinuationRuntime')) {
+    foreach ($name in @('New-LabStageEvidence','Get-LabPowerShellRuntimeHandoffEvidence','Test-LabShouldStopAfterContinuationRuntime','Test-LabRebootAfterBootstrap')) {
         $helper = $ast.Find({ param($node)
             $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
         }, $true)
@@ -82,6 +82,13 @@ Describe 'Lab completion requires observed cleanup' {
 }
 
 Describe 'Lab runtime handoff stage evidence' {
+    It 'compares guest boot time and host stage time in UTC' {
+        $bootstrap = [datetime]'2026-11-14T19:18:45Z'
+
+        Test-LabRebootAfterBootstrap -BootTimeUtc '2026-11-14T19:19:40.0000000Z' -BootstrapObservedAtUtc $bootstrap | Should -BeTrue
+        Test-LabRebootAfterBootstrap -BootTimeUtc '2026-11-14T19:18:44.0000000Z' -BootstrapObservedAtUtc $bootstrap | Should -BeFalse
+    }
+
     It 'records the elapsed phase time with the observed facts' {
         $start = [datetime]'2026-11-14T12:00:00Z'
         $observed = [datetime]'2026-11-14T12:00:03.500Z'

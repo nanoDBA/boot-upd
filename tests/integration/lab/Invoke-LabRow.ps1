@@ -119,6 +119,14 @@ function Test-LabShouldStopAfterContinuationRuntime {
     param([bool]$Enabled, $Evidence)
     return ($Enabled -and $null -ne $Evidence -and [bool]$Evidence.Passed)
 }
+
+function Test-LabRebootAfterBootstrap {
+    param([string]$BootTimeUtc, [datetime]$BootstrapObservedAtUtc)
+    if ([string]::IsNullOrWhiteSpace($BootTimeUtc)) { return $false }
+    $bootTime = [datetime]::Parse($BootTimeUtc, [Globalization.CultureInfo]::InvariantCulture,
+        [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
+    return ($bootTime -gt $BootstrapObservedAtUtc.ToUniversalTime())
+}
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'LabCredential.ps1')
 . (Join-Path $PSScriptRoot 'LabEvidence.ps1')
@@ -517,7 +525,7 @@ while ((Get-Date) -lt $deadline) {
                 ResumeUser = [string]$state.ResumeUser
                 LogonOnlyVerified = @($lines | Where-Object { $_ -match 'Resume chain verified: BootUpdateCycle \(saved-user logon only\)' }).Count -gt 0
                 StateFileExists = Test-Path 'C:\ProgramData\BootUpdateCycle\BootUpdateCycle.state.json'
-                LatestBootTime = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+                LatestBootTimeUtc = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o')
                 RuntimeLines = @($lines | Where-Object { $_ -match 'PowerShell runtime \|' })
                 MsiVersions = @(Get-ItemProperty @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*') -ErrorAction SilentlyContinue |
                     Where-Object { $_.DisplayName -match '^PowerShell 7(?:\b|[- ])' -and [int]($_.WindowsInstaller -as [int]) -eq 1 -and $_.DisplayVersion } |
@@ -546,10 +554,11 @@ while ((Get-Date) -lt $deadline) {
                 RuntimeLine=[string]$updRuntime[0]; MsiVersions=@($r.MsiVersions); MsixVersions=@($r.MsixVersions)
             })
         }
-        if ($null -ne $bootstrapObservedAtUtc -and $null -eq $rebootObservedAtUtc -and [datetime]$r.LatestBootTime -gt $bootstrapObservedAtUtc) {
+        if ($null -ne $bootstrapObservedAtUtc -and $null -eq $rebootObservedAtUtc -and
+            (Test-LabRebootAfterBootstrap -BootTimeUtc ([string]$r.LatestBootTimeUtc) -BootstrapObservedAtUtc $bootstrapObservedAtUtc)) {
             $rebootObservedAtUtc = $observedAtUtc
             Add-LabStage -Name 'reboot-seen' -ObservedAtUtc $observedAtUtc -Facts ([pscustomobject]@{
-                LatestBootTime=([datetime]$r.LatestBootTime).ToUniversalTime().ToString('o'); MsiVersions=@($r.MsiVersions); MsixVersions=@($r.MsixVersions)
+                LatestBootTimeUtc=[string]$r.LatestBootTimeUtc; MsiVersions=@($r.MsiVersions); MsixVersions=@($r.MsixVersions)
             })
         }
         $handoffEvidence = Get-LabPowerShellRuntimeHandoffEvidence -RuntimeLines @($r.RuntimeLines) `
