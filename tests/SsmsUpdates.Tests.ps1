@@ -21,9 +21,10 @@ BeforeAll {
             [string]$Id = 'ssms-22',
             [bool]$RebootRequired = $false
         )
+        $major = ([version]$Version).Major
         [pscustomobject]@{
             InstanceId = $Id; InstallationPath = $Path; InstallationVersion = [version]$Version
-            ChannelId = 'SSMS.22.SSMS.Release'; ChannelUri = 'https://example.invalid/channel.json'
+            ChannelId = "SSMS.$major.SSMS.Release"; ChannelUri = 'https://example.invalid/channel.json'
             IsComplete = $true; IsLaunchable = $true; IsRebootRequired = $RebootRequired
         }
     }
@@ -106,6 +107,39 @@ Describe 'SSMS native provider contract' {
         $result.Success | Should -BeFalse
         $result.Count | Should -Be 0
         $result.AttentionDetails[0].Detail | Should -Match 'did not advance'
+    }
+
+    It 'updates an outdated SSMS 21 instance through the same verified installer path' {
+        $before = New-SsmsFixture -Version '21.6.11234.12' -Path 'C:\SSMS21' -Id 'ssms-21'
+        $after = New-SsmsFixture -Version '21.7.12345.67' -Path 'C:\SSMS21' -Id 'ssms-21'
+        $script:calls = 0
+        Mock Get-SsmsInstances { $script:calls++; if ($script:calls -eq 1) { New-SsmsInventory -Instances @($before) } else { New-SsmsInventory -Instances @($after) } }
+        Mock Get-SsmsChannelTarget { [pscustomobject]@{ Version=[version]'21.7.12345.67' } }
+        Mock Test-Path { $true }; Mock Test-SsmsProcessOpen { $false }; Mock Invoke-PackageManagerWithTimeout { New-SsmsRun }
+
+        $result = Update-SsmsInstances -VswherePath 'C:\vswhere.exe' -InstallerPath 'C:\VSInstaller\setup.exe'
+
+        $result.Success | Should -BeTrue
+        $result.Count | Should -Be 1
+        Should -Invoke Invoke-PackageManagerWithTimeout -Times 1 -Exactly -ParameterFilter { $Name -eq 'SSMS-native-update' }
+    }
+
+    It 'reports other SSMS versions once per cycle using only major and minor' {
+        $other = New-SsmsFixture -Version '20.3.12345.67' -Path 'C:\SSMS20' -Id 'ssms-20'
+        $script:CurrentState = [pscustomobject]@{ SsmsUnsupportedVersionsReported=$false }
+        $script:SsmsMessages = [Collections.Generic.List[object]]::new()
+        Mock Get-SsmsInstances { New-SsmsInventory -Instances @($other) }
+        Mock Get-SsmsPendingUpdate { $null }
+        Mock Test-Path { $true }
+        Mock Write-Log { $script:SsmsMessages.Add([pscustomobject]@{ Message=$Message; Level=$Level }) }
+
+        $null = Update-SsmsInstances -VswherePath 'C:\vswhere.exe' -InstallerPath 'C:\VSInstaller\setup.exe'
+        $null = Update-SsmsInstances -VswherePath 'C:\vswhere.exe' -InstallerPath 'C:\VSInstaller\setup.exe'
+
+        @($script:SsmsMessages | Where-Object Message -Match '20\.3').Count | Should -Be 1
+        $script:SsmsMessages[0].Message | Should -Match 'SSMS(?: versions)? 20\.3.*updates SSMS 21 and 22'
+        $script:SsmsMessages[0].Message | Should -Not -Match 'unsupported|20\.3\.12345\.67'
+        $script:SsmsMessages[0].Level | Should -Be 'Info'
     }
 
     It 'keeps the phase incomplete when setup reports a reboot requirement' {

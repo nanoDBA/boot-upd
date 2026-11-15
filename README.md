@@ -132,14 +132,12 @@ and whether anything still needs your attention:
 | 15 | **Drivers / firmware** | **Off** | Explicit opt-in with `-drv` / `-fw` |
 | 16 | **WSL / containers** | **Off** | Explicit opt-in; user-context work resumes at logon |
 
-SSMS 22 has its own servicing path, so a package manager reporting no updates is not
-the final SSMS check. The SSMS phase compares installed build versions with the
-configured channel manifest, updates only existing SSMS instances, and verifies fresh
-inventory afterward. It does not force SSMS to close. Busy installers, open SSMS,
-unreachable update sources, and unrecognized manifest formats leave the phase
-unfinished and use the cycle's bounded retry policy. Only a verified version increase
-counts as an SSMS update. Starting the installer isn't proof that SSMS changed; boot-upd
-checks the installed build afterward.
+SSMS 21 and 22 have their own servicing path, so a package manager reporting no updates
+isn't the final check. boot-upd updates existing SSMS 21 and 22 instances through Visual
+Studio Installer, then checks the installed build. It won't force SSMS to close. A busy
+installer, open SSMS, unreachable update source, or unrecognized manifest leaves the phase
+unfinished for the cycle's bounded retry policy. Only a verified version increase counts
+as an update. Other SSMS major versions are left alone and reported once in the cycle log.
 Use `upd --skip-ssms` to skip native SSMS servicing for the cycle, including its
 reboot resumes. Winget and Chocolatey keep their existing package selection.
 
