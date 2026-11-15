@@ -1057,14 +1057,27 @@ function Get-WingetInventoryPackageIds {
         $text = ([string]$_) -replace "`e\[[0-?]*[ -/]*[@-~]", ''
         $text -replace '^\[[^\]]+\]\s+\[[^\]]+\]\s*', ''
     })
-    $sourceWarnings = @($normalized | Where-Object { $_ -match '(?i)\bwarning\b' })
+    $sourceWarnings = @($normalized | Where-Object {
+        $_ -match '(?i)\bwarning\b|failed when searching source|results will not be included'
+    })
     $headerIndex = -1
     $header = $null
+    $explicitHeadingIndex = -1
     for ($index = 0; $index -lt $normalized.Count; $index++) {
+        if ($explicitHeadingIndex -lt 0 -and $normalized[$index] -match '(?i)^\s*The following packages have an upgrade available, but require explicit targeting for upgrade:') {
+            $explicitHeadingIndex = $index
+        }
         if ($normalized[$index] -match '^\s*Name\s{2,}Id\s{2,}Version(?:\s+Available)?(?:\s+Source)?\s*$') {
             $headerIndex = $index
             $header = $normalized[$index]
             break
+        }
+    }
+    if ($explicitHeadingIndex -ge 0 -and ($headerIndex -lt 0 -or $explicitHeadingIndex -lt $headerIndex)) {
+        return [pscustomobject]@{
+            HeaderRecognized=$true; EmptyInventory=$false; ExplicitOnly=$true; PackageIds=@(); PackageRecords=@()
+            HasAvailableVersionColumn=$false; SourceWarnings=$sourceWarnings; MalformedRows=0
+            Reason='Only packages requiring explicit targeting were listed.'
         }
     }
     if ($headerIndex -lt 0) {
@@ -1109,7 +1122,7 @@ function Get-WingetInventoryPackageIds {
     $malformedRows = 0
     foreach ($row in ($normalized | Select-Object -Skip ($headerIndex + 1))) {
         if ($row -match '^\s*Name\s{2,}Id\s{2,}Version(?:\s+Available)?(?:\s+Source)?\s*$') { break }
-        if ($row -match '(?i)^\s*The following packages require explicit upgrade selection') { break }
+        if ($row -match '(?i)^\s*The following packages (require explicit upgrade selection|have an upgrade available, but require explicit targeting for upgrade)') { break }
         if ([string]::IsNullOrWhiteSpace($row) -or $row -match '^\s*-{3,}\s*$') { continue }
         <# Winget's footer sentences ("2 upgrades available.", "1 package(s) have ...") are
            not rows. Read by column they produced the target "available." and "malformed
@@ -1125,13 +1138,15 @@ function Get-WingetInventoryPackageIds {
             if (-not $ids.Contains($idField)) { $ids.Add($idField) }
             if ($availableColStart -ge 0 -and $row.Length -gt $availableColStart) {
                 $availableVersion = ($row.Substring($availableColStart).Trim() -split '\s+')[0]
-                if ($availableVersion) {
-                    $observedVersion = if ($versionColStart -ge 0 -and $row.Length -gt $versionColStart) {
-                        ($row.Substring($versionColStart).Trim() -split '\s+')[0]
-                    } else { '' }
+                $installedVersion = if ($versionColStart -ge 0 -and $row.Length -gt $versionColStart) {
+                    ($row.Substring($versionColStart).Trim() -split '\s+')[0]
+                } else { '' }
+                if ($availableVersion -and $installedVersion) {
                     $packageRecords.Add([pscustomobject]@{
-                        Id=$idField; ObservedVersion=$observedVersion; AvailableVersion=$availableVersion
+                        Id=$idField; InstalledVersion=$installedVersion; AvailableVersion=$availableVersion
                     })
+                } else {
+                    $malformedRows++
                 }
             }
         } elseif (-not [string]::IsNullOrWhiteSpace($idField)) {
@@ -1163,16 +1178,17 @@ function Resolve-WingetKnownFailureInventory {
     foreach ($record in @($Records)) {
         if ([string]$record.Scope -ne $Scope) { $remaining.Add($record); continue }
         $offered = @($Inventory.PackageRecords | Where-Object { [string]$_.Id -ieq [string]$record.PackageId } | Select-Object -First 1)
-        $sameObservedVersion = $offered.Count -gt 0 -and (
-            -not $record.ObservedVersion -or [string]$offered[0].ObservedVersion -eq [string]$record.ObservedVersion
-        )
-        if ($offered.Count -and [string]$offered[0].AvailableVersion -eq [string]$record.AvailableVersion -and $sameObservedVersion) {
+        $sameVersion = $offered.Count -gt 0 -and $record.AvailableVersion -and $record.InstalledVersion -and
+            [string]$offered[0].AvailableVersion -eq [string]$record.AvailableVersion -and
+            [string]$offered[0].InstalledVersion -eq [string]$record.InstalledVersion
+        if ($sameVersion) {
             $skipped.Add([string]$record.PackageId)
             $remaining.Add($record)
+        } elseif ($offered.Count) {
+            if ($record.PackageId) { $changed.Add([string]$record.PackageId) }
         } else {
             if (-not $EvidenceComplete) {
                 $remaining.Add($record)
-                $skipped.Add([string]$record.PackageId)
             }
             elseif ($record.PackageId) { $changed.Add([string]$record.PackageId) }
         }
@@ -1247,11 +1263,11 @@ function Save-WingetKnownFailures {
     $records = @(Get-WingetKnownFailureRecords)
     $eligibleFailures = @($Failures | Where-Object { $_.Scope -in @('user','machine') -and $_.Id -and (Get-BootUpdateFailureClass -Failure $_) -ne 'Network' })
     foreach ($failure in $eligibleFailures) {
-        if (-not $failure.AvailableVersion -or -not $failure.ObservedVersion) { continue }
+        if (-not $failure.AvailableVersion -or -not $failure.InstalledVersion) { continue }
         $records = @($records | Where-Object { -not ($_.Scope -eq $failure.Scope -and $_.PackageId -ieq [string]$failure.Id) })
         $records += [pscustomobject]@{
             Scope=[string]$failure.Scope; PackageId=[string]$failure.Id; FailureCode=[long]$failure.Code
-            ObservedVersion=[string]$failure.ObservedVersion; AvailableVersion=[string]$failure.AvailableVersion
+            InstalledVersion=[string]$failure.InstalledVersion; AvailableVersion=[string]$failure.AvailableVersion
             RecordedAt=(Get-Date).ToString('o')
         }
     }
@@ -1474,7 +1490,8 @@ function Complete-WingetFailureClassification {
             $version = if ($_.AvailableVersion) { [string]$_.AvailableVersion }
                        elseif ($_.ObservedVersion) { [string]$_.ObservedVersion }
                        else { 'unknown' }
-            "$($_.Id):$($_.Code):$version"
+            $scope = if ($_.Scope -in @('user','machine')) { [string]$_.Scope } else { 'unknown-scope' }
+            "$scope`:$($_.Id):$($_.Code):$version"
         })
         @($ExecutionFailures | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { "execution:$_" })
     ) | Sort-Object -Unique
@@ -1798,7 +1815,8 @@ function Write-WingetScopeSummary {
         [AllowNull()][object]$ExitCode,
         [string]$WingetPath = '',
         [string]$TargetPackageId = '',
-        [string]$AvailableVersion = ''
+        [string]$AvailableVersion = '',
+        [string]$InstalledVersion = ''
     )
     Write-ProviderTranscript -Provider Winget -Scope $Scope -Lines $Lines
     $summary = Get-WingetOutputSummary -Lines $Lines -TargetPackageId $TargetPackageId
@@ -1809,6 +1827,7 @@ function Write-WingetScopeSummary {
         foreach ($failure in $summary.Failures) {
             $failure | Add-Member -NotePropertyName Scope -NotePropertyValue ([string](($Scope -replace '-retry$','') -split '/')[0]) -Force
             if ($AvailableVersion) { $failure | Add-Member -NotePropertyName AvailableVersion -NotePropertyValue $AvailableVersion -Force }
+            if ($InstalledVersion) { $failure | Add-Member -NotePropertyName InstalledVersion -NotePropertyValue $InstalledVersion -Force }
             $collector.Value.Add($failure)
         }
     }
@@ -4240,7 +4259,7 @@ function Update-WingetPackages {
     $priorFailureIds = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     if ($script:CurrentState -and $script:CurrentState.PSObject.Properties.Name -contains 'WingetFailureSignature') {
         foreach ($part in ([string]$script:CurrentState.WingetFailureSignature -split '\|')) {
-            if ($part -match '^([A-Za-z0-9][A-Za-z0-9._+-]*):-?\d+(?::.+)?$') { $null = $priorFailureIds.Add($Matches[1]) }
+            if ($part -match '^(?:(?:user|machine):)?([A-Za-z0-9][A-Za-z0-9._+-]*):-?\d+(?::.+)?$') { $null = $priorFailureIds.Add($Matches[1]) }
         }
     }
     $executionFailures = [Collections.Generic.List[string]]::new()
@@ -4526,6 +4545,14 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
                     $anyTimeout = $true
                     continue
                 }
+                $hasRememberedScopeFailure = @($knownFailureRecords | Where-Object Scope -eq $scope).Count -gt 0
+                $versionBoundInventoryRequired = $hasRememberedScopeFailure -or $priorFailureIds.Count -gt 0
+                if ($versionBoundInventoryRequired -and -not $inventory.HasAvailableVersionColumn -and -not $inventory.ExplicitOnly) {
+                    Write-Log "Winget ($scope): inventory did not include offered versions; keeping failure memory and refusing an ambiguous targeted pass." -Level Error
+                    $executionFailures.Add("${scope}:inventory-missing-available-version")
+                    $anyTimeout = $true
+                    continue
+                }
                 $inventoryEvidenceComplete = Test-WingetInventoryComplete -Inventory $inventory -ExitCode $inventoryRead.ExitCode
                 $knownDecision = Resolve-WingetKnownFailureInventory -Scope $scope -Records $knownFailureRecords -Inventory $inventory `
                     -EvidenceComplete:$inventoryEvidenceComplete
@@ -4537,9 +4564,9 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
                 if ($inventory.MalformedRows -gt 0) {
                     Write-Log "Winget ($scope): $($inventory.Reason)" -Level Warn
                 }
-                $hasKnownFailureForScope = @($knownFailureRecords | Where-Object Scope -eq $scope).Count -gt 0
-                $packageIds = if ($hasKnownFailureForScope -and $inventory.HasAvailableVersionColumn) {
-                    @($inventory.PackageRecords | ForEach-Object Id)
+                $packageIds = if ($versionBoundInventoryRequired -and $inventory.HasAvailableVersionColumn) {
+                    $availableIds = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+                    @($inventory.PackageRecords | Where-Object { $availableIds.Add([string]$_.Id) } | ForEach-Object { [string]$_.Id })
                 } else { @($inventory.PackageIds) }
 
                 if ($packageIds.Count -eq 0) {
@@ -4597,8 +4624,10 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
                         -DeferExitCodeReporting
                     $packageOffer = @($inventory.PackageRecords | Where-Object Id -ieq $pkgId | Select-Object -First 1)
                     $availableVersion = if ($packageOffer.Count) { [string]$packageOffer[0].AvailableVersion } else { '' }
+                    $installedVersion = if ($packageOffer.Count) { [string]$packageOffer[0].InstalledVersion } else { '' }
                     $packageSummary = Write-WingetScopeSummary -Scope "$scope/$pkgId" -TargetPackageId $pkgId `
-                        -AvailableVersion $availableVersion -Lines $pkgResult.Output -ExitCode $pkgResult.ExitCode
+                        -AvailableVersion $availableVersion -InstalledVersion $installedVersion `
+                        -Lines $pkgResult.Output -ExitCode $pkgResult.ExitCode
                     $count += $packageSummary.Updated
                     $packageSummaries.Add($packageSummary)
                     foreach ($successfulId in @($packageSummary.SuccessfulIds)) { $null = $successfulPackageIds.Add($successfulId) }
