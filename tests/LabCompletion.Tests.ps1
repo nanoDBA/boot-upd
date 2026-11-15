@@ -59,6 +59,13 @@ Describe 'Lab completion requires observed cleanup' {
         $source | Should -Match 'GuestState.*OffAtCheckpoint'
     }
 
+    It 'can gracefully stop an idle guest before restoring its selected checkpoint' {
+        $source = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'integration/lab/Invoke-LabRow.ps1') -Raw
+
+        $source | Should -Match '\[switch\]\$ShutdownBeforeRestore'
+        $source | Should -Match '(?s)\$ShutdownBeforeRestore.*?BootUpdateCycle.*?shutdown\.exe /s /t 0.*?Restore-VMCheckpoint -VMName \$VMName -Name \$Checkpoint'
+    }
+
     It 'recognizes the progress-aware reboot stop as a terminal outcome' {
         $source = Get-Content (Join-Path $PSScriptRoot 'integration/lab/Invoke-LabRow.ps1') -Raw
         $source | Should -Match 'recovery limit\|Reboot limit\|No-progress reboot limit'

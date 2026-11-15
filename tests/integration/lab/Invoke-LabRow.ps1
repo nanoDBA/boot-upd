@@ -65,7 +65,8 @@ param(
     [switch]$StopAtSavedUserWait,
     <# After evidence is collected, shut down normally and restore the selected existing
        checkpoint so the disposable guest is left Off and ready for its next row. #>
-    [switch]$ResetToCheckpointAfterRow
+    [switch]$ResetToCheckpointAfterRow,
+    [switch]$ShutdownBeforeRestore
 )
 
 function Test-LabCompletionEvidence {
@@ -177,7 +178,29 @@ try { $lease = [IO.File]::Open($lockPath, 'OpenOrCreate', 'ReadWrite', 'Read') }
 catch { throw "Cannot acquire exclusive VM lease at $lockPath. Another row may own this guest." }
 $manifest = $null
 try {
-if ((Get-VM -Name $VMName).State -ne 'Off') { throw 'Cold restore requires guest Off. Inspect any existing run before shutting it down.' }
+$vm = Get-VM -Name $VMName -ErrorAction Stop
+if ($vm.State -ne 'Off' -and $ShutdownBeforeRestore -and $vm.State -eq 'Running') {
+    $activity = Invoke-Command -VMName $VMName -Credential $cred -ErrorAction Stop -ScriptBlock {
+        $tasks = @(Get-ScheduledTask -TaskName 'BootUpdateCycle*' -ErrorAction SilentlyContinue | Where-Object State -eq 'Running')
+        $processes = @(Get-CimInstance Win32_Process | Where-Object {
+            $_.CommandLine -match '(?i)(Deploy-BootUpdateCycle\.ps1|Invoke-BootUpdateCycle\.ps1|Invoke-UpdLauncher\.ps1)'
+        })
+        [pscustomobject]@{ RunningUpdaterTasks=$tasks.Count; UpdaterProcesses=$processes.Count }
+    }
+    if ($activity.RunningUpdaterTasks -gt 0 -or $activity.UpdaterProcesses -gt 0) {
+        throw 'Refusing to shut down a guest with an active updater task or process.'
+    }
+    Invoke-Command -VMName $VMName -Credential $cred -ErrorAction Stop -ScriptBlock {
+        & shutdown.exe /s /t 0
+        if ($LASTEXITCODE -ne 0) { throw 'Guest shutdown command failed.' }
+    } | Out-Null
+    $shutdownDeadline = (Get-Date).AddMinutes(3)
+    while ((Get-VM -Name $VMName -ErrorAction Stop).State -ne 'Off' -and (Get-Date) -lt $shutdownDeadline) {
+        Start-Sleep -Seconds 5
+    }
+    $vm = Get-VM -Name $VMName -ErrorAction Stop
+}
+if ($vm.State -ne 'Off') { throw 'Cold restore requires guest Off. Use the harness shutdown option only after confirming the previous run has ended.' }
 $snapshots = @(Get-VMSnapshot -VMName $VMName -Name $Checkpoint -ErrorAction Stop)
 if ($snapshots.Count -ne 1 -or $snapshots[0].State -ne 'Off') {
     throw 'Choose exactly one cold (Off) checkpoint; saved running-state checkpoints are not supported.'
