@@ -2399,6 +2399,7 @@ function New-BootUpdateStateV2 {
         UnobservedStops        = @()
         ExplicitRebootRequests = @()
         SsmsPendingUpdates    = @()
+        SsmsUnsupportedVersionsReported = $false
         WingetAggressiveRepairSignatures = @()
         WingetQuarantines       = @()
         <# Package IDs Winget reported "Successfully installed" for this session, across
@@ -2483,6 +2484,7 @@ function Update-BootUpdateStateSchema {
     if ($props -notcontains 'ExplicitRebootRequests') { $State | Add-Member -NotePropertyName 'ExplicitRebootRequests' -NotePropertyValue @() -Force }
     if ($props -notcontains 'SsmsPendingUpdates') { $State | Add-Member -NotePropertyName 'SsmsPendingUpdates' -NotePropertyValue @() -Force }
     else { $State.SsmsPendingUpdates = @($State.SsmsPendingUpdates | Where-Object { $null -ne $_ }) }
+    if ($props -notcontains 'SsmsUnsupportedVersionsReported') { $State | Add-Member -NotePropertyName 'SsmsUnsupportedVersionsReported' -NotePropertyValue $false -Force }
     if ($props -notcontains 'WingetAggressiveRepairSignatures') { $State | Add-Member -NotePropertyName 'WingetAggressiveRepairSignatures' -NotePropertyValue @() -Force }
     if ($props -notcontains 'WingetQuarantines') { $State | Add-Member -NotePropertyName 'WingetQuarantines' -NotePropertyValue @() -Force }
     if ($props -notcontains 'WingetUpdatedIds') { $State | Add-Member -NotePropertyName 'WingetUpdatedIds' -NotePropertyValue @() -Force }
@@ -5440,6 +5442,19 @@ function Update-SsmsInstances {
         }
     }
     if ($inventory.Absent) { Write-SsmsUpdateLog 'No SSMS instance found.'; return New-SsmsUpdateResult -Success $true }
+
+    $unsupportedInstances = @($inventory.Instances | Where-Object { $_.InstallationVersion.Major -notin @(21,22) })
+    if ($unsupportedInstances.Count -gt 0 -and $script:CurrentState -and -not $script:CurrentState.SsmsUnsupportedVersionsReported) {
+        $versions = @($unsupportedInstances | ForEach-Object { '{0}.{1}' -f $_.InstallationVersion.Major, $_.InstallationVersion.Minor } | Sort-Object -Unique)
+        $versionLabel = if ($versions.Count -eq 1) { "SSMS $($versions[0]) found." } else { "SSMS versions $($versions -join ', ') found." }
+        $scopeLabel = if ($unsupportedInstances.Count -eq 1) { 'this instance was not changed.' } else { 'those instances were not changed.' }
+        Write-SsmsUpdateLog "$versionLabel boot-upd updates SSMS 21 and 22 only, so $scopeLabel"
+        $script:CurrentState.SsmsUnsupportedVersionsReported = $true
+        Set-BootUpdateState -State $script:CurrentState
+    }
+    $supportedInstances = @($inventory.Instances | Where-Object { $_.InstallationVersion.Major -in @(21,22) })
+    if ($supportedInstances.Count -eq 0) { return New-SsmsUpdateResult -Success $true }
+
     if (-not (Test-Path -LiteralPath $InstallerPath -PathType Leaf)) {
         return New-SsmsUpdateResult -Success $false -AttentionDetails @("Visual Studio Installer setup.exe is missing: $InstallerPath")
     }
@@ -5448,12 +5463,8 @@ function Update-SsmsInstances {
     }
 
     $count = 0; $triggered = $false
-    foreach ($instance in @($inventory.Instances)) {
+    foreach ($instance in $supportedInstances) {
         $null = Get-SsmsPendingUpdate -Instance $instance
-        if ($instance.InstallationVersion.Major -ne 22) {
-            Write-SsmsUpdateLog "Leaving unsupported SSMS major version $($instance.InstallationVersion) unchanged." -Level Warn
-            continue
-        }
         if ($instance.IsRebootRequired) {
             $detail = "SSMS inventory reports a reboot is required for '$($instance.InstallationPath)' before update assessment."
             Register-SsmsRebootEvidence -Detail $detail
