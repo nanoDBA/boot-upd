@@ -1620,7 +1620,7 @@ Describe 'Delayed and explicit reboot evidence' {
         $handoff = $text.IndexOf('if ($pending) {', $freshProbe)
         $scanSection = $text.Substring($initialProbe, $handoff - $initialProbe)
 
-        $scanSection | Should -Match 'if \(-not \$WhatIfPreference -and -not \$pending -and \[bool\]\$state\.WindowsUpdateDone\)'
+        $scanSection | Should -Match 'if \(-not \$WhatIfPreference -and -not \$pending -and \[bool\]\$state\.WindowsUpdateDone -and -not \$script:SkipWindowsUpdate\)'
         $scanSection | Should -Match '\$stagedRemainingBeforeWuConvergence = @\(\$allPhasesFlat \| Where-Object \{'
         $scanSection | Should -Match '\(-not \$_\.Skip\) -and \(-not \$_\.UserCompletionDeferred\) -and \(-not \[bool\]\$state\.\(\$_\.Flag\)\)'
         $scanSection | Should -Match '\$state\.WindowsUpdateDone = \$false'
@@ -1652,7 +1652,7 @@ Describe 'Delayed and explicit reboot evidence' {
         $scan = $cycleAst.Find({
             param($node)
             $node -is [Management.Automation.Language.IfStatementAst] -and
-            $node.Extent.Text.StartsWith('if (-not $WhatIfPreference -and -not $pending -and [bool]$state.WindowsUpdateDone)')
+            $node.Extent.Text.StartsWith('if (-not $WhatIfPreference -and -not $pending -and [bool]$state.WindowsUpdateDone -and -not $script:SkipWindowsUpdate)')
         }, $true)
         $handoff = $cycleAst.Find({
             param($node)
