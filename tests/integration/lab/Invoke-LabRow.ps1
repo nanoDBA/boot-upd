@@ -62,7 +62,10 @@ param(
     [switch]$StopAfterBootstrap,
     <# Collect a deliberate saved-user wait as PARTIAL instead of idling until timeout.
        Resume-LabSavedUser.ps1 can then test the real sign-in continuation. #>
-    [switch]$StopAtSavedUserWait
+    [switch]$StopAtSavedUserWait,
+    <# After evidence is collected, shut down normally and restore the selected existing
+       checkpoint so the disposable guest is left Off and ready for its next row. #>
+    [switch]$ResetToCheckpointAfterRow
 )
 
 function Test-LabCompletionEvidence {
@@ -914,6 +917,23 @@ $summary = [pscustomobject]@{
     EvidenceDir      = $evidenceDir
 }
 $summary | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $evidenceDir 'summary.json')
+if ($ResetToCheckpointAfterRow) {
+    if ((Get-VM -Name $VMName -ErrorAction Stop).State -eq 'Running') {
+        Invoke-Command -VMName $VMName -Credential $cred -ErrorAction Stop -ScriptBlock {
+            & shutdown.exe /s /t 0
+            if ($LASTEXITCODE -ne 0) { throw 'Guest shutdown command failed.' }
+        } | Out-Null
+        $shutdownDeadline = (Get-Date).AddMinutes(3)
+        while ((Get-VM -Name $VMName -ErrorAction Stop).State -ne 'Off' -and (Get-Date) -lt $shutdownDeadline) {
+            Start-Sleep -Seconds 5
+        }
+    }
+    if ((Get-VM -Name $VMName -ErrorAction Stop).State -ne 'Off') { throw 'Guest did not reach Off before checkpoint restore.' }
+    Restore-VMCheckpoint -VMName $VMName -Name $Checkpoint -Confirm:$false -ErrorAction Stop | Out-Null
+    $summary | Add-Member -NotePropertyName GuestState -NotePropertyValue 'OffAtCheckpoint' -Force
+    $summary | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $evidenceDir 'summary.json')
+    Say "guest restored to '$Checkpoint' and left Off"
+}
 $summary
 $manifest.Status = 'Collected'
 } finally {

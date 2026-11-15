@@ -106,3 +106,7 @@ The evidence folder includes the fixture command log and the persisted Winget fa
 
 Both scenarios use `-Launcher deploy`, so the orchestrator hash is still checked against the
 pinned source tree. The fixtures are under `fixtures/` and run only when a scenario is named.
+
+For a row that must leave its guest clean for the next run, add
+`-ResetToCheckpointAfterRow`. The harness collects evidence first, shuts Windows down
+normally, restores the same cold checkpoint, and leaves the guest Off.

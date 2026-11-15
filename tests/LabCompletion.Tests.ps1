@@ -42,6 +42,14 @@ Describe 'A parked saved-user cycle needs checkpoint and scheduler evidence' {
 }
 
 Describe 'Lab completion requires observed cleanup' {
+    It 'can reset the guest to its existing checkpoint and leave it off after evidence collection' {
+        $source = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'integration/lab/Invoke-LabRow.ps1') -Raw
+
+        $source | Should -Match '\[switch\]\$ResetToCheckpointAfterRow'
+        $source | Should -Match '(?s)if \(\$ResetToCheckpointAfterRow\).*?shutdown\.exe /s /t 0.*?Restore-VMCheckpoint -VMName \$VMName -Name \$Checkpoint'
+        $source | Should -Match 'GuestState.*OffAtCheckpoint'
+    }
+
     It 'recognizes the progress-aware reboot stop as a terminal outcome' {
         $source = Get-Content (Join-Path $PSScriptRoot 'integration/lab/Invoke-LabRow.ps1') -Raw
         $source | Should -Match 'recovery limit\|Reboot limit\|No-progress reboot limit'
