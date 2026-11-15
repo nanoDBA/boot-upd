@@ -85,7 +85,7 @@ $gateRoot = Join-Path $env:ProgramData ('BootUpdateCycle-Test-' + [guid]::NewGui
 $null = New-Item -ItemType Directory -Path $gateRoot
 $MutexName = 'Global\BootUpdateCycle-Gate-' + [guid]::NewGuid().ToString('N')
 $taskName = 'BootUpdateCycleMutexGate-' + [guid]::NewGuid().ToString('N')
-$pwsh = (Get-Command pwsh).Source
+$pwsh = Join-Path $PSHOME 'pwsh.exe'   # SYSTEM has no per-user pwsh alias; an MSIX pwsh must be named by its real path
 $workerScript = Join-Path $gateRoot 'Invoke-CrossContextMutexGate.ps1'
 $workerCore = Join-Path $gateRoot 'Invoke-BootUpdateCycle.ps1'
 Copy-Item -LiteralPath $PSCommandPath -Destination $workerScript
