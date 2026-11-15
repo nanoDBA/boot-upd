@@ -42,7 +42,7 @@ BeforeAll {
         return $function.Extent.Text
     }
 
-    foreach ($name in @('Get-PowerShell7LatestStableVersion','Get-PowerShell7UpgradeDecision','ConvertFrom-PowerShell7HashFile','Select-PowerShell7LegacyEntry')) {
+    foreach ($name in @('Get-PowerShell7LatestStableVersion','Get-PowerShell7UpgradeDecision','ConvertFrom-PowerShell7HashFile')) {
         . ([scriptblock]::Create((Get-FunctionText -Ast $ps7BootstrapAst -Name $name)))
     }
 
@@ -289,6 +289,14 @@ exit 29
         $compatInstallerSource | Should -Match 'PromptForArguments=\[bool\]\$PromptForArguments'
         $compatInstallerSource.IndexOf("Write-Host 'The verified updater is ready") |
             Should -BeGreaterThan $compatInstallerSource.IndexOf('Committed bundle verification failed')
+    }
+
+    It 'documents why the PowerShell MSI stays installed and how to refresh a stale Terminal profile' {
+        $readme = Get-Content -LiteralPath (Join-Path $repoRoot 'README.md') -Raw
+        $readme | Should -Match '\*\*An existing PowerShell 7\.6 MSI stays installed\.\*\*'
+        $readme | Should -Match '(?s)WinRM remoting into PowerShell 7.*all-users profile.*machine-wide execution policy.*stable path for SYSTEM or services'
+        $readme | Should -Match 'Why does Windows Terminal say it cannot find `pwsh\.exe` \(error 0x80070002\)\?'
+        $readme | Should -Match 'Close every Terminal window, then open Terminal again\.'
     }
 
     It 'coheres release versions and detects cloud races around every bundle commit' {
@@ -728,10 +736,10 @@ Describe 'upd bootstrap upgrades an installed PowerShell 7' {
         (Get-PowerShell7UpgradeDecision -InstalledVersion '7.5.0' -LatestVersion '7.4.6').NeedsUpgrade | Should -BeFalse
     }
 
-    It 'treats any non-MSIX PowerShell 7 as needing the move to MSIX, whatever its version' {
+    It 'installs an MSIX alongside any existing MSI, whatever its version' {
         $decision = Get-PowerShell7UpgradeDecision -InstalledVersion '7.6.10' -LatestVersion '7.7.0' -Legacy
         $decision.NeedsUpgrade | Should -BeTrue
-        $decision.Message | Should -Match 'MSI install, which Microsoft no longer ships'
+        $decision.Message | Should -Match 'MSI install.*installing the .* MSIX alongside it'
         (Get-PowerShell7UpgradeDecision -InstalledVersion '7.8.0' -LatestVersion '7.7.0' -Legacy).NeedsUpgrade | Should -BeTrue
     }
 
@@ -805,18 +813,34 @@ Describe 'upd bootstrap upgrades an installed PowerShell 7' {
         { ConvertFrom-PowerShell7HashFile -Text $text -FileName 'PowerShell-7.7.1.msixbundle' } | Should -Throw '*no entry*'
     }
 
-    It 'finds the deprecated MSI and its Microsoft Update bundle, bundle first, and nothing else' {
-        $entries = @(
-            [pscustomobject]@{ PSChildName='{5417B253-1A6D-4638-BC94-743A6EC2E6F4}'; DisplayName='PowerShell 7-x64'; DisplayVersion='7.6.9.0'; WindowsInstaller=1; UninstallString='MsiExec.exe /X{5417B253-1A6D-4638-BC94-743A6EC2E6F4}' }
-            [pscustomobject]@{ PSChildName='{2f3d8eae-0153-446e-8adf-1a3ef35c591f}'; DisplayName='PowerShell 7.6.9.0-x64'; DisplayVersion='7.6.9.0'; WindowsInstaller=$null; UninstallString='"C:\ProgramData\Package Cache\{2f3d8eae-0153-446e-8adf-1a3ef35c591f}\PowerShell-7.6.9-win-x64.exe"  /uninstall' }
-            [pscustomobject]@{ PSChildName='{11111111-2222-3333-4444-555555555555}'; DisplayName='PowerShell 7-preview-x64'; DisplayVersion='7.7.0.5'; WindowsInstaller=1; UninstallString='MsiExec.exe /X{11111111-2222-3333-4444-555555555555}' }
-            [pscustomobject]@{ PSChildName='Example'; DisplayName='Example App'; DisplayVersion='1.0'; WindowsInstaller=1; UninstallString='MsiExec.exe /X{x}' }
-        )
-        $legacy = @(Select-PowerShell7LegacyEntry -Entries $entries)
-        $legacy.Count | Should -Be 2
-        $legacy[0].Kind | Should -Be 'Bundle'
-        $legacy[1].Kind | Should -Be 'Msi'
-        $legacy[1].ProductCode | Should -Be '{5417B253-1A6D-4638-BC94-743A6EC2E6F4}'
+    It 'keeps the MSI installed after a fresh MSIX install' {
+        $script:msiPresent = $true
+        function Install-PowerShell7Msix { param($Release) $script:msixPresent = $true; [pscustomobject]@{ Version='7.7.0'; PwshPath='C:\MSIX\pwsh.exe' } }
+        function Remove-PowerShell7LegacyInstall { $script:msiPresent = $false }
+        . ([scriptblock]::Create((Get-FunctionText -Ast $ps7BootstrapAst -Name 'Complete-PowerShell7Install')))
+
+        $null = Complete-PowerShell7Install -Release ([pscustomobject]@{ Package='Msix'; Version='7.7.0' })
+
+        $script:msixPresent | Should -BeTrue
+        $script:msiPresent | Should -BeTrue
+    }
+
+    It 'keeps the MSI installed after an MSIX upgrade' {
+        $script:msiPresent = $true
+        function Install-PowerShell7Msix { param($Release) $script:msixPresent = $true; [pscustomobject]@{ Version='7.7.0'; PwshPath='C:\MSIX\pwsh.exe' } }
+        function Remove-PowerShell7LegacyInstall { $script:msiPresent = $false }
+        . ([scriptblock]::Create((Get-FunctionText -Ast $ps7BootstrapAst -Name 'Complete-PowerShell7Install')))
+
+        $null = Complete-PowerShell7Install -Release ([pscustomobject]@{ Package='Msix'; Version='7.7.0' })
+
+        $script:msixPresent | Should -BeTrue
+        $script:msiPresent | Should -BeTrue
+    }
+
+    It 'keeps the MSI installed when bootstrap checks an already-current MSIX' {
+        $ps7BootstrapSource | Should -Not -Match 'Remove-PowerShell7LegacyInstall'
+        $ps7BootstrapSource | Should -Not -Match 'Get-PowerShell7LegacyEntry'
+        $ps7BootstrapSource | Should -Not -Match 'msiexec\.exe.*?/x|\x27/x\x27'
     }
 
     It 'keeps the byte-for-byte early exit when -Upgrade is absent' {
@@ -856,11 +880,11 @@ Describe 'upd bootstrap upgrades an installed PowerShell 7' {
         $ps7BootstrapSource | Should -Match 'Get-FileHash -LiteralPath \$bundlePath -Algorithm SHA256'
     }
 
-    It 'removes the old MSI only after the MSIX starts, with Restart Manager off' {
-        $ps7BootstrapSource | Should -Match '(?s)function Complete-PowerShell7Install.*?Install-PowerShell7Msix -Release.*?Remove-PowerShell7LegacyInstall'
+    It 'installs the MSIX without uninstalling the MSI' {
+        $ps7BootstrapSource | Should -Match '(?s)function Complete-PowerShell7Install.*?Install-PowerShell7Msix -Release'
         $ps7BootstrapSource | Should -Match '(?s)function Install-PowerShell7Msix.*?Get-PowerShell7InstalledVersion -PwshPath \$installed\.PwshPath'
-        $ps7BootstrapSource | Should -Match 'MSIRESTARTMANAGERCONTROL=Disable'
-        $ps7BootstrapSource | Should -Match "'/x', \`$entry\.ProductCode, '/qn', '/norestart'"
+        $ps7BootstrapSource | Should -Not -Match 'Remove-PowerShell7LegacyInstall'
+        $ps7BootstrapSource | Should -Not -Match "Start-Process -FilePath msiexec\.exe.*?'/x'"
     }
 
     It 'never changes the runtime under a running cycle and reports a check with exit 100' {

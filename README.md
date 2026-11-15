@@ -263,9 +263,10 @@ per-user alias and SYSTEM, which runs the continuation tasks, has none.
   is in `PowerShellRuntimeUpgrade.log` beside the installed updater. `upd bootstrap` does
   the same on demand and writes `%TEMP%\boot-upd-pwsh-upgrade.log`. The runtime never
   changes while a cycle is in progress.
-- **An existing MSI install is replaced.** After the MSIX is installed and starts, the old
-  MSI (and the Microsoft Update package that services it) is uninstalled. PowerShell
-  windows that are already open keep running; files still in use go at the next restart.
+- **An existing PowerShell 7.6 MSI stays installed.** The packaged build does not support
+  WinRM remoting into PowerShell 7, an all-users profile, or a machine-wide execution policy,
+  and it has no stable path for SYSTEM or services. Keeping the MSI lets anything that relies
+  on those features keep working; boot-upd may continue to run from the MSI path.
 - **Older Windows keeps the MSI.** Windows older than build 17763 (Windows Server 2016)
   and Server Core cannot install the MSIX. They get the signed PowerShell 7.6 LTS MSI,
   the last line Microsoft ships that way.
@@ -481,6 +482,12 @@ its resume tasks; use the task-removal command above to stop automatic continuat
 
 <a id="common-questions"></a>
 ## 🙋 Common questions
+
+### Why does Windows Terminal say it cannot find `pwsh.exe` (error 0x80070002)?
+
+Windows Terminal builds its PowerShell profile list when it starts. If an earlier boot-upd
+release removed the PowerShell 7.6 MSI while Terminal was already open, that window can keep
+the old executable path. Close every Terminal window, then open Terminal again.
 
 ### Is `ChocolateyPrototypeCleanup` a problem?
 
