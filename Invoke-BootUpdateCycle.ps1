@@ -294,6 +294,7 @@ $script:InstallDir            = $PSScriptRoot
 $script:ProviderTranscriptPath = Join-Path $PSScriptRoot 'BootUpdateCycle.providers.log'
 $script:StatePath             = Join-Path $PSScriptRoot 'BootUpdateCycle.state.json'
 $script:WingetQuarantinePath  = Join-Path $PSScriptRoot 'BootUpdateCycle-winget-quarantine.json'
+$script:WingetKnownFailurePath = Join-Path $PSScriptRoot 'BootUpdateCycle-winget-known-failures.json'
 <# Pending-file cleanup evidence. ADR-0004: absence of a record is not a record of absence.
    This is on an EVIDENCE lifecycle, not a cache lifecycle - never TTL'd, never invalidated
    on a fingerprint, never skipped under -WhatIf - because its whole purpose is to answer
@@ -1098,6 +1099,7 @@ function Get-WingetInventoryPackageIds {
     $nextColumn = ($afterId -split '\s{2,}' | Where-Object { $_ } | Select-Object -First 1)
     $nextColOffset = if ($nextColumn) { $header.IndexOf($nextColumn, $idColStart + 2) } else { -1 }
     $ids = [Collections.Generic.List[string]]::new()
+    $packageRecords = [Collections.Generic.List[object]]::new()
     $malformedRows = 0
     foreach ($row in ($normalized | Select-Object -Skip ($headerIndex + 1))) {
         if ([string]::IsNullOrWhiteSpace($row) -or $row -match '^\s*-{3,}\s*$') { continue }
@@ -1113,6 +1115,11 @@ function Get-WingetInventoryPackageIds {
         }
         if ($idField -match $validIdPattern) {
             if (-not $ids.Contains($idField)) { $ids.Add($idField) }
+            $fields = @($row.Substring($idColStart).Trim() -split '\s+')
+            $availableVersion = if ($fields.Count -ge 3) { [string]$fields[2] } else { '' }
+            if ($availableVersion -and $availableVersion -notin @('Source', 'winget')) {
+                $packageRecords.Add([pscustomobject]@{ Id=$idField; AvailableVersion=$availableVersion })
+            }
         } elseif (-not [string]::IsNullOrWhiteSpace($idField)) {
             $malformedRows++
         }
@@ -1121,9 +1128,90 @@ function Get-WingetInventoryPackageIds {
     return [pscustomobject]@{
         HeaderRecognized = $true
         PackageIds = $ids.ToArray()
+        PackageRecords = $packageRecords.ToArray()
         MalformedRows = $malformedRows
         Reason = if ($malformedRows) { "$malformedRows malformed inventory row(s) were rejected." } else { '' }
     }
+}
+
+function Resolve-WingetKnownFailureInventory {
+    param(
+        [Parameter(Mandatory)][string]$Scope,
+        [object[]]$Records = @(),
+        [Parameter(Mandatory)][pscustomobject]$Inventory
+    )
+    $skipped = [Collections.Generic.List[string]]::new()
+    $remaining = [Collections.Generic.List[object]]::new()
+    $changed = [Collections.Generic.List[string]]::new()
+    foreach ($record in @($Records)) {
+        if ([string]$record.Scope -ne $Scope) { $remaining.Add($record); continue }
+        $offered = @($Inventory.PackageRecords | Where-Object { [string]$_.Id -ieq [string]$record.PackageId } | Select-Object -First 1)
+        if ($offered.Count -and [string]$offered[0].AvailableVersion -eq [string]$record.AvailableVersion) {
+            $skipped.Add([string]$record.PackageId)
+            $remaining.Add($record)
+        } else {
+            if ($record.PackageId) { $changed.Add([string]$record.PackageId) }
+        }
+    }
+    return [pscustomobject]@{
+        SkippedIds=$skipped.ToArray()
+        RemainingRecords=$remaining.ToArray()
+        ChangedIds=$changed.ToArray()
+        Outstanding=@($remaining | Where-Object { [string]$_.Scope -eq $Scope })
+    }
+}
+
+function Get-WingetKnownFailureRecords {
+    if ([string]::IsNullOrWhiteSpace([string]$script:WingetKnownFailurePath)) {
+        if ([string]::IsNullOrWhiteSpace([string]$script:InstallDir)) { return @() }
+        $script:WingetKnownFailurePath = Join-Path $script:InstallDir 'BootUpdateCycle-winget-known-failures.json'
+    }
+    if (-not (Test-Path -LiteralPath $script:WingetKnownFailurePath)) { return @() }
+    try { return @((Get-Content -LiteralPath $script:WingetKnownFailurePath -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json) | Where-Object { $null -ne $_ }) }
+    catch {
+        Write-Log "Winget known-failure record could not be read; no packages will be suppressed. $_" -Level Warn
+        return @()
+    }
+}
+
+function Set-WingetKnownFailureRecords {
+    param([object[]]$Records = @())
+    if ([string]::IsNullOrWhiteSpace([string]$script:WingetKnownFailurePath)) {
+        if ([string]::IsNullOrWhiteSpace([string]$script:InstallDir)) { throw 'Winget known-failure path is unavailable.' }
+        $script:WingetKnownFailurePath = Join-Path $script:InstallDir 'BootUpdateCycle-winget-known-failures.json'
+    }
+    $directory = Split-Path -Parent $script:WingetKnownFailurePath
+    if (-not (Test-Path -LiteralPath $directory)) { New-Item -Path $directory -ItemType Directory -Force | Out-Null }
+    $temporaryPath = '{0}.{1}.{2}.tmp' -f $script:WingetKnownFailurePath,$PID,[guid]::NewGuid().ToString('N')
+    try {
+        $json = if (@($Records).Count) { ConvertTo-Json -InputObject @($Records) -Depth 8 } else { '[]' }
+        Set-Content -LiteralPath $temporaryPath -Value $json -Encoding UTF8
+        [IO.File]::Move($temporaryPath, $script:WingetKnownFailurePath, $true)
+    } finally { Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue }
+}
+
+function Save-WingetKnownFailures {
+    param([Parameter(Mandatory)][string]$WingetPath,[object[]]$Failures = @())
+    $records = @(Get-WingetKnownFailureRecords)
+    foreach ($group in @($Failures | Where-Object { $_.Scope -in @('user','machine') -and $_.Id } | Group-Object Scope)) {
+        try {
+            $lines = @(& $WingetPath list --scope $group.Name --upgrade-available --accept-source-agreements --disable-interactivity --no-vt 2>&1 | ForEach-Object { $_.ToString() })
+            $inventory = Get-WingetInventoryPackageIds -Lines $lines
+            if (-not $inventory.HeaderRecognized) { continue }
+            foreach ($failure in $group.Group) {
+                $offer = @($inventory.PackageRecords | Where-Object { $_.Id -ieq [string]$failure.Id } | Select-Object -First 1)
+                if (-not $offer.Count -or -not $offer[0].AvailableVersion) { continue }
+                $records = @($records | Where-Object { -not ($_.Scope -eq $group.Name -and $_.PackageId -ieq [string]$failure.Id) })
+                $records += [pscustomobject]@{
+                    Scope=$group.Name; PackageId=[string]$failure.Id; FailureCode=[long]$failure.Code
+                    AvailableVersion=[string]$offer[0].AvailableVersion; RecordedAt=(Get-Date).ToString('o')
+                }
+            }
+        } catch {
+            Write-Log "Winget known-failure inventory could not be saved for $($group.Name); the next cycle may try it again. $_" -Level Warn
+        }
+    }
+    Set-WingetKnownFailureRecords -Records $records
 }
 
 function Get-WingetOutputSummary {
@@ -1668,7 +1756,10 @@ function Write-WingetScopeSummary {
     $summary | Add-Member -NotePropertyName ExitReconciled -NotePropertyValue $exitReconciled -Force
     $collector = Get-Variable -Name CurrentWingetFailures -Scope Script -ErrorAction SilentlyContinue
     if ($collector -and $null -ne $collector.Value -and $summary.Failures.Count) {
-        foreach ($failure in $summary.Failures) { $collector.Value.Add($failure) }
+        foreach ($failure in $summary.Failures) {
+            $failure | Add-Member -NotePropertyName Scope -NotePropertyValue ([string]($Scope -split '/')[0]) -Force
+            $collector.Value.Add($failure)
+        }
     }
     $changedPackageIds = @($summary.SuccessfulIds) + @($summary.Failures | ForEach-Object { $_.Id })
     $stalePresentation = Resolve-WingetStaleAbsentPresentation -Scope $Scope `
@@ -4093,6 +4184,7 @@ function Update-WingetPackages {
     param()
     $TimeoutMinutes = $script:PackageTimeoutMinutes
     $script:CurrentWingetFailures = [Collections.Generic.List[object]]::new()
+    $knownFailureRecords = @(Get-WingetKnownFailureRecords)
     $executionFailures = [Collections.Generic.List[string]]::new()
     $wingetPath = $null
     $wg = Get-Command winget -EA SilentlyContinue
@@ -4280,6 +4372,7 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
         if ($PSCmdlet.ShouldProcess("Winget ($scope)", "Run Winget $scope-scope upgrades")) {
 
             $useTargetedInventory = $script:ExcludePatterns.Count -gt 0 -or $script:IncludePatterns.Count -gt 0 -or
+                @($knownFailureRecords | Where-Object Scope -eq $scope).Count -gt 0 -or
                 ($scope -eq 'machine' -and $successfulPackageIds.Count -gt 0)
             if (-not $useTargetedInventory) {
                 <# Fast path: no package filters — use --all for best performance #>
@@ -4362,6 +4455,15 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
                     $anyTimeout = $true
                     continue
                 }
+                $knownDecision = Resolve-WingetKnownFailureInventory -Scope $scope -Records $knownFailureRecords -Inventory $inventory
+                $knownFailureRecords = @($knownDecision.RemainingRecords)
+                Set-WingetKnownFailureRecords -Records $knownFailureRecords
+                foreach ($changedId in @($knownDecision.ChangedIds)) {
+                    Write-Log "Winget ($scope): clearing the old failure memory for $changedId because the offered version changed or is no longer available."
+                }
+                foreach ($known in @($knownDecision.Outstanding)) {
+                    Write-Log "Winget ($scope): skipping known failure $($known.PackageId) [$($known.FailureCode)] at offered version $($known.AvailableVersion); it remains outstanding." -Level Warn
+                }
                 if ($inventory.MalformedRows -gt 0) {
                     Write-Log "Winget ($scope): $($inventory.Reason)" -Level Warn
                 }
@@ -4383,7 +4485,9 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
                 $toUpgrade = @()
                 foreach ($pkgId in $packageIds) {
                     $skipReason = Test-PackageExcluded -Name $pkgId
-                    if ($successfulPackageIds.Contains($pkgId)) {
+                    if ($knownDecision.SkippedIds -contains $pkgId) {
+                        Write-Log "Winget ($scope): skipping $pkgId because the same offered version has a recorded installer failure."
+                    } elseif ($successfulPackageIds.Contains($pkgId)) {
                         Write-Log "Winget ($scope): skipping $pkgId because it already succeeded in user scope during this run."
                     } elseif ($skipReason) {
                         Write-Log "Skipped ($skipReason): $pkgId" -Level Info
@@ -4420,8 +4524,14 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
                    deliberately keeps out of the ledger. Record their deferrals under the
                    scope itself, or targeted runs would never qualify the completion claim. #>
                 if ($script:CurrentState) {
+                    $scopeDeferred = @(Get-BootUpdateDeferredInventory -State $script:CurrentState | Where-Object {
+                        $_.Provider -eq 'Winget' -and $_.Scope -eq $scope -and $_.Kind -ne 'KnownFailure'
+                    })
+                    $knownDeferred = @($knownDecision.Outstanding | ForEach-Object {
+                        [pscustomobject]@{ Kind='KnownFailure'; Count=1; Detail="$($_.PackageId) version $($_.AvailableVersion), exit $($_.FailureCode)" }
+                    })
                     Add-BootUpdateDeferredInventory -State $script:CurrentState -Provider 'Winget' -Scope $scope `
-                        -Records (Get-WingetDeferredInventoryRecords -Summaries $packageSummaries.ToArray())
+                        -Records (@((Get-WingetDeferredInventoryRecords -Summaries $packageSummaries.ToArray())) + $scopeDeferred + $knownDeferred)
                 }
                 $totalCount += $count
             }
@@ -4436,6 +4546,9 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
         }
     }
     $classification = Complete-WingetFailureClassification -State $script:CurrentState -Failures $script:CurrentWingetFailures.ToArray() -ExecutionFailures $executionFailures.ToArray()
+    if ($classification.TerminalFailure -and $script:CurrentWingetFailures.Count) {
+        Save-WingetKnownFailures -WingetPath $wingetPath -Failures $script:CurrentWingetFailures.ToArray()
+    }
     if ($script:AggressiveRepair -and $classification.Signature) {
         if (Register-WingetAggressiveRepairAttempt -State $script:CurrentState -Signature $classification.Signature) {
             Invoke-WingetAggressiveRepair -WingetPath $wingetPath -Failures $script:CurrentWingetFailures.ToArray() -TimeoutMinutes $TimeoutMinutes

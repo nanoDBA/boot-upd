@@ -100,6 +100,10 @@ BeforeAll {
           'Get-BootUpdateRetryTriggerTime',
           'ConvertTo-BootUpdatePrincipalSid',
           'Get-WingetInventoryPackageIds',
+          'Resolve-WingetKnownFailureInventory',
+          'Get-WingetKnownFailureRecords',
+          'Set-WingetKnownFailureRecords',
+          'Save-WingetKnownFailures',
           'Get-WingetOutputSummary',
           'Get-ChocolateyOutputSummary',
           'Test-BootUpdateAwsCliPackagePair',
@@ -243,6 +247,34 @@ Describe 'Concise provider diagnostics' {
         $inventory.HeaderRecognized | Should -BeTrue
         $inventory.PackageIds | Should -Be @('Example.App')
         $inventory.MalformedRows | Should -Be 1
+        $inventory.PackageRecords[0].AvailableVersion | Should -Be '1.2.4'
+    }
+
+    It 'keeps a known Winget failure outstanding only while the offered version is unchanged' {
+        $known = @([pscustomobject]@{ Scope='machine'; PackageId='Example.App'; FailureCode=1603; AvailableVersion='2.0' })
+        $inventory = [pscustomobject]@{ PackageRecords=@([pscustomobject]@{ Id='Example.App'; AvailableVersion='2.0' }) }
+        $same = Resolve-WingetKnownFailureInventory -Scope machine -Records $known -Inventory $inventory
+        $same.SkippedIds | Should -Be @('Example.App')
+        $same.RemainingRecords.Count | Should -Be 1
+        $same.Outstanding[0].FailureCode | Should -Be 1603
+
+        $changedInventory = [pscustomobject]@{ PackageRecords=@([pscustomobject]@{ Id='Example.App'; AvailableVersion='2.1' }) }
+        $changed = Resolve-WingetKnownFailureInventory -Scope machine -Records $known -Inventory $changedInventory
+        $changed.SkippedIds | Should -BeNullOrEmpty
+        $changed.RemainingRecords | Should -BeNullOrEmpty
+        $changed.ChangedIds | Should -Be @('Example.App')
+    }
+
+    It 'round-trips known Winget failure records through an atomic sidecar' {
+        $script:WingetKnownFailurePath = Join-Path $TestDrive 'known-failures.json'
+        $records = @([pscustomobject]@{ Scope='machine'; PackageId='Example.App'; FailureCode=1603; AvailableVersion='2.0' })
+        Set-WingetKnownFailureRecords -Records $records
+        $loaded = @(Get-WingetKnownFailureRecords)
+        $loaded.Count | Should -Be 1
+        $loaded[0].AvailableVersion | Should -Be '2.0'
+        $loaded[0].FailureCode | Should -Be 1603
+        Set-WingetKnownFailureRecords -Records @()
+        @(Get-WingetKnownFailureRecords).Count | Should -Be 0
     }
 
     It 'fails closed when targeted inventory contains no syntactically valid IDs' {
@@ -571,6 +603,8 @@ Describe 'Concise provider diagnostics' {
         $script:AggressiveRepair = $false
         $script:CurrentState = [pscustomobject]@{}
         $script:InstallDir = $TestDrive
+        $script:WingetKnownFailurePath = Join-Path $TestDrive 'no-known-failures-msi-1605.json'
+        Remove-Item -LiteralPath $script:WingetKnownFailurePath -Force -ErrorAction SilentlyContinue
         Mock Get-Command { [pscustomobject]@{ Source='C:\Program Files\WindowsApps\winget.exe' } } -ParameterFilter { $Name -eq 'winget' }
         Mock Write-ProviderTranscript { }
         Mock Write-Log { }
