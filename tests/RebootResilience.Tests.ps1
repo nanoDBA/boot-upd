@@ -3368,6 +3368,37 @@ Describe 'Transient Winget and Chocolatey failures' {
     }
 }
 
+Describe 'A Winget hard timeout stops automatic same-boot retries' {
+    It 'returns a terminal phase result after machine-scope hard timeout' {
+        $script:PackageTimeoutMinutes = 30
+        $script:ExcludePatterns = @()
+        $script:IncludePatterns = @()
+        $script:AggressiveRepair = $false
+        $script:CurrentState = [pscustomobject]@{}
+        $script:CurrentWingetFailures = [Collections.Generic.List[object]]::new()
+        $script:InstallDir = $TestDrive
+        $script:WingetResolvedAbsentPath = Join-Path $TestDrive 'hard-timeout-resolved-absent.json'
+        Mock Get-Command { [pscustomobject]@{ Source='C:\Path\To\winget.exe' } } -ParameterFilter { $Name -eq 'winget' }
+        Mock Write-ProviderTranscript { }
+        Mock Write-Log { }
+        Mock Invoke-PackageManagerWithTimeout {
+            if ($Name -eq 'Winget-machine') {
+                return @{ Output=@(); TimedOut=$true; Failed=$true; Reason='HardTimeout'; ExitCode=$null; RebootRequired=$false }
+            }
+            return @{ Output=@('No installed package found matching input criteria'); TimedOut=$false; Failed=$false; Reason='Completed'; ExitCode=0; RebootRequired=$false }
+        }
+
+        $result = Update-WingetPackages -Confirm:$false
+
+        $result.Success | Should -BeFalse
+        $result.TerminalFailure | Should -BeTrue
+        $result.AttentionDetails | Should -Contain 'Winget machine scope exceeded its hard timeout; automatic retries stopped for this cycle.'
+        Should -Invoke Write-Log -Times 1 -Exactly -ParameterFilter { $Message -match 'Hard timeout.*Automatic retries stopped for this cycle; manual attention is required' }
+        Should -Invoke Invoke-PackageManagerWithTimeout -Times 2 -Exactly
+        Should -Invoke Invoke-PackageManagerWithTimeout -Times 0 -ParameterFilter { $Name -like '*retry*' }
+    }
+}
+
 Describe 'Explicit Winget and Chocolatey package identity handling' {
     It 'maps only the explicit AWS CLI provider ID pair' {
         Test-BootUpdateAwsCliPackagePair -ChocolateyId 'awscli' -WingetId 'Amazon.AWSCLI' | Should -BeTrue
@@ -5121,7 +5152,29 @@ Describe 'A suspended laptop does not have sleep charged to the provider timeout
            the hard-timeout/suspend interaction is what is under test, not idle detection,
            which ADR-0005's own case already covers. #>
         $script:CpuSeconds = 0
-        function Get-ProcessTreeActivity { param($ParentPid) $script:CpuSeconds++; [pscustomobject]@{ TotalCpuTime = [timespan]::FromSeconds($script:CpuSeconds); ProcessCount = 1; HandleCount = 10 } }
+        $script:CpuIncrement = 1
+        function Get-ProcessTreeActivity { param($ParentPid) $script:CpuSeconds += $script:CpuIncrement; [pscustomobject]@{ TotalCpuTime = [timespan]::FromSeconds($script:CpuSeconds); ProcessCount = 1; HandleCount = 10 } }
+    }
+
+    <# A healthy MSI install and a stuck one look the same from here: the real work runs in
+       the Windows Installer service, outside the tree, while Winget waits at well under one
+       CPU second per minute. A CPU-rate idle rule killed a 12-minute install that succeeded
+       in the 2026-11 diagnostics replay, so the hard timeout bounds this case instead. #>
+    It 'does not idle-kill a live installer whose CPU only trickles while it waits' {
+        $proc = Start-DisposableSleeper
+        try {
+            $script:CpuIncrement = 0.25 # 0.5 CPU seconds per simulated minute
+            $clock = New-SteppingClock -Start $script:BaseClockTime -StepSeconds 30
+
+            $result = Wait-ProcessWithIdleTimeout -Process $proc -Status 'INSTALLER//WAIT test' `
+                -IdleTimeoutMinutes 5 -HardTimeoutMinutes 30 -PollIntervalSeconds 0.2 -Clock $clock
+
+            $result.Reason | Should -Be 'HardTimeout' -Because 'a waiting installer cannot be told apart from a stuck one by CPU rate'
+            @($script:Logged | Where-Object { $_.Message -match '^IDLE TIMEOUT:' }).Count | Should -Be 0
+        } finally {
+            if (-not $proc.HasExited) { try { $proc.Kill($true) } catch {} }
+            $proc.Dispose()
+        }
     }
 
     It 'does not charge a 50-minute suspend gap at 17 minutes elapsed against a 30-minute hard timeout' {

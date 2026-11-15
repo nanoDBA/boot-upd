@@ -4055,7 +4055,7 @@ try {
     }
     $timedOut = $result.Reason -in @('IdleTimeout','HardTimeout')
     $failed = $timedOut -or $result.Reason -ne 'Completed' -or $effectiveExitCode -notin @(0, 1641, 3010)
-    if ($timedOut) { Write-Log "${Name}: Killed ($($result.Reason)) after $([math]::Round($result.Elapsed.TotalMinutes,1))m. Will retry next boot." -Level Warn }
+    if ($timedOut) { Write-Log "${Name}: Killed ($($result.Reason)) after $([math]::Round($result.Elapsed.TotalMinutes,1))m; retry policy is decided by the provider." -Level Warn }
     elseif ($failed -and -not $DeferExitCodeReporting) { Write-Log "${Name}: child process exited with code $effectiveExitCode." -Level Warn }
     else { Write-Log "${Name}: Done in $([math]::Round($result.Elapsed.TotalMinutes,1))m" }
     return @{ Output = $visibleOutput.ToArray(); TimedOut = $timedOut; Failed = $failed; Reason = $result.Reason; Elapsed = $result.Elapsed; ExitCode = $effectiveExitCode; RebootRequired = $rebootRequired }
@@ -4110,6 +4110,7 @@ function Update-WingetPackages {
     else { $scopes = @('user', 'machine') }
 
     $totalCount = 0; $anyTimeout = $false
+    $hardTimeoutDetails = [Collections.Generic.List[string]]::new()
     $successfulPackageIds = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 
     <# ── Fast path (no ExcludePatterns): run user + machine scopes in parallel via ThreadJob ──
@@ -4205,8 +4206,12 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
                 $installBlocked = @($jr.Lines | Where-Object { $_ -match 'install.+in progress|in progress.+install' }).Count -gt 0
                 $scopeSummary = Write-WingetScopeSummary -Scope $sc -Lines $jr.Lines -ExitCode $jr.ExitCode
                 if ($jr.TimedOut) {
-                    Write-Log "Winget ($sc): Hard timeout ($TimeoutMinutes min). Will retry next boot." -Level Warn
                     $anyTimeout = $true
+                    if ($jr.Reason -eq 'HardTimeout') {
+                        $detail = "Winget $sc scope exceeded its hard timeout; automatic retries stopped for this cycle."
+                        $hardTimeoutDetails.Add($detail)
+                        Write-Log "Winget ($sc): Hard timeout ($TimeoutMinutes min). Automatic retries stopped for this cycle; manual attention is required." -Level Error
+                    } else { Write-Log "Winget ($sc): Timed out ($TimeoutMinutes min); retry policy is decided after the phase." -Level Warn }
                 }
                 if ($jr.RebootRequired) {
                     $rebootEvidence = [pscustomobject]@{ Source="Winget-$sc-exit-$($jr.ExitCode)"; Status='Pending'; Detail="Winget $sc scope requested a reboot (native exit code $($jr.ExitCode))" }
@@ -4232,6 +4237,11 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
                     $retryCount = $retrySummary.Updated
                     $totalCount += $retryCount
                     if ($retryResult.TimedOut) { $anyTimeout = $true }
+                    if ($retryResult.Reason -eq 'HardTimeout') {
+                        $detail = "Winget $sc scope exceeded its hard timeout; automatic retries stopped for this cycle."
+                        $hardTimeoutDetails.Add($detail)
+                        Write-Log "Winget ($sc): Hard timeout ($TimeoutMinutes min). Automatic retries stopped for this cycle; manual attention is required." -Level Error
+                    }
                 }
                 $totalCount += $jr.Count
             }
@@ -4261,7 +4271,8 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
         }
         $phaseSuccess = if ($quarantine -and $quarantine.AllPinned) { $true } elseif ($script:CurrentWingetFailures.Count) { $false } else { -not $anyTimeout }
         Save-BootUpdateWingetSuccessIds -State $script:CurrentState -Ids $successfulPackageIds
-        return @{ Success = $phaseSuccess; Count = $totalCount; TerminalFailure=$classification.TerminalFailure; AttentionDetails=$classification.Details }
+        $attentionDetails = @($classification.Details) + @($hardTimeoutDetails.ToArray())
+        return @{ Success = $phaseSuccess; Count = $totalCount; TerminalFailure=($classification.TerminalFailure -or $hardTimeoutDetails.Count -gt 0); AttentionDetails=$attentionDetails }
     }
 
     <# ── Sequential path: single scope (SYSTEM: machine only) OR ExcludePatterns active ── #>
@@ -4282,7 +4293,14 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
                 $scopeSummary = Write-WingetScopeSummary -Scope $scope -Lines $result.Output -ExitCode $result.ExitCode
                 $count = $scopeSummary.Updated
                 foreach ($successfulId in @($scopeSummary.SuccessfulIds)) { $null = $successfulPackageIds.Add($successfulId) }
-                if ($result.TimedOut) { $anyTimeout = $true }
+                if ($result.TimedOut) {
+                    $anyTimeout = $true
+                    if ($result.Reason -eq 'HardTimeout') {
+                        $detail = "Winget $scope scope exceeded its hard timeout; automatic retries stopped for this cycle."
+                        $hardTimeoutDetails.Add($detail)
+                        Write-Log "Winget ($scope): Hard timeout ($TimeoutMinutes min). Automatic retries stopped for this cycle; manual attention is required." -Level Error
+                    } else { Write-Log "Winget ($scope): Timed out ($TimeoutMinutes min); retry policy is decided after the phase." -Level Warn }
+                }
                 if ($null -ne $result.ExitCode -and $result.ExitCode -notin @(0,1641,3010) -and
                     @($scopeSummary.Failures).Count -eq 0 -and -not $scopeSummary.ExitReconciled) {
                     $kind = if (@($result.Output).Count -eq 0) { 'no-output' } else { 'unclassified' }
@@ -4303,7 +4321,14 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
                     $retrySummary = Write-WingetScopeSummary -Scope "$scope-retry" -Lines $retry.Output -ExitCode $retry.ExitCode
                     $count += $retrySummary.Updated
                     foreach ($successfulId in @($retrySummary.SuccessfulIds)) { $null = $successfulPackageIds.Add($successfulId) }
-                    if ($retry.TimedOut) { $anyTimeout = $true }
+                    if ($retry.TimedOut) {
+                        $anyTimeout = $true
+                        if ($retry.Reason -eq 'HardTimeout') {
+                            $detail = "Winget $scope scope exceeded its hard timeout; automatic retries stopped for this cycle."
+                            $hardTimeoutDetails.Add($detail)
+                            Write-Log "Winget ($scope): Hard timeout ($TimeoutMinutes min). Automatic retries stopped for this cycle; manual attention is required." -Level Error
+                        }
+                    }
                 }
                 $totalCount += $count
 
@@ -4381,7 +4406,15 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
                     $count += $packageSummary.Updated
                     $packageSummaries.Add($packageSummary)
                     foreach ($successfulId in @($packageSummary.SuccessfulIds)) { $null = $successfulPackageIds.Add($successfulId) }
-                    if ($pkgResult.TimedOut) { $anyTimeout = $true }
+                    if ($pkgResult.TimedOut) {
+                        $anyTimeout = $true
+                        if ($pkgResult.Reason -eq 'HardTimeout') {
+                            $detail = "Winget $scope package exceeded its hard timeout; automatic retries stopped for this cycle."
+                            $hardTimeoutDetails.Add($detail)
+                            Write-Log "Winget ($scope): Hard timeout ($TimeoutMinutes min). Automatic retries stopped for this cycle; manual attention is required." -Level Error
+                            break
+                        }
+                    }
                 }
                 <# Per-package summaries use "<scope>/<id>" labels, which the scope summary
                    deliberately keeps out of the ledger. Record their deferrals under the
@@ -4392,7 +4425,7 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
                 }
                 $totalCount += $count
             }
-
+            if ($hardTimeoutDetails.Count -gt 0) { break }
         } else {
             if ($script:ExcludePatterns.Count -eq 0 -and $script:IncludePatterns.Count -eq 0) {
                 Write-Log "  [WHATIF] Would run: winget upgrade --all --scope $scope"
@@ -4424,7 +4457,8 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
     }
     $phaseSuccess = if ($quarantine -and $quarantine.AllPinned) { $true } elseif ($script:CurrentWingetFailures.Count) { $false } else { -not $anyTimeout }
     Save-BootUpdateWingetSuccessIds -State $script:CurrentState -Ids $successfulPackageIds
-    return @{ Success = $phaseSuccess; Count = $totalCount; TerminalFailure=$classification.TerminalFailure; AttentionDetails=$classification.Details }
+    $attentionDetails = @($classification.Details) + @($hardTimeoutDetails.ToArray())
+    return @{ Success = $phaseSuccess; Count = $totalCount; TerminalFailure=($classification.TerminalFailure -or $hardTimeoutDetails.Count -gt 0); AttentionDetails=$attentionDetails }
 }
 
 function Get-ChocolateyOutputSummary {
