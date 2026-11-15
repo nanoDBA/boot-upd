@@ -42,6 +42,10 @@
     Leave feature updates to Windows Update's own schedule. By default a feature update
     that Windows Update offers this machine installs like any other update.
 
+.PARAMETER SkipWindowsUpdate
+    Skip the Windows Update phase entirely for this run, including discovery, downloads,
+    installation, and convergence scans. The choice carries across continuation tasks.
+
 .PARAMETER RebootDelaySec
     Seconds before forced reboot (no user abort window).  Default 0 (immediate, forced).
 
@@ -88,6 +92,7 @@ param(
     [switch]$SkipDefender,                # Defender signature update (default: runs)
     [switch]$IncludeDriverUpdates,        # Driver updates via PSWindowsUpdate (default: opt-in, off)
     [switch]$IncludeFirmwareUpdates,      # Firmware updates via PSWindowsUpdate (default: opt-in, off)
+    [switch]$SkipWindowsUpdate,           # Skip Windows Update discovery, download, install, and convergence for this run
     [switch]$SkipFeatureUpdates,          # Leave Windows feature updates (new Windows versions) to Windows Update's own schedule
     [ValidateRange(30,1440)]
     [int]$FeatureUpdateTimeoutMinutes = 240,  # Hard timeout for the Windows Update phase when a feature or cumulative update is in scope
@@ -347,6 +352,7 @@ $script:SkipAiTools           = $SkipAiTools
 $script:SkipDotnetTools       = $SkipDotnetTools
 $script:SkipVscode            = $SkipVscode
 $script:SkipDefender          = $SkipDefender
+$script:SkipWindowsUpdate     = $SkipWindowsUpdate
 $script:IncludeDriverUpdates  = $IncludeDriverUpdates
 $script:IncludeFirmwareUpdates = $IncludeFirmwareUpdates
 $script:SkipFeatureUpdates    = $SkipFeatureUpdates
@@ -7900,6 +7906,7 @@ function Register-BootUpdateTaskForReboot {
     if ($script:SkipDotnetTools)      { $taskArgs += '-SkipDotnetTools' }
     if ($script:SkipVscode)           { $taskArgs += '-SkipVscode' }
     if ($script:SkipDefender)         { $taskArgs += '-SkipDefender' }
+    if ($script:SkipWindowsUpdate)   { $taskArgs += '-SkipWindowsUpdate' }
     if ($script:IncludeDriverUpdates) { $taskArgs += '-IncludeDriverUpdates' }
     if ($script:IncludeFirmwareUpdates) { $taskArgs += '-IncludeFirmwareUpdates' }
     if ($script:SkipFeatureUpdates)   { $taskArgs += '-SkipFeatureUpdates' }
@@ -9183,6 +9190,7 @@ function Apply-RemoteConfig {
         'SkipPip', 'SkipNpm', 'SkipScoop', 'SkipAiTools', 'SkipDotnetTools', 'SkipVscode',
         'SkipPowerShellModules', 'SkipOffice365', 'SkipSsms', 'SkipAwsTooling',
         'SkipDefender', 'SkipBitLocker', 'SkipRestorePoint', 'SkipHealthCheck',
+        'SkipWindowsUpdate',
         'IncludeDriverUpdates', 'IncludeFirmwareUpdates', 'SkipFeatureUpdates', 'FeatureUpdateTimeoutMinutes',
         'UpdateWsl', 'UpdateContainers', 'AllowMetered', 'DisableSelfUpdate',
         'StagedRollout', 'AggressiveRepair', 'OutputMode', 'WatchdogIntervalMinutes'
@@ -9262,6 +9270,7 @@ function Get-BootUpdateLaunchContract {
         if ($script:SkipDotnetTools)       { 'DotnetTools' }
         if ($script:SkipVscode)            { 'VSCode' }
         if ($script:SkipDefender)          { 'Defender' }
+        if ($script:SkipWindowsUpdate)     { 'WindowsUpdate' }
         if ($script:SkipFeatureUpdates)    { 'FeatureUpdates' }
         if ($script:SkipRestorePoint)      { 'RestorePoint' }
         if ($script:SkipHealthCheck)       { 'HealthCheck' }
@@ -9562,39 +9571,48 @@ function Invoke-BootUpdateCycle {
        boot), WhatIf, WU already done, or PSWindowsUpdate not yet installed (the module
        install belongs to the WU phase — no racing it from here). #>
     $script:WuPrefetchJob = $null
-    if (-not $state.WindowsUpdateDone -and -not $WhatIfPreference) {
-        $wuScope = Get-WindowsUpdateVerificationScope
-        if (Test-WindowsUpdateAssessmentCache -Scope $wuScope) {
-            $state.WindowsUpdateDone = $true
-            $state.WindowsUpdateZeroEvidence = [pscustomobject]@{
-                BootSessionId = Get-BootUpdateBootSessionId
-                ScopeSignature = $wuScope.Signature
-                ObservedAt = [datetime]::UtcNow.ToString('o')
-                Source = 'PSWindowsUpdate-post-search-zero'
-            }
+    if ($script:SkipWindowsUpdate) {
+        if ([bool]$state.WindowsUpdateDone) {
+            $state.WindowsUpdateDone = $false
+            $state.WindowsUpdateZeroEvidence = $null
             Set-BootUpdateState -State $state
         }
-    }
-    $wuServiceRunningForPrefetch = $false
-    try { $wuServiceRunningForPrefetch = (Get-Service wuauserv -ErrorAction Stop).Status -eq 'Running' } catch { }
-    if (-not $script:StagedRollout -and -not $WhatIfPreference -and -not $state.WindowsUpdateDone -and
-        (Get-Module -ListAvailable PSWindowsUpdate) -and $wuServiceRunningForPrefetch) {
-        try {
-            $prefetchScope = Get-WindowsUpdateVerificationScope
-            $script:WuPrefetchJob = Start-Job -ScriptBlock {
-                param($NotTitle, $Criteria)
-                Import-Module PSWindowsUpdate -Force
-                Get-WindowsUpdate -AcceptAll -Download -NotTitle $NotTitle -Criteria $Criteria `
-                    -IgnoreReboot -Confirm:$false 2>&1 | ForEach-Object { $_.ToString() }
-            } -ArgumentList $prefetchScope.ExcludedTitle, $prefetchScope.Criteria
-            Write-Log 'Windows Update prefetch: scan + download started in background (install stays sequential).'
-        } catch {
-            Write-Log "Windows Update prefetch failed to start (non-fatal): $_" -Level Warn
-            $script:WuPrefetchJob = $null
+        Write-Log 'Windows Update: skipped by request (no discovery, download, or install ran).'
+    } else {
+        if (-not $state.WindowsUpdateDone -and -not $WhatIfPreference) {
+            $wuScope = Get-WindowsUpdateVerificationScope
+            if (Test-WindowsUpdateAssessmentCache -Scope $wuScope) {
+                $state.WindowsUpdateDone = $true
+                $state.WindowsUpdateZeroEvidence = [pscustomobject]@{
+                    BootSessionId = Get-BootUpdateBootSessionId
+                    ScopeSignature = $wuScope.Signature
+                    ObservedAt = [datetime]::UtcNow.ToString('o')
+                    Source = 'PSWindowsUpdate-post-search-zero'
+                }
+                Set-BootUpdateState -State $state
+            }
         }
-    } elseif (-not $script:StagedRollout -and -not $WhatIfPreference -and -not $state.WindowsUpdateDone -and
-        (Get-Module -ListAvailable PSWindowsUpdate)) {
-        Write-Log 'Windows Update prefetch: skipped because wuauserv is not running; the Windows Update phase will attempt bounded recovery.' -Level Warn
+        $wuServiceRunningForPrefetch = $false
+        try { $wuServiceRunningForPrefetch = (Get-Service wuauserv -ErrorAction Stop).Status -eq 'Running' } catch { }
+        if (-not $script:StagedRollout -and -not $WhatIfPreference -and -not $state.WindowsUpdateDone -and
+            (Get-Module -ListAvailable PSWindowsUpdate) -and $wuServiceRunningForPrefetch) {
+            try {
+                $prefetchScope = Get-WindowsUpdateVerificationScope
+                $script:WuPrefetchJob = Start-Job -ScriptBlock {
+                    param($NotTitle, $Criteria)
+                    Import-Module PSWindowsUpdate -Force
+                    Get-WindowsUpdate -AcceptAll -Download -NotTitle $NotTitle -Criteria $Criteria `
+                        -IgnoreReboot -Confirm:$false 2>&1 | ForEach-Object { $_.ToString() }
+                } -ArgumentList $prefetchScope.ExcludedTitle, $prefetchScope.Criteria
+                Write-Log 'Windows Update prefetch: scan + download started in background (install stays sequential).'
+            } catch {
+                Write-Log "Windows Update prefetch failed to start (non-fatal): $_" -Level Warn
+                $script:WuPrefetchJob = $null
+            }
+        } elseif (-not $script:StagedRollout -and -not $WhatIfPreference -and -not $state.WindowsUpdateDone -and
+            (Get-Module -ListAvailable PSWindowsUpdate)) {
+            Write-Log 'Windows Update prefetch: skipped because wuauserv is not running; the Windows Update phase will attempt bounded recovery.' -Level Warn
+        }
     }
 
     <# System restore point — first iteration only; skipped on SYSTEM, Server SKUs, -SkipRestorePoint, or WhatIf #>
@@ -9619,8 +9637,8 @@ function Invoke-BootUpdateCycle {
             } else { Update-ChocolateyPackages }
         } }
         @{ Name='Ssms';              Flag='SsmsDone';              Key='Ssms';              Skip=[bool]$SkipSsms;                                                             Action={ Update-SsmsInstances } }
-        @{ Name='WindowsUpdate';     Flag='WindowsUpdateDone';     Key='WindowsUpdate';     Skip=$false;                                                                       Action={ Install-WindowsUpdates } }
-        @{ Name='DriverFirmware';    Flag='DriverFirmwareDone';    Key='DriverFirmware';    Skip=(-not ($IncludeDriverUpdates -or $IncludeFirmwareUpdates));                    Action={ Install-DriverFirmwareUpdates } }
+        @{ Name='WindowsUpdate';     Flag='WindowsUpdateDone';     Key='WindowsUpdate';     Skip=[bool]$script:SkipWindowsUpdate;                                              Action={ Install-WindowsUpdates } }
+        @{ Name='DriverFirmware';    Flag='DriverFirmwareDone';    Key='DriverFirmware';    Skip=($script:SkipWindowsUpdate -or -not ($IncludeDriverUpdates -or $IncludeFirmwareUpdates)); Action={ Install-DriverFirmwareUpdates } }
         @{ Name='AwsTooling';        Flag='AwsToolingDone';        Key=$null;               Skip=[bool]$SkipAwsTooling;                                                        Action={ $r = Repair-AwsTooling; @{ Success = $r; Count = 0 } } }
         @{ Name='Wsl';               Flag='WslDone';               Key='Wsl';               Skip=(-not $UpdateWsl); Defer=$isSystemCtx; UserCompletionDeferred=$isSystemCtx; Action={ Update-WslKernelAndDistros } }
         @{ Name='Containers';        Flag='ContainersDone';        Key='Containers';        Skip=(-not $UpdateContainers); Defer=$isSystemCtx; UserCompletionDeferred=$isSystemCtx; Action={ Update-ContainerImages } }
@@ -10267,7 +10285,7 @@ function Invoke-BootUpdateCycle {
         Add-BootUpdatePendingCleanupRecord -Context 'after updates' -Observation 'phase-skipped' -Source 'whatif'
         @()
     } else { Get-ConfirmedPendingReboot -Context 'after updates' }
-    if (-not $WhatIfPreference -and -not $pending -and [bool]$state.WindowsUpdateDone) {
+    if (-not $WhatIfPreference -and -not $pending -and [bool]$state.WindowsUpdateDone -and -not $script:SkipWindowsUpdate) {
         if ($script:StagedRollout) {
             $stagedRemainingBeforeWuConvergence = @($allPhasesFlat | Where-Object {
                 (-not $_.Skip) -and (-not $_.UserCompletionDeferred) -and (-not [bool]$state.($_.Flag))
@@ -10598,6 +10616,7 @@ function Invoke-BootUpdateCycle {
                 Chocolatey       = $s.Chocolatey
                 Ssms             = $s.Ssms
                 WindowsUpdate    = $s.WindowsUpdate
+                WindowsUpdateDisposition = if ($script:SkipWindowsUpdate) { 'SkippedByRequest' } else { 'Included' }
                 Pip              = $s.Pip
                 Npm              = $s.Npm
                 Office365        = $s.Office365
@@ -10630,6 +10649,7 @@ function Invoke-BootUpdateCycle {
             $congratulations
             if (-not $WhatIfPreference) { '[RESTART] NOT REQUIRED - no blocking restart evidence remains' }
             "[OK] $($enabledPhases.Count)/$($enabledPhases.Count) configured phases completed"
+            if ($script:SkipWindowsUpdate) { '[SKIPPED] Windows Update skipped by request; no discovery, download, or install ran.' }
             if ($hasWingetQuarantine) {
                 "[SKIPPED] $($wingetQuarantines.Count) repeatedly failing Winget package(s) were not updated"
                 '[WHY] They were reversibly pinned so they cannot keep restarting this update run'
