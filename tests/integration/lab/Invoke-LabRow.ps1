@@ -393,7 +393,7 @@ Invoke-Command -VMName $VMName -Credential $cred -ErrorAction Stop -ScriptBlock 
 } | Out-Null
 if ($LabScenario -ne 'None') {
     Invoke-Command -VMName $VMName -Credential $cred -ErrorAction Stop -ScriptBlock {
-        Remove-Item -LiteralPath 'C:\ProgramData\BootUpdateCycle\LabWingetFixture.jsonl' -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath 'C:\ProgramData\BootUpdateCycle\LabFixture.jsonl' -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath 'C:\ProgramData\BootUpdateCycle\BootUpdateCycle-winget-known-failures.json' -Force -ErrorAction SilentlyContinue
     } | Out-Null
 }
@@ -787,7 +787,7 @@ $evidence = Invoke-Command -VMName $VMName -Credential $cred -ScriptBlock {
         ConsoleUser     = (Get-CimInstance Win32_ComputerSystem).UserName
         ExplorerCount   = @(Get-Process explorer -ErrorAction SilentlyContinue).Count
         DeployOutput    = @(if (Test-Path 'C:\Lab\deploy-output.txt') { Get-Content 'C:\Lab\deploy-output.txt' -ErrorAction SilentlyContinue })
-        LabWingetFixture = @(if (Test-Path 'C:\ProgramData\BootUpdateCycle\LabWingetFixture.jsonl') { Get-Content 'C:\ProgramData\BootUpdateCycle\LabWingetFixture.jsonl' -ErrorAction SilentlyContinue })
+        LabFixture = @(if (Test-Path 'C:\ProgramData\BootUpdateCycle\LabFixture.jsonl') { Get-Content 'C:\ProgramData\BootUpdateCycle\LabFixture.jsonl' -ErrorAction SilentlyContinue })
         WingetKnownFailureMemory = $wingetKnownFailureMemory
         DeployTaskResult = (Get-ScheduledTaskInfo -TaskName 'Lab-RunDeploy' -ErrorAction SilentlyContinue).LastTaskResult
     }
@@ -800,7 +800,7 @@ $schedulerEvents = @($evidence.SchedulerEvents | ConvertFrom-BootUpdLabTaskEvent
 ConvertTo-Json -InputObject @($schedulerEvents.Xml) | Set-Content (Join-Path $evidenceDir 'task-events.json')
 $evidence.Log | Set-Content (Join-Path $evidenceDir 'BootUpdateCycle.log')
 if ($evidence.DeployOutput.Count) { $evidence.DeployOutput | Set-Content (Join-Path $evidenceDir 'deploy-output.txt') }
-if ($evidence.LabWingetFixture.Count) { $evidence.LabWingetFixture | Set-Content (Join-Path $evidenceDir 'lab-winget-fixture.jsonl') }
+if ($evidence.LabFixture.Count) { $evidence.LabFixture | Set-Content (Join-Path $evidenceDir 'lab-fixture.jsonl') }
 ConvertTo-Json -InputObject @($evidence.WingetKnownFailureMemory) -Depth 5 | Set-Content (Join-Path $evidenceDir 'winget-known-failure-memory.json')
 ConvertTo-Json -InputObject @($evidence.OsBootTimes) | Set-Content (Join-Path $evidenceDir 'os-boot-times.json')
 if ($ScreenCaptureScript) {

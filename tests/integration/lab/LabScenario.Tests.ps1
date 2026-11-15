@@ -82,9 +82,16 @@ Describe 'Lab scenario contracts' {
     }
 
     It 'provides a no-op Windows Update module for the isolated repeat-failure scenario' {
-        $manifest = Join-Path $PSScriptRoot 'fixtures/modules/PSWindowsUpdate/2.2.1.5/PSWindowsUpdate.psd1'
+        $manifest = Join-Path $PSScriptRoot 'fixtures/modules/PSWindowsUpdate/99.0.0/PSWindowsUpdate.psd1'
+        $oldLog = $env:BOOTUPD_LAB_FIXTURE_LOG
+        $env:BOOTUPD_LAB_FIXTURE_LOG = Join-Path $TestDrive 'windows-update-fixture.jsonl'
         $module = Import-Module $manifest -Force -PassThru
-        try { @(Get-WindowsUpdate -AcceptAll -Download).Count | Should -Be 0 }
-        finally { Remove-Module $module.Name -Force }
+        try {
+            @(Get-WindowsUpdate -AcceptAll -Download).Count | Should -Be 0
+            (Get-Content -LiteralPath $env:BOOTUPD_LAB_FIXTURE_LOG -Raw | ConvertFrom-Json).Provider | Should -Be 'WindowsUpdate'
+        } finally {
+            Remove-Module $module.Name -Force
+            if ($null -eq $oldLog) { Remove-Item Env:BOOTUPD_LAB_FIXTURE_LOG -ErrorAction SilentlyContinue } else { $env:BOOTUPD_LAB_FIXTURE_LOG = $oldLog }
+        }
     }
 }

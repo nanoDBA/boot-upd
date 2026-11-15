@@ -14,7 +14,7 @@ function Get-LabScenarioContract {
                 RepeatCycles = 1
                 WingetPath = "$fixtureRoot\bin"
                 ModulePath = "$fixtureRoot\modules"
-                EvidenceFile = 'C:\ProgramData\BootUpdateCycle\LabWingetFixture.jsonl'
+                EvidenceFile = 'C:\ProgramData\BootUpdateCycle\LabFixture.jsonl'
             }
         }
         'RepeatedWingetFailure' {
@@ -23,7 +23,7 @@ function Get-LabScenarioContract {
                 RepeatCycles = 2
                 WingetPath = "$fixtureRoot\bin"
                 ModulePath = "$fixtureRoot\modules"
-                EvidenceFile = 'C:\ProgramData\BootUpdateCycle\LabWingetFixture.jsonl'
+                EvidenceFile = 'C:\ProgramData\BootUpdateCycle\LabFixture.jsonl'
             }
         }
         default {
