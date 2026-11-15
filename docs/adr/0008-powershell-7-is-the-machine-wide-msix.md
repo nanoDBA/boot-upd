@@ -31,11 +31,14 @@ for every install method, and on an MSI machine it is the same path as before.
 
 ## Considered options
 
-- **Keep the 7.6 LTS MSI.** Microsoft still supports it and it runs as SYSTEM. Rejected as
-  the default because the operator asked for the current release, and staying on 7.6 means
-  staying on an install method Microsoft has stopped shipping for new versions. It remains
-  the fallback where the MSIX cannot install: Windows older than build 17763 (the package's
-  minimum, so Windows Server 2016) and Server Core (PowerShell/PowerShell#27610).
+- **Keep the 7.6 LTS MSI alongside the MSIX.** Microsoft still supports it and it runs as
+  SYSTEM. The packaged build does not support WinRM remoting into PowerShell 7, an all-users
+  profile, or a machine-wide execution policy, and it has no stable path for SYSTEM or
+  services. Leave the MSI installed so workflows that rely on those features keep working.
+  boot-upd can still install the current MSIX; this decision does not change which runtime an
+  existing launcher selects. The MSI also remains the install route where the MSIX cannot
+  install: Windows older than build 17763 (the package's minimum, so Windows Server 2016) and
+  Server Core (PowerShell/PowerShell#27610).
 - **The ZIP package under `Program Files\PowerShell\7`.** Microsoft documents it and it runs as
   SYSTEM, but it has no servicing story. Moving to it means uninstalling the MSI and
   unpacking files into the folder the MSI just left, which leaves a half-installed machine
@@ -53,10 +56,10 @@ for every install method, and on an MSI machine it is the same path as before.
   (exit 3) while `BootUpdateCycle` or `BootUpdateCycleFallback` exists. A cycle that completes
   starts it with `-WaitForProcessId`, so upgrades happen between cycles without the operator
   running `upd bootstrap`.
-- An existing MSI install is uninstalled once the MSIX has been provisioned and its pwsh.exe
-  has started and reported the expected version. The Microsoft Update package that services
-  the MSI goes with it. Restart Manager stays off, so open PowerShell windows keep running and
-  files still in use go at the next restart.
+- An existing PowerShell 7.6 MSI and its Microsoft Update servicing package stay installed
+  when boot-upd installs the MSIX. This preserves MSI-dependent WinRM, profile, execution
+  policy, SYSTEM and service workflows; it does not change the runtime selected by the current
+  launcher.
 - The installer finds the installed MSIX through `Get-AppxPackage -AllUsers` and also by its
   folder under WindowsApps, which SYSTEM can list, so a provisioned package that no account
   has registered yet is still found.
