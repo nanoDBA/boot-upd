@@ -92,8 +92,9 @@ Each cost real time to find and is commented at the point it matters.
 `Invoke-LabRow.ps1 -LabScenario HardTimeout` puts a tracked fake `winget.cmd` first in the
 scheduled process's PATH. It waits without changing the guest, and the row uses a one-minute
 package timeout. A test-only Windows Update module returns no offers so the cycle reaches
-cleanup without installing updates. The harness collects the manual-attention log and confirms
-the run stops.
+cleanup without installing updates. The harness stages the module under a dedicated test
+version in the guest's standard module directory so child processes see the same stub. The
+checkpoint restore removes it after the row.
 
 `Invoke-LabRow.ps1 -LabScenario RepeatedWingetFailure` uses the same fake provider to offer a
 test package at a fixed version and return the same installer error. It runs two cycles on

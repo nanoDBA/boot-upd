@@ -14,6 +14,8 @@ function Get-LabScenarioContract {
                 RepeatCycles = 1
                 WingetPath = "$fixtureRoot\bin"
                 ModulePath = "$fixtureRoot\modules"
+                WindowsUpdateModule = "$fixtureRoot\modules\PSWindowsUpdate\99.0.0"
+                WindowsUpdateModuleTarget = 'C:\Program Files\WindowsPowerShell\Modules\PSWindowsUpdate\99.0.0'
                 EvidenceFile = 'C:\ProgramData\BootUpdateCycle\LabFixture.jsonl'
             }
         }
@@ -23,6 +25,8 @@ function Get-LabScenarioContract {
                 RepeatCycles = 2
                 WingetPath = "$fixtureRoot\bin"
                 ModulePath = "$fixtureRoot\modules"
+                WindowsUpdateModule = "$fixtureRoot\modules\PSWindowsUpdate\99.0.0"
+                WindowsUpdateModuleTarget = 'C:\Program Files\WindowsPowerShell\Modules\PSWindowsUpdate\99.0.0'
                 EvidenceFile = 'C:\ProgramData\BootUpdateCycle\LabFixture.jsonl'
             }
         }
@@ -32,6 +36,8 @@ function Get-LabScenarioContract {
                 RepeatCycles = 1
                 WingetPath = $null
                 ModulePath = $null
+                WindowsUpdateModule = $null
+                WindowsUpdateModuleTarget = $null
                 EvidenceFile = $null
             }
         }

@@ -396,6 +396,18 @@ if ($LabScenario -ne 'None') {
         Remove-Item -LiteralPath 'C:\ProgramData\BootUpdateCycle\LabFixture.jsonl' -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath 'C:\ProgramData\BootUpdateCycle\BootUpdateCycle-winget-known-failures.json' -Force -ErrorAction SilentlyContinue
     } | Out-Null
+    Invoke-Command -VMName $VMName -Credential $cred -ArgumentList $scenario.WindowsUpdateModule, $scenario.WindowsUpdateModuleTarget -ErrorAction Stop -ScriptBlock {
+        param($Source, $Destination)
+        if (-not (Test-Path -LiteralPath (Join-Path $source 'PSWindowsUpdate.psd1') -PathType Leaf)) {
+            throw 'The Windows Update fixture is missing from the synced lab tree.'
+        }
+        Remove-Item -LiteralPath $Destination -Recurse -Force -ErrorAction SilentlyContinue
+        New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+        Copy-Item -Path (Join-Path $source '*') -Destination $Destination -Force
+        if (-not (Test-Path -LiteralPath (Join-Path $Destination 'PSWindowsUpdate.psd1') -PathType Leaf)) {
+            throw 'The Windows Update fixture was not staged in the guest module path.'
+        }
+    } | Out-Null
 }
 if ($StopAfterBootstrap) {
     $readBootstrapInventory = {
