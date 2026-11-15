@@ -109,16 +109,12 @@ goto adopt
 set "UPD_EXIT=%errorlevel%"
 
 :: The PowerShell bootstrap cannot safely replace the batch file that cmd.exe
-:: is currently reading. Adoption swaps this file on disk, so the adopt call and
-:: everything after it must be ONE physical line — cmd buffers a full line before
-:: executing, so nothing is re-read from the replaced file at a stale byte offset.
+:: is currently reading. Keep adoption and its exit handling on ONE physical line:
+:: cmd buffers that line before the file is replaced, avoiding a stale read offset.
 :adopt
 if defined UPD_BOOTSTRAP_ACTIVE del /f /q "%UPD_BOOTSTRAP_ACTIVE%" >nul 2>&1
 if not exist "%UPD_ROOT%upd.cmd.next" exit /b %UPD_EXIT%
-"%UPD_PWSH%" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%UPD_LAUNCHER%" adopt-staged-batch
-if errorlevel 1 echo WARNING: upd.cmd.next was rejected or could not be adopted.
-if not errorlevel 1 echo Updated upd.cmd from the checksummed release bundle.
-exit /b %UPD_EXIT%
+"%UPD_PWSH%" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%UPD_LAUNCHER%" adopt-staged-batch & if errorlevel 1 (echo WARNING: upd.cmd.next was rejected or could not be adopted.) else (echo Updated upd.cmd from the checksummed release bundle.) & exit /b %UPD_EXIT%
 
 :bootstrap_help
 "%UPD_PWSH%" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%UPD_LAUNCHER%" help
@@ -168,8 +164,8 @@ if /i "%~1"=="--disable-self-update" set "UPD_NO_UPDATE=1"
 shift
 goto classify_no_update_loop
 
-:: Keep the wrapper at physical EOF. The nested cmd returns its exit code naturally,
-:: and the original cmd.exe never resumes reading the replaced source file.
+:: The child may replace this batch file before it returns. Keep the child launch and
+:: return the child's exit code and leave the replaced file on one buffered line.
 :trampoline_wrapper
 setlocal
 set "UPD_ORIGINAL_ROOT=%~dp0"
@@ -182,4 +178,4 @@ if errorlevel 1 (
     exit /b 1
 )
 set "UPD_TRAMPOLINE_ACTIVE=1"
-cmd.exe /d /s /c ""%UPD_TRAMPOLINE_PATH%" %*"
+cmd.exe /d /s /c ""%UPD_TRAMPOLINE_PATH%" %*" & call exit /b %%errorlevel%%

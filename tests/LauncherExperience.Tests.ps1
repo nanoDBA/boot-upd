@@ -177,8 +177,8 @@ Describe 'Checksummed launcher self-update handoff' {
         $cmdSource | Should -Match '"%UPD_PWSH%" .*"%UPD_BOOTSTRAP_ACTIVE%" %\*'
         $cmdSource.IndexOf('set "UPD_EXIT=%errorlevel%"') | Should -BeLessThan $cmdSource.IndexOf('upd.cmd.next')
         $cmdSource | Should -Match 'UPD_TRAMPOLINE_ACTIVE'
-        $cmdSource | Should -Match 'cmd\.exe /d /s /c ""%UPD_TRAMPOLINE_PATH%" %\*"\s*$'
-        $cmdSource.TrimEnd() | Should -Match 'cmd\.exe /d /s /c ""%UPD_TRAMPOLINE_PATH%" %\*"$'
+        $cmdSource | Should -Match 'cmd\.exe /d /s /c ""%UPD_TRAMPOLINE_PATH%" %\*" & call exit /b %%errorlevel%%\s*$'
+        $cmdSource.TrimEnd() | Should -Match 'cmd\.exe /d /s /c ""%UPD_TRAMPOLINE_PATH%" %\*" & call exit /b %%errorlevel%%$'
         $cmdSource | Should -Match 'set "UPD_ROOT=%UPD_ORIGINAL_ROOT%"'
         $deploySource | Should -Match '\$destination\.baseline'
         $deploySource | Should -Match 'verified and staged for delayed activation'
@@ -417,6 +417,38 @@ exit 29
         $text | Should -Not -Match 'The system cannot find the path specified|Terminate batch job'
         (Get-FileHash $target -Algorithm SHA256).Hash | Should -Be $nextHash
         Test-Path "$target.next" | Should -BeFalse
+    }
+
+    It 'adopts both longer and shorter batch files without resuming at a stale offset' {
+        foreach ($variant in @(
+            @{ Name='longer'; Comment=':: A deliberately longer staged launcher comment shifts every later byte offset by a useful amount.' },
+            @{ Name='shorter'; Comment=':: short' }
+        )) {
+            $root = Join-Path $TestDrive "adopt-$($variant.Name)-offset"
+            $tools = Join-Path $root 'tools'
+            $null = New-Item -ItemType Directory -Path $tools -Force
+            Copy-Item $launcherPath (Join-Path $tools 'Invoke-UpdLauncher.ps1')
+            Copy-Item $invokePath (Join-Path $root 'Invoke-BootUpdateCycle.ps1')
+            $target = Join-Path $root 'upd.cmd'
+            Copy-Item $cmdPath $target
+
+            $stagedText = [IO.File]::ReadAllText($cmdPath)
+            $stagedText = [regex]::Replace($stagedText, '(?m)^:: Friendly entry point.*$', $variant.Comment, 1)
+            [IO.File]::WriteAllText("$target.next", $stagedText, [Text.UTF8Encoding]::new($false))
+            $nextHash = (Get-FileHash "$target.next" -Algorithm SHA256).Hash
+            Set-Content "$target.next.sha256" $nextHash -NoNewline
+            Set-Content "$target.next.baseline" (Get-FileHash $target -Algorithm SHA256).Hash -NoNewline
+
+            $output = & cmd.exe /d /c "`"$target`" help" 2>&1
+            $exitCode = $LASTEXITCODE
+            $text = $output -join "`n"
+
+            $exitCode | Should -Be 0 -Because "$($variant.Name) staged content must not corrupt the old cmd.exe read offset; output was: $text"
+            $text | Should -Match 'Updated upd\.cmd from the checksummed release bundle\.'
+            $text | Should -Not -Match 'WARNING: upd\.cmd.next|The system cannot find the path specified|Terminate batch job'
+            (Get-FileHash $target -Algorithm SHA256).Hash | Should -Be $nextHash
+            Test-Path "$target.next" | Should -BeFalse
+        }
     }
 
     It 'does not trust an inherited trampoline marker when the invoked batch path differs' {
