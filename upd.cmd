@@ -5,7 +5,7 @@ goto trampoline_wrapper
 
 :trampoline_active
 setlocal
-:: BootUpdateCycleVersion=2.5.94
+:: BootUpdateCycleVersion=2.5.95
 :: Friendly entry point. Argument parsing, safe demo modes, and elevation live in
 :: tools\Invoke-UpdLauncher.ps1 so quoting and validation remain testable.
 
@@ -133,7 +133,7 @@ echo   Help is read-only. Operational commands bootstrap PowerShell 7 automatica
 exit /b 0
 
 :ps5_version
-echo Boot Update Cycle v2.5.94 ^(PowerShell 7 runtime not installed^)
+echo Boot Update Cycle v2.5.95 ^(PowerShell 7 runtime not installed^)
 exit /b 0
 
 :ps7_required

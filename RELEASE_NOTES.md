@@ -1,9 +1,32 @@
 # Boot Update Cycle — Release Notes
 
-**Latest published version:** v2.5.94
+**Latest published version:** v2.5.95
 **Status:** Released
 
 ---
+
+## v2.5.95 (2026-11-15)
+
+Seven fixes from a review of real diagnostics bundles. The largest: one installer that never finished could hold a machine for about three and a half hours.
+
+- **A provider that hits its hard timeout is not started again in the same boot.** A Winget scope or package that runs to the 30-minute hard timeout now stops the cycle for manual attention. Before, each of the five same-boot recovery passes started it again and waited the full 30 minutes, while the log said "Will retry next boot". The messages now say what happens.
+- **A Winget package that fails the same way every cycle no longer stops every cycle.** boot-upd remembers the package, the scope, the exit code and the version on offer in `BootUpdateCycle-winget-known-failures.json` in the install folder. The package is still tried once per cycle. If it fails the same way for the same version it is listed as outstanding in the summary, and the cycle finishes without the extra verification pass and manual-attention stop. The record is dropped when the package installs, when Winget offers a different version, or when Winget stops offering it. Aggressive repair (`upd -ar`) is unchanged.
+- **npm is left for the signed-in user when the cycle runs as SYSTEM.** Global npm packages live in a user profile; as SYSTEM the phase failed with ENOENT and cost retry passes. It is now deferred the way Scoop and the AI tools already are.
+- **SSMS 21 is updated the same way as SSMS 22**, through Visual Studio Installer, with the installed build checked afterward. Other SSMS major versions are left alone and reported once per cycle as, for example, "SSMS 20.2 found. boot-upd updates SSMS 21 and 22 only, so this instance was not changed." The old message called them unsupported.
+- **`upd.cmd` replaces itself on one buffered line.** The step that swaps in a new `upd.cmd` ran across four lines of the file being replaced, so cmd.exe could resume reading the new file at the old position. Both self-replacement points are now single lines.
+- **Diagnostics bundles include `PowerShellRuntimeUpgrade.log`**, sanitized like the other logs, and the manifest's capture state comes from the last cycle event in the log. A cycle that stopped for manual attention or at a retry limit is reported as `manual-attention` or `limit-reached`, not as still active.
+- **The clipboard helper is skipped where there is no clipboard.** A cycle running as SYSTEM, or without an interactive session, no longer starts `clip.exe` and logs its exit code 1. The repair plan is on disk either way.
+
+Not changed: how soon a stuck installer is noticed. A rule based on the installer's CPU rate was tried and removed before release, because replayed against recorded runs it would have killed an install that took 12 minutes and then succeeded. A stuck installer still waits for the 30-minute hard timeout, once.
+
+### Testing
+
+Full results: [docs/validation-2.5.95.md](docs/validation-2.5.95.md).
+
+- Gates on the release branch: 782 Pester tests passed, 0 failed; the User/SYSTEM boundary and published-launcher upgrade gates passed.
+- Each fix has a test that failed before the change.
+- **Not run:** a multi-reboot lab row. Three of these changes alter what a cycle does across retry passes: the hard-timeout stop, the npm deferral and the Winget failure memory. They are covered by unit and process tests only.
+- **Not run:** an SSMS 21 update on a real machine.
 
 ## v2.5.94 (2026-11-14)
 
