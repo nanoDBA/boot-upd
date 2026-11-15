@@ -391,11 +391,14 @@ if ($StopAfterBootstrap) {
             }
             function Invoke-PwshEvidenceProbe {
                 param([string]$Path)
-                $probe = [ordered]@{ Path=$Path; Success=$false; Version=$null; PSHome=$null; ExitCode=$null }
+                $probe = [ordered]@{ Path=$Path; Success=$false; Version=$null; PSHome=$null; ExitCode=$null; Output=$null }
                 if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return [pscustomobject]$probe }
                 try {
                     $output = @(& $Path -NoLogo -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion.ToString() + "|" + $PSHOME' 2>&1)
                     $probe.ExitCode = $LASTEXITCODE
+                    if ($probe.ExitCode -ne 0) {
+                        $probe.Output = @($output | ForEach-Object { [string]$_ } | Select-Object -Last 8)
+                    }
                     $line = @($output | ForEach-Object { [string]$_ } | Where-Object { $_ -match '^\d+(?:\.\d+){1,3}\|.+$' } | Select-Object -Last 1)[0]
                     if ($probe.ExitCode -eq 0 -and $line -match '^(?<version>\d+(?:\.\d+){1,3})\|(?<home>.+)$') {
                         $probe.Version = $Matches.version
