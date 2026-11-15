@@ -158,6 +158,21 @@ Describe 'Trusted file write-mask honors real ACLs' -Tag 'RequiresAdmin' {
     BeforeAll {
         $administratorsSid = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
         $usersSid = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-545')
+
+        # The flag set at the top of this file exists only while Pester discovers tests. Set it
+        # again for the run, or BeforeEach never builds the ACL and the tests check the temp
+        # folder's inherited one.
+        $script:isElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).
+            IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+        # A file made by an elevated process is owned by Administrators only while UAC is on.
+        # With UAC off the owner is the user, which the resolver rightly distrusts, so the
+        # fixture states the owner instead of inheriting it from the test host's token.
+        function Set-TestHookOwner {
+            $hookAcl = Get-Acl -LiteralPath $hookPath
+            $hookAcl.SetOwner($administratorsSid)
+            Set-Acl -LiteralPath $hookPath -AclObject $hookAcl
+        }
     }
 
     BeforeEach {
@@ -176,6 +191,7 @@ Describe 'Trusted file write-mask honors real ACLs' -Tag 'RequiresAdmin' {
                 [Security.AccessControl.AccessControlType]::Allow
             ))
             Set-Acl -LiteralPath $testRoot -AclObject $acl
+            Set-TestHookOwner
         }
     }
 
@@ -234,6 +250,7 @@ Describe 'Trusted file write-mask honors real ACLs' -Tag 'RequiresAdmin' {
     It 'accepts the exact grant Set-BootUpdateInstallDirectoryAcl produces on the trust root' -Skip:(-not $script:isElevated) {
         Set-BootUpdateInstallDirectoryAcl -Path $testRoot
         Set-Content -LiteralPath $hookPath -Value '# trusted test hook' -Encoding utf8
+        Set-TestHookOwner
 
         Resolve-BootUpdateTrustedFile -Path $hookPath -TrustRoot $testRoot `
             -AllowedExtension @('.ps1') | Should -Be (Resolve-Path $hookPath).Path

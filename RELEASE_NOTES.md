@@ -1,9 +1,27 @@
 # Boot Update Cycle — Release Notes
 
-**Latest published version:** v2.5.93
+**Latest published version:** v2.5.94
 **Status:** Released
 
 ---
+
+## v2.5.94 (2026-11-14)
+
+boot-upd no longer removes the PowerShell 7.6 MSI. v2.5.93 installed the PowerShell 7.7 MSIX and then uninstalled the MSI, which deleted `C:\Program Files\PowerShell\7\pwsh.exe`. Anything that still named that file stopped working: a Windows Terminal window left open across the upgrade reported error 0x80070002 on its next new tab, and scheduled tasks, OpenSSH's default shell and scripts that call the old path had nothing to start.
+
+- **The 7.7 MSIX is installed beside an existing MSI.** `upd bootstrap` and the check after a finished cycle install the MSIX and leave the MSI, its PATH entry and its Microsoft Update package alone. Whatever pointed at the MSI keeps working, on PowerShell 7.6.
+- **Windows Terminal picks 7.7 by itself.** With both installed, a newly started Windows Terminal lists the MSIX as its "PowerShell" profile. A Terminal that was already open keeps its old list until it is closed and reopened.
+- **Removing the MSI is your decision.** Uninstall "PowerShell 7-x64" from Installed apps once nothing on the machine names the old path. boot-upd will not do it.
+- **A machine v2.5.93 already changed stays changed.** This release does not put the MSI back. If Windows Terminal reports 0x80070002 there, close every Terminal window and reopen it; the README has the details. Tasks and tools that name the old path need to be pointed at `pwsh.exe` again by hand.
+
+### Testing
+
+Full results: [docs/validation-2.5.94.md](docs/validation-2.5.94.md).
+
+- On a lab guest with the PowerShell 7.6.5 MSI and no MSIX, `upd bootstrap` installed the 7.7.0 MSIX and left the MSI installed. Both `pwsh.exe` files started from their own folders. No reboot and no update cycle.
+- With both installed on a lab guest, a newly started Windows Terminal opened PowerShell 7.7 from the MSIX.
+- Gates: 754 Pester tests passed, 0 failed; the User/SYSTEM boundary and published-launcher upgrade gates passed.
+- **Not run:** a multi-reboot lab row on this release. The change removes the uninstall step from the PowerShell installer and touches nothing in the cycle, the tasks or the reboot chain.
 
 ## v2.5.93 (2026-11-12)
 
