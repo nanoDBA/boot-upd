@@ -54,6 +54,8 @@ param(
     [string]$ModuleCachePath = '',
     [string]$ModuleCacheSha256 = '',
     [string]$ScreenCaptureScript = '',
+    <# Run upd bootstrap and collect runtime-install evidence without entering an update cycle. #>
+    [switch]$StopAfterBootstrap,
     <# Collect a deliberate saved-user wait as PARTIAL instead of idling until timeout.
        Resume-LabSavedUser.ps1 can then test the real sign-in continuation. #>
     [switch]$StopAtSavedUserWait
@@ -81,6 +83,34 @@ function Test-LabSavedUserWaitEvidence {
         $LogonOnlyVerified -and @($TaskNames).Count -eq 1 -and $TaskNames[0] -eq 'BootUpdateCycle' -and
         @($PrimaryTriggerTypes).Count -eq 1 -and $PrimaryTriggerTypes[0] -eq 'MSFT_TaskLogonTrigger')
 }
+
+function Test-LabBootstrapEvidence {
+    param(
+        [Parameter(Mandatory)]$Before,
+        [Parameter(Mandatory)]$After,
+        [Parameter(Mandatory)][bool]$UpgradeCompleted,
+        [Parameter(Mandatory)][bool]$BootChanged,
+        [Parameter(Mandatory)][bool]$CycleStarted
+    )
+    if (-not $UpgradeCompleted -or $BootChanged -or $CycleStarted) { return $false }
+    if (-not $Before.MsiVersion -or $Before.MsixVersion) { return $false }
+    if (-not $After.MsiVersion -or $After.MsiVersion -ne $Before.MsiVersion -or -not $After.MsixVersion) { return $false }
+    foreach ($runtime in @(
+        @{ Probe=$After.MsiPwshLaunch; Folder=$After.MsiFolder; InstalledVersion=$After.MsiVersion }
+        @{ Probe=$After.MsixPwshLaunch; Folder=$After.MsixFolder; InstalledVersion=$After.MsixVersion }
+    )) {
+        if (-not $runtime.Probe.Success -or -not $runtime.Probe.Version -or -not $runtime.Probe.PSHome -or -not $runtime.Folder) {
+            return $false
+        }
+        if (([string]$runtime.Probe.PSHome).TrimEnd('\') -ine ([string]$runtime.Folder).TrimEnd('\')) { return $false }
+        try {
+            $running = [version]$runtime.Probe.Version
+            $installed = [version]$runtime.InstalledVersion
+            if ($running.Major -ne $installed.Major -or $running.Minor -ne $installed.Minor -or $running.Build -ne $installed.Build) { return $false }
+        } catch { return $false }
+    }
+    return $true
+}
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'LabCredential.ps1')
 . (Join-Path $PSScriptRoot 'LabEvidence.ps1')
@@ -91,6 +121,9 @@ if (-not $GuestPassword) {
 $cred = New-Object System.Management.Automation.PSCredential($GuestUser,
         (ConvertTo-BootUpdLabSecureString $GuestPassword))
 if ($Row -notmatch '^[A-Za-z0-9][A-Za-z0-9_.-]*$') { throw 'Row must be a simple label, not a path.' }
+if ($StopAfterBootstrap -and ($Launcher -ne 'upd' -or $SystemContext -or $ArmReboots -gt 0 -or $InjectWhen -or $InjectAction -or $StopAtSavedUserWait)) {
+    throw 'StopAfterBootstrap requires Launcher upd and forbids SYSTEM, armed reboots, and injection.'
+}
 $SourceRoot = (Resolve-Path -LiteralPath $SourceRoot).Path.TrimEnd('\','/')
 if ($ModuleCachePath) {
     if ($ModuleCacheSha256 -notmatch '^[A-Fa-f0-9]{64}$') { throw 'Module cache requires an explicit SHA256.' }
@@ -134,7 +167,7 @@ $manifest = [ordered]@{
     HarnessSha256=(Get-FileHash $PSCommandPath).Hash
     Launcher=$Launcher; DeployArgs=$DeployArgs; ArmReboots=$ArmReboots
     SystemContext=[bool]$SystemContext; TimeoutMinutes=$TimeoutMinutes; SkipSync=[bool]$SkipSync
-    StopAtSavedUserWait=[bool]$StopAtSavedUserWait
+    StopAtSavedUserWait=[bool]$StopAtSavedUserWait; StopAfterBootstrap=[bool]$StopAfterBootstrap
     ModuleCacheSha256=$ModuleCacheSha256; InjectWhen=$InjectWhen; InjectionConfigured=[bool]$InjectAction
     SourceFiles=$sourceHashes
     InjectionAction=if ($InjectAction) { $InjectAction.ToString() } else { $null }
@@ -325,6 +358,70 @@ Invoke-Command -VMName $VMName -Credential $cred -ErrorAction Stop -ScriptBlock 
         }
     }
 } | Out-Null
+if ($StopAfterBootstrap) {
+    $readBootstrapInventory = {
+        param([bool]$ProbeLaunches)
+        $keys = @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                  'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*')
+        $msi = Get-ItemProperty -Path $keys -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -eq 'PowerShell 7-x64' -and [int]($_.WindowsInstaller -as [int]) -eq 1 } |
+            Sort-Object DisplayVersion -Descending | Select-Object -First 1
+        $packages = @(Get-AppxPackage -AllUsers -Name Microsoft.PowerShell -ErrorAction SilentlyContinue |
+            Where-Object PublisherId -eq '8wekyb3d8bbwe' | Sort-Object { [version]$_.Version } -Descending)
+        $provisioned = @(try { Get-AppxProvisionedPackage -Online -ErrorAction Stop |
+            Where-Object DisplayName -eq 'Microsoft.PowerShell' | Sort-Object { [version]$_.Version } -Descending } catch { @() })
+        $package = $packages | Select-Object -First 1
+        $provisionedPackage = $provisioned | Select-Object -First 1
+        $msiPath = Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'
+        $msiFolder = Split-Path -Parent $msiPath
+        $msixVersion = if ($package) { [string]$package.Version } elseif ($provisionedPackage) { [string]$provisionedPackage.Version } else { $null }
+        $msixFolder = if ($package) { [string]$package.InstallLocation } elseif ($provisionedPackage) { [string]$provisionedPackage.InstallLocation } else { $null }
+        $result = [ordered]@{
+            MsiVersion = if ($msi) { [string]$msi.DisplayVersion } else { $null }
+            MsixVersion = $msixVersion
+            MsiFolder = $msiFolder
+            MsixFolder = $msixFolder
+            MsiPwshExists = Test-Path -LiteralPath $msiPath
+            BootTimeUtc = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o')
+        }
+        if ($ProbeLaunches) {
+            if ($msixFolder -and -not (Get-AppxPackage -Name Microsoft.PowerShell -ErrorAction SilentlyContinue |
+                    Where-Object PublisherId -eq '8wekyb3d8bbwe')) {
+                Add-AppxPackage -RegisterByFamilyName -MainPackage Microsoft.PowerShell_8wekyb3d8bbwe -ErrorAction Stop
+            }
+            function Invoke-PwshEvidenceProbe {
+                param([string]$Path)
+                $probe = [ordered]@{ Path=$Path; Success=$false; Version=$null; PSHome=$null; ExitCode=$null }
+                if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return [pscustomobject]$probe }
+                try {
+                    $output = @(& $Path -NoLogo -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion.ToString() + "|" + $PSHOME' 2>&1)
+                    $probe.ExitCode = $LASTEXITCODE
+                    $line = @($output | ForEach-Object { [string]$_ } | Where-Object { $_ -match '^\d+(?:\.\d+){1,3}\|.+$' } | Select-Object -Last 1)[0]
+                    if ($probe.ExitCode -eq 0 -and $line -match '^(?<version>\d+(?:\.\d+){1,3})\|(?<home>.+)$') {
+                        $probe.Version = $Matches.version
+                        $probe.PSHome = $Matches.home
+                        $probe.Success = $true
+                    }
+                } catch { }
+                [pscustomobject]$probe
+            }
+            $result.MsiPwshLaunch = Invoke-PwshEvidenceProbe -Path $msiPath
+            $msixPath = if ($msixFolder) { Join-Path $msixFolder 'pwsh.exe' } else { $null }
+            $result.MsixPwshLaunch = Invoke-PwshEvidenceProbe -Path $msixPath
+        }
+        $cycleLog = 'C:\ProgramData\BootUpdateCycle\BootUpdateCycle.log'
+        $result.CycleStarted = [bool](@(if (Test-Path -LiteralPath $cycleLog) {
+            Get-Content -LiteralPath $cycleLog -ErrorAction SilentlyContinue | Where-Object { $_ -match 'BOOT UPDATE CYCLE (STARTED|RESUMED)' }
+        }).Count)
+        [pscustomobject]$result
+    }
+    $DeployArgs = 'bootstrap --no-update'
+    $bootstrapBefore = Invoke-Command -VMName $VMName -Credential $cred -ArgumentList $false -ScriptBlock $readBootstrapInventory
+    if (-not $bootstrapBefore.MsiVersion -or -not $bootstrapBefore.MsiPwshExists -or $bootstrapBefore.MsixVersion) {
+        throw 'StopAfterBootstrap requires a PowerShell 7 MSI-only checkpoint.'
+    }
+    Say ("MSI-only checkpoint verified: PowerShell {0}; no MSIX" -f $bootstrapBefore.MsiVersion)
+}
 if ($ArmReboots -gt 0) {
     Say "arming $ArmReboots real pending reboot(s)"
     Invoke-Command -VMName $VMName -Credential $cred -ArgumentList $ArmReboots -ScriptBlock {
@@ -354,7 +451,8 @@ if ($n -lt $limit -and $n -lt $features.Count) {
 <# An Interactive principal cannot run while nobody is signed in - the task just stays
    queued - so a no-user row has to launch as SYSTEM. That is also the context the
    updater's own BootUpdateCycleFallback task runs in, which is what such a row exercises. #>
-if ($SystemContext) { Say 'launching the cycle as SYSTEM (no interactive user)' }
+if ($StopAfterBootstrap) { Say 'launching upd bootstrap; no update cycle' }
+elseif ($SystemContext) { Say 'launching the cycle as SYSTEM (no interactive user)' }
 else { Say 'launching the cycle in the interactive session' }
 Invoke-Command -VMName $VMName -Credential $cred -ArgumentList $GuestUser, ([bool]$SystemContext), $DeployArgs, $Launcher -ScriptBlock {
     param($User, $AsSystem, $Extra, $Entry)
@@ -406,14 +504,87 @@ if ($launchProbe.State -ne 'Running' -and $launchProbe.Result -ne 0 -and $launch
     throw ("Deploy task did not start: LastTaskResult 0x{0:X8}, state {1}.{2}" -f $launchProbe.Result, $launchProbe.State, $hint)
 }
 if ($Launcher -eq 'upd') { Say ("guest PowerShell 7 present at launch: {0}" -f $launchProbe.HasPwsh) }
+$timelinePath = Join-Path $evidenceDir 'host-timeline.txt'
+function Add-Timeline { param([string]$Line) Add-Content -LiteralPath $timelinePath -Value $Line }
+if ($StopAfterBootstrap) {
+    Say 'waiting for the detached PowerShell upgrade to finish'
+    $bootstrapDeadline = (Get-Date).AddMinutes($TimeoutMinutes)
+    $upgradeCompleted = $false
+    $cycleStarted = $false
+    $taskResult = $launchProbe.Result
+    $quietSince = $null
+    while ((Get-Date) -lt $bootstrapDeadline) {
+        $status = Invoke-Command -VMName $VMName -Credential $cred -ErrorAction Stop -ScriptBlock {
+            $task = Get-ScheduledTask -TaskName 'Lab-RunDeploy' -ErrorAction SilentlyContinue
+            $result = (Get-ScheduledTaskInfo -TaskName 'Lab-RunDeploy' -ErrorAction SilentlyContinue).LastTaskResult
+            $upgradeLog = Join-Path $env:TEMP 'boot-upd-pwsh-upgrade.log'
+            $text = if (Test-Path -LiteralPath $upgradeLog) { Get-Content -LiteralPath $upgradeLog -Raw -ErrorAction SilentlyContinue } else { '' }
+            $cycleLog = 'C:\ProgramData\BootUpdateCycle\BootUpdateCycle.log'
+            $cycle = if (Test-Path -LiteralPath $cycleLog) { Select-String -LiteralPath $cycleLog -Pattern 'BOOT UPDATE CYCLE (STARTED|RESUMED)' -Quiet } else { $false }
+            [pscustomobject]@{
+                TaskState = [string]$task.State
+                TaskResult = $result
+                UpgradeCompleted = [bool]($text -match '(?m)^PowerShell \d+(?:\.\d+){1,3} -> \d+(?:\.\d+){1,3} installed\.')
+                UpgradeLogPresent = Test-Path -LiteralPath $upgradeLog
+                ActiveInstallers = @(Get-CimInstance Win32_Process | Where-Object {
+                    $_.Name -ieq 'powershell.exe' -and $_.CommandLine -match 'Install-PowerShell7\.ps1' -and $_.CommandLine -match '-Upgrade'
+                }).Count
+                CycleStarted = [bool]$cycle
+            }
+        }
+        $taskResult = $status.TaskResult
+        Add-Timeline ("{0} bootstrap task={1}/{2} upgrade-complete={3} installer-processes={4}" -f
+            (Get-Date -Format 'HH:mm:ss'), $status.TaskState, $status.TaskResult, $status.UpgradeCompleted, $status.ActiveInstallers)
+        if ($status.CycleStarted) { $cycleStarted = $true; break }
+        if ($status.UpgradeCompleted -and $status.ActiveInstallers -eq 0) { $upgradeCompleted = $true; break }
+        if ($status.TaskState -ne 'Running' -and $status.ActiveInstallers -eq 0 -and -not $status.UpgradeCompleted) {
+            if (-not $quietSince) { $quietSince = Get-Date }
+            elseif (((Get-Date) - $quietSince).TotalSeconds -ge 120) { break }
+        } else { $quietSince = $null }
+        Start-Sleep -Seconds 5
+    }
+
+    $bootstrapAfter = Invoke-Command -VMName $VMName -Credential $cred -ArgumentList $true -ScriptBlock $readBootstrapInventory
+    $bootChanged = $bootstrapBefore.BootTimeUtc -ne $bootstrapAfter.BootTimeUtc
+    $cycleStarted = $cycleStarted -or [bool]$bootstrapAfter.CycleStarted
+    $passed = Test-LabBootstrapEvidence -Before $bootstrapBefore -After $bootstrapAfter `
+        -UpgradeCompleted $upgradeCompleted -BootChanged $bootChanged -CycleStarted $cycleStarted
+    Invoke-Command -VMName $VMName -Credential $cred -ErrorAction SilentlyContinue -ScriptBlock {
+        $task = Get-ScheduledTask -TaskName 'Lab-RunDeploy' -ErrorAction SilentlyContinue
+        if ($task -and $task.State -ne 'Running') { Unregister-ScheduledTask -TaskName 'Lab-RunDeploy' -Confirm:$false -ErrorAction SilentlyContinue }
+    } | Out-Null
+    $summary = [pscustomobject]@{
+        Row = $Row
+        VM = $VMName
+        Checkpoint = $Checkpoint
+        Result = if ($passed) { 'PASS' } else { 'FAIL' }
+        Completed = [bool]$upgradeCompleted
+        SourceCommit = $manifest.SourceCommit
+        InitialMsiVersion = $bootstrapBefore.MsiVersion
+        InitialMsixVersion = $bootstrapBefore.MsixVersion
+        MsiVersion = $bootstrapAfter.MsiVersion
+        MsixVersion = $bootstrapAfter.MsixVersion
+        MsiFolder = $bootstrapAfter.MsiFolder
+        MsixFolder = $bootstrapAfter.MsixFolder
+        MsiPwshLaunch = $bootstrapAfter.MsiPwshLaunch
+        MsixPwshLaunch = $bootstrapAfter.MsixPwshLaunch
+        BootstrapTaskResult = $taskResult
+        BootstrapUpgradeCompleted = [bool]$upgradeCompleted
+        BootChanged = [bool]$bootChanged
+        UpdateCycleStarted = [bool]$cycleStarted
+        EvidenceDir = $evidenceDir
+    }
+    $summary | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $evidenceDir 'summary.json')
+    $summary
+    $manifest.Status = 'Collected'
+    return
+}
 Say 'monitoring'
 $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
 <# Append every poll line to the evidence file as it is produced. Accumulating the timeline
    in memory and writing it once at the end meant a row killed or timed out mid-run left no
    timeline at all, and nothing was tailable while the row ran. With this, Get-Content -Wait
    on one or several guests' host-timeline.txt is a live view that costs no agent at all. #>
-$timelinePath = Join-Path $evidenceDir 'host-timeline.txt'
-function Add-Timeline { param([string]$Line) Add-Content -LiteralPath $timelinePath -Value $Line }
 <# The guest's updater log, appended poll by poll as it grows. BootUpdateCycle.log in the
    evidence directory is still the authoritative copy, taken whole at collection time; this
    one exists for the rows that never get there. A guest that dies, hangs, or loses its
