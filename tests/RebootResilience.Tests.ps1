@@ -2572,6 +2572,17 @@ Describe 'Terminal Defender platform failure' {
 }
 
 Describe 'Behavioral completion disposition' {
+    It 'defers npm global updates to the signed-in user after a SYSTEM pass' {
+        $invokeSource | Should -Match 'Name=''Npm'';\s+Flag=''NpmDone'';\s+Key=''Npm'';\s+Skip=\[bool\]\$SkipNpm;\s+Defer=\$isSystemCtx;\s+UserCompletionDeferred=\$isSystemCtx;\s+Action=\{ Update-NpmPackages \}'
+        $invokeSource | Should -Match 'Name=''Pip'';\s+Flag=''PipDone'';\s+Key=''Pip'';\s+Skip=\[bool\]\$SkipPip;\s+UserCompletionDeferred=\$false;\s+Action=\{ Update-PipPackages \}'
+
+        $result = Resolve-BootUpdateCompletionDisposition -IncompletePhases @(
+            [pscustomobject]@{ Name='Npm'; UserCompletionDeferred=$true }
+        )
+        $result.Kind | Should -Be 'UserContext'
+        $result.Phases.Name | Should -Contain 'Npm'
+    }
+
     It 'retries ordinary incomplete phases before considering completion' {
         $result = Resolve-BootUpdateCompletionDisposition -IncompletePhases @(
             [pscustomobject]@{ Name='WindowsUpdate'; UserCompletionDeferred=$false },

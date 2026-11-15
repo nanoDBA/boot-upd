@@ -9290,10 +9290,11 @@ function Invoke-BootUpdateCycle {
        Defender uses MpCmdRun.exe, Office365 uses the ClickToRun service, PS modules are
        PSGallery file copies. Each entry includes an Action for staged-rollout compatibility
        (single-phase sequential execution uses the original function on the parent thread).
-       SYSTEM-context skips (Scoop, Vscode) are checked both here (Skip flag) and inside each Action. #>
+       SYSTEM-context deferrals (Npm, Scoop, Vscode) are checked here before their user-scoped
+       commands can run under the service account. Pip remains machine-PATH work. #>
     $parallelCohort = @(
-        @{ Name='Pip';               Flag='PipDone';               Key='Pip';               Skip=[bool]$SkipPip;                              Action={ Update-PipPackages } }
-        @{ Name='Npm';               Flag='NpmDone';               Key='Npm';               Skip=[bool]$SkipNpm;                              Action={ Update-NpmPackages } }
+        @{ Name='Pip';               Flag='PipDone';               Key='Pip';               Skip=[bool]$SkipPip; UserCompletionDeferred=$false; Action={ Update-PipPackages } }
+        @{ Name='Npm';               Flag='NpmDone';               Key='Npm';               Skip=[bool]$SkipNpm; Defer=$isSystemCtx; UserCompletionDeferred=$isSystemCtx; Action={ Update-NpmPackages } }
         @{ Name='Scoop';             Flag='ScoopDone';             Key='Scoop';             Skip=[bool]$SkipScoop; Defer=$isSystemCtx; UserCompletionDeferred=$isSystemCtx; Action={ Update-ScoopPackages } }
         @{ Name='AiTools';           Flag='AiToolsDone';           Key='AiTools';           Skip=[bool]$SkipAiTools; Defer=$isSystemCtx; UserCompletionDeferred=$isSystemCtx; Action={ Update-AiTools } }
         @{ Name='DotnetTools';       Flag='DotnetToolsDone';       Key='DotnetTools';       Skip=[bool]$SkipDotnetTools;                      Action={ Update-DotnetTools } }
