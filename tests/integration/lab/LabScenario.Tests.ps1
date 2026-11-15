@@ -19,7 +19,7 @@ Describe 'Lab scenario contracts' {
         $scenario.Mode | Should -Be 'hang'
         $scenario.RepeatCycles | Should -Be 1
         $scenario.WingetPath | Should -Be 'C:\Lab\boot-upd\tests\integration\lab\fixtures\bin'
-        $scenario.ModulePath | Should -BeNullOrEmpty
+        $scenario.ModulePath | Should -Be 'C:\Lab\boot-upd\tests\integration\lab\fixtures\modules'
     }
 
     It 'runs two repeated-failure cycles with Windows Update stubbed by a test module' {

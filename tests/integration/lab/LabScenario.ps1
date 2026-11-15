@@ -13,7 +13,7 @@ function Get-LabScenarioContract {
                 Mode = 'hang'
                 RepeatCycles = 1
                 WingetPath = "$fixtureRoot\bin"
-                ModulePath = $null
+                ModulePath = "$fixtureRoot\modules"
                 EvidenceFile = 'C:\ProgramData\BootUpdateCycle\LabWingetFixture.jsonl'
             }
         }
