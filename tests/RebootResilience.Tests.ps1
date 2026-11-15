@@ -5156,7 +5156,11 @@ Describe 'A suspended laptop does not have sleep charged to the provider timeout
         function Get-ProcessTreeActivity { param($ParentPid) $script:CpuSeconds += $script:CpuIncrement; [pscustomobject]@{ TotalCpuTime = [timespan]::FromSeconds($script:CpuSeconds); ProcessCount = 1; HandleCount = 10 } }
     }
 
-    It 'idle-times-out a live installer whose CPU rate stays below the activity threshold' {
+    <# A healthy MSI install and a stuck one look the same from here: the real work runs in
+       the Windows Installer service, outside the tree, while Winget waits at well under one
+       CPU second per minute. A CPU-rate idle rule killed a 12-minute install that succeeded
+       in the 2026-11 diagnostics replay, so the hard timeout bounds this case instead. #>
+    It 'does not idle-kill a live installer whose CPU only trickles while it waits' {
         $proc = Start-DisposableSleeper
         try {
             $script:CpuIncrement = 0.25 # 0.5 CPU seconds per simulated minute
@@ -5165,8 +5169,8 @@ Describe 'A suspended laptop does not have sleep charged to the provider timeout
             $result = Wait-ProcessWithIdleTimeout -Process $proc -Status 'INSTALLER//WAIT test' `
                 -IdleTimeoutMinutes 5 -HardTimeoutMinutes 30 -PollIntervalSeconds 0.2 -Clock $clock
 
-            $result.Reason | Should -Be 'IdleTimeout' -Because 'slow spinner CPU is not meaningful installer progress'
-            @($script:Logged | Where-Object { $_.Message -match '^IDLE TIMEOUT:' }).Count | Should -Be 1
+            $result.Reason | Should -Be 'HardTimeout' -Because 'a waiting installer cannot be told apart from a stuck one by CPU rate'
+            @($script:Logged | Where-Object { $_.Message -match '^IDLE TIMEOUT:' }).Count | Should -Be 0
         } finally {
             if (-not $proc.HasExited) { try { $proc.Kill($true) } catch {} }
             $proc.Dispose()

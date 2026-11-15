@@ -3842,10 +3842,7 @@ function Wait-ProcessWithIdleTimeout {
            callers must not set this. #>
         [Parameter(DontShow)][scriptblock]$Clock = { [datetime]::UtcNow }
     )
-    $startTime = & $Clock; $lastCpuActivity = $startTime; $finalCpu = [timespan]::Zero
-    $cpuActivityWindow = [timespan]::FromMinutes(1)
-    $cpuActivityThreshold = [timespan]::FromSeconds(1.25)
-    $cpuWindowStart = $startTime; $cpuWindowStartTime = [timespan]::Zero
+    $startTime = & $Clock; $lastCpuIncrease = $startTime; $lastCpuTime = [timespan]::Zero; $finalCpu = [timespan]::Zero
     $lastPollTime = $startTime
     $unobservedTree = $false
     $hardLimit = [timespan]::FromMinutes($HardTimeoutMinutes); $idleLimit = [timespan]::FromMinutes($IdleTimeoutMinutes)
@@ -3903,8 +3900,7 @@ function Wait-ProcessWithIdleTimeout {
         $pollGap = $now - $lastPollTime
         if ($pollGap.TotalSeconds -gt $suspendGapThresholdSeconds) {
             $startTime = $startTime.Add($pollGap)
-            $lastCpuActivity = $lastCpuActivity.Add($pollGap)
-            $cpuWindowStart = $cpuWindowStart.Add($pollGap)
+            $lastCpuIncrease = $lastCpuIncrease.Add($pollGap)
             Write-Log ("System was suspended for {0:N1} min during {1}; not charged to the timeout." -f $pollGap.TotalMinutes, $Status) -Level Warn
         }
         $lastPollTime = $now
@@ -3936,23 +3932,12 @@ function Wait-ProcessWithIdleTimeout {
                 $unobservedTree = $true
                 Write-Log "  Process tree for PID $($Process.Id) is not observable; holding the idle clock and relying on the ${HardTimeoutMinutes}m hard timeout." -Level Warn
             }
-            $lastCpuActivity = $now
-            $cpuWindowStart = $now
-            $cpuWindowStartTime = $activity.TotalCpuTime
+            $lastCpuIncrease = $now
         } else {
             $unobservedTree = $false
-            if ($activity.TotalCpuTime -lt $cpuWindowStartTime) {
-                $cpuWindowStart = $now
-                $cpuWindowStartTime = $activity.TotalCpuTime
-            }
-            if (($now - $cpuWindowStart) -ge $cpuActivityWindow) {
-                $cpuUsed = $activity.TotalCpuTime - $cpuWindowStartTime
-                if ($cpuUsed -ge $cpuActivityThreshold) { $lastCpuActivity = $now }
-                $cpuWindowStart = $now
-                $cpuWindowStartTime = $activity.TotalCpuTime
-            }
+            if ($activity.TotalCpuTime -gt $lastCpuTime) { $lastCpuTime = $activity.TotalCpuTime; $lastCpuIncrease = $now }
         }
-        $idleFor = $now - $lastCpuActivity
+        $idleFor = $now - $lastCpuIncrease
         if ($idleFor -ge $idleLimit) {
             Write-Log "IDLE TIMEOUT: PID $($Process.Id) idle $([math]::Round($idleFor.TotalMinutes,1))m (threshold: ${IdleTimeoutMinutes}m), final CPU=$([math]::Round($activity.TotalCpuTime.TotalSeconds,1))s. Killing." -Level Error
             Write-Log "  Tree at kill: $($activity.ProcessCount) processes, handles=$($activity.HandleCount)" -Level Warn
