@@ -7,8 +7,35 @@ BeforeAll {
         $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
         $node.Name -eq 'Test-LabBootstrapEvidence'
     }, $true)
+    $script:probeOutputFunction = $ast.Find({ param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'ConvertFrom-LabPwshProbeOutput'
+    }, $true)
     if ($script:bootstrapEvidenceFunction) {
         . ([scriptblock]::Create($script:bootstrapEvidenceFunction.Extent.Text))
+    }
+    if ($script:probeOutputFunction) {
+        . ([scriptblock]::Create($script:probeOutputFunction.Extent.Text))
+    }
+}
+
+Describe 'PowerShell launch probe output' {
+    It 'reads version and install folder from separate command output lines' {
+        $script:probeOutputFunction | Should -Not -BeNullOrEmpty
+        $probe = ConvertFrom-LabPwshProbeOutput -ExitCode 0 -Output @(
+            '7.7.0'
+            'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe'
+        )
+        $probe.Success | Should -BeTrue
+        $probe.Version | Should -Be '7.7.0'
+        $probe.PSHome | Should -Be 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe'
+    }
+
+    It 'keeps the error output when the runtime exits unsuccessfully' {
+        $probe = ConvertFrom-LabPwshProbeOutput -ExitCode 1 -Output @('ParserError: invalid command')
+        $probe.Success | Should -BeFalse
+        $probe.ExitCode | Should -Be 1
+        $probe.Output | Should -Contain 'ParserError: invalid command'
     }
 }
 

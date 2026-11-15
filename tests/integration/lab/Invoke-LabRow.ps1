@@ -111,6 +111,28 @@ function Test-LabBootstrapEvidence {
     }
     return $true
 }
+
+function ConvertFrom-LabPwshProbeOutput {
+    param(
+        [Parameter(Mandatory)][int]$ExitCode,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Output
+    )
+    $lines = @($Output | ForEach-Object { [string]$_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $probe = [ordered]@{ Success=$false; Version=$null; PSHome=$null; ExitCode=$ExitCode; Output=$null }
+    $versionIndex = -1
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match '^\d+(?:\.\d+){1,3}$') { $versionIndex = $i; break }
+    }
+    if ($ExitCode -eq 0 -and $versionIndex -ge 0 -and ($versionIndex + 1) -lt $lines.Count) {
+        $probe.Version = $lines[$versionIndex]
+        $probe.PSHome = $lines[$versionIndex + 1]
+        $probe.Success = -not [string]::IsNullOrWhiteSpace($probe.PSHome)
+    } else {
+        $probe.Output = @($lines | Select-Object -Last 8)
+    }
+    [pscustomobject]$probe
+}
+
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'LabCredential.ps1')
 . (Join-Path $PSScriptRoot 'LabEvidence.ps1')
@@ -394,18 +416,13 @@ if ($StopAfterBootstrap) {
                 $probe = [ordered]@{ Path=$Path; Success=$false; Version=$null; PSHome=$null; ExitCode=$null; Output=$null }
                 if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return [pscustomobject]$probe }
                 try {
-                    $output = @(& $Path -NoLogo -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion.ToString() + "|" + $PSHOME' 2>&1)
+                    $output = @(& $Path -NoLogo -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion.ToString(); $PSHOME' 2>&1)
                     $probe.ExitCode = $LASTEXITCODE
-                    if ($probe.ExitCode -ne 0) {
-                        $probe.Output = @($output | ForEach-Object { [string]$_ } | Select-Object -Last 8)
-                    }
-                    $line = @($output | ForEach-Object { [string]$_ } | Where-Object { $_ -match '^\d+(?:\.\d+){1,3}\|.+$' } | Select-Object -Last 1)[0]
-                    if ($probe.ExitCode -eq 0 -and $line -match '^(?<version>\d+(?:\.\d+){1,3})\|(?<home>.+)$') {
-                        $probe.Version = $Matches.version
-                        $probe.PSHome = $Matches.home
-                        $probe.Success = $true
-                    }
-                } catch { }
+                    $probe.Output = @($output | ForEach-Object { [string]$_ } | Select-Object -Last 8)
+                } catch {
+                    $probe.ExitCode = 1
+                    $probe.Output = @([string]$_)
+                }
                 [pscustomobject]$probe
             }
             $result.MsiPwshLaunch = Invoke-PwshEvidenceProbe -Path $msiPath
@@ -548,6 +565,13 @@ if ($StopAfterBootstrap) {
     }
 
     $bootstrapAfter = Invoke-Command -VMName $VMName -Credential $cred -ArgumentList $true -ScriptBlock $readBootstrapInventory
+    foreach ($property in 'MsiPwshLaunch','MsixPwshLaunch') {
+        $rawProbe = $bootstrapAfter.$property
+        $exitCode = if ($null -eq $rawProbe.ExitCode) { 1 } else { [int]$rawProbe.ExitCode }
+        $probe = ConvertFrom-LabPwshProbeOutput -ExitCode $exitCode -Output @($rawProbe.Output)
+        $probe | Add-Member -NotePropertyName Path -NotePropertyValue $rawProbe.Path
+        $bootstrapAfter.$property = $probe
+    }
     $bootChanged = $bootstrapBefore.BootTimeUtc -ne $bootstrapAfter.BootTimeUtc
     $cycleStarted = $cycleStarted -or [bool]$bootstrapAfter.CycleStarted
     $passed = Test-LabBootstrapEvidence -Before $bootstrapBefore -After $bootstrapAfter `
