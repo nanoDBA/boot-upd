@@ -100,6 +100,13 @@ BeforeAll {
           'Get-BootUpdateRetryTriggerTime',
           'ConvertTo-BootUpdatePrincipalSid',
           'Get-WingetInventoryPackageIds',
+          'Resolve-WingetKnownFailureInventory',
+          'Test-WingetKnownFailureRepeat',
+          'Get-WingetUpgradeInventory',
+          'Test-WingetInventoryComplete',
+          'Get-WingetKnownFailureRecords',
+          'Set-WingetKnownFailureRecords',
+          'Save-WingetKnownFailures',
           'Get-WingetOutputSummary',
           'Get-ChocolateyOutputSummary',
           'Test-BootUpdateAwsCliPackagePair',
@@ -120,6 +127,7 @@ BeforeAll {
           'Get-WingetDeferredInventoryRecords',
           'Write-WingetScopeSummary',
           'Save-BootUpdateWingetSuccessIds',
+          'Test-PackageExcluded',
           'Update-WingetPackages',
           'Test-PipFatalInterpreterEvidence',
           'Get-PipInterpreterAttentionDetail',
@@ -243,6 +251,295 @@ Describe 'Concise provider diagnostics' {
         $inventory.HeaderRecognized | Should -BeTrue
         $inventory.PackageIds | Should -Be @('Example.App')
         $inventory.MalformedRows | Should -Be 1
+        $inventory.PackageRecords[0].AvailableVersion | Should -Be '1.2.4'
+        $inventory.PackageRecords[0].InstalledVersion | Should -Be '1.2.3'
+    }
+
+    It 'rejects a Winget row truncated before its available version' {
+        $inventory = Get-WingetInventoryPackageIds -Lines @(
+            'Name                         Id                         Version Available Source',
+            '--------------------------------------------------------------------------------',
+            'Example App                  Example.App                1.2.3'
+        )
+
+        $inventory.PackageIds | Should -Be @('Example.App')
+        $inventory.MalformedRows | Should -Be 1
+        Test-WingetInventoryComplete -Inventory $inventory -ExitCode 0 | Should -BeFalse
+    }
+
+    It 'does not guess an offered version from a source column' {
+        $inventory = Get-WingetInventoryPackageIds -Lines @(
+            'Name                 Id                 Version Source',
+            '-------------------------------------------------------',
+            'Example App          Example.App        1.2.3   msstore'
+        )
+        $inventory.PackageRecords | Should -BeNullOrEmpty
+    }
+
+    It 'keeps explicit-upgrade rows out of the bulk upgrade inventory' {
+        $inventory = Get-WingetInventoryPackageIds -Lines @(
+            'Name                 Id                 Version Available Source',
+            '---------------------------------------------------------------',
+            'Routine App          Routine.App        1.0     1.1       winget',
+            'The following packages require explicit upgrade selection:',
+            'Name                 Id                 Version Available Source',
+            '---------------------------------------------------------------',
+            'Opt-in App           OptIn.App          1.0     1.1       winget'
+        )
+        $inventory.PackageIds | Should -Be @('Routine.App')
+    }
+
+    It 'ignores the explicit-targeting table when it is the only Winget upgrade table' {
+        $inventory = Get-WingetInventoryPackageIds -Lines @(
+            'The following packages have an upgrade available, but require explicit targeting for upgrade:',
+            'Name                 Id                 Version Available Source',
+            '---------------------------------------------------------------',
+            'Opt-in App           OptIn.App          1.0     1.1       winget'
+        )
+        $inventory.HeaderRecognized | Should -BeTrue
+        $inventory.ExplicitOnly | Should -BeTrue
+        $inventory.PackageIds | Should -BeNullOrEmpty
+        Test-WingetInventoryComplete -Inventory $inventory -ExitCode 0 | Should -BeFalse
+    }
+
+    It 'deduplicates IDs before running a targeted Winget pass' {
+        $inventory = Get-WingetInventoryPackageIds -Lines @(
+            'Name                 Id                 Version Available Source',
+            '---------------------------------------------------------------',
+            'Example App          Example.App        1.0     2.0       winget',
+            'Example App          Example.App        1.0     2.0       winget'
+        )
+        $inventory.PackageIds | Should -Be @('Example.App')
+        $winget = Get-FunctionText $invokeAst 'Update-WingetPackages'
+        $winget | Should -Match 'HashSet\[string\].*OrdinalIgnoreCase'
+    }
+
+    It 'accepts Winget empty-scope results and rejects partial source inventories as complete evidence' {
+        $empty = Get-WingetInventoryPackageIds -Lines @('No installed package found matching input criteria.')
+        Test-WingetInventoryComplete -Inventory $empty -ExitCode -1978335212 | Should -BeTrue
+        $noUpdates = Get-WingetInventoryPackageIds -Lines @('No packages need an upgrade.')
+        Test-WingetInventoryComplete -Inventory $noUpdates -ExitCode 0 | Should -BeTrue
+        $emptyWithSourceWarning = Get-WingetInventoryPackageIds -Lines @(
+            'Failed when searching source; results will not be included: winget',
+            'No installed package found matching input criteria.'
+        )
+        Test-WingetInventoryComplete -Inventory $emptyWithSourceWarning -ExitCode -1978335212 | Should -BeFalse
+
+        $partial = [pscustomobject]@{
+            HeaderRecognized=$true; MalformedRows=0; HasAvailableVersionColumn=$true
+            SourceWarnings=@('Failed when searching source; results will not be included: winget')
+        }
+        Test-WingetInventoryComplete -Inventory $partial -ExitCode 0 | Should -BeFalse
+    }
+
+    It 'keeps a known Winget failure outstanding only while the offered version is unchanged' {
+        $known = @([pscustomobject]@{ Scope='machine'; PackageId='Example.App'; FailureCode=1603; InstalledVersion='1.0'; AvailableVersion='2.0' })
+        $inventory = [pscustomobject]@{ PackageRecords=@([pscustomobject]@{ Id='Example.App'; InstalledVersion='1.0'; AvailableVersion='2.0' }) }
+        $same = Resolve-WingetKnownFailureInventory -Scope machine -Records $known -Inventory $inventory
+        $same.MatchingIds | Should -Be @('Example.App')
+        $same.RemainingRecords.Count | Should -Be 1
+        $same.Outstanding[0].FailureCode | Should -Be 1603
+
+        $changedInventory = [pscustomobject]@{ PackageRecords=@([pscustomobject]@{ Id='Example.App'; InstalledVersion='1.0'; AvailableVersion='2.1' }) }
+        $changed = Resolve-WingetKnownFailureInventory -Scope machine -Records $known -Inventory $changedInventory -EvidenceComplete
+        $changed.MatchingIds | Should -BeNullOrEmpty
+        $changed.RemainingRecords | Should -BeNullOrEmpty
+        $changed.ChangedIds | Should -Be @('Example.App')
+
+        $incomplete = Resolve-WingetKnownFailureInventory -Scope machine -Records $known -Inventory $inventory
+        $incomplete.RemainingRecords.Count | Should -Be 1
+        $incomplete.ChangedIds | Should -BeNullOrEmpty
+
+        $missingFromPartial = Resolve-WingetKnownFailureInventory -Scope machine -Records $known `
+            -Inventory ([pscustomobject]@{ PackageRecords=@() })
+        $missingFromPartial.RemainingRecords.Count | Should -Be 1
+        $missingFromPartial.MatchingIds | Should -BeNullOrEmpty
+    }
+
+    It 'matches a remembered Winget failure only for the same scope, package, code and offered version' {
+        $record = [pscustomobject]@{ Scope='machine'; PackageId='Example.App'; FailureCode=1603; AvailableVersion='2.0' }
+        $failure = [pscustomobject]@{ Scope='machine'; Id='Example.App'; Code=1603; ObservedVersion='2.0' }
+        Test-WingetKnownFailureRepeat -Failure $failure -Record $record -OfferedVersion '2.0' | Should -BeTrue
+        (Test-WingetKnownFailureRepeat -Failure ([pscustomobject]@{ Scope='machine'; Id='Example.App'; Code=1612; ObservedVersion='2.0' }) -Record $record -OfferedVersion '2.0') | Should -BeFalse
+        (Test-WingetKnownFailureRepeat -Failure ([pscustomobject]@{ Scope='user'; Id='Example.App'; Code=1603; ObservedVersion='2.0' }) -Record $record -OfferedVersion '2.0') | Should -BeFalse
+        (Test-WingetKnownFailureRepeat -Failure ([pscustomobject]@{ Scope='machine'; Id='Example.App'; Code=1603; ObservedVersion='2.1' }) -Record $record -OfferedVersion '2.0') | Should -BeFalse
+    }
+
+    It 'tries a remembered Winget failure once in a new cycle, then reports the same failure as outstanding' {
+        $script:PackageTimeoutMinutes = 5
+        $script:ExcludePatterns = @()
+        $script:IncludePatterns = @()
+        $script:AggressiveRepair = $false
+        $script:CurrentState = [pscustomobject]@{
+            WingetFailureSignature=''; WingetFailureRepeatCount=0; RebootCount=0; DeferredInventory=@()
+        }
+        $script:knownFailureLogs = [Collections.Generic.List[string]]::new()
+        $script:InstallDir = $TestDrive
+        $script:WingetKnownFailurePath = Join-Path $TestDrive 'known-repeat-next-cycle.json'
+        $script:WingetResolvedAbsentPath = Join-Path $TestDrive 'known-repeat-next-cycle-absent.json'
+        Set-WingetKnownFailureRecords -Records @([pscustomobject]@{
+            Scope='machine'; PackageId='Example.App'; FailureCode=1603
+            InstalledVersion='1.0'; AvailableVersion='2.0'
+        })
+        Mock Get-Command { [pscustomobject]@{ Source='C:\Program Files\WindowsApps\winget.exe' } } -ParameterFilter { $Name -eq 'winget' }
+        Mock Get-WingetUpgradeInventory {
+            return @{ Parsed=[pscustomobject]@{
+                HeaderRecognized=$true; EmptyInventory=$false; ExplicitOnly=$false; PackageIds=@('Example.App')
+                PackageRecords=@([pscustomobject]@{ Id='Example.App'; InstalledVersion='1.0'; AvailableVersion='2.0' })
+                HasAvailableVersionColumn=$true; SourceWarnings=@(); MalformedRows=0
+            }; ExitCode=0 }
+        }
+        Mock Write-ProviderTranscript { }
+        Mock Write-Log { $script:knownFailureLogs.Add($Message) }
+        Mock Invoke-PackageManagerWithTimeout {
+            if ($Name -eq 'Winget-user') {
+                return @{ Output=@('No installed package found matching input criteria'); TimedOut=$false; Failed=$false; ExitCode=0; RebootRequired=$false }
+            }
+            return @{
+                Output=@('Found Example App [Example.App] Version 2.0','Installer failed with exit code: 1603')
+                TimedOut=$false; Failed=$true; ExitCode=-1978335188; RebootRequired=$false
+            }
+        }
+
+        $result = Update-WingetPackages -Confirm:$false
+
+        $result.Success | Should -BeTrue -Because ($script:knownFailureLogs -join ' | ')
+        Should -Invoke Invoke-PackageManagerWithTimeout -Times 1 -Exactly -ParameterFilter { $Name -eq 'Winget-machine-Example.App' }
+        $result.TerminalFailure | Should -BeFalse
+        $script:CurrentWingetFailures | Should -BeNullOrEmpty
+        @(Get-WingetKnownFailureRecords).Count | Should -Be 1
+        @($script:CurrentState.DeferredInventory | Where-Object { $_.Scope -eq 'machine' -and $_.Kind -eq 'KnownFailure' }).Count | Should -Be 1
+        Should -Invoke Write-Log -Times 0 -Exactly -ParameterFilter { $Message -match 'partial failure, retry required' }
+        Should -Invoke Write-Log -Times 1 -Exactly -ParameterFilter { $Message -match 'repeated its remembered exit 1603.*without another automatic pass' }
+    }
+
+    It 'forgets a remembered Winget failure when the offered version changes' {
+        $script:PackageTimeoutMinutes = 5
+        $script:ExcludePatterns = @()
+        $script:IncludePatterns = @()
+        $script:AggressiveRepair = $false
+        $script:CurrentState = [pscustomobject]@{
+            WingetFailureSignature=''; WingetFailureRepeatCount=0; RebootCount=0; DeferredInventory=@()
+        }
+        $script:InstallDir = $TestDrive
+        $script:WingetKnownFailurePath = Join-Path $TestDrive 'known-version-change.json'
+        $script:WingetResolvedAbsentPath = Join-Path $TestDrive 'known-version-change-absent.json'
+        Set-WingetKnownFailureRecords -Records @([pscustomobject]@{
+            Scope='machine'; PackageId='Example.App'; FailureCode=1603
+            InstalledVersion='1.0'; AvailableVersion='2.0'
+        })
+        Mock Get-Command { [pscustomobject]@{ Source='C:\Program Files\WindowsApps\winget.exe' } } -ParameterFilter { $Name -eq 'winget' }
+        Mock Get-WingetUpgradeInventory {
+            return @{ Parsed=[pscustomobject]@{
+                HeaderRecognized=$true; EmptyInventory=$false; ExplicitOnly=$false; PackageIds=@('Example.App')
+                PackageRecords=@([pscustomobject]@{ Id='Example.App'; InstalledVersion='1.0'; AvailableVersion='2.1' })
+                HasAvailableVersionColumn=$true; SourceWarnings=@(); MalformedRows=0
+            }; ExitCode=0 }
+        }
+        Mock Write-ProviderTranscript { }
+        Mock Write-Log { }
+        Mock Invoke-PackageManagerWithTimeout {
+            if ($Name -eq 'Winget-user') {
+                return @{ Output=@('No installed package found matching input criteria'); TimedOut=$false; Failed=$false; ExitCode=0; RebootRequired=$false }
+            }
+            return @{
+                Output=@('Found Example App [Example.App] Version 2.1','Installer failed with exit code: 1603')
+                TimedOut=$false; Failed=$true; ExitCode=-1978335188; RebootRequired=$false
+            }
+        }
+
+        $result = Update-WingetPackages -Confirm:$false
+
+        $result.Success | Should -BeFalse
+        $script:CurrentWingetFailures.Count | Should -Be 1
+        @(Get-WingetKnownFailureRecords).Count | Should -Be 0
+        Should -Invoke Write-Log -Times 0 -Exactly -ParameterFilter { $Message -match 'repeated its remembered exit' }
+    }
+
+    It 'keeps an unexplained targeted Winget exit as a failed pass' {
+        $script:PackageTimeoutMinutes = 5
+        $script:ExcludePatterns = @('NoMatch*')
+        $script:IncludePatterns = @()
+        $script:AggressiveRepair = $false
+        $script:CurrentState = [pscustomobject]@{
+            WingetFailureSignature=''; WingetFailureRepeatCount=0; RebootCount=0; DeferredInventory=@()
+        }
+        $script:InstallDir = $TestDrive
+        $script:WingetKnownFailurePath = Join-Path $TestDrive 'known-unexplained-targeted.json'
+        $script:WingetResolvedAbsentPath = Join-Path $TestDrive 'known-unexplained-targeted-absent.json'
+        Set-WingetKnownFailureRecords -Records @([pscustomobject]@{
+            Scope='machine'; PackageId='Example.App'; FailureCode=1603
+            InstalledVersion='1.0'; AvailableVersion='2.0'
+        })
+        $global:bootUpdWingetInventoryReads = 0
+        Mock Get-Command { [pscustomobject]@{ Source='C:\Program Files\WindowsApps\winget.exe' } } -ParameterFilter { $Name -eq 'winget' }
+        Mock Get-WingetUpgradeInventory {
+            $global:bootUpdWingetInventoryReads++
+            if ($global:bootUpdWingetInventoryReads -eq 1) {
+                return @{ Parsed=[pscustomobject]@{
+                    HeaderRecognized=$true; EmptyInventory=$true; ExplicitOnly=$false; PackageIds=@(); PackageRecords=@()
+                    HasAvailableVersionColumn=$true; SourceWarnings=@(); MalformedRows=0
+                }; ExitCode=-1978335212 }
+            }
+            return @{ Parsed=[pscustomobject]@{
+                HeaderRecognized=$true; EmptyInventory=$false; ExplicitOnly=$false; PackageIds=@('Example.App')
+                PackageRecords=@([pscustomobject]@{ Id='Example.App'; InstalledVersion='1.0'; AvailableVersion='2.0' })
+                HasAvailableVersionColumn=$true; SourceWarnings=@(); MalformedRows=0
+            }; ExitCode=0 }
+        }
+        Mock Write-ProviderTranscript { }
+        Mock Write-Log { }
+        Mock Invoke-PackageManagerWithTimeout {
+            return @{ Output=@('unexpected output'); TimedOut=$false; Failed=$true; ExitCode=-1978335188; RebootRequired=$false }
+        }
+
+        $result = Update-WingetPackages -Confirm:$false
+
+        $result.Success | Should -BeFalse
+        $script:CurrentState.WingetFailureSignature | Should -Match 'targeted-unreconciled'
+        Should -Invoke Invoke-PackageManagerWithTimeout -Times 1 -Exactly -ParameterFilter { $Name -eq 'Winget-machine-Example.App' }
+        Remove-Variable -Name bootUpdWingetInventoryReads -Scope Global -ErrorAction SilentlyContinue
+    }
+
+    It 'round-trips known Winget failure records through an atomic sidecar' {
+        $script:WingetKnownFailurePath = Join-Path $TestDrive 'known-failures.json'
+        $records = @([pscustomobject]@{ Scope='machine'; PackageId='Example.App'; FailureCode=1603; InstalledVersion='1.0'; AvailableVersion='2.0' })
+        Set-WingetKnownFailureRecords -Records $records
+        $loaded = @(Get-WingetKnownFailureRecords)
+        $loaded.Count | Should -Be 1
+        $loaded[0].AvailableVersion | Should -Be '2.0'
+        $loaded[0].InstalledVersion | Should -Be '1.0'
+        $loaded[0].FailureCode | Should -Be 1603
+        Set-WingetKnownFailureRecords -Records @()
+        @(Get-WingetKnownFailureRecords).Count | Should -Be 0
+    }
+
+    It 'saves only persistent package failures with the attempted offered version' {
+        $script:WingetKnownFailurePath = Join-Path $TestDrive 'saved-known-failures.json'
+        Save-WingetKnownFailures -Failures @(
+            [pscustomobject]@{ Scope='machine'; Id='Transient.App'; Code=1; Text='getaddrinfo ENOTFOUND'; ObservedVersion='1.0'; AvailableVersion='2.0' },
+            [pscustomobject]@{ Scope='machine'; Id='Persistent.App'; Code=1603; Text='installer failed'; InstalledVersion='1.0'; AvailableVersion='2.0' }
+        )
+        $saved = @(Get-WingetKnownFailureRecords)
+        $saved.Count | Should -Be 1
+        $saved[0].PackageId | Should -Be 'Persistent.App'
+        $saved[0].FailureCode | Should -Be 1603
+        $saved[0].InstalledVersion | Should -Be '1.0'
+        $saved[0].AvailableVersion | Should -Be '2.0'
+    }
+
+    It 'does not let a failed known-failure write stop Winget recovery' {
+        $parentFile = Join-Path $TestDrive 'not-a-directory'
+        Set-Content -LiteralPath $parentFile -Value 'fixture'
+        $script:WingetKnownFailurePath = Join-Path $parentFile 'child\known-failures.json'
+        { Set-WingetKnownFailureRecords -Records @([pscustomobject]@{ PackageId='Example.App' }) } | Should -Not -Throw
+    }
+
+    It 'shows package identity and installer exit in the known-failure completion summary' {
+        $summary = Get-BootUpdateDeferredInventorySummary -Records @(
+            [pscustomobject]@{ Provider='Winget'; Scope='machine'; Kind='KnownFailure'; Count=1; Detail='Example.App version 2.0, exit 1603' }
+        )
+        $summary | Should -Match 'Example.App version 2.0, exit 1603'
     }
 
     It 'fails closed when targeted inventory contains no syntactically valid IDs' {
@@ -571,6 +868,8 @@ Describe 'Concise provider diagnostics' {
         $script:AggressiveRepair = $false
         $script:CurrentState = [pscustomobject]@{}
         $script:InstallDir = $TestDrive
+        $script:WingetKnownFailurePath = Join-Path $TestDrive 'no-known-failures-msi-1605.json'
+        Remove-Item -LiteralPath $script:WingetKnownFailurePath -Force -ErrorAction SilentlyContinue
         Mock Get-Command { [pscustomobject]@{ Source='C:\Program Files\WindowsApps\winget.exe' } } -ParameterFilter { $Name -eq 'winget' }
         Mock Write-ProviderTranscript { }
         Mock Write-Log { }
@@ -805,6 +1104,14 @@ Describe 'Concise provider diagnostics' {
         $winget | Should -Match 'refusing a duplicate --all mutation'
     }
 
+    It 'uses targeted inventory when prior terminal Winget failures are remembered' {
+        $winget = Get-FunctionText $invokeAst 'Update-WingetPackages'
+        $winget | Should -Match 'Get-WingetKnownFailureRecords'
+        $winget | Should -Match 'Where-Object Scope -eq \$scope'
+        $winget | Should -Match 'Resolve-WingetKnownFailureInventory'
+        $winget | Should -Match "Kind='KnownFailure'"
+    }
+
     It 'creates paste-ready remediation only from safe package identifiers' {
         Get-WingetRemediationCommand -PackageId 'JohnMacFarlane.Pandoc' |
             Should -Be 'winget install --id JohnMacFarlane.Pandoc -e --source winget --force --accept-source-agreements --accept-package-agreements'
@@ -822,6 +1129,27 @@ Describe 'Concise provider diagnostics' {
         (Complete-WingetFailureClassification -State $state -Failures @($failure)).TerminalFailure | Should -BeTrue
         $changed = [pscustomobject]@{ Name='iCUE'; Id='Corsair.iCUE.5'; Code=3221226525; Hex='0xC000041D' }
         (Complete-WingetFailureClassification -State $state -Failures @($changed)).TerminalFailure | Should -BeFalse
+    }
+
+    It 'does not carry a terminal failure streak across an offered-version change' {
+        $state = [pscustomobject]@{ RebootCount=0; WingetFailureSignature=''; WingetFailureRepeatCount=0 }
+        $first = [pscustomobject]@{ Name='App'; Scope='machine'; Id='Example.App'; Code=1603; ObservedVersion='2.0' }
+        (Complete-WingetFailureClassification -State $state -Failures @($first)).TerminalFailure | Should -BeFalse
+        $targetedRetry = [pscustomobject]@{ Name='App'; Scope='machine'; Id='Example.App'; Code=1603; ObservedVersion='2.0'; AvailableVersion='2.0' }
+        (Complete-WingetFailureClassification -State $state -Failures @($targetedRetry)).TerminalFailure | Should -BeTrue
+
+        $newOffer = [pscustomobject]@{ Name='App'; Scope='machine'; Id='Example.App'; Code=1603; ObservedVersion='2.1'; AvailableVersion='2.1' }
+        (Complete-WingetFailureClassification -State $state -Failures @($newOffer)).TerminalFailure | Should -BeFalse
+        $state.WingetFailureRepeatCount | Should -Be 1
+    }
+
+    It 'keeps user and machine failures in separate Winget repeat signatures' {
+        $state = [pscustomobject]@{ RebootCount=0; WingetFailureSignature=''; WingetFailureRepeatCount=0 }
+        $userFailure = [pscustomobject]@{ Name='App'; Scope='user'; Id='Example.App'; Code=1603; AvailableVersion='2.0' }
+        $machineFailure = [pscustomobject]@{ Name='App'; Scope='machine'; Id='Example.App'; Code=1603; AvailableVersion='2.0' }
+        (Complete-WingetFailureClassification -State $state -Failures @($userFailure)).TerminalFailure | Should -BeFalse
+        (Complete-WingetFailureClassification -State $state -Failures @($machineFailure)).TerminalFailure | Should -BeFalse
+        $state.WingetFailureRepeatCount | Should -Be 1
     }
 
     It 'registers each aggressive Winget repair signature only once' {
