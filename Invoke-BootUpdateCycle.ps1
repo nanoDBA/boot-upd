@@ -1148,7 +1148,7 @@ function Get-WingetInventoryPackageIds {
                 } else {
                     $malformedRows++
                 }
-            }
+            } elseif ($availableColStart -ge 0) { $malformedRows++ }
         } elseif (-not [string]::IsNullOrWhiteSpace($idField)) {
             $malformedRows++
         }
@@ -1172,7 +1172,7 @@ function Resolve-WingetKnownFailureInventory {
         [switch]$EvidenceComplete,
         [Parameter(Mandatory)][pscustomobject]$Inventory
     )
-    $skipped = [Collections.Generic.List[string]]::new()
+    $matching = [Collections.Generic.List[string]]::new()
     $remaining = [Collections.Generic.List[object]]::new()
     $changed = [Collections.Generic.List[string]]::new()
     foreach ($record in @($Records)) {
@@ -1182,7 +1182,7 @@ function Resolve-WingetKnownFailureInventory {
             [string]$offered[0].AvailableVersion -eq [string]$record.AvailableVersion -and
             [string]$offered[0].InstalledVersion -eq [string]$record.InstalledVersion
         if ($sameVersion) {
-            $skipped.Add([string]$record.PackageId)
+            $matching.Add([string]$record.PackageId)
             $remaining.Add($record)
         } elseif ($offered.Count) {
             if ($record.PackageId) { $changed.Add([string]$record.PackageId) }
@@ -1194,11 +1194,23 @@ function Resolve-WingetKnownFailureInventory {
         }
     }
     return [pscustomobject]@{
-        SkippedIds=$skipped.ToArray()
+        MatchingIds=$matching.ToArray()
         RemainingRecords=$remaining.ToArray()
         ChangedIds=$changed.ToArray()
         Outstanding=@($remaining | Where-Object { [string]$_.Scope -eq $Scope })
     }
+}
+
+function Test-WingetKnownFailureRepeat {
+    param(
+        [Parameter(Mandatory)][pscustomobject]$Failure,
+        [Parameter(Mandatory)][pscustomobject]$Record,
+        [Parameter(Mandatory)][string]$OfferedVersion
+    )
+    if ([string]$Failure.Scope -notin @('user','machine') -or [string]$Record.Scope -ne [string]$Failure.Scope) { return $false }
+    if ([string]$Record.PackageId -ine [string]$Failure.Id -or [long]$Record.FailureCode -ne [long]$Failure.Code) { return $false }
+    if ([string]::IsNullOrWhiteSpace($OfferedVersion) -or [string]$Record.AvailableVersion -ne $OfferedVersion) { return $false }
+    return ([string]$Failure.ObservedVersion -eq $OfferedVersion)
 }
 
 function Get-WingetUpgradeInventory {
@@ -1816,18 +1828,34 @@ function Write-WingetScopeSummary {
         [string]$WingetPath = '',
         [string]$TargetPackageId = '',
         [string]$AvailableVersion = '',
-        [string]$InstalledVersion = ''
+        [string]$InstalledVersion = '',
+        [AllowNull()][pscustomobject]$KnownFailureRecord
     )
     Write-ProviderTranscript -Provider Winget -Scope $Scope -Lines $Lines
     $summary = Get-WingetOutputSummary -Lines $Lines -TargetPackageId $TargetPackageId
-    $exitReconciled = Test-WingetExitReconciled -Summary $summary -ExitCode $ExitCode
+    foreach ($failure in $summary.Failures) {
+        $failure | Add-Member -NotePropertyName Scope -NotePropertyValue ([string](($Scope -replace '-retry$','') -split '/')[0]) -Force
+        if ($AvailableVersion) { $failure | Add-Member -NotePropertyName AvailableVersion -NotePropertyValue $AvailableVersion -Force }
+        if ($InstalledVersion) { $failure | Add-Member -NotePropertyName InstalledVersion -NotePropertyValue $InstalledVersion -Force }
+    }
+    $knownFailureRepeated = $false
+    if ($KnownFailureRecord) {
+        $matchingKnownFailure = @($summary.Failures | Where-Object {
+            Test-WingetKnownFailureRepeat -Failure $_ -Record $KnownFailureRecord -OfferedVersion $AvailableVersion
+        } | Select-Object -First 1)
+        if ($matchingKnownFailure.Count -gt 0) {
+            $knownFailureRepeated = $true
+            $summary.Failures = @($summary.Failures | Where-Object { $_ -ne $matchingKnownFailure[0] })
+        }
+    }
+    $exitReconciled = if ($knownFailureRepeated -and $null -ne $ExitCode -and [long]$ExitCode -notin @(0L,1641L,3010L)) {
+        $true
+    } else { Test-WingetExitReconciled -Summary $summary -ExitCode $ExitCode }
     $summary | Add-Member -NotePropertyName ExitReconciled -NotePropertyValue $exitReconciled -Force
+    $summary | Add-Member -NotePropertyName KnownFailureRepeated -NotePropertyValue $knownFailureRepeated -Force
     $collector = Get-Variable -Name CurrentWingetFailures -Scope Script -ErrorAction SilentlyContinue
     if ($collector -and $null -ne $collector.Value -and $summary.Failures.Count) {
         foreach ($failure in $summary.Failures) {
-            $failure | Add-Member -NotePropertyName Scope -NotePropertyValue ([string](($Scope -replace '-retry$','') -split '/')[0]) -Force
-            if ($AvailableVersion) { $failure | Add-Member -NotePropertyName AvailableVersion -NotePropertyValue $AvailableVersion -Force }
-            if ($InstalledVersion) { $failure | Add-Member -NotePropertyName InstalledVersion -NotePropertyValue $InstalledVersion -Force }
             $collector.Value.Add($failure)
         }
     }
@@ -1838,18 +1866,23 @@ function Write-WingetScopeSummary {
         $suffix = if ($summary.Pinned) { " ($($summary.Pinned) pinned)" } else { '' }
         Write-Log "Winget ${Scope}: no applicable upgrades$suffix."
     } elseif ($summary.Recognized) {
-        $level = if ($summary.Failures.Count -gt 0) { 'Warn' } else { 'Info' }
+        $reportedFailures = [int]$summary.Failures.Count + [int]$knownFailureRepeated
+        $level = if ($reportedFailures -gt 0) { 'Warn' } else { 'Info' }
         $staleSuffix = if ($stalePresentation.Unresolved) { ", $($stalePresentation.Unresolved) stale record(s) need attention" } else { '' }
         $blockedSuffix = if ($summary.ScopeBlocked.Count) { ", $($summary.ScopeBlocked.Count) blocked by elevation scope" } else { '' }
         $modifiedSuffix = if ($summary.PortableModified.Count) { ", $($summary.PortableModified.Count) portable package(s) modified" } else { '' }
         $downloadSuffix = if ($summary.DownloadUnavailable.Count) { ", $($summary.DownloadUnavailable.Count) installer download(s) unavailable" } else { '' }
-        Write-Log "Winget ${Scope}: $($summary.Attempted) attempted, $($summary.Updated) updated, $($summary.Failures.Count) failed$staleSuffix$blockedSuffix$modifiedSuffix$downloadSuffix." -Level $level
+        $knownFailureSuffix = if ($knownFailureRepeated) { ', 1 known failure left outstanding' } else { '' }
+        Write-Log "Winget ${Scope}: $($summary.Attempted) attempted, $($summary.Updated) updated, $reportedFailures failed$knownFailureSuffix$staleSuffix$blockedSuffix$modifiedSuffix$downloadSuffix." -Level $level
     } else {
         Write-Log "Winget ${Scope}: provider finished without recognizable English summary output; raw transcript retained for verification." -Level Warn
     }
     foreach ($failure in $summary.Failures) {
         $identity = if ($failure.Id) { "$($failure.Name) [$($failure.Id)]" } else { $failure.Name }
         Write-Log "Winget ${Scope}: $identity failed — $($failure.Summary) ($($failure.Code), $($failure.Hex))." -Level Warn
+    }
+    if ($knownFailureRepeated) {
+        Write-Log "Winget ${Scope}: $($KnownFailureRecord.PackageId) repeated its remembered exit $($KnownFailureRecord.FailureCode) for version $AvailableVersion; leaving it outstanding without another automatic pass." -Level Warn
     }
     foreach ($blocked in $summary.ScopeBlocked) {
         $identity = if ($blocked.Id) { "$($blocked.Name) [$($blocked.Id)]" } else { [string]$blocked.Name }
@@ -4594,11 +4627,6 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
                     $skipReason = Test-PackageExcluded -Name $pkgId
                     if ($skipReason) {
                         Write-Log "Skipped ($skipReason): $pkgId" -Level Info
-                    } elseif ($knownDecision.SkippedIds -contains $pkgId) {
-                        $knownRecord = @($knownDecision.Outstanding | Where-Object PackageId -ieq $pkgId | Select-Object -First 1)[0]
-                        if ($knownRecord) {
-                            $knownOutstanding.Add($knownRecord)
-                        }
                     } elseif ($successfulPackageIds.Contains($pkgId)) {
                         Write-Log "Winget ($scope): skipping $pkgId because it already succeeded in user scope during this run."
                     } else {
@@ -4625,9 +4653,27 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
                     $packageOffer = @($inventory.PackageRecords | Where-Object Id -ieq $pkgId | Select-Object -First 1)
                     $availableVersion = if ($packageOffer.Count) { [string]$packageOffer[0].AvailableVersion } else { '' }
                     $installedVersion = if ($packageOffer.Count) { [string]$packageOffer[0].InstalledVersion } else { '' }
+                    $knownRecord = if ($pkgId -in $knownDecision.MatchingIds) {
+                        @($knownDecision.Outstanding | Where-Object PackageId -ieq $pkgId | Select-Object -First 1)
+                    } else { @() }
+                    $knownRecordForSummary = if ($knownRecord.Count) { $knownRecord[0] } else { $null }
                     $packageSummary = Write-WingetScopeSummary -Scope "$scope/$pkgId" -TargetPackageId $pkgId `
                         -AvailableVersion $availableVersion -InstalledVersion $installedVersion `
+                        -KnownFailureRecord $knownRecordForSummary `
                         -Lines $pkgResult.Output -ExitCode $pkgResult.ExitCode
+                    if ($knownRecord.Count -gt 0) {
+                        if (@($packageSummary.SuccessfulIds | Where-Object { $_ -ieq $pkgId }).Count -gt 0) {
+                            $knownFailureRecords = @($knownFailureRecords | Where-Object {
+                                -not ($_.Scope -eq $scope -and $_.PackageId -ieq $pkgId)
+                            })
+                            $null = Set-WingetKnownFailureRecords -Records $knownFailureRecords
+                            Write-Log "Winget ($scope): clearing remembered failure for $pkgId after a successful upgrade."
+                        } elseif ($packageSummary.KnownFailureRepeated) {
+                            $knownOutstanding.Add($knownRecord[0])
+                        } elseif (@($packageSummary.Failures).Count -eq 0) {
+                            $knownOutstanding.Add($knownRecord[0])
+                        }
+                    }
                     $count += $packageSummary.Updated
                     $packageSummaries.Add($packageSummary)
                     foreach ($successfulId in @($packageSummary.SuccessfulIds)) { $null = $successfulPackageIds.Add($successfulId) }
@@ -4639,6 +4685,12 @@ if (`$null -ne `$LASTEXITCODE) { "BOOTUPDATE_NATIVE_EXIT|`$LASTEXITCODE" | Out-F
                             Write-Log "Winget ($scope): Hard timeout ($TimeoutMinutes min). Automatic retries stopped for this cycle; manual attention is required." -Level Error
                             break
                         }
+                    }
+                    if ($null -ne $pkgResult.ExitCode -and [long]$pkgResult.ExitCode -notin @(0L,1641L,3010L) -and
+                        -not $packageSummary.ExitReconciled -and @($packageSummary.Failures).Count -eq 0) {
+                        $anyTimeout = $true
+                        $executionFailures.Add("${scope}:$pkgId`:$($pkgResult.ExitCode):targeted-unreconciled")
+                        Write-Log "Winget ($scope): $pkgId exited $($pkgResult.ExitCode) without package evidence that accounts for the result; retry required." -Level Error
                     }
                 }
                 <# Per-package summaries use "<scope>/<id>" labels, which the scope summary
