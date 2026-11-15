@@ -167,6 +167,33 @@ Version: 10.20.30.40; peer 10.20.30.41
         $explicitActivity.Iteration | Should -Be 4
     }
 
+    It 'uses the latest cycle event and distinguishes attention and limit stops' {
+        $attentionText = @'
+[Info] BOOT UPDATE CYCLE STARTED | Pass: 2
+[Error] Persistent non-transient failure requires manual attention: Winget
+[Info] Automatic continuation tasks were removed and verified absent.
+'@
+        $attention = Get-BootUpdateDiagnosticActivity -Text $attentionText
+        $attention.ActiveAtCapture | Should -BeFalse
+        $attention.CaptureState | Should -Be 'manual-attention'
+
+        $limitText = @'
+[Info] BOOT UPDATE CYCLE STARTED | Pass: 3
+[Error] Same-boot recovery limit 5 reached; incomplete phases: Winget
+'@
+        $limit = Get-BootUpdateDiagnosticActivity -Text $limitText
+        $limit.ActiveAtCapture | Should -BeFalse
+        $limit.CaptureState | Should -Be 'limit-reached'
+
+        $resumedText = @'
+[Info] BOOT UPDATE CYCLE COMPLETE
+[Info] BOOT UPDATE CYCLE RESUMED | Pass: 4
+'@
+        $resumed = Get-BootUpdateDiagnosticActivity -Text $resumedText
+        $resumed.ActiveAtCapture | Should -BeTrue
+        $resumed.CaptureState | Should -Be 'active-at-capture'
+    }
+
     It 'exports a completed run with a parallel-cohort banner to a manifest with Phase null and a valid Iteration, not "s ran" (-vla0)' {
         # Full pipeline regression for -vla0's exact reported symptom: a real
         # completed bundle whose manifest.json showed Phase="s ran" and
@@ -241,6 +268,7 @@ Version: 10.20.30.40; peer 10.20.30.41
 '@
         Set-Content (Join-Path $source 'BootUpdateCycle.providers.20260721-010203.log') '[Winget] alice@acme.example 192.168.10.4'
         Set-Content (Join-Path $source 'BootUpdateCycle.aws.log') '[AWS] E:\OneDrive\ACME Holdings\PowerShell\Modules'
+        Set-Content (Join-Path $source 'PowerShellRuntimeUpgrade.log') '[Info] PowerShell MSI 7.6 MSIX 7.7; installer path C:\Private\runtime-installer.exe'
         Set-Content (Join-Path $source 'BootUpdateCycle-winget-quarantine.json') '[{"PackageId":"Corsair.iCUE.5","UnpinCommand":"winget pin remove --id Corsair.iCUE.5 -e --disable-interactivity"}]'
         Set-Content (Join-Path $source 'BootUpdateCycle-winget-resolved-absent.json') '[{"SchemaVersion":2,"PackageId":"Microsoft.WindowsPCHealthCheck","Scope":"machine","FailureCode":1605,"ObservedVersion":"4.0","OutcomeKey":"microsoft.windowspchealthcheck|machine|1605|4.0|msi-unknown-product","Evidence":"MSI_ERROR_UNKNOWN_PRODUCT"}]'
         $redactions = @('ACME','Alice','BUILD-PC','acme.example','ACME Holdings')
@@ -260,6 +288,8 @@ Version: 10.20.30.40; peer 10.20.30.41
         $safe | Should -Match 'BootUpdateCycle\.providers\.20260721-010203\.log'
         $safe | Should -Match 'BootUpdateCycle-winget-quarantine\.json'
         $safe | Should -Match 'BootUpdateCycle-winget-resolved-absent\.json'
+        $safe | Should -Match 'PowerShellRuntimeUpgrade\.log'
+        $safe | Should -Match 'PowerShell MSI 7\.6 MSIX 7\.7'
         $safe | Should -Match 'winget pin remove --id Corsair\.iCUE\.5'
         $safe | Should -Not -Match 'ACME|Alice|BUILD-PC|acme\.example|C:\\|E:\\|192\.168\.10\.4'
         $manifest = Get-Content (Join-Path $expanded 'manifest.json') -Raw | ConvertFrom-Json
