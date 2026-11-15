@@ -13,6 +13,16 @@ BeforeAll {
 }
 
 Describe 'Lab scenario contracts' {
+    It 'persists fixture mode, evidence path, and Winget PATH in the guest machine environment for continuations' {
+        $harness = Get-Content (Join-Path $PSScriptRoot 'Invoke-LabRow.ps1') -Raw
+
+        $harness | Should -Match 'SetEnvironmentVariable\(''BOOTUPD_LAB_WINGET_MODE''.*?''Machine''\)'
+        $harness | Should -Match 'SetEnvironmentVariable\(''BOOTUPD_LAB_FIXTURE_LOG''.*?''Machine''\)'
+        $harness | Should -Match 'SetEnvironmentVariable\(''Path''.*?''Machine''\)'
+        $harness | Should -Match '(?s)\$FixturePath.*\$machinePath'
+        $harness | Should -Match 'PackageTimeoutMinutes 1 -SkipWindowsUpdate'
+    }
+
     It 'limits the hard-timeout scenario to one pass with a fake Winget command' {
         $scenario = Get-LabScenarioContract -Scenario HardTimeout
 

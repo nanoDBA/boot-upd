@@ -55,7 +55,8 @@ param(
     [string]$ModuleCacheSha256 = '',
     [string]$ScreenCaptureScript = '',
     <# Deterministic provider fixtures for repeatable lifecycle scenarios. Fixtures are test-only
-       and their environment overrides exist only in the scheduled launch process. #>
+       and their environment overrides are written to the disposable guest machine environment
+       so SYSTEM continuation tasks see the same fake provider after a reboot. #>
     [ValidateSet('None','HardTimeout','RepeatedWingetFailure')][string]$LabScenario = 'None',
     <# Run upd bootstrap and collect runtime-install evidence without entering an update cycle. #>
     [switch]$StopAfterBootstrap,
@@ -154,7 +155,7 @@ if ($StopAfterBootstrap -and ($Launcher -ne 'upd' -or $SystemContext -or $ArmReb
 if ($LabScenario -ne 'None') {
     if ($Launcher -ne 'deploy') { throw 'Lab provider scenarios require Launcher deploy so they exercise this source tree.' }
     if ($DeployArgs -match '(?i)-PackageTimeoutMinutes\s+') { throw 'Lab provider scenarios set their own short PackageTimeoutMinutes.' }
-    $DeployArgs = ($DeployArgs + ' -PackageTimeoutMinutes 1').Trim()
+    $DeployArgs = ($DeployArgs + ' -PackageTimeoutMinutes 1 -SkipWindowsUpdate').Trim()
 }
 $SourceRoot = (Resolve-Path -LiteralPath $SourceRoot).Path.TrimEnd('\','/')
 if ($ModuleCachePath) {
@@ -408,6 +409,16 @@ if ($LabScenario -ne 'None') {
             throw 'The Windows Update fixture was not staged in the guest module path.'
         }
     } | Out-Null
+    Invoke-Command -VMName $VMName -Credential $cred -ArgumentList $scenario.Mode, $scenario.EvidenceFile, $scenario.WingetPath -ErrorAction Stop -ScriptBlock {
+        param($Mode, $FixtureLog, $FixturePath)
+        $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+        $pathEntries = @($machinePath -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        if ($pathEntries -notcontains $FixturePath) { $machinePath = (@($FixturePath) + $pathEntries) -join ';' }
+        [Environment]::SetEnvironmentVariable('BOOTUPD_LAB_WINGET_MODE', $Mode, 'Machine')
+        [Environment]::SetEnvironmentVariable('BOOTUPD_LAB_FIXTURE_LOG', $FixtureLog, 'Machine')
+        [Environment]::SetEnvironmentVariable('Path', $machinePath, 'Machine')
+        [pscustomobject]@{ FixtureMode=$Mode; FixtureLog=$FixtureLog; FixturePathFirst=($machinePath -split ';')[0] }
+    } | ConvertTo-Json -Compress | Set-Content (Join-Path $evidenceDir 'fixture-machine-environment.json')
 }
 if ($StopAfterBootstrap) {
     $readBootstrapInventory = {

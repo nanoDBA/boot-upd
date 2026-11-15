@@ -98,10 +98,11 @@ checkpoint restore removes it after the row.
 
 `Invoke-LabRow.ps1 -LabScenario RepeatedWingetFailure` uses the same fake provider to offer a
 test package at a fixed version and return the same installer error. It runs two cycles on
-the same restored guest, while a test-only `PSWindowsUpdate` module returns an empty inventory.
-This keeps Windows Update out of the scenario. The evidence folder includes the fixture
-command log and the persisted Winget failure memory. The PATH and module-path overrides live
-only in the scheduled task process; the guest's machine and user environment are not changed.
+the same restored guest. The harness sets `-SkipWindowsUpdate`, so Windows Update does no
+discovery, download, or install work during the scenario. The fake Winget path, mode, and log
+location are written to the disposable guest's machine environment so SYSTEM continuation
+tasks still find the fixture after a reboot. Restoring the checkpoint removes those changes.
+The evidence folder includes the fixture command log and the persisted Winget failure memory.
 
 Both scenarios use `-Launcher deploy`, so the orchestrator hash is still checked against the
 pinned source tree. The fixtures are under `fixtures/` and run only when a scenario is named.
