@@ -515,21 +515,31 @@ exit 29
         $tools = Join-Path $root 'tools'
         $null = New-Item -ItemType Directory -Path $tools
         Copy-Item $cmdPath (Join-Path $root 'upd.cmd')
+        Copy-Item -LiteralPath $runtimeHelperPath -Destination $root
         @'
 param([Parameter(ValueFromRemainingArguments)][string[]]$Arguments)
 "launcher reached: $($Arguments -join ' ')"
 '@ | Set-Content -LiteralPath (Join-Path $tools 'Invoke-UpdLauncher.ps1') -Encoding utf8
         $priorActive = $env:UPD_TRAMPOLINE_ACTIVE
         $priorPath = $env:UPD_TRAMPOLINE_PATH
+        $priorLocalAppData = $env:LocalAppData
+        $priorProgramFiles = $env:ProgramFiles
+        $priorSearchPath = $env:PATH
         try {
             $env:UPD_TRAMPOLINE_ACTIVE = '1'
             $env:UPD_TRAMPOLINE_PATH = Join-Path $TestDrive 'some-other-process.cmd'
+            $env:LocalAppData = Join-Path $TestDrive 'no-user-alias'
+            $env:ProgramFiles = Join-Path $TestDrive 'no-machine-installs'
+            $env:PATH = '{0};{1}' -f $PSHOME,(Join-Path $env:SystemRoot 'System32')
             $output = & cmd.exe /d /c "`"$(Join-Path $root 'upd.cmd')`" help" 2>&1
             $LASTEXITCODE | Should -Be 0
             ($output -join "`n") | Should -Match 'launcher reached: help'
         } finally {
             $env:UPD_TRAMPOLINE_ACTIVE = $priorActive
             $env:UPD_TRAMPOLINE_PATH = $priorPath
+            $env:LocalAppData = $priorLocalAppData
+            $env:ProgramFiles = $priorProgramFiles
+            $env:PATH = $priorSearchPath
         }
     }
 
