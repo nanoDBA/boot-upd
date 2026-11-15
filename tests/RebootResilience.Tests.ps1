@@ -53,6 +53,7 @@ BeforeAll {
         'Stop-BootUpdateAtRebootLimit',
         'Stop-BootUpdateAtRetryLimit',
         'Update-BootUpdateStagedRetryCount',
+        'Test-BootUpdateClipboardContext',
         'Get-NextMaintenanceWindowStart',
         'Get-WindowsUpdateVerificationScope',
         'Get-WindowsUpdateOfferScanScriptBlock',
@@ -1262,6 +1263,38 @@ Describe 'Concise provider diagnostics' {
             Should -BeFalse
         $fake.Killed | Should -BeTrue
         $fake.Disposed | Should -BeTrue
+    }
+
+    It 'skips clipboard access quietly when the current context has no interactive clipboard' {
+        Mock Test-BootUpdateClipboardContext { $false }
+        Mock Write-Log { }
+        $factoryCalled = $false
+        $processFactory = { $factoryCalled = $true; throw 'clipboard process must not be started' }.GetNewClosure()
+
+        Set-BootUpdateClipboardText -Value 'C:\repair-plan.txt' -ProcessFactory $processFactory |
+            Should -BeFalse
+
+        $factoryCalled | Should -BeFalse
+        Assert-MockCalled Write-Log -Times 0 -Exactly
+    }
+
+    It 'allows clipboard access only for an interactive non-SYSTEM identity' {
+        Test-BootUpdateClipboardContext -IdentitySid 'S-1-5-18' -UserInteractive $true | Should -BeFalse
+        Test-BootUpdateClipboardContext -IdentitySid 'S-1-5-21-1-2-3-1001' -UserInteractive $false | Should -BeFalse
+        Test-BootUpdateClipboardContext -IdentitySid 'S-1-5-21-1-2-3-1001' -UserInteractive $true | Should -BeTrue
+    }
+
+    It 'keeps clipboard-context detection failures from failing repair-plan handling' {
+        Mock Test-BootUpdateClipboardContext { throw 'context lookup failed' }
+        Mock Write-Log { }
+        $factoryCalled = $false
+        $processFactory = { $factoryCalled = $true; throw 'clipboard process must not be started' }.GetNewClosure()
+
+        { Set-BootUpdateClipboardText -Value 'C:\repair-plan.txt' -ProcessFactory $processFactory } |
+            Should -Not -Throw
+
+        $factoryCalled | Should -BeFalse
+        Assert-MockCalled Write-Log -Times 0 -Exactly
     }
 
     It 'reports a durable repair plan even when clipboard delivery is unavailable' {

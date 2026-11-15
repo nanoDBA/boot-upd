@@ -3765,6 +3765,14 @@ function Stop-BootUpdateForManualAttention {
     )
 }
 
+function Test-BootUpdateClipboardContext {
+    param(
+        [string]$IdentitySid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value,
+        [bool]$UserInteractive = [Environment]::UserInteractive
+    )
+    return $UserInteractive -and $IdentitySid -ne 'S-1-5-18'
+}
+
 function Set-BootUpdateClipboardText {
     <# Clipboard APIs can block indefinitely in a SYSTEM or disconnected session.
        Use the native helper in a bounded child process and make clipboard delivery
@@ -3775,6 +3783,11 @@ function Set-BootUpdateClipboardText {
         [Parameter(DontShow)][scriptblock]$ProcessFactory
     )
     $process = $null
+    try {
+        if (-not (Test-BootUpdateClipboardContext)) { return $false }
+    } catch {
+        return $false
+    }
     try {
         if ($ProcessFactory) {
             $process = & $ProcessFactory
