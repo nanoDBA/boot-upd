@@ -159,9 +159,23 @@ function Copy-BootUpdateDiagnosticSnapshot {
 
 function Get-BootUpdateDiagnosticActivity {
     param([Parameter(Mandatory)][string]$Text)
-    $completed = $Text -match '(?im)^\s*(?:\[[^\]]+\]\s*)*BOOT UPDATE CYCLE COMPLETE\b'
-    $started = $Text -match '(?im)^\s*(?:\[[^\]]+\]\s*)*BOOT UPDATE CYCLE (?:STARTED|RESUMED)\b'
-    $active = if ($completed) { $false } elseif ($started) { $true } else { $null }
+    $active = $null
+    $captureState = 'unknown'
+    foreach ($line in ($Text -split '\r?\n')) {
+        if ($line -match '(?i)\bBOOT UPDATE CYCLE (?:STARTED|RESUMED)\b') {
+            $active = $true
+            $captureState = 'active-at-capture'
+        } elseif ($line -match '(?i)\bBOOT UPDATE CYCLE COMPLETE\b') {
+            $active = $false
+            $captureState = 'completed'
+        } elseif ($line -match '(?i)\bPersistent non-transient failure requires manual attention\b|\bManual-attention checkpoint remains stopped\b') {
+            $active = $false
+            $captureState = 'manual-attention'
+        } elseif ($line -match '(?i)\b(?:No-progress reboot|Same-boot recovery) limit\b.*\b(?:reached|exceeded|stopped)\b') {
+            $active = $false
+            $captureState = 'limit-reached'
+        }
+    }
     $phase = $null
     $iteration = $null
     $phaseMatches = [regex]::Matches(
@@ -174,7 +188,7 @@ function Get-BootUpdateDiagnosticActivity {
         '(?im)(?:^|\|)\s*(?:\[[^\]]+\]\s*)*(?:Pass|Iteration)\s*[:=]\s*(?<value>\d+)\b'
     )
     if ($iterationMatches.Count -gt 0) { $iteration = [int]$iterationMatches[$iterationMatches.Count - 1].Groups['value'].Value }
-    return [pscustomobject]@{ ActiveAtCapture=$active; Phase=$phase; Iteration=$iteration }
+    return [pscustomobject]@{ ActiveAtCapture=$active; CaptureState=$captureState; Phase=$phase; Iteration=$iteration }
 }
 
 function Get-BootUpdateDiagnosticCurrentRunText {
@@ -351,7 +365,7 @@ if (-not (Test-Path -LiteralPath $OutputDirectory)) {
 
 $sensitive = @(Get-BootUpdateSensitiveValues -Additional $AdditionalRedaction)
 $logs = @(Get-ChildItem -LiteralPath $SourceDirectory -File -ErrorAction Stop |
-    Where-Object { $_.Name -match '^BootUpdateCycle(?:\.(?:providers|aws))?(?:\.\d{8}-\d{6})?\.log$' -or $_.Name -in @('BootUpdateCycle-repair-plan.txt','BootUpdateCycle-winget-quarantine.json','BootUpdateCycle-winget-resolved-absent.json','BootUpdateCycle.wu-assessment.json','BootUpdateCycle.pending-cleanup.json') } |
+    Where-Object { $_.Name -match '^BootUpdateCycle(?:\.(?:providers|aws))?(?:\.\d{8}-\d{6})?\.log$' -or $_.Name -in @('PowerShellRuntimeUpgrade.log','BootUpdateCycle-repair-plan.txt','BootUpdateCycle-winget-quarantine.json','BootUpdateCycle-winget-resolved-absent.json','BootUpdateCycle.wu-assessment.json','BootUpdateCycle.pending-cleanup.json') } |
     Sort-Object LastWriteTimeUtc)
 if (-not $logs.Count) { throw 'No Boot Update Cycle log files were found to export.' }
 
@@ -385,7 +399,7 @@ try {
     }
     $currentRunText = if ($coreText) { Get-BootUpdateDiagnosticCurrentRunText -Text $coreText } else { $null }
     $activity = if ($currentRunText) { Get-BootUpdateDiagnosticActivity -Text $currentRunText } else {
-        [pscustomobject]@{ ActiveAtCapture=$null; Phase=$null; Iteration=$null }
+        [pscustomobject]@{ ActiveAtCapture=$null; CaptureState='unknown'; Phase=$null; Iteration=$null }
     }
     <# Prefer the evidence sidecar. Log parsing is retained solely for bundles captured
        before the sidecar existed, and those now say so - unknown-legacy-log - instead of
@@ -403,7 +417,7 @@ try {
         }
     }
     $snapshotComplete = @($sourceRecords | Where-Object { -not $_.Stable }).Count -eq 0
-    $captureState = if (-not $snapshotComplete) { 'unstable-snapshot' } elseif ($activity.ActiveAtCapture -eq $true) { 'active-at-capture' } elseif ($activity.ActiveAtCapture -eq $false) { 'completed' } else { 'unknown' }
+    $captureState = if (-not $snapshotComplete) { 'unstable-snapshot' } else { $activity.CaptureState }
     $sanitizedPath = Join-Path $stage 'BootUpdateCycle.sanitized.log'
     [IO.File]::WriteAllText($sanitizedPath, ($sections -join "`r`n`r`n"), [Text.UTF8Encoding]::new($true))
     $manifest = [ordered]@{
