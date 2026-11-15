@@ -89,7 +89,10 @@ Describe 'Lab scenario contracts' {
         $module = Import-Module $manifest -Force -PassThru
         try {
             @(Get-WindowsUpdate -AcceptAll -Download).Count | Should -Be 0
-            (Get-Content -LiteralPath $env:BOOTUPD_LAB_FIXTURE_LOG -Raw | ConvertFrom-Json).Provider | Should -Be 'WindowsUpdate'
+            @(Get-WindowsUpdate -AcceptAll -Install -Confirm:$false).Count | Should -Be 0
+            $records = @(Get-Content -LiteralPath $env:BOOTUPD_LAB_FIXTURE_LOG | ForEach-Object { $_ | ConvertFrom-Json })
+            $records.Provider | Should -Be @('WindowsUpdate', 'WindowsUpdate')
+            $records.Install | Should -Be @($false, $true)
         } finally {
             Remove-Module $module.Name -Force
             if ($null -eq $oldLog) { Remove-Item Env:BOOTUPD_LAB_FIXTURE_LOG -ErrorAction SilentlyContinue } else { $env:BOOTUPD_LAB_FIXTURE_LOG = $oldLog }

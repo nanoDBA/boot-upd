@@ -1,5 +1,5 @@
 function Get-WindowsUpdate {
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess = $true)]
     param(
         [switch]$AcceptAll,
         [switch]$Download,
