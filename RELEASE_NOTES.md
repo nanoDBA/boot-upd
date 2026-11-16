@@ -1,9 +1,25 @@
 # Boot Update Cycle — Release Notes
 
-**Latest published version:** v2.5.95
+**Latest published version:** v2.5.96
 **Status:** Released
 
 ---
+
+## v2.5.96 (2026-11-16)
+
+One new option, and the lab evidence v2.5.95 shipped without.
+
+- **`upd --skip-windows-update` leaves Windows Update out of one run.** Nothing is scanned, downloaded or installed, and driver and firmware updates are skipped with it. The choice is kept across reboots in that run. The log and the final summary say Windows Update was skipped by request, never that it is done or up to date. The short form is `-no-wu`; `Deploy-BootUpdateCycle.ps1` and `Invoke-BootUpdateCycle.ps1` take `-SkipWindowsUpdate`. It is off unless you pass it, and the next run without it updates Windows as usual. A machine that always skips Windows Update is not being patched.
+- **Nothing else changes.** A run without the flag behaves as it did on v2.5.95.
+
+### Testing
+
+Full results: [docs/validation-2.5.96.md](docs/validation-2.5.96.md).
+
+- Gates on the release branch: 788 Pester tests passed, 0 failed; the User/SYSTEM boundary and published-launcher upgrade gates passed.
+- The three multi-reboot lab rows listed as not run for v2.5.95 have now run on Hyper-V guests and passed: the hard-timeout stop, npm left for the signed-in user by a SYSTEM run, and the Winget failure memory across three cycles. The first ran on v2.5.95 as tagged; the other two ran on v2.5.95 plus this option, with Windows Update skipped.
+- **Not run:** a row started through `upd --skip-windows-update`. The lab rows passed the switch through the deploy script, which is where the launcher hands it. The launcher flag is covered by a test of `upd plan`.
+- **Not run:** an SSMS 21 update on a real machine.
 
 ## v2.5.95 (2026-11-15)
 

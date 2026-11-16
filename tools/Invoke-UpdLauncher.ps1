@@ -32,6 +32,7 @@ param(
     [Alias('no-ai','skip-ai-tools')][switch]$SkipAiTools,
     [Alias('no-code','skip-vscode')][switch]$SkipVscode,
     [Alias('no-def','skip-defender')][switch]$SkipDefender,
+    [Alias('no-wu','skip-windows-update')][switch]$SkipWindowsUpdate,
     [Alias('no-fu','skip-feature-updates')][switch]$SkipFeatureUpdates,
     [Alias('no-check','skip-health-check')][switch]$SkipHealthCheck,
     [Alias('no-bl','skip-bit-locker')][switch]$SkipBitLocker,
@@ -148,6 +149,7 @@ function Show-UpdHelp {
     --skip-ai-tools            Skip Claude Code (native install) and Hermes Agent self-updates
     --skip-vscode              Skip VS Code extensions
     --skip-defender            Skip Defender signatures
+    --skip-windows-update      Leave Windows Update out of this run: no scan, download, or install
     --skip-feature-updates     Leave new Windows versions (feature updates) to Windows Update's own schedule
     --skip-health-check        Skip service verification (completion is downgraded)
     --skip-bit-locker          Do not suspend BitLocker for an orchestrated reboot
@@ -253,7 +255,7 @@ function Get-UpdDeployParameters {
         RestorePoint='EnableRestorePoint'; DotnetTools='EnableDotnetTools'; AwsTooling='EnableAwsTooling'
         SkipPip='SkipPip'; SkipNpm='SkipNpm'; SkipOffice365='SkipOffice365'; SkipSsms='SkipSsms'
         SkipPowerShellModules='SkipPowerShellModules'; SkipScoop='SkipScoop'; SkipAiTools='SkipAiTools'; SkipVscode='SkipVscode'
-        SkipDefender='SkipDefender'; SkipFeatureUpdates='SkipFeatureUpdates'; SkipHealthCheck='SkipHealthCheck'; SkipBitLocker='SkipBitLocker'
+        SkipDefender='SkipDefender'; SkipWindowsUpdate='SkipWindowsUpdate'; SkipFeatureUpdates='SkipFeatureUpdates'; SkipHealthCheck='SkipHealthCheck'; SkipBitLocker='SkipBitLocker'
         DisableSelfUpdate='DisableSelfUpdate'; ResumeAfterAttention='ResumeAfterAttention'
     }
     foreach ($entry in $switchMap.GetEnumerator()) {
