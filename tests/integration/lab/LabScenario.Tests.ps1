@@ -16,6 +16,7 @@ Describe 'Lab scenario contracts' {
     It 'parses every PowerShell file used by the lab scenario harness' {
         $paths = @(
             (Join-Path $PSScriptRoot 'Invoke-LabRow.ps1'),
+            (Join-Path $PSScriptRoot 'Resume-LabSavedUser.ps1'),
             (Join-Path $PSScriptRoot 'LabScenario.ps1'),
             (Join-Path $PSScriptRoot 'fixtures/bin/npm-fixture.ps1'),
             (Join-Path $PSScriptRoot 'fixtures/bin/winget-fixture.ps1')
@@ -84,6 +85,7 @@ Describe 'Lab scenario contracts' {
         $scenario = Get-LabScenarioContract -Scenario SystemNpm
         $prefix = Get-LabScenarioEnvironmentPrefix -Scenario $scenario
         $harness = Get-Content (Join-Path $PSScriptRoot 'Invoke-LabRow.ps1') -Raw
+        $resume = Get-Content (Join-Path $PSScriptRoot 'Resume-LabSavedUser.ps1') -Raw
 
         $scenario.NpmPath | Should -Be 'C:\Lab\boot-upd\tests\integration\lab\fixtures\bin'
         $scenario.NpmEvidenceFile | Should -Be 'C:\ProgramData\BootUpdateCycle\LabNpmFixture.jsonl'
@@ -94,6 +96,9 @@ Describe 'Lab scenario contracts' {
         $harness | Should -Match 'NpmFixtureRuns'
         $harness | Should -Match 'NpmFixtureContexts'
         $harness | Should -Match 'npm-fixture-summary.json'
+        $resume | Should -Match 'LabNpmFixture'
+        $resume | Should -Match 'NpmFixtureRuns'
+        $resume | Should -Match 'NpmFixtureContexts'
     }
 
     It 'records the fake npm caller and arguments and exits successfully' {

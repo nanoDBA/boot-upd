@@ -23,6 +23,7 @@ param(
 $ErrorActionPreference='Stop'
 . (Join-Path $PSScriptRoot 'LabCredential.ps1')
 . (Join-Path $PSScriptRoot 'LabEvidence.ps1')
+. (Join-Path $PSScriptRoot 'LabScenario.ps1')
 $password=Get-BootUpdLabPassword -Target $CredentialTarget
 $credential=[pscredential]::new($GuestUser,(ConvertTo-BootUpdLabSecureString $password))
 $vm=Get-VM -Name $VMName -ErrorAction Stop
@@ -122,9 +123,14 @@ try {
             Boots=@(Get-WinEvent -FilterHashtable @{LogName='System';Id=6005;StartTime=([datetime]$StartUtc).ToLocalTime()} -ErrorAction SilentlyContinue | Select-Object TimeCreated,Id)
             TaskEvents=@($events | ForEach-Object {$_.ToXml()})
             InstalledHash=(Get-FileHash 'C:\ProgramData\BootUpdateCycle\Invoke-BootUpdateCycle.ps1').Hash
+            LabNpmFixture=@(if (Test-Path 'C:\ProgramData\BootUpdateCycle\LabNpmFixture.jsonl') { Get-Content 'C:\ProgramData\BootUpdateCycle\LabNpmFixture.jsonl' -ErrorAction SilentlyContinue })
         }
     }
     $collected.Log | Set-Content (Join-Path $evidenceDir 'BootUpdateCycle.log')
+    if ($collected.LabNpmFixture.Count) { $collected.LabNpmFixture | Set-Content (Join-Path $evidenceDir 'npm-fixture.jsonl') }
+    $npmFixtureRecords=@($collected.LabNpmFixture | ForEach-Object { try { $_ | ConvertFrom-Json } catch { $null } } | Where-Object { $_ })
+    $npmFixtureSummary=@(Get-LabNpmFixtureSummary -Records $npmFixtureRecords)
+    if ($npmFixtureSummary.Count) { $npmFixtureSummary | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $evidenceDir 'npm-fixture-summary.json') }
     $collected.Boots | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $evidenceDir 'os-boots.json')
     $taskEvents=@($collected.TaskEvents | ConvertFrom-BootUpdLabTaskEvent | Where-Object TaskName -eq '\BootUpdateCycle')
     ConvertTo-Json -InputObject @($taskEvents.Xml) | Set-Content (Join-Path $evidenceDir 'task-events.json')
@@ -141,6 +147,7 @@ try {
         HealthChecksPassed=(@($collected.ResumedLog | Where-Object {$_ -match 'Health check: policy-aware assessment passed'}).Count -gt 0)
         DeferredCompletion=(@($collected.ResumedLog | Where-Object {$_ -match 'BOOT UPDATE CYCLE COMPLETE[^\r\n]*DEFERRED INVENTORY'}).Count -gt 0)
         CompletionLine=($collected.ResumedLog | Where-Object {$_ -match 'BOOT UPDATE CYCLE COMPLETE'} | Select-Object -Last 1)
+        NpmFixtureRuns=$npmFixtureSummary.Count; NpmFixtureContexts=@($npmFixtureSummary.Context | Select-Object -Unique)
         TaskEventsObserved=$taskEvents.Count; SchedulerTotalEvents=@($collected.TaskEvents).Count
         GuestBootsObserved=@($collected.Boots).Count
         HarnessSha256=(Get-FileHash $PSCommandPath).Hash
