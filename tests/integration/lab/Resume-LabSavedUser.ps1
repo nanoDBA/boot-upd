@@ -12,15 +12,18 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$VMName,
+    [Parameter(Mandatory)][string]$Checkpoint,
     [Parameter(Mandatory)][ValidatePattern('^[A-Fa-f0-9]{64}$')][string]$ExpectedSourceSha256,
     [Parameter(Mandatory)][string]$EvidenceRoot,
     [string]$GuestUser='updtest',
     [string]$CredentialTarget='boot-upd-lab-guest',
-    [ValidateRange(1,60)][int]$TimeoutMinutes=20
+    [ValidateRange(1,60)][int]$TimeoutMinutes=20,
+    [switch]$ResetToCheckpointAfterResume
 )
 $ErrorActionPreference='Stop'
 . (Join-Path $PSScriptRoot 'LabCredential.ps1')
 . (Join-Path $PSScriptRoot 'LabEvidence.ps1')
+. (Join-Path $PSScriptRoot 'LabScenario.ps1')
 $password=Get-BootUpdLabPassword -Target $CredentialTarget
 $credential=[pscredential]::new($GuestUser,(ConvertTo-BootUpdLabSecureString $password))
 $vm=Get-VM -Name $VMName -ErrorAction Stop
@@ -120,9 +123,14 @@ try {
             Boots=@(Get-WinEvent -FilterHashtable @{LogName='System';Id=6005;StartTime=([datetime]$StartUtc).ToLocalTime()} -ErrorAction SilentlyContinue | Select-Object TimeCreated,Id)
             TaskEvents=@($events | ForEach-Object {$_.ToXml()})
             InstalledHash=(Get-FileHash 'C:\ProgramData\BootUpdateCycle\Invoke-BootUpdateCycle.ps1').Hash
+            LabNpmFixture=@(if (Test-Path 'C:\ProgramData\BootUpdateCycle\LabNpmFixture.jsonl') { Get-Content 'C:\ProgramData\BootUpdateCycle\LabNpmFixture.jsonl' -ErrorAction SilentlyContinue })
         }
     }
     $collected.Log | Set-Content (Join-Path $evidenceDir 'BootUpdateCycle.log')
+    if ($collected.LabNpmFixture.Count) { $collected.LabNpmFixture | Set-Content (Join-Path $evidenceDir 'npm-fixture.jsonl') }
+    $npmFixtureRecords=@($collected.LabNpmFixture | ForEach-Object { try { $_ | ConvertFrom-Json } catch { $null } } | Where-Object { $_ })
+    $npmFixtureSummary=@(Get-LabNpmFixtureSummary -Records $npmFixtureRecords)
+    if ($npmFixtureSummary.Count) { $npmFixtureSummary | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $evidenceDir 'npm-fixture-summary.json') }
     $collected.Boots | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $evidenceDir 'os-boots.json')
     $taskEvents=@($collected.TaskEvents | ConvertFrom-BootUpdLabTaskEvent | Where-Object TaskName -eq '\BootUpdateCycle')
     ConvertTo-Json -InputObject @($taskEvents.Xml) | Set-Content (Join-Path $evidenceDir 'task-events.json')
@@ -139,10 +147,12 @@ try {
         HealthChecksPassed=(@($collected.ResumedLog | Where-Object {$_ -match 'Health check: policy-aware assessment passed'}).Count -gt 0)
         DeferredCompletion=(@($collected.ResumedLog | Where-Object {$_ -match 'BOOT UPDATE CYCLE COMPLETE[^\r\n]*DEFERRED INVENTORY'}).Count -gt 0)
         CompletionLine=($collected.ResumedLog | Where-Object {$_ -match 'BOOT UPDATE CYCLE COMPLETE'} | Select-Object -Last 1)
+        NpmFixtureRuns=$npmFixtureSummary.Count; NpmFixtureContexts=@($npmFixtureSummary.Context | Select-Object -Unique)
         TaskEventsObserved=$taskEvents.Count; SchedulerTotalEvents=@($collected.TaskEvents).Count
         GuestBootsObserved=@($collected.Boots).Count
         HarnessSha256=(Get-FileHash $PSCommandPath).Hash
         EventParserSha256=(Get-FileHash (Join-Path $PSScriptRoot 'LabEvidence.ps1')).Hash
+        Checkpoint=$Checkpoint
         EvidenceDir=$evidenceDir
     }
     $summary | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $evidenceDir 'summary.json')
@@ -181,6 +191,20 @@ try {
             $summary | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $evidenceDir 'summary.json')
         }
         if (-not $cleaned) { throw "Temporary guest autologon cleanup failed; recover and scrub this guest before reuse. Evidence: $evidenceDir" }
+        if ($ResetToCheckpointAfterResume) {
+            Invoke-Command -VMName $VMName -Credential $credential -ErrorAction Stop -ScriptBlock {
+                & shutdown.exe /s /t 0
+                if ($LASTEXITCODE -ne 0) { throw 'Guest shutdown command failed.' }
+            } | Out-Null
+            $shutdownDeadline=(Get-Date).AddMinutes(3)
+            while ((Get-VM -Name $VMName -ErrorAction Stop).State -ne 'Off' -and (Get-Date) -lt $shutdownDeadline) {
+                Start-Sleep -Seconds 5
+            }
+            if ((Get-VM -Name $VMName -ErrorAction Stop).State -ne 'Off') { throw 'Guest did not reach Off before checkpoint restore.' }
+            Restore-VMCheckpoint -VMName $VMName -Name $Checkpoint -Confirm:$false -ErrorAction Stop | Out-Null
+            $summary['GuestState']='OffAtCheckpoint'
+            $summary | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $evidenceDir 'summary.json')
+        }
       }
     } finally { $lease.Dispose() }
 }

@@ -54,11 +54,19 @@ param(
     [string]$ModuleCachePath = '',
     [string]$ModuleCacheSha256 = '',
     [string]$ScreenCaptureScript = '',
+    <# Deterministic provider fixtures for repeatable lifecycle scenarios. Fixtures are test-only
+       and their environment overrides are written to the disposable guest machine environment
+       so SYSTEM continuation tasks see the same fake provider after a reboot. #>
+    [ValidateSet('None','HardTimeout','RepeatedWingetFailure','SystemNpm')][string]$LabScenario = 'None',
     <# Run upd bootstrap and collect runtime-install evidence without entering an update cycle. #>
     [switch]$StopAfterBootstrap,
     <# Collect a deliberate saved-user wait as PARTIAL instead of idling until timeout.
        Resume-LabSavedUser.ps1 can then test the real sign-in continuation. #>
-    [switch]$StopAtSavedUserWait
+    [switch]$StopAtSavedUserWait,
+    <# After evidence is collected, shut down normally and restore the selected existing
+       checkpoint so the disposable guest is left Off and ready for its next row. #>
+    [switch]$ResetToCheckpointAfterRow,
+    [switch]$ShutdownBeforeRestore
 )
 
 function Test-LabCompletionEvidence {
@@ -136,6 +144,8 @@ function ConvertFrom-LabPwshProbeOutput {
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'LabCredential.ps1')
 . (Join-Path $PSScriptRoot 'LabEvidence.ps1')
+. (Join-Path $PSScriptRoot 'LabScenario.ps1')
+$scenario = Get-LabScenarioContract -Scenario $LabScenario
 if (-not $GuestPassword) { $GuestPassword = Get-BootUpdLabPassword -Target $CredentialTarget }
 if (-not $GuestPassword) {
     throw 'No lab guest password available. Store one with: . ./LabCredential.ps1; Set-BootUpdLabPassword -Generate'
@@ -145,6 +155,11 @@ $cred = New-Object System.Management.Automation.PSCredential($GuestUser,
 if ($Row -notmatch '^[A-Za-z0-9][A-Za-z0-9_.-]*$') { throw 'Row must be a simple label, not a path.' }
 if ($StopAfterBootstrap -and ($Launcher -ne 'upd' -or $SystemContext -or $ArmReboots -gt 0 -or $InjectWhen -or $InjectAction -or $StopAtSavedUserWait)) {
     throw 'StopAfterBootstrap requires Launcher upd and forbids SYSTEM, armed reboots, and injection.'
+}
+if ($LabScenario -ne 'None') {
+    if ($Launcher -ne 'deploy') { throw 'Lab provider scenarios require Launcher deploy so they exercise this source tree.' }
+    if ($DeployArgs -match '(?i)-PackageTimeoutMinutes\s+') { throw 'Lab provider scenarios set their own short PackageTimeoutMinutes.' }
+    $DeployArgs = ($DeployArgs + ' -PackageTimeoutMinutes 1 -SkipWindowsUpdate').Trim()
 }
 $SourceRoot = (Resolve-Path -LiteralPath $SourceRoot).Path.TrimEnd('\','/')
 if ($ModuleCachePath) {
@@ -163,7 +178,29 @@ try { $lease = [IO.File]::Open($lockPath, 'OpenOrCreate', 'ReadWrite', 'Read') }
 catch { throw "Cannot acquire exclusive VM lease at $lockPath. Another row may own this guest." }
 $manifest = $null
 try {
-if ((Get-VM -Name $VMName).State -ne 'Off') { throw 'Cold restore requires guest Off. Inspect any existing run before shutting it down.' }
+$vm = Get-VM -Name $VMName -ErrorAction Stop
+if ($vm.State -ne 'Off' -and $ShutdownBeforeRestore -and $vm.State -eq 'Running') {
+    $activity = Invoke-Command -VMName $VMName -Credential $cred -ErrorAction Stop -ScriptBlock {
+        $tasks = @(Get-ScheduledTask -TaskName 'BootUpdateCycle*' -ErrorAction SilentlyContinue | Where-Object State -eq 'Running')
+        $processes = @(Get-CimInstance Win32_Process | Where-Object {
+            $_.CommandLine -match '(?i)(Deploy-BootUpdateCycle\.ps1|Invoke-BootUpdateCycle\.ps1|Invoke-UpdLauncher\.ps1)'
+        })
+        [pscustomobject]@{ RunningUpdaterTasks=$tasks.Count; UpdaterProcesses=$processes.Count }
+    }
+    if ($activity.RunningUpdaterTasks -gt 0 -or $activity.UpdaterProcesses -gt 0) {
+        throw 'Refusing to shut down a guest with an active updater task or process.'
+    }
+    Invoke-Command -VMName $VMName -Credential $cred -ErrorAction Stop -ScriptBlock {
+        & shutdown.exe /s /t 0
+        if ($LASTEXITCODE -ne 0) { throw 'Guest shutdown command failed.' }
+    } | Out-Null
+    $shutdownDeadline = (Get-Date).AddMinutes(3)
+    while ((Get-VM -Name $VMName -ErrorAction Stop).State -ne 'Off' -and (Get-Date) -lt $shutdownDeadline) {
+        Start-Sleep -Seconds 5
+    }
+    $vm = Get-VM -Name $VMName -ErrorAction Stop
+}
+if ($vm.State -ne 'Off') { throw 'Cold restore requires guest Off. Use the harness shutdown option only after confirming the previous run has ended.' }
 $snapshots = @(Get-VMSnapshot -VMName $VMName -Name $Checkpoint -ErrorAction Stop)
 if ($snapshots.Count -ne 1 -or $snapshots[0].State -ne 'Off') {
     throw 'Choose exactly one cold (Off) checkpoint; saved running-state checkpoints are not supported.'
@@ -190,6 +227,7 @@ $manifest = [ordered]@{
     Launcher=$Launcher; DeployArgs=$DeployArgs; ArmReboots=$ArmReboots
     SystemContext=[bool]$SystemContext; TimeoutMinutes=$TimeoutMinutes; SkipSync=[bool]$SkipSync
     StopAtSavedUserWait=[bool]$StopAtSavedUserWait; StopAfterBootstrap=[bool]$StopAfterBootstrap
+    LabScenario=$LabScenario; ScenarioRepeatCycles=$scenario.RepeatCycles
     ModuleCacheSha256=$ModuleCacheSha256; InjectWhen=$InjectWhen; InjectionConfigured=[bool]$InjectAction
     SourceFiles=$sourceHashes
     InjectionAction=if ($InjectAction) { $InjectAction.ToString() } else { $null }
@@ -380,6 +418,41 @@ Invoke-Command -VMName $VMName -Credential $cred -ErrorAction Stop -ScriptBlock 
         }
     }
 } | Out-Null
+if ($LabScenario -ne 'None') {
+    Invoke-Command -VMName $VMName -Credential $cred -ErrorAction Stop -ScriptBlock {
+        Remove-Item -LiteralPath 'C:\ProgramData\BootUpdateCycle\LabFixture.jsonl' -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath 'C:\ProgramData\BootUpdateCycle\LabFixture.jsonl.installed-version' -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath 'C:\ProgramData\BootUpdateCycle\LabNpmFixture.jsonl' -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath 'C:\ProgramData\BootUpdateCycle\BootUpdateCycle-winget-known-failures.json' -Force -ErrorAction SilentlyContinue
+    } | Out-Null
+    Invoke-Command -VMName $VMName -Credential $cred -ArgumentList $scenario.WindowsUpdateModule, $scenario.WindowsUpdateModuleTarget -ErrorAction Stop -ScriptBlock {
+        param($Source, $Destination)
+        if (-not (Test-Path -LiteralPath (Join-Path $source 'PSWindowsUpdate.psd1') -PathType Leaf)) {
+            throw 'The Windows Update fixture is missing from the synced lab tree.'
+        }
+        Remove-Item -LiteralPath $Destination -Recurse -Force -ErrorAction SilentlyContinue
+        New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+        Copy-Item -Path (Join-Path $source '*') -Destination $Destination -Force
+        if (-not (Test-Path -LiteralPath (Join-Path $Destination 'PSWindowsUpdate.psd1') -PathType Leaf)) {
+            throw 'The Windows Update fixture was not staged in the guest module path.'
+        }
+    } | Out-Null
+    Invoke-Command -VMName $VMName -Credential $cred -ArgumentList $scenario.Mode, $scenario.Version, $scenario.EvidenceFile, $scenario.NpmEvidenceFile, $scenario.WingetPath, $scenario.NpmPath -ErrorAction Stop -ScriptBlock {
+        param($Mode, $Version, $FixtureLog, $NpmFixtureLog, $WingetPath, $NpmPath)
+        $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+        $pathEntries = @($machinePath -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        $fixturePaths = @($WingetPath, $NpmPath) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique
+        $fixturePaths = @($fixturePaths)
+        $machinePath = (@($fixturePaths) + @($pathEntries | Where-Object { $_ -notin $fixturePaths })) -join ';'
+        [Environment]::SetEnvironmentVariable('BOOTUPD_LAB_WINGET_MODE', $Mode, 'Machine')
+        [Environment]::SetEnvironmentVariable('BOOTUPD_LAB_WINGET_VERSION', $Version, 'Machine')
+        [Environment]::SetEnvironmentVariable('BOOTUPD_LAB_FIXTURE_LOG', $FixtureLog, 'Machine')
+        [Environment]::SetEnvironmentVariable('BOOTUPD_LAB_NPM_FIXTURE_LOG', $NpmFixtureLog, 'Machine')
+        [Environment]::SetEnvironmentVariable('BOOTUPD_LAB_FIXTURE_PATH', ($fixturePaths -join ';'), 'Machine')
+        [Environment]::SetEnvironmentVariable('Path', $machinePath, 'Machine')
+        [pscustomobject]@{ FixtureMode=$Mode; FixtureVersion=$Version; FixtureLogConfigured=[bool]$FixtureLog; NpmFixtureLogConfigured=[bool]$NpmFixtureLog; FixturePathFirst=($machinePath -split ';')[0] }
+    } | ConvertTo-Json -Compress | Set-Content (Join-Path $evidenceDir 'fixture-machine-environment.json')
+}
 if ($StopAfterBootstrap) {
     $readBootstrapInventory = {
         param([bool]$ProbeLaunches)
@@ -474,8 +547,9 @@ if ($n -lt $limit -and $n -lt $features.Count) {
 if ($StopAfterBootstrap) { Say 'launching upd bootstrap; no update cycle' }
 elseif ($SystemContext) { Say 'launching the cycle as SYSTEM (no interactive user)' }
 else { Say 'launching the cycle in the interactive session' }
-Invoke-Command -VMName $VMName -Credential $cred -ArgumentList $GuestUser, ([bool]$SystemContext), $DeployArgs, $Launcher -ScriptBlock {
-    param($User, $AsSystem, $Extra, $Entry)
+$scenarioPrefix = Get-LabScenarioEnvironmentPrefix -Scenario $scenario
+Invoke-Command -VMName $VMName -Credential $cred -ArgumentList $GuestUser, ([bool]$SystemContext), $DeployArgs, $Launcher, $scenarioPrefix -ScriptBlock {
+    param($User, $AsSystem, $Extra, $Entry, $ScenarioPrefix)
     <# Capture Deploy's own stdout and stderr. Without this a failing deploy leaves nothing
        behind at all: the updater log stops wherever the script died, and everything the
        script itself printed goes to a scheduled task and is lost. Row B first failed with
@@ -489,7 +563,7 @@ Invoke-Command -VMName $VMName -Credential $cred -ArgumentList $GuestUser, ([boo
             -Argument ('/c ""C:\Lab\boot-upd\upd.cmd" ' + $Extra + ' > C:\Lab\deploy-output.txt 2>&1"') `
             -WorkingDirectory 'C:\Lab\boot-upd'
     } else {
-        $inner = '& "C:\Lab\boot-upd\Deploy-BootUpdateCycle.ps1" -NonInteractive -OutputMode Normal EXTRA_ARGS *>&1 | Tee-Object -FilePath C:\Lab\deploy-output.txt'
+        $inner = $ScenarioPrefix + '& "C:\Lab\boot-upd\Deploy-BootUpdateCycle.ps1" -NonInteractive -OutputMode Normal EXTRA_ARGS *>&1 | Tee-Object -FilePath C:\Lab\deploy-output.txt'
         $inner = $inner.Replace('EXTRA_ARGS', $Extra)
         $argument = '-NoProfile -ExecutionPolicy Bypass -Command "' + $inner.Replace('"', '\"') + '"'
         $guestPwsh = @(@(Get-AppxPackage -AllUsers -Name Microsoft.PowerShell -ErrorAction SilentlyContinue | Where-Object PublisherId -eq '8wekyb3d8bbwe' | Sort-Object { [version]$_.Version } -Descending | ForEach-Object { Join-Path $_.InstallLocation 'pwsh.exe' }) + 'C:\Program Files\PowerShell\7\pwsh.exe' | Where-Object { Test-Path -LiteralPath $_ })[0]
@@ -621,6 +695,8 @@ $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
 $liveLogPath = Join-Path $evidenceDir 'BootUpdateCycle.live.log'
 $knownLogLines = 0
 $complete = $false
+$completedScenarioCycles = 0
+$scenarioCyclesStarted = 1
 $injected = $false
 $maxConsent = 0
 $pwshSeen = $false
@@ -655,6 +731,7 @@ while ((Get-Date) -lt $deadline) {
                    reported adds nothing but wall-clock. Row B v5 sat here for eight minutes
                    after the updater had finished saying everything it had to say. #>
                 Terminal = @($lines | Where-Object { $_ -match '(recovery limit|Reboot limit|No-progress reboot limit) .*reached' }).Count
+                ManualAttention = @($lines | Where-Object { $_ -match '(?i)(?:Persistent non-transient failure requires manual attention|manual attention is required|manual-attention handoff|Stop.*manual attention)' }).Count
                 Tasks    = @(Get-ScheduledTask -TaskName 'BootUpdateCycle*' -ErrorAction SilentlyContinue).Count
                 TaskNames = @($tasks.TaskName)
                 PrimaryTriggerTypes = @($tasks | Where-Object TaskName -eq 'BootUpdateCycle' | ForEach-Object { $_.Triggers } | ForEach-Object { $_.CimClass.CimClassName })
@@ -698,12 +775,64 @@ while ((Get-Date) -lt $deadline) {
         <# Requiring a pass as well as a completion line is belt and braces after the scalar
            bug above: a cycle cannot complete before it has started, so a claim of completion
            with zero observed passes is a harness fault, not a result. #>
-        if (Test-LabCompletionEvidence -Passes $r.Passes -CompletionRecords $r.Complete -TasksRemaining $r.Tasks -StateFileExists $r.StateFileExists) { $complete = $true; Say "cycle complete after $($r.Passes) pass(es)"; break }
+        $cycleCompletionReady = Test-LabCompletionEvidence -Passes $r.Passes -CompletionRecords $r.Complete -TasksRemaining $r.Tasks -StateFileExists $r.StateFileExists
+        if ($LabScenario -eq 'RepeatedWingetFailure') {
+            $completedScenarioCycles = [int]$r.Complete
+            $cycleAction = Get-LabScenarioCycleAction -Completed $completedScenarioCycles -ManualAttentionCount $r.ManualAttention -Started $scenarioCyclesStarted -Expected $scenario.RepeatCycles
+            if ($cycleAction -eq 'Complete' -and $cycleCompletionReady) {
+                $complete = $true
+                Say "scenario complete after $($r.Passes) pass(es); $completedScenarioCycles cycle(s) completed and $($r.ManualAttention) manual-attention stop(s) observed"
+                break
+            }
+            $manualStopReady = ($r.ManualAttention -ge $scenarioCyclesStarted -and $r.Tasks -eq 0)
+            if ($cycleAction -eq 'StartNext' -and ($cycleCompletionReady -or $manualStopReady)) {
+                $nextCycle = $scenarioCyclesStarted + 1
+                if ($nextCycle -ge 3) {
+                    $cycleFixture = Get-LabScenarioCycleFixture -Scenario $scenario -CycleNumber $nextCycle
+                    Invoke-Command -VMName $VMName -Credential $cred -ArgumentList $cycleFixture.Mode, $cycleFixture.Version -ErrorAction Stop -ScriptBlock {
+                        param($Mode, $Version)
+                        [Environment]::SetEnvironmentVariable('BOOTUPD_LAB_WINGET_MODE', $Mode, 'Machine')
+                        [Environment]::SetEnvironmentVariable('BOOTUPD_LAB_WINGET_VERSION', $Version, 'Machine')
+                    }
+                    Say "fixture changed for cycle ${nextCycle}: $($cycleFixture.Mode), offer $($cycleFixture.Version)"
+                }
+                Invoke-Command -VMName $VMName -Credential $cred -ErrorAction Stop -ScriptBlock {
+                    if ((Get-ScheduledTask -TaskName 'Lab-RunDeploy' -ErrorAction Stop).State -eq 'Running') {
+                        throw 'Previous lab deployment task is still running; retry the next-cycle start on a later poll.'
+                    }
+                    Start-ScheduledTask -TaskName 'Lab-RunDeploy'
+                }
+                $scenarioCyclesStarted = $nextCycle
+                Say "scenario cycle $scenarioCyclesStarted of $($scenario.RepeatCycles) started"
+            }
+        } elseif ($cycleCompletionReady) {
+            $completedScenarioCycles = [int]$r.Complete
+            $cycleAction = Get-LabScenarioCycleAction -Completed $completedScenarioCycles -Started $scenarioCyclesStarted -Expected $scenario.RepeatCycles
+            if ($cycleAction -eq 'Complete') {
+                $complete = $true
+                Say "cycle complete after $($r.Passes) pass(es); $completedScenarioCycles scenario cycle(s) observed"
+                break
+            }
+            if ($cycleAction -eq 'StartNext') {
+                Invoke-Command -VMName $VMName -Credential $cred -ErrorAction Stop -ScriptBlock {
+                    if ((Get-ScheduledTask -TaskName 'Lab-RunDeploy' -ErrorAction Stop).State -eq 'Running') {
+                        throw 'Previous lab deployment task is still running; retry the next-cycle start on a later poll.'
+                    }
+                    Start-ScheduledTask -TaskName 'Lab-RunDeploy'
+                }
+                $scenarioCyclesStarted++
+                Say "scenario cycle $scenarioCyclesStarted of $($scenario.RepeatCycles) started"
+            }
+        }
         if ($StopAtSavedUserWait -and (Test-LabSavedUserWaitEvidence -Phase $r.Phase -ResumeUser $r.ResumeUser -TaskNames $r.TaskNames -PrimaryTriggerTypes $r.PrimaryTriggerTypes -LogonOnlyVerified $r.LogonOnlyVerified)) {
             Say 'machine servicing finished; collecting saved-user wait as PARTIAL'
             break
         }
         if ($r.Terminal -ge 1 -and $r.Tasks -eq 0) { Say "cycle stopped itself at a limit after $($r.Passes) pass(es)"; break }
+        if ($r.ManualAttention -ge 1 -and $r.Tasks -eq 0 -and $LabScenario -ne 'RepeatedWingetFailure') {
+            Say "cycle stopped for manual attention after $($r.Passes) pass(es)"
+            break
+        }
     } catch { Add-Timeline (("{0} unreachable (rebooting)" -f (Get-Date -Format 'HH:mm:ss'))) }
     <# Poll fast while waiting to inject: a restart countdown is measured in seconds, so a
        40-second cadence would sail past the only moment the row cares about. #>
@@ -720,6 +849,7 @@ $evidence = Invoke-Command -VMName $VMName -Credential $cred -ScriptBlock {
     $boots = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 6005 } -MaxEvents 40 -ErrorAction SilentlyContinue |
                Select-Object -ExpandProperty TimeCreated)
     $activeStateJson = try { [IO.File]::ReadAllText('C:\ProgramData\BootUpdateCycle\BootUpdateCycle.state.json') } catch [IO.FileNotFoundException] { $null } catch [IO.DirectoryNotFoundException] { $null }
+    $wingetKnownFailureMemory = try { Get-Content 'C:\ProgramData\BootUpdateCycle\BootUpdateCycle-winget-known-failures.json' -Raw -ErrorAction Stop | ConvertFrom-Json } catch { @() }
     $firstPass = $lines | Where-Object { $_ -match 'BOOT UPDATE CYCLE (STARTED|RESUMED)' } | Select-Object -First 1
     $taskEvents = @()
     if ($firstPass -match '\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]') {
@@ -746,6 +876,9 @@ $evidence = Invoke-Command -VMName $VMName -Credential $cred -ScriptBlock {
         ConsoleUser     = (Get-CimInstance Win32_ComputerSystem).UserName
         ExplorerCount   = @(Get-Process explorer -ErrorAction SilentlyContinue).Count
         DeployOutput    = @(if (Test-Path 'C:\Lab\deploy-output.txt') { Get-Content 'C:\Lab\deploy-output.txt' -ErrorAction SilentlyContinue })
+        LabFixture = @(if (Test-Path 'C:\ProgramData\BootUpdateCycle\LabFixture.jsonl') { Get-Content 'C:\ProgramData\BootUpdateCycle\LabFixture.jsonl' -ErrorAction SilentlyContinue })
+        LabNpmFixture = @(if (Test-Path 'C:\ProgramData\BootUpdateCycle\LabNpmFixture.jsonl') { Get-Content 'C:\ProgramData\BootUpdateCycle\LabNpmFixture.jsonl' -ErrorAction SilentlyContinue })
+        WingetKnownFailureMemory = $wingetKnownFailureMemory
         DeployTaskResult = (Get-ScheduledTaskInfo -TaskName 'Lab-RunDeploy' -ErrorAction SilentlyContinue).LastTaskResult
     }
 }
@@ -757,6 +890,12 @@ $schedulerEvents = @($evidence.SchedulerEvents | ConvertFrom-BootUpdLabTaskEvent
 ConvertTo-Json -InputObject @($schedulerEvents.Xml) | Set-Content (Join-Path $evidenceDir 'task-events.json')
 $evidence.Log | Set-Content (Join-Path $evidenceDir 'BootUpdateCycle.log')
 if ($evidence.DeployOutput.Count) { $evidence.DeployOutput | Set-Content (Join-Path $evidenceDir 'deploy-output.txt') }
+if ($evidence.LabFixture.Count) { $evidence.LabFixture | Set-Content (Join-Path $evidenceDir 'lab-fixture.jsonl') }
+if ($evidence.LabNpmFixture.Count) { $evidence.LabNpmFixture | Set-Content (Join-Path $evidenceDir 'npm-fixture.jsonl') }
+$npmFixtureRecords = @($evidence.LabNpmFixture | ForEach-Object { try { $_ | ConvertFrom-Json } catch { $null } } | Where-Object { $_ })
+$npmFixtureSummary = @(Get-LabNpmFixtureSummary -Records $npmFixtureRecords)
+if ($npmFixtureSummary.Count) { $npmFixtureSummary | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $evidenceDir 'npm-fixture-summary.json') }
+ConvertTo-Json -InputObject @($evidence.WingetKnownFailureMemory) -Depth 5 | Set-Content (Join-Path $evidenceDir 'winget-known-failure-memory.json')
 ConvertTo-Json -InputObject @($evidence.OsBootTimes) | Set-Content (Join-Path $evidenceDir 'os-boot-times.json')
 if ($ScreenCaptureScript) {
     & $ScreenCaptureScript -VMName $VMName -Path (Join-Path $evidenceDir 'console.png') | Out-Null
@@ -771,10 +910,18 @@ if ($ScreenCaptureScript) {
    file left. A reader checking the summary against a release note claiming a pass would have
    found them contradicting each other, which is the exact pattern this release exists to
    stop. The collected evidence is the more reliable witness, so it decides. #>
-$complete = Test-LabCompletionEvidence `
+$completedScenarioCycles = @($evidence.Log | Where-Object { $_ -match 'BOOT UPDATE CYCLE COMPLETE' }).Count
+$manualAttentionCount = @($evidence.Log | Where-Object { $_ -match '(?i)Persistent non-transient failure requires manual attention|manual attention is required|manual-attention handoff|Stop.*manual attention' }).Count
+$complete = (Test-LabCompletionEvidence `
     -Passes @($evidence.Log | Where-Object { $_ -match 'BOOT UPDATE CYCLE (STARTED|RESUMED)' }).Count `
     -CompletionRecords @($evidence.Log | Where-Object { $_ -match 'BOOT UPDATE CYCLE COMPLETE' }).Count `
-    -TasksRemaining $evidence.TasksRemaining -StateFileExists $evidence.StateFileExists
+    -TasksRemaining $evidence.TasksRemaining -StateFileExists $evidence.StateFileExists)
+if ($LabScenario -eq 'RepeatedWingetFailure') {
+    $complete = $complete -and (Get-LabScenarioCycleAction -Completed $completedScenarioCycles `
+        -ManualAttentionCount $manualAttentionCount -Started $scenarioCyclesStarted -Expected $scenario.RepeatCycles) -eq 'Complete'
+} else {
+    $complete = $complete -and $completedScenarioCycles -ge $scenario.RepeatCycles
+}
 
 $startLine = @($evidence.Log) | Where-Object { $_ -match 'BOOT UPDATE CYCLE STARTED' } | Select-Object -First 1
 $sessionStart = if ($startLine -match '\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]') { [datetime]$Matches[1] } else { (Get-Date).AddHours(-2) }
@@ -822,6 +969,7 @@ $summary = [pscustomobject]@{
     InstalledIsCandidate = $(if ($hostHash) { $evidence.InstalledOrchestratorHash -eq $hostHash } else { $null })
     StateFileRemains = $evidence.StateFileExists
     TasksRemaining   = $evidence.TasksRemaining
+    ManualAttentionObserved = Test-LabManualAttentionEvidence -Lines @($evidence.Log)
     WaitingForSavedUser = Test-LabSavedUserWaitEvidence @waitEvidence
     SchedulerEventsCollected = $schedulerEvents.Count
     SchedulerTotalEvents = @($evidence.SchedulerEvents).Count
@@ -830,6 +978,12 @@ $summary = [pscustomobject]@{
     InjectionAttempted = $injectAttempted
     InjectionError   = $injectionError
     Launcher         = $Launcher
+    LabScenario      = $LabScenario
+    ScenarioCyclesExpected = $scenario.RepeatCycles
+    ScenarioCyclesObserved = $completedScenarioCycles
+    ScenarioCyclesStarted = $scenarioCyclesStarted
+    NpmFixtureRuns = $npmFixtureSummary.Count
+    NpmFixtureContexts = @($npmFixtureSummary.Context | Select-Object -Unique)
     <# Zero here means no prompt was observed, which for an already-elevated scheduled task is expected and is NOT evidence that the interactive flow demands none. #>
     MaxConsentPrompts = $maxConsent
     Ps7SeenDuringRun = $pwshSeen
@@ -840,6 +994,23 @@ $summary = [pscustomobject]@{
     EvidenceDir      = $evidenceDir
 }
 $summary | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $evidenceDir 'summary.json')
+if ($ResetToCheckpointAfterRow) {
+    if ((Get-VM -Name $VMName -ErrorAction Stop).State -eq 'Running') {
+        Invoke-Command -VMName $VMName -Credential $cred -ErrorAction Stop -ScriptBlock {
+            & shutdown.exe /s /t 0
+            if ($LASTEXITCODE -ne 0) { throw 'Guest shutdown command failed.' }
+        } | Out-Null
+        $shutdownDeadline = (Get-Date).AddMinutes(3)
+        while ((Get-VM -Name $VMName -ErrorAction Stop).State -ne 'Off' -and (Get-Date) -lt $shutdownDeadline) {
+            Start-Sleep -Seconds 5
+        }
+    }
+    if ((Get-VM -Name $VMName -ErrorAction Stop).State -ne 'Off') { throw 'Guest did not reach Off before checkpoint restore.' }
+    Restore-VMCheckpoint -VMName $VMName -Name $Checkpoint -Confirm:$false -ErrorAction Stop | Out-Null
+    $summary | Add-Member -NotePropertyName GuestState -NotePropertyValue 'OffAtCheckpoint' -Force
+    $summary | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $evidenceDir 'summary.json')
+    Say "guest restored to '$Checkpoint' and left Off"
+}
 $summary
 $manifest.Status = 'Collected'
 } finally {

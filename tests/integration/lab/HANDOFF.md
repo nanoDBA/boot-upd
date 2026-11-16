@@ -75,6 +75,7 @@ $guest = $config.Guests[0]
 $parameters = @{
     VMName = $guest.Name
     Checkpoint = $guest.Checkpoint
+    Checkpoint = $guest.Checkpoint
     SourceRoot = $config.SourceRoot
     EvidenceRoot = $config.EvidenceRoot
     GuestUser = $config.GuestUser
