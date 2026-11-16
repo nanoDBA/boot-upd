@@ -131,6 +131,16 @@ Describe 'Safe fun and planning commands' {
         $result.Text | Should -Match 'PLAN ONLY.*no elevation.*reboots'
     }
 
+    It 'resolves --skip-windows-update and -no-wu to the updater switch and lists the flag in help' {
+        foreach ($spelling in @('--skip-windows-update','-no-wu')) {
+            $result = Invoke-UpdCommand "plan $spelling"
+            $result.ExitCode | Should -Be 0
+            $result.Text | Should -Match 'SkipWindowsUpdate\s+: True'
+        }
+        (Invoke-UpdCommand 'plan').Text | Should -Not -Match 'SkipWindowsUpdate\s+: True'
+        (Invoke-UpdCommand 'help').Text | Should -Match '--skip-windows-update\s+Leave Windows Update out of this run'
+    }
+
     It 'supports compact command and option aliases' {
         $result = Invoke-UpdCommand 'p -r 90 -drv -fw -w -c -m -s -o Quiet -n 6 -t 40 -x Teams -i Git'
         $result.ExitCode | Should -Be 0

@@ -118,7 +118,7 @@ and whether anything still needs your attention:
 | 1 | **Winget** | On | User + machine scope; ARSO resumes user scope after reboot, with a delayed SYSTEM safety net |
 | 2 | **Chocolatey** | On | `choco upgrade all -y` |
 | 3 | **SQL Server Management Studio 22** | On | Native Visual Studio Installer update for each existing instance, after package managers; preserves its configured channel and source |
-| 4 | **Windows Update** | On | Everything Windows Update would install on its own, plus feature updates (new Windows versions) unless `--skip-feature-updates`; excludes SQL Server; drivers stay opt-in |
+| 4 | **Windows Update** | On | Everything Windows Update would install on its own, plus feature updates (new Windows versions) unless `--skip-feature-updates`; excludes SQL Server; drivers stay opt-in. `--skip-windows-update` leaves the whole phase out of one run |
 | 5 | **AWS Tooling** | Off | Optional CLI v2 + AWS.Tools repair |
 | 6 | **pip** | On | All outdated global packages |
 | 7 | **npm** | On | Outdated global packages, one at a time; a package held open by a running program is deferred by name. A run as SYSTEM leaves npm for the signed-in user |
@@ -207,6 +207,7 @@ upd --staged --output-mode Verbose
 upd --wsl --containers --allow-metered
 upd -ar                          Opt in to aggressive Winget repair/reinstall attempts
 upd --exclude Teams,OneDrive --skip-office365
+upd --skip-windows-update        Leave Windows Update out of this run (no scan, download, or install)
 upd --skip-feature-updates       Leave new Windows versions to Windows Update's own schedule
 upd --feature-timeout 360        Allow six hours for a feature or cumulative update instead of four
 ```
@@ -235,7 +236,7 @@ has exited**. It verifies the installer against the hash embedded below, then th
 verifies and transactionally replaces the complete release bundle before forwarding `aws`:
 
 ```powershell
-$u='https://github.com/nanoDBA/boot-upd/releases/download/v2.5.95/Install-UpdCompat.ps1'; $f=Join-Path $env:TEMP 'Install-UpdCompat-v2.5.95.ps1'; Invoke-WebRequest $u -OutFile $f; if((Get-FileHash $f -Algorithm SHA256).Hash -ne '67662B3B02252FF6DE045FCDF28FB74D8DEB6FDA8080C46B1DAFC7BFBE54ABE3'){throw 'Compatibility installer hash mismatch'}; & $f -CommandArguments aws
+$u='https://github.com/nanoDBA/boot-upd/releases/download/v2.5.96/Install-UpdCompat.ps1'; $f=Join-Path $env:TEMP 'Install-UpdCompat-v2.5.96.ps1'; Invoke-WebRequest $u -OutFile $f; if((Get-FileHash $f -Algorithm SHA256).Hash -ne '67662B3B02252FF6DE045FCDF28FB74D8DEB6FDA8080C46B1DAFC7BFBE54ABE3'){throw 'Compatibility installer hash mismatch'}; & $f -CommandArguments aws
 ```
 
 Use this when the old launcher cannot update itself. It resolves the first `upd.cmd` on PATH,
@@ -520,6 +521,14 @@ Update still lists them as optional, unless you pass `--skip-feature-updates`. D
 firmware stay opt-in (`--drivers`, `--firmware`). SQL Server updates and anything matching
 `--exclude` are left alone.
 
+To leave Windows Update out of one run entirely, pass `--skip-windows-update` (short form
+`-no-wu`). Nothing is scanned, downloaded or installed, driver and firmware updates are
+skipped with it, and the choice is kept across any reboots in that run. The log and the final
+summary say Windows Update was skipped by request; they do not report it as done or up to
+date. The next run without the flag updates Windows as usual. Use it when you want the
+package managers now and the Windows restart later, not as a standing setting: a machine
+that always skips Windows Update is not being patched.
+
 Everything Windows Update offers and the phase does not take is named in the log with the
 reason (`Windows Update offers outside scope: ...`), so a new kind of update is visible the
 first time it appears rather than silently skipped. Up to v2.5.92 the phase took only
@@ -652,8 +661,8 @@ repair](docs/validation-aws-repair-2.5.83.md), [v2.5.86](docs/validation-2.5.86.
 [v2.5.87](docs/validation-2.5.87.md), [v2.5.88](docs/validation-2.5.88.md),
 [v2.5.89](docs/validation-2.5.89.md), [v2.5.90](docs/validation-2.5.90.md),
 [v2.5.91](docs/validation-2.5.91.md), [v2.5.92](docs/validation-2.5.92.md),
-[v2.5.93](docs/validation-2.5.93.md), [v2.5.94](docs/validation-2.5.94.md), and
-[v2.5.95](docs/validation-2.5.95.md). To run the gates, use
+[v2.5.93](docs/validation-2.5.93.md), [v2.5.94](docs/validation-2.5.94.md),
+[v2.5.95](docs/validation-2.5.95.md), and [v2.5.96](docs/validation-2.5.96.md). To run the gates, use
 `./tools/Invoke-TestGates.ps1` from an elevated PowerShell 7 console.
 
 ## License
