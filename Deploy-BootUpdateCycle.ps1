@@ -23,6 +23,7 @@ param(
     [switch]$ResumeAfterAttention,
     [switch]$IncludeDriverUpdates,
     [switch]$IncludeFirmwareUpdates,
+    [switch]$SkipWindowsUpdate,
     [switch]$SkipFeatureUpdates,
     [switch]$UpdateWsl,
     [switch]$UpdateContainers,
@@ -98,6 +99,7 @@ $Config = @{
     IncludeDriverUpdates  = $false  # Opt in to Windows driver updates
     IncludeFirmwareUpdates = $false # Opt in to firmware updates
     SkipFeatureUpdates    = $false  # Set $true to leave Windows feature updates (new Windows versions) to Windows Update
+    SkipWindowsUpdate     = $false  # Set $true to leave the entire Windows Update phase out of this run
     FeatureUpdateTimeoutMin = 240   # Hard timeout for the Windows Update phase when a feature or cumulative update is applicable
     UpdateWsl             = $false  # Opt in to WSL kernel/distribution updates
     UpdateContainers      = $false  # Opt in to Docker/Podman image refresh
@@ -148,7 +150,7 @@ if ($PSBoundParameters.ContainsKey('MaxUserIdentityWaits')) { $Config.MaxUserIde
 if ($PSBoundParameters.ContainsKey('WatchdogIntervalMinutes')) { $Config.WatchdogIntervalMinutes = $WatchdogIntervalMinutes }
 if ($PSBoundParameters.ContainsKey('PackageTimeoutMinutes')) { $Config.PackageTimeoutMin = $PackageTimeoutMinutes }
 if ($PSBoundParameters.ContainsKey('FeatureUpdateTimeoutMinutes')) { $Config.FeatureUpdateTimeoutMin = $FeatureUpdateTimeoutMinutes }
-foreach ($name in @('StagedRollout','AggressiveRepair','IncludeDriverUpdates','IncludeFirmwareUpdates','SkipFeatureUpdates','UpdateWsl','UpdateContainers','AllowMetered','SkipPip','SkipNpm','SkipOffice365','SkipPowerShellModules','SkipScoop','SkipAiTools','SkipVscode','SkipDefender','SkipHealthCheck','SkipBitLocker','DisableSelfUpdate')) {
+foreach ($name in @('StagedRollout','AggressiveRepair','IncludeDriverUpdates','IncludeFirmwareUpdates','SkipWindowsUpdate','SkipFeatureUpdates','UpdateWsl','UpdateContainers','AllowMetered','SkipPip','SkipNpm','SkipOffice365','SkipPowerShellModules','SkipScoop','SkipAiTools','SkipVscode','SkipDefender','SkipHealthCheck','SkipBitLocker','DisableSelfUpdate')) {
     if ($PSBoundParameters.ContainsKey($name)) { $Config[$name] = $true }
 }
 if ($PSBoundParameters.ContainsKey('SkipSsms')) { $Config.SkipSsms = [bool]$SkipSsms }
@@ -574,6 +576,7 @@ $invokeArgs = @{
     IncludeDriverUpdates = $Config.IncludeDriverUpdates
     IncludeFirmwareUpdates = $Config.IncludeFirmwareUpdates
     SkipFeatureUpdates   = $Config.SkipFeatureUpdates
+    SkipWindowsUpdate    = $Config.SkipWindowsUpdate
     UpdateWsl            = $Config.UpdateWsl
     UpdateContainers     = $Config.UpdateContainers
     SkipRestorePoint     = $Config.SkipRestorePoint
@@ -791,6 +794,7 @@ function Register-ScheduledTaskNow {
     if ($Config.SkipDotnetTools)      { $taskArgs += '-SkipDotnetTools' }
     if ($Config.SkipVscode)           { $taskArgs += '-SkipVscode' }
     if ($Config.SkipDefender)         { $taskArgs += '-SkipDefender' }
+    if ($Config.SkipWindowsUpdate)    { $taskArgs += '-SkipWindowsUpdate' }
     if ($Config.IncludeDriverUpdates) { $taskArgs += '-IncludeDriverUpdates' }
     if ($Config.IncludeFirmwareUpdates) { $taskArgs += '-IncludeFirmwareUpdates' }
     if ($Config.SkipFeatureUpdates)   { $taskArgs += '-SkipFeatureUpdates' }
