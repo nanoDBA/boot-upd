@@ -57,7 +57,7 @@ param(
     <# Deterministic provider fixtures for repeatable lifecycle scenarios. Fixtures are test-only
        and their environment overrides are written to the disposable guest machine environment
        so SYSTEM continuation tasks see the same fake provider after a reboot. #>
-    [ValidateSet('None','HardTimeout','RepeatedWingetFailure')][string]$LabScenario = 'None',
+    [ValidateSet('None','HardTimeout','RepeatedWingetFailure','SystemNpm')][string]$LabScenario = 'None',
     <# Run upd bootstrap and collect runtime-install evidence without entering an update cycle. #>
     [switch]$StopAfterBootstrap,
     <# Collect a deliberate saved-user wait as PARTIAL instead of idling until timeout.
@@ -421,6 +421,8 @@ Invoke-Command -VMName $VMName -Credential $cred -ErrorAction Stop -ScriptBlock 
 if ($LabScenario -ne 'None') {
     Invoke-Command -VMName $VMName -Credential $cred -ErrorAction Stop -ScriptBlock {
         Remove-Item -LiteralPath 'C:\ProgramData\BootUpdateCycle\LabFixture.jsonl' -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath 'C:\ProgramData\BootUpdateCycle\LabFixture.jsonl.installed-version' -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath 'C:\ProgramData\BootUpdateCycle\LabNpmFixture.jsonl' -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath 'C:\ProgramData\BootUpdateCycle\BootUpdateCycle-winget-known-failures.json' -Force -ErrorAction SilentlyContinue
     } | Out-Null
     Invoke-Command -VMName $VMName -Credential $cred -ArgumentList $scenario.WindowsUpdateModule, $scenario.WindowsUpdateModuleTarget -ErrorAction Stop -ScriptBlock {
@@ -435,15 +437,20 @@ if ($LabScenario -ne 'None') {
             throw 'The Windows Update fixture was not staged in the guest module path.'
         }
     } | Out-Null
-    Invoke-Command -VMName $VMName -Credential $cred -ArgumentList $scenario.Mode, $scenario.EvidenceFile, $scenario.WingetPath -ErrorAction Stop -ScriptBlock {
-        param($Mode, $FixtureLog, $FixturePath)
+    Invoke-Command -VMName $VMName -Credential $cred -ArgumentList $scenario.Mode, $scenario.Version, $scenario.EvidenceFile, $scenario.NpmEvidenceFile, $scenario.WingetPath, $scenario.NpmPath -ErrorAction Stop -ScriptBlock {
+        param($Mode, $Version, $FixtureLog, $NpmFixtureLog, $WingetPath, $NpmPath)
         $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
         $pathEntries = @($machinePath -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-        if ($pathEntries -notcontains $FixturePath) { $machinePath = (@($FixturePath) + $pathEntries) -join ';' }
+        $fixturePaths = @($WingetPath, $NpmPath) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique
+        $fixturePaths = @($fixturePaths)
+        $machinePath = (@($fixturePaths) + @($pathEntries | Where-Object { $_ -notin $fixturePaths })) -join ';'
         [Environment]::SetEnvironmentVariable('BOOTUPD_LAB_WINGET_MODE', $Mode, 'Machine')
+        [Environment]::SetEnvironmentVariable('BOOTUPD_LAB_WINGET_VERSION', $Version, 'Machine')
         [Environment]::SetEnvironmentVariable('BOOTUPD_LAB_FIXTURE_LOG', $FixtureLog, 'Machine')
+        [Environment]::SetEnvironmentVariable('BOOTUPD_LAB_NPM_FIXTURE_LOG', $NpmFixtureLog, 'Machine')
+        [Environment]::SetEnvironmentVariable('BOOTUPD_LAB_FIXTURE_PATH', ($fixturePaths -join ';'), 'Machine')
         [Environment]::SetEnvironmentVariable('Path', $machinePath, 'Machine')
-        [pscustomobject]@{ FixtureMode=$Mode; FixtureLog=$FixtureLog; FixturePathFirst=($machinePath -split ';')[0] }
+        [pscustomobject]@{ FixtureMode=$Mode; FixtureVersion=$Version; FixtureLogConfigured=[bool]$FixtureLog; NpmFixtureLogConfigured=[bool]$NpmFixtureLog; FixturePathFirst=($machinePath -split ';')[0] }
     } | ConvertTo-Json -Compress | Set-Content (Join-Path $evidenceDir 'fixture-machine-environment.json')
 }
 if ($StopAfterBootstrap) {
@@ -724,7 +731,7 @@ while ((Get-Date) -lt $deadline) {
                    reported adds nothing but wall-clock. Row B v5 sat here for eight minutes
                    after the updater had finished saying everything it had to say. #>
                 Terminal = @($lines | Where-Object { $_ -match '(recovery limit|Reboot limit|No-progress reboot limit) .*reached' }).Count
-                ManualAttention = @($lines | Where-Object { $_ -match '(?i)manual attention is required|manual-attention handoff|Stop.*manual attention' }).Count
+                ManualAttention = @($lines | Where-Object { $_ -match '(?i)(?:Persistent non-transient failure requires manual attention|manual attention is required|manual-attention handoff|Stop.*manual attention)' }).Count
                 Tasks    = @(Get-ScheduledTask -TaskName 'BootUpdateCycle*' -ErrorAction SilentlyContinue).Count
                 TaskNames = @($tasks.TaskName)
                 PrimaryTriggerTypes = @($tasks | Where-Object TaskName -eq 'BootUpdateCycle' | ForEach-Object { $_.Triggers } | ForEach-Object { $_.CimClass.CimClassName })
@@ -768,7 +775,37 @@ while ((Get-Date) -lt $deadline) {
         <# Requiring a pass as well as a completion line is belt and braces after the scalar
            bug above: a cycle cannot complete before it has started, so a claim of completion
            with zero observed passes is a harness fault, not a result. #>
-        if (Test-LabCompletionEvidence -Passes $r.Passes -CompletionRecords $r.Complete -TasksRemaining $r.Tasks -StateFileExists $r.StateFileExists) {
+        $cycleCompletionReady = Test-LabCompletionEvidence -Passes $r.Passes -CompletionRecords $r.Complete -TasksRemaining $r.Tasks -StateFileExists $r.StateFileExists
+        if ($LabScenario -eq 'RepeatedWingetFailure') {
+            $completedScenarioCycles = [int]$r.Complete
+            $cycleAction = Get-LabScenarioCycleAction -Completed $completedScenarioCycles -ManualAttentionCount $r.ManualAttention -Started $scenarioCyclesStarted -Expected $scenario.RepeatCycles
+            if ($cycleAction -eq 'Complete' -and $cycleCompletionReady) {
+                $complete = $true
+                Say "scenario complete after $($r.Passes) pass(es); $completedScenarioCycles cycle(s) completed and $($r.ManualAttention) manual-attention stop(s) observed"
+                break
+            }
+            $manualStopReady = ($r.ManualAttention -ge $scenarioCyclesStarted -and $r.Tasks -eq 0)
+            if ($cycleAction -eq 'StartNext' -and ($cycleCompletionReady -or $manualStopReady)) {
+                $nextCycle = $scenarioCyclesStarted + 1
+                if ($nextCycle -ge 3) {
+                    $cycleFixture = Get-LabScenarioCycleFixture -Scenario $scenario -CycleNumber $nextCycle
+                    Invoke-Command -VMName $VMName -Credential $cred -ArgumentList $cycleFixture.Mode, $cycleFixture.Version -ErrorAction Stop -ScriptBlock {
+                        param($Mode, $Version)
+                        [Environment]::SetEnvironmentVariable('BOOTUPD_LAB_WINGET_MODE', $Mode, 'Machine')
+                        [Environment]::SetEnvironmentVariable('BOOTUPD_LAB_WINGET_VERSION', $Version, 'Machine')
+                    }
+                    Say "fixture changed for cycle ${nextCycle}: $($cycleFixture.Mode), offer $($cycleFixture.Version)"
+                }
+                Invoke-Command -VMName $VMName -Credential $cred -ErrorAction Stop -ScriptBlock {
+                    if ((Get-ScheduledTask -TaskName 'Lab-RunDeploy' -ErrorAction Stop).State -eq 'Running') {
+                        throw 'Previous lab deployment task is still running; retry the next-cycle start on a later poll.'
+                    }
+                    Start-ScheduledTask -TaskName 'Lab-RunDeploy'
+                }
+                $scenarioCyclesStarted = $nextCycle
+                Say "scenario cycle $scenarioCyclesStarted of $($scenario.RepeatCycles) started"
+            }
+        } elseif ($cycleCompletionReady) {
             $completedScenarioCycles = [int]$r.Complete
             $cycleAction = Get-LabScenarioCycleAction -Completed $completedScenarioCycles -Started $scenarioCyclesStarted -Expected $scenario.RepeatCycles
             if ($cycleAction -eq 'Complete') {
@@ -792,7 +829,10 @@ while ((Get-Date) -lt $deadline) {
             break
         }
         if ($r.Terminal -ge 1 -and $r.Tasks -eq 0) { Say "cycle stopped itself at a limit after $($r.Passes) pass(es)"; break }
-        if ($r.ManualAttention -ge 1 -and $r.Tasks -eq 0) { Say "cycle stopped for manual attention after $($r.Passes) pass(es)"; break }
+        if ($r.ManualAttention -ge 1 -and $r.Tasks -eq 0 -and $LabScenario -ne 'RepeatedWingetFailure') {
+            Say "cycle stopped for manual attention after $($r.Passes) pass(es)"
+            break
+        }
     } catch { Add-Timeline (("{0} unreachable (rebooting)" -f (Get-Date -Format 'HH:mm:ss'))) }
     <# Poll fast while waiting to inject: a restart countdown is measured in seconds, so a
        40-second cadence would sail past the only moment the row cares about. #>
@@ -837,6 +877,7 @@ $evidence = Invoke-Command -VMName $VMName -Credential $cred -ScriptBlock {
         ExplorerCount   = @(Get-Process explorer -ErrorAction SilentlyContinue).Count
         DeployOutput    = @(if (Test-Path 'C:\Lab\deploy-output.txt') { Get-Content 'C:\Lab\deploy-output.txt' -ErrorAction SilentlyContinue })
         LabFixture = @(if (Test-Path 'C:\ProgramData\BootUpdateCycle\LabFixture.jsonl') { Get-Content 'C:\ProgramData\BootUpdateCycle\LabFixture.jsonl' -ErrorAction SilentlyContinue })
+        LabNpmFixture = @(if (Test-Path 'C:\ProgramData\BootUpdateCycle\LabNpmFixture.jsonl') { Get-Content 'C:\ProgramData\BootUpdateCycle\LabNpmFixture.jsonl' -ErrorAction SilentlyContinue })
         WingetKnownFailureMemory = $wingetKnownFailureMemory
         DeployTaskResult = (Get-ScheduledTaskInfo -TaskName 'Lab-RunDeploy' -ErrorAction SilentlyContinue).LastTaskResult
     }
@@ -850,6 +891,10 @@ ConvertTo-Json -InputObject @($schedulerEvents.Xml) | Set-Content (Join-Path $ev
 $evidence.Log | Set-Content (Join-Path $evidenceDir 'BootUpdateCycle.log')
 if ($evidence.DeployOutput.Count) { $evidence.DeployOutput | Set-Content (Join-Path $evidenceDir 'deploy-output.txt') }
 if ($evidence.LabFixture.Count) { $evidence.LabFixture | Set-Content (Join-Path $evidenceDir 'lab-fixture.jsonl') }
+if ($evidence.LabNpmFixture.Count) { $evidence.LabNpmFixture | Set-Content (Join-Path $evidenceDir 'npm-fixture.jsonl') }
+$npmFixtureRecords = @($evidence.LabNpmFixture | ForEach-Object { try { $_ | ConvertFrom-Json } catch { $null } } | Where-Object { $_ })
+$npmFixtureSummary = @(Get-LabNpmFixtureSummary -Records $npmFixtureRecords)
+if ($npmFixtureSummary.Count) { $npmFixtureSummary | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $evidenceDir 'npm-fixture-summary.json') }
 ConvertTo-Json -InputObject @($evidence.WingetKnownFailureMemory) -Depth 5 | Set-Content (Join-Path $evidenceDir 'winget-known-failure-memory.json')
 ConvertTo-Json -InputObject @($evidence.OsBootTimes) | Set-Content (Join-Path $evidenceDir 'os-boot-times.json')
 if ($ScreenCaptureScript) {
@@ -866,11 +911,17 @@ if ($ScreenCaptureScript) {
    found them contradicting each other, which is the exact pattern this release exists to
    stop. The collected evidence is the more reliable witness, so it decides. #>
 $completedScenarioCycles = @($evidence.Log | Where-Object { $_ -match 'BOOT UPDATE CYCLE COMPLETE' }).Count
+$manualAttentionCount = @($evidence.Log | Where-Object { $_ -match '(?i)Persistent non-transient failure requires manual attention|manual attention is required|manual-attention handoff|Stop.*manual attention' }).Count
 $complete = (Test-LabCompletionEvidence `
     -Passes @($evidence.Log | Where-Object { $_ -match 'BOOT UPDATE CYCLE (STARTED|RESUMED)' }).Count `
     -CompletionRecords @($evidence.Log | Where-Object { $_ -match 'BOOT UPDATE CYCLE COMPLETE' }).Count `
-    -TasksRemaining $evidence.TasksRemaining -StateFileExists $evidence.StateFileExists) -and
-    $completedScenarioCycles -ge $scenario.RepeatCycles
+    -TasksRemaining $evidence.TasksRemaining -StateFileExists $evidence.StateFileExists)
+if ($LabScenario -eq 'RepeatedWingetFailure') {
+    $complete = $complete -and (Get-LabScenarioCycleAction -Completed $completedScenarioCycles `
+        -ManualAttentionCount $manualAttentionCount -Started $scenarioCyclesStarted -Expected $scenario.RepeatCycles) -eq 'Complete'
+} else {
+    $complete = $complete -and $completedScenarioCycles -ge $scenario.RepeatCycles
+}
 
 $startLine = @($evidence.Log) | Where-Object { $_ -match 'BOOT UPDATE CYCLE STARTED' } | Select-Object -First 1
 $sessionStart = if ($startLine -match '\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]') { [datetime]$Matches[1] } else { (Get-Date).AddHours(-2) }
@@ -918,7 +969,7 @@ $summary = [pscustomobject]@{
     InstalledIsCandidate = $(if ($hostHash) { $evidence.InstalledOrchestratorHash -eq $hostHash } else { $null })
     StateFileRemains = $evidence.StateFileExists
     TasksRemaining   = $evidence.TasksRemaining
-    ManualAttentionObserved = @($evidence.Log | Where-Object { $_ -match '(?i)manual attention is required|manual-attention handoff|Stop.*manual attention' }).Count -gt 0
+    ManualAttentionObserved = Test-LabManualAttentionEvidence -Lines @($evidence.Log)
     WaitingForSavedUser = Test-LabSavedUserWaitEvidence @waitEvidence
     SchedulerEventsCollected = $schedulerEvents.Count
     SchedulerTotalEvents = @($evidence.SchedulerEvents).Count
@@ -930,6 +981,9 @@ $summary = [pscustomobject]@{
     LabScenario      = $LabScenario
     ScenarioCyclesExpected = $scenario.RepeatCycles
     ScenarioCyclesObserved = $completedScenarioCycles
+    ScenarioCyclesStarted = $scenarioCyclesStarted
+    NpmFixtureRuns = $npmFixtureSummary.Count
+    NpmFixtureContexts = @($npmFixtureSummary.Context | Select-Object -Unique)
     <# Zero here means no prompt was observed, which for an already-elevated scheduled task is expected and is NOT evidence that the interactive flow demands none. #>
     MaxConsentPrompts = $maxConsent
     Ps7SeenDuringRun = $pwshSeen

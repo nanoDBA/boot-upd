@@ -97,12 +97,21 @@ version in the guest's standard module directory so child processes see the same
 checkpoint restore removes it after the row.
 
 `Invoke-LabRow.ps1 -LabScenario RepeatedWingetFailure` uses the same fake provider to offer a
-test package at a fixed version and return the same installer error. It runs two cycles on
-the same restored guest. The harness sets `-SkipWindowsUpdate`, so Windows Update does no
-discovery, download, or install work during the scenario. The fake Winget path, mode, and log
-location are written to the disposable guest's machine environment so SYSTEM continuation
-tasks still find the fixture after a reboot. Restoring the checkpoint removes those changes.
-The evidence folder includes the fixture command log and the persisted Winget failure memory.
+test package at a fixed version and return the same installer error. Cycle one reaches the
+manual-attention stop. The harness then starts a fresh cycle, where the remembered failure
+should be attempted once and left outstanding. For cycle three it changes the fixture to a
+successful newer offer and checks that the package installs and the memory clears. The
+harness sets `-SkipWindowsUpdate`, so Windows Update does no discovery, download, or install
+work during the scenario. The fake Winget path, mode, and log location are written to the
+disposable guest's machine environment so SYSTEM continuation tasks still find the fixture
+after a reboot. Restoring the checkpoint removes those changes. The evidence folder includes
+the fixture command log, manual-attention evidence, and the persisted Winget failure memory.
+
+`Invoke-LabRow.ps1 -LabScenario SystemNpm` adds a guest-only fake `npm.cmd` to the fixture
+path. It logs the caller and arguments, and exits successfully. The row checks that a SYSTEM
+pass defers user-scope npm work and a later signed-in user pass invokes the fixture once.
+Windows Update is skipped here too. The evidence folder includes the raw caller log and a
+short context-and-arguments summary.
 
 Both scenarios use `-Launcher deploy`, so the orchestrator hash is still checked against the
 pinned source tree. The fixtures are under `fixtures/` and run only when a scenario is named.
