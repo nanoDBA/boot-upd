@@ -89,6 +89,9 @@ Describe 'Lab scenario contracts' {
 
         $scenario.NpmPath | Should -Be 'C:\Lab\boot-upd\tests\integration\lab\fixtures\bin'
         $scenario.NpmEvidenceFile | Should -Be 'C:\ProgramData\BootUpdateCycle\LabNpmFixture.jsonl'
+        $scenario.Mode | Should -Be 'no-updates'
+        $scenario.WingetPath | Should -Be $scenario.NpmPath
+        $scenario.EvidenceFile | Should -Be 'C:\ProgramData\BootUpdateCycle\LabFixture.jsonl'
         $prefix | Should -Match 'GetEnvironmentVariable\("BOOTUPD_LAB_NPM_FIXTURE_LOG","Machine"\)'
         $prefix | Should -Match 'GetEnvironmentVariable\("BOOTUPD_LAB_FIXTURE_PATH","Machine"\)'
         $harness | Should -Match 'SetEnvironmentVariable\(''BOOTUPD_LAB_NPM_FIXTURE_LOG''.*?''Machine''\)'
@@ -176,6 +179,29 @@ Describe 'Lab scenario contracts' {
             $failureExitCode | Should -Be 1603
             $failureLines | Should -Contain 'Installer failed with exit code: 1603'
             @(Get-Content -LiteralPath $logPath).Count | Should -Be 2
+        } finally {
+            if ($null -eq $oldMode) { Remove-Item Env:BOOTUPD_LAB_WINGET_MODE -ErrorAction SilentlyContinue } else { $env:BOOTUPD_LAB_WINGET_MODE = $oldMode }
+            if ($null -eq $oldLog) { Remove-Item Env:BOOTUPD_LAB_FIXTURE_LOG -ErrorAction SilentlyContinue } else { $env:BOOTUPD_LAB_FIXTURE_LOG = $oldLog }
+        }
+    }
+
+    It 'keeps the SYSTEM-to-user scenario offline with a successful no-offer Winget fixture' {
+        $scriptPath = Join-Path $PSScriptRoot 'fixtures/bin/winget-fixture.ps1'
+        $logPath = Join-Path $TestDrive 'winget-no-updates.jsonl'
+        $oldMode = $env:BOOTUPD_LAB_WINGET_MODE
+        $oldLog = $env:BOOTUPD_LAB_FIXTURE_LOG
+        try {
+            $env:BOOTUPD_LAB_WINGET_MODE = 'no-updates'
+            $env:BOOTUPD_LAB_FIXTURE_LOG = $logPath
+            $pwsh = (Get-Command pwsh -ErrorAction Stop).Source
+            $inventory = @(& $pwsh -NoProfile -File $scriptPath list --upgrade-available --scope machine 2>&1)
+            $LASTEXITCODE | Should -Be 0
+            $inventory | Should -Contain 'No applicable upgrade found.'
+            $upgrade = @(& $pwsh -NoProfile -File $scriptPath upgrade --all --scope machine 2>&1)
+            $LASTEXITCODE | Should -Be 0
+            $upgrade | Should -Contain 'No package upgrades available.'
+            $records = @(Get-Content -LiteralPath $logPath | ForEach-Object { $_ | ConvertFrom-Json })
+            $records.Mode | Should -Be @('no-updates','no-updates')
         } finally {
             if ($null -eq $oldMode) { Remove-Item Env:BOOTUPD_LAB_WINGET_MODE -ErrorAction SilentlyContinue } else { $env:BOOTUPD_LAB_WINGET_MODE = $oldMode }
             if ($null -eq $oldLog) { Remove-Item Env:BOOTUPD_LAB_FIXTURE_LOG -ErrorAction SilentlyContinue } else { $env:BOOTUPD_LAB_FIXTURE_LOG = $oldLog }

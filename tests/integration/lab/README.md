@@ -108,10 +108,11 @@ after a reboot. Restoring the checkpoint removes those changes. The evidence fol
 the fixture command log, manual-attention evidence, and the persisted Winget failure memory.
 
 `Invoke-LabRow.ps1 -LabScenario SystemNpm` adds a guest-only fake `npm.cmd` to the fixture
-path. It logs the caller and arguments, and exits successfully. The row checks that a SYSTEM
-pass defers user-scope npm work and a later signed-in user pass invokes the fixture once.
-Windows Update is skipped here too. The evidence folder includes the raw caller log and a
-short context-and-arguments summary.
+path and a no-offers Winget command. It logs the npm caller and arguments, and exits
+successfully; the Winget fixture keeps the row independent of installed packages and network
+offers. The row checks that a SYSTEM pass defers user-scope npm work and a later signed-in
+user pass invokes the fixture once. Windows Update is skipped here too. The evidence folder
+includes the raw caller log and a short context-and-arguments summary.
 
 Both scenarios use `-Launcher deploy`, so the orchestrator hash is still checked against the
 pinned source tree. The fixtures are under `fixtures/` and run only when a scenario is named.

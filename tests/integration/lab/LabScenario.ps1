@@ -33,16 +33,16 @@ function Get-LabScenarioContract {
         }
         'SystemNpm' {
             return [pscustomobject]@{
-                Mode = $null
-                Version = $null
+                Mode = 'no-updates'
+                Version = '1.0'
                 RepeatCycles = 1
-                WingetPath = $null
+                WingetPath = "$fixtureRoot\bin"
                 NpmPath = "$fixtureRoot\bin"
                 NpmEvidenceFile = 'C:\ProgramData\BootUpdateCycle\LabNpmFixture.jsonl'
                 ModulePath = "$fixtureRoot\modules"
                 WindowsUpdateModule = "$fixtureRoot\modules\PSWindowsUpdate\99.0.0"
                 WindowsUpdateModuleTarget = 'C:\Program Files\WindowsPowerShell\Modules\PSWindowsUpdate\99.0.0'
-                EvidenceFile = $null
+                EvidenceFile = 'C:\ProgramData\BootUpdateCycle\LabFixture.jsonl'
             }
         }
         default {
